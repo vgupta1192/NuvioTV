@@ -1,11 +1,11 @@
-name: Build NuvioTV (upstream + self-host backend)
+name: Build NuvioTV (upstream release sync)
 
 on:
   push:
     branches: [dev]
     paths: ['.github/**']
   schedule:
-    - cron: '30 7 * * 1'
+    - cron: '23 */6 * * *'
   workflow_dispatch:
 
 permissions:
@@ -15,36 +15,50 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - name: Check upstream release
+        id: ver
+        run: |
+          UP=$(curl -s https://api.github.com/repos/NuvioMedia/NuvioTV/releases/latest | python3 -c "import json,sys;print(json.load(sys.stdin)['tag_name'])")
+          echo "upstream tag: $UP"
+          BUILT=$(curl -s -o /dev/null -w "%{http_code}" "https://api.github.com/repos/vgupta1192/NuvioTV/releases/tags/tv-$UP")
+          if [ "$BUILT" = "200" ]; then echo "already built, skipping"; echo "should_build=false" >> "$GITHUB_OUTPUT"; else echo "should_build=true" >> "$GITHUB_OUTPUT"; fi
+          echo "tag=$UP" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
+        if: steps.ver.outputs.should_build == 'true'
         with:
           repository: NuvioMedia/NuvioTV
           ref: dev
           lfs: true
 
       - uses: actions/setup-java@v4
+        if: steps.ver.outputs.should_build == 'true'
         with:
           distribution: temurin
           java-version: '21'
 
       - name: Fetch CI signing keystore (from fork)
+        if: steps.ver.outputs.should_build == 'true'
         run: |
           curl -sSL https://raw.githubusercontent.com/vgupta1192/NuvioTV/dev/nuviotv.jks -o nuviotv.jks
           test -s nuviotv.jks
 
       - name: Create local.properties (self-hosted backend)
+        if: steps.ver.outputs.should_build == 'true'
         run: |
           printf '%s\n' \
             'NUVIO_SUPABASE_URL=https://nuviobackend.kissmissi.duckdns.org' \
             'NUVIO_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzg5NzY2MDkyLCJleHAiOjE5NDc0NDYwOTJ9.XB5a12DpW9Uf11QARCv4AAfYHGyk4qRq2Oi_7t8t7X0' \
             'NUVIO_SUPABASE_FALLBACK_URL=' \
+            'AVATAR_PUBLIC_BASE_URL=https://nuviobackend.kissmissi.duckdns.org/storage/v1/object/public/avatars' \
             'SIMKL_CLIENT_ID=cf7f2a335cfcd9759fa01d752d9cf8f42fb4fa1a4e4ff08fe4cafb84ec836621' \
             'TMDB_API_KEY=af624aa414c84ad32d55d5ac45feae76' \
-            'AVATAR_PUBLIC_BASE_URL=https://nuviobackend.kissmissi.duckdns.org/storage/v1/object/public/avatars' \
             'TRAKT_REDIRECT_URI=urn:ietf:wg:oauth:2.0:oob' \
             > local.properties
           cp local.properties local.dev.properties
 
       - name: Build debug APK
+        if: steps.ver.outputs.should_build == 'true'
         env:
           CI_USE_DEBUG_SIGNING: 'true'
         run: |
@@ -52,11 +66,13 @@ jobs:
           ./gradlew :app:assembleFullDebug --stacktrace 2>&1 | tee build-log.txt
 
       - name: Build release APK
+        if: steps.ver.outputs.should_build == 'true'
         run: |
           set -o pipefail
           ./gradlew :app:assembleFullRelease --stacktrace 2>&1 | tee build-log-release.txt || true
 
       - name: Upload artifacts
+        if: steps.ver.outputs.should_build == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: NuvioTV-apks
@@ -64,12 +80,29 @@ jobs:
           if-no-files-found: error
 
       - name: Publish to release
+        if: steps.ver.outputs.should_build == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: tv-build-${{ github.run_number }}
-          name: NuvioTV upstream build ${{ github.run_number }}
+          tag_name: tv-${{ steps.ver.outputs.tag }}
+          name: NuvioTV ${{ steps.ver.outputs.tag }}
           prerelease: true
           files: app/build/outputs/apk/full/*/*.apk
+
+      - name: Notify Telegram
+        if: steps.ver.outputs.should_build == 'true' && env.TG_BOT_TOKEN != '' && env.TG_CHAT_ID != ''
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          REL_TAG: tv-${{ steps.ver.outputs.tag }}
+          VER: ${{ steps.ver.outputs.tag }}
+        run: |
+          MSG="📺 NuvioTV ${VER} is ready
+          Upstream release: ${VER}
+          Download: https://github.com/vgupta1192/NuvioTV/releases/tag/${REL_TAG}
+          (install the arm64-v8a APK over the existing app)"
+          curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TG_CHAT_ID}" \
+            --data-urlencode "text=${MSG}" > /dev/null
 
       - name: Attach build log on failure
         if: failure()
