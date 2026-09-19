@@ -1,8 +1,11 @@
-name: Build NuvioTV APK
+name: Build NuvioTV (upstream + self-host backend)
 
 on:
   push:
     branches: [dev]
+    paths: ['.github/**']
+  schedule:
+    - cron: '0 30 7 * * 1'
   workflow_dispatch:
 
 permissions:
@@ -13,11 +16,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          repository: NuvioMedia/NuvioTV
+          ref: dev
+          lfs: true
 
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
+
+      - name: Fetch CI signing keystore (from fork)
+        run: |
+          curl -sSL https://raw.githubusercontent.com/vgupta1192/NuvioTV/dev/nuviotv.jks -o nuviotv.jks
+          test -s nuviotv.jks
 
       - name: Create local.properties (self-hosted backend)
         run: |
@@ -26,6 +38,7 @@ jobs:
             'NUVIO_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzg5NzY2MDkyLCJleHAiOjE5NDc0NDYwOTJ9.XB5a12DpW9Uf11QARCv4AAfYHGyk4qRq2Oi_7t8t7X0' \
             'NUVIO_SUPABASE_FALLBACK_URL=' \
             'AVATAR_PUBLIC_BASE_URL=https://nuviobackend.kissmissi.duckdns.org/storage/v1/object/public/avatars' \
+            'TRAKT_REDIRECT_URI=urn:ietf:wg:oauth:2.0:oob' \
             > local.properties
           cp local.properties local.dev.properties
 
@@ -36,7 +49,7 @@ jobs:
           set -o pipefail
           ./gradlew :app:assembleFullDebug --stacktrace 2>&1 | tee build-log.txt
 
-      - name: Build release APK (best effort)
+      - name: Build release APK
         run: |
           set -o pipefail
           ./gradlew :app:assembleFullRelease --stacktrace 2>&1 | tee build-log-release.txt || true
@@ -52,7 +65,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: tv-build-${{ github.run_number }}
-          name: NuvioTV build ${{ github.run_number }}
+          name: NuvioTV upstream build ${{ github.run_number }}
           prerelease: true
           files: app/build/outputs/apk/full/*/*.apk
 
