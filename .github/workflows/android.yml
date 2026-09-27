@@ -48,6 +48,30 @@ jobs:
           ref: dev
           lfs: true
 
+      - uses: actions/checkout@v4
+        if: steps.ver.outputs.should_build == 'true'
+        with:
+          path: fork-src
+          sparse-checkout: .github/patches
+
+      # Self-host fork patch: the addon manager's refresh re-reads every addon manifest, and
+      # foreground/periodic pulls re-read manifests older than 30 min, so new addon versions
+      # (same URL) reach a running app. If upstream changed the code so the patch no longer
+      # applies, the build goes on without it and the Telegram message says so.
+      - name: Apply addon-manifest-refresh patch
+        id: patch_manifest
+        if: steps.ver.outputs.should_build == 'true'
+        run: |
+          P=fork-src/.github/patches/addon-manifest-refresh.patch
+          if git apply "$P" || git apply --3way "$P"; then
+            echo "applied=true" >> "$GITHUB_OUTPUT"
+            git diff --stat
+          else
+            echo "::warning::addon-manifest-refresh.patch no longer applies to upstream dev; building without it"
+            git reset --hard -q
+            echo "applied=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/setup-java@v4
         if: steps.ver.outputs.should_build == 'true'
         with:
@@ -138,9 +162,12 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           REL_TAG: tv-${{ steps.ver.outputs.tag }}
           VER: ${{ steps.ver.outputs.tag }}
+          PATCHED: ${{ steps.patch_manifest.outputs.applied }}
         run: |
+          if [ "$PATCHED" = "true" ]; then NOTE="Includes: addon refresh patch (refresh button + auto re-read of addon manifests)"; else NOTE="⚠️ addon refresh patch did NOT apply to this upstream version — built without it"; fi
           MSG="📺 NuvioTV ${VER} is ready
           Upstream release: ${VER}
+          ${NOTE}
           Download: https://github.com/vgupta1192/NuvioTV/releases/tag/${REL_TAG}
           (install the arm64-v8a APK over the existing app)"
           curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
