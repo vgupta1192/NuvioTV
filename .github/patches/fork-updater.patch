@@ -1,0 +1,122 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index fafe747..123a86f 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -147,8 +147,10 @@ android {
+         buildConfigField("String", "SENTRY_DSN", buildConfigString(sentryDsn))
+ 
+         // In-app updater (GitHub Releases)
+-        buildConfigField("String", "GITHUB_OWNER", "\"NuvioMedia\"")
++        // Self-host fork patch: update from the fork's CI releases; FORK_BUILD = CI run number
++        buildConfigField("String", "GITHUB_OWNER", "\"vgupta1192\"")
+         buildConfigField("String", "GITHUB_REPO", "\"NuvioTV\"")
++        buildConfigField("int", "FORK_BUILD", (env("FORK_BUILD")?.toIntOrNull() ?: 0).toString())
+     }
+ 
+     flavorDimensions += "distribution"
+diff --git a/app/src/full/java/com/nuvio/tv/updater/ForkBuild.kt b/app/src/full/java/com/nuvio/tv/updater/ForkBuild.kt
+new file mode 100644
+index 0000000..8ad1881
+--- /dev/null
++++ b/app/src/full/java/com/nuvio/tv/updater/ForkBuild.kt
+@@ -0,0 +1,46 @@
++package com.nuvio.tv.updater
++
++import com.nuvio.tv.BuildConfig
++import com.nuvio.tv.data.remote.dto.GitHubAssetDto
++import com.nuvio.tv.data.remote.dto.GitHubReleaseDto
++
++/**
++ * Self-host fork patch: updates come from github.com/vgupta1192/NuvioTV releases. CI names assets
++ * NuvioTV-<version>-b<run number>-<abi>-<debug|release>.apk and builds this app with
++ * BuildConfig.FORK_BUILD = that run number, so "newer" = higher build number (the upstream
++ * version name stays the same across fork rebuilds). Only assets of the installed variant
++ * (debug = com.nuviodebug.com, release = com.nuvio.tv) are offered, so the update installs over it.
++ */
++internal object ForkBuild {
++    private val buildPattern = Regex("-b(\\d+)-")
++    private const val TAG_PREFIX = "fork-build-"
++
++    fun buildNumber(assetName: String): Int? =
++        buildPattern.find(assetName)?.groupValues?.get(1)?.toIntOrNull()
++
++    fun tag(build: Int): String = "$TAG_PREFIX$build"
++
++    fun isNewer(tag: String): Boolean {
++        val remote = tag.removePrefix(TAG_PREFIX).toIntOrNull() ?: return false
++        return remote > BuildConfig.FORK_BUILD
++    }
++
++    fun newest(releases: List<GitHubReleaseDto>): Triple<GitHubReleaseDto, GitHubAssetDto, Int>? {
++        val variantSuffix = if (BuildConfig.IS_DEBUG_BUILD) "-debug.apk" else "-release.apk"
++        return releases
++            .asSequence()
++            .filterNot(GitHubReleaseDto::draft)
++            .mapNotNull { release ->
++                val candidates = release.assets.filter {
++                    it.name.endsWith(variantSuffix, ignoreCase = true) && buildNumber(it.name) != null
++                }
++                val newestBuild = candidates.mapNotNull { buildNumber(it.name) }.maxOrNull()
++                    ?: return@mapNotNull null
++                val asset = AbiSelector.chooseBestApkAsset(
++                    candidates.filter { buildNumber(it.name) == newestBuild }
++                ) ?: return@mapNotNull null
++                Triple(release, asset, newestBuild)
++            }
++            .maxByOrNull { it.third }
++    }
++}
+diff --git a/app/src/full/java/com/nuvio/tv/updater/UpdateRepository.kt b/app/src/full/java/com/nuvio/tv/updater/UpdateRepository.kt
+index 135fb6a..1d4fd34 100644
+--- a/app/src/full/java/com/nuvio/tv/updater/UpdateRepository.kt
++++ b/app/src/full/java/com/nuvio/tv/updater/UpdateRepository.kt
+@@ -19,6 +19,26 @@ class UpdateRepository @Inject constructor(
+             val owner = BuildConfig.GITHUB_OWNER
+             val repo = BuildConfig.GITHUB_REPO
+ 
++            // Self-host fork patch: the fork publishes every CI build (as prereleases) with the
++            // CI run number in the asset names; newest build number wins, channel does not matter.
++            val forkResponse = gitHubReleaseApi.getReleases(owner = owner, repo = repo)
++            if (!forkResponse.isSuccessful) {
++                error("GitHub API error: ${forkResponse.code()}")
++            }
++            val (forkRelease, forkAsset, forkBuild) = ForkBuild
++                .newest(forkResponse.body() ?: error("Empty GitHub release response"))
++                ?: throw NoEligibleUpdateException(channel)
++            return@runCatching AppUpdate(
++                tag = ForkBuild.tag(forkBuild),
++                title = "${forkRelease.name?.takeIf { it.isNotBlank() } ?: forkRelease.tagName.orEmpty()} (build $forkBuild)".trim(),
++                notes = forkRelease.body.orEmpty(),
++                releaseUrl = forkRelease.htmlUrl,
++                assetName = forkAsset.name,
++                assetUrl = forkAsset.browserDownloadUrl,
++                assetSizeBytes = forkAsset.size
++            )
++
++            @Suppress("UNREACHABLE_CODE")
+             val releases = when (channel) {
+                 UpdateChannel.STABLE -> {
+                     val response = gitHubReleaseApi.getLatestRelease(owner = owner, repo = repo)
+diff --git a/app/src/full/java/com/nuvio/tv/updater/UpdateViewModel.kt b/app/src/full/java/com/nuvio/tv/updater/UpdateViewModel.kt
+index 028843d..4692030 100644
+--- a/app/src/full/java/com/nuvio/tv/updater/UpdateViewModel.kt
++++ b/app/src/full/java/com/nuvio/tv/updater/UpdateViewModel.kt
+@@ -57,7 +57,8 @@ class UpdateViewModel @Inject constructor(
+                     updateChannel = channel
+                 )
+             }
+-            if (enabled && !BuildConfig.IS_DEBUG_BUILD) {
++            // Self-host fork patch: the fork's debug variant is a normal install, check it too
++            if (enabled) {
+                 checkForUpdates(force = false, showNoUpdateFeedback = false)
+             }
+         }
+@@ -85,7 +86,7 @@ class UpdateViewModel @Inject constructor(
+ 
+             result
+                 .onSuccess { update ->
+-                    val remoteNewer = VersionUtils.isRemoteNewer(update.tag, BuildConfig.VERSION_NAME)
++                    val remoteNewer = ForkBuild.isNewer(update.tag) // self-host fork patch
+                     val shouldShow = UpdateBannerPolicy.shouldShow(
+                         isRemoteNewer = remoteNewer,
+                         force = force,
