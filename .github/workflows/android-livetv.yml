@@ -1,0 +1,236 @@
+name: Build NuvioTV LiveTV (upstream release sync)
+
+on:
+  push:
+    branches: [livetv]
+    paths: ['.github/**']
+  workflow_dispatch:
+    # Builds are triggered by the local watcher on vgupta1192's box
+    # (~/bin/nuvio-sync-check.sh nuviotv): GitHub's schedule event drops runs
+    # for hours, so the old hourly cron never fired reliably. The watcher
+    # pushes a sync-pulse commit when upstream has an unbuilt release, which
+    # lands here via the push trigger above.
+
+permissions:
+  contents: write
+
+# one LiveTV build at a time; separate group so it never races the main android.yml run
+concurrency:
+  group: build-nuviotv-livetv
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check upstream release
+        id: ver
+        env:
+          HEAD_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          UP=$(curl -s -H "Authorization: Bearer ${{ github.token }}" https://api.github.com/repos/NuvioMedia/NuvioTV/releases/latest | python3 -c "import json,sys;print(json.load(sys.stdin)['tag_name'])")
+          VER="${UP%%-*}"
+          echo "upstream tag: $UP (version $VER)"
+          BUILT=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${{ github.token }}" "https://api.github.com/repos/vgupta1192/NuvioTV/releases/tags/tv-livetv-$UP")
+          # workflow_dispatch or a head commit message containing [force-build] rebuilds
+          # even when the release already exists
+          FORCE=false
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then FORCE=true; fi
+          if echo "$HEAD_MSG" | grep -qi '\[force-build\]'; then FORCE=true; fi
+          SHOULD=true
+          if [ "$BUILT" = "200" ] && [ "$FORCE" != "true" ]; then
+            RENAMED=$(curl -s -H "Authorization: Bearer ${{ github.token }}" "https://api.github.com/repos/vgupta1192/NuvioTV/releases/tags/tv-livetv-$UP" | jq --arg want "NuvioTV-LiveTV-${VER}-b" '[.assets[] | select(.name | startswith($want))] | length')
+            if [ "${RENAMED:-0}" -ge 1 ]; then echo "already built with release naming, skipping"; SHOULD=false; else echo "release exists but assets need renaming, rebuilding"; fi
+          fi
+          echo "should_build=$SHOULD" >> "$GITHUB_OUTPUT"
+          echo "tag=$UP" >> "$GITHUB_OUTPUT"
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        if: steps.ver.outputs.should_build == 'true'
+        with:
+          repository: NuvioMedia/NuvioTV
+          ref: dev
+          lfs: true
+
+      - uses: actions/checkout@v4
+        if: steps.ver.outputs.should_build == 'true'
+        with:
+          path: fork-src
+          sparse-checkout: .github/patches
+
+      # Self-host fork patch: the addon manager's refresh re-reads every addon manifest, and
+      # foreground/periodic pulls re-read manifests older than 30 min, so new addon versions
+      # (same URL) reach a running app. If upstream changed the code so the patch no longer
+      # applies, the build goes on without it and the Telegram message says so.
+      - name: Apply addon-manifest-refresh patch
+        id: patch_manifest
+        if: steps.ver.outputs.should_build == 'true'
+        run: |
+          P=fork-src/.github/patches/addon-manifest-refresh.patch
+          if git apply "$P" || git apply --3way "$P"; then
+            echo "applied=true" >> "$GITHUB_OUTPUT"
+            git diff --stat
+          else
+            echo "::warning::addon-manifest-refresh.patch no longer applies to upstream dev; building without it"
+            git reset --hard -q
+            echo "applied=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Self-host fork patch: the in-app updater checks this fork's releases and compares the CI
+      # run number (asset names ...-b<run>-..., BuildConfig.FORK_BUILD) instead of the version name.
+      - name: Apply fork-updater patch
+        id: patch_updater
+        if: steps.ver.outputs.should_build == 'true'
+        run: |
+          P=fork-src/.github/patches/fork-updater.patch
+          if git apply "$P" || git apply --3way "$P"; then
+            echo "applied=true" >> "$GITHUB_OUTPUT"
+            git diff --stat
+          else
+            echo "::warning::fork-updater.patch no longer applies to upstream dev; building without it"
+            git checkout -- app/build.gradle.kts app/src/full 2>/dev/null; git clean -fdq app/src/full
+            echo "applied=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Live TV feature port (from vgupta1192/NuvioGTvMod), side-installed via
+      # applicationIdSuffix ".livetv" so it doesn't collide with the main app.
+      - name: Apply livetv-feature patch
+        id: patch_livetv
+        if: steps.ver.outputs.should_build == 'true'
+        run: |
+          P=fork-src/.github/patches/livetv-feature.patch
+          if git apply "$P" || git apply --3way "$P"; then
+            echo "applied=true" >> "$GITHUB_OUTPUT"
+            git diff --stat
+          else
+            echo "::warning::livetv-feature.patch no longer applies to upstream dev; building without it"
+            git reset --hard -q
+            echo "applied=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-java@v4
+        if: steps.ver.outputs.should_build == 'true'
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Fetch CI signing keystore (from fork)
+        if: steps.ver.outputs.should_build == 'true'
+        run: |
+          curl -sSL https://raw.githubusercontent.com/vgupta1192/NuvioTV/dev/nuviotv.jks -o nuviotv.jks
+          test -s nuviotv.jks
+
+      - name: Create local.properties (self-hosted backend)
+        if: steps.ver.outputs.should_build == 'true'
+        run: |
+          printf '%s\n' \
+            'NUVIO_SUPABASE_URL=https://nuviobackend.kissmissi.duckdns.org' \
+            'NUVIO_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzg5NzY2MDkyLCJleHAiOjE5NDc0NDYwOTJ9.XB5a12DpW9Uf11QARCv4AAfYHGyk4qRq2Oi_7t8t7X0' \
+            'NUVIO_SUPABASE_FALLBACK_URL=' \
+            'AVATAR_PUBLIC_BASE_URL=https://nuviobackend.kissmissi.duckdns.org/storage/v1/object/public/avatars' \
+            'SIMKL_CLIENT_ID=cf7f2a335cfcd9759fa01d752d9cf8f42fb4fa1a4e4ff08fe4cafb84ec836621' \
+            'TMDB_API_KEY=af624aa414c84ad32d55d5ac45feae76' \
+            'TRAKT_REDIRECT_URI=urn:ietf:wg:oauth:2.0:oob' \
+            'TV_LOGIN_WEB_BASE_URL=https://nuvioweb.kissmissi.duckdns.org/tv-login' \
+            'DEVICE_LOGIN_WEB_BASE_URL=https://nuvioweb.kissmissi.duckdns.org/link' \
+            > local.properties
+          cp local.properties local.dev.properties
+
+      - name: Build debug APK
+        if: steps.ver.outputs.should_build == 'true'
+        env:
+          CI_USE_DEBUG_SIGNING: 'true'
+          FORK_BUILD: ${{ github.run_number }}
+        run: |
+          set -o pipefail
+          ./gradlew :app:assembleFullDebug --stacktrace 2>&1 | tee build-log.txt
+
+      - name: Build release APK
+        if: steps.ver.outputs.should_build == 'true'
+        env:
+          FORK_BUILD: ${{ github.run_number }}
+        run: |
+          set -o pipefail
+          ./gradlew :app:assembleFullRelease --stacktrace 2>&1 | tee build-log-release.txt || true
+
+      - name: Rename artifacts
+        if: steps.ver.outputs.should_build == 'true'
+        run: |
+          mkdir -p release-files
+          for f in app/build/outputs/apk/full/*/*.apk; do
+            base="$(basename "$f")"
+            cp "$f" "release-files/NuvioTV-LiveTV-${{ steps.ver.outputs.ver }}-b${{ github.run_number }}-${base#app-full-}"
+          done
+          ls -l release-files
+
+      - name: Upload artifacts
+        if: steps.ver.outputs.should_build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: NuvioTV-LiveTV-apks
+          path: release-files/*.apk
+          if-no-files-found: error
+
+      - name: Publish to release
+        if: steps.ver.outputs.should_build == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: tv-livetv-${{ steps.ver.outputs.tag }}
+          name: NuvioTV LiveTV ${{ steps.ver.outputs.tag }}
+          prerelease: true
+          files: release-files/*.apk
+
+      - name: Remove legacy-named assets
+        if: steps.ver.outputs.should_build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: NuvioTV-LiveTV-${{ steps.ver.outputs.ver }}-b${{ github.run_number }}-
+          TAG: tv-livetv-${{ steps.ver.outputs.tag }}
+        run: |
+          gh api "repos/${{ github.repository }}/releases/tags/$TAG" \
+            | jq -r --arg keep "$KEEP" --argjson run "${{ github.run_number }}" '.assets[]
+                | select(.name | startswith($keep) | not)
+                | select((((.name | capture("-b(?<n>[0-9]+)-") | .n) // "0") | tonumber) < $run)
+                | .id' \
+            | while read -r id; do
+                echo "deleting legacy asset $id"
+                gh api -X DELETE "repos/${{ github.repository }}/releases/assets/$id"
+              done
+
+      - name: Notify Telegram
+        if: steps.ver.outputs.should_build == 'true' && env.TG_BOT_TOKEN != '' && env.TG_CHAT_ID != ''
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          REL_TAG: tv-livetv-${{ steps.ver.outputs.tag }}
+          VER: ${{ steps.ver.outputs.tag }}
+          PATCHED: ${{ steps.patch_manifest.outputs.applied }}
+          UPD_PATCHED: ${{ steps.patch_updater.outputs.applied }}
+          LIVETV_PATCHED: ${{ steps.patch_livetv.outputs.applied }}
+          BUILD_NO: ${{ github.run_number }}
+        run: |
+          if [ "$PATCHED" = "true" ]; then NOTE="Includes: addon refresh patch (refresh button + auto re-read of addon manifests)"; else NOTE="⚠️ addon refresh patch did NOT apply to this upstream version — built without it"; fi
+          if [ "$UPD_PATCHED" = "true" ]; then NOTE="${NOTE}
+          Build ${BUILD_NO}: patched TVs show the update banner at app start (or Settings → check for updates) and install it in-app"; else NOTE="${NOTE}
+          ⚠️ fork-updater patch did NOT apply — this build updates only by manual APK install"; fi
+          if [ "$LIVETV_PATCHED" = "true" ]; then NOTE="${NOTE}
+          Live TV feature included (installs side-by-side with the main app via .livetv suffix)"; else NOTE="${NOTE}
+          ⚠️ livetv-feature patch did NOT apply — this build has no Live TV feature"; fi
+          MSG="📺 NuvioTV LiveTV ${VER} is ready
+          Upstream release: ${VER}
+          ${NOTE}
+          Download: https://github.com/vgupta1192/NuvioTV/releases/tag/${REL_TAG}
+          (installs alongside the main NuvioTV app)"
+          curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TG_CHAT_ID}" \
+            --data-urlencode "text=${MSG}" > /dev/null
+
+      - name: Attach build log on failure
+        if: failure()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: tv-livetv-debug-logs
+          name: LiveTV CI debug logs
+          prerelease: true
+          files: build-log.txt
