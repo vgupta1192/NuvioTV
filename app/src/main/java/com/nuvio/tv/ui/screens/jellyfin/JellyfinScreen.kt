@@ -533,8 +533,8 @@ private fun TvJellyfinHiddenExpander(
             focusedContentColor = Color.Black,
         ),
         border = ClickableSurfaceDefaults.border(
-            border = Border(BorderStroke(1.dp, NuvioTheme.colors.Border), shape),
-            focusedBorder = Border(BorderStroke(2.dp, NuvioTheme.colors.FocusRing), shape),
+            border = Border(border = BorderStroke(1.dp, NuvioTheme.colors.Border), shape = shape),
+            focusedBorder = Border(border = BorderStroke(2.dp, NuvioTheme.colors.FocusRing), shape = shape),
         ),
     ) {
         Text(
@@ -589,7 +589,7 @@ private fun TvJellyfinLibraryRow(
                     ),
                     shape = rowShape,
                 ),
-                focusedBorder = Border(BorderStroke(2.dp, NuvioTheme.colors.FocusRing), rowShape),
+                focusedBorder = Border(border = BorderStroke(2.dp, NuvioTheme.colors.FocusRing), shape = rowShape),
             ),
         ) {
             Text(
@@ -612,8 +612,8 @@ private fun TvJellyfinLibraryRow(
                 focusedContentColor = Color.Black,
             ),
             border = ClickableSurfaceDefaults.border(
-                border = Border(BorderStroke(1.dp, NuvioTheme.colors.Border), rowShape),
-                focusedBorder = Border(BorderStroke(2.dp, NuvioTheme.colors.FocusRing), rowShape),
+                border = Border(border = BorderStroke(1.dp, NuvioTheme.colors.Border), shape = rowShape),
+                focusedBorder = Border(border = BorderStroke(2.dp, NuvioTheme.colors.FocusRing), shape = rowShape),
             ),
         ) {
             Text(
