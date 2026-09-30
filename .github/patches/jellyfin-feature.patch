@@ -1,16 +1,8 @@
 diff --git a/app/src/main/java/com/nuvio/tv/MainActivity.kt b/app/src/main/java/com/nuvio/tv/MainActivity.kt
-index 95b2d0d8..2a3ffed9 100644
+index 95b2d0d8..c6a64eaf 100644
 --- a/app/src/main/java/com/nuvio/tv/MainActivity.kt
 +++ b/app/src/main/java/com/nuvio/tv/MainActivity.kt
-@@ -49,6 +49,7 @@ import androidx.compose.foundation.selection.selectableGroup
- import androidx.compose.foundation.shape.CircleShape
- import androidx.compose.foundation.shape.RoundedCornerShape
- import androidx.compose.material.icons.Icons
-+import androidx.compose.material.icons.rounded.VideoLibrary
- import androidx.compose.material.icons.filled.Explore
- import androidx.compose.material.icons.filled.Home
- import androidx.compose.material.icons.filled.Search
-@@ -350,6 +351,10 @@ open class MainActivity : ComponentActivity() {
+@@ -350,6 +350,10 @@ open class MainActivity : ComponentActivity() {
          installSplashScreen()
          super.onCreate(savedInstanceState)
          isFirstResumeAfterCreate = true
@@ -21,7 +13,7 @@ index 95b2d0d8..2a3ffed9 100644
          window?.setBackgroundDrawable(ColorDrawable(android.graphics.Color.TRANSPARENT))
  
          // Wire the Activity-level launcher to the tracker
-@@ -1011,6 +1016,7 @@ open class MainActivity : ComponentActivity() {
+@@ -1011,6 +1015,7 @@ open class MainActivity : ComponentActivity() {
                          buildSet {
                              add(Screen.Home.route)
                              add(Screen.Search.route)
@@ -29,7 +21,7 @@ index 95b2d0d8..2a3ffed9 100644
                              add(Screen.Library.route)
                              add(Screen.Settings.route)
                              if (discoverLocation == DiscoverLocation.IN_SIDEBAR) {
-@@ -1019,6 +1025,7 @@ open class MainActivity : ComponentActivity() {
+@@ -1019,6 +1024,7 @@ open class MainActivity : ComponentActivity() {
                          }
                      }
  
@@ -37,7 +29,7 @@ index 95b2d0d8..2a3ffed9 100644
                      val strNavHome = stringResource(R.string.nav_home)
                      val strNavDiscover = stringResource(R.string.nav_discover)
                      val strNavSearch = stringResource(R.string.nav_search)
-@@ -1040,6 +1047,13 @@ open class MainActivity : ComponentActivity() {
+@@ -1040,6 +1046,13 @@ open class MainActivity : ComponentActivity() {
                                      icon = Icons.Default.Home
                                  )
                              )
@@ -45,7 +37,7 @@ index 95b2d0d8..2a3ffed9 100644
 +                                    DrawerItem(
 +                                        route = Screen.Jellyfin.route,
 +                                        label = strNavJellyfin,
-+                                        icon = Icons.Rounded.VideoLibrary
++                                        iconRes = R.raw.sidebar_jellyfin
 +                                    )
 +                            )
                              if (discoverLocation == DiscoverLocation.IN_SIDEBAR) {
@@ -1612,3 +1604,243 @@ index 00000000..d778dc3e
 +    val minutes = (totalSeconds % 3600) / 60
 +    return if (hours > 0) "${hours}h ${minutes.toString().padStart(2, '0')}m" else "${minutes}m"
 +}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/JellyfinSettingsPane.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/JellyfinSettingsPane.kt
+new file mode 100644
+index 00000000..42e5f410
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/JellyfinSettingsPane.kt
+@@ -0,0 +1,170 @@
++@file:OptIn(ExperimentalTvMaterial3Api::class)
++
++package com.nuvio.tv.ui.screens.settings
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.CheckCircle
++import androidx.compose.material.icons.filled.Logout
++import androidx.compose.material.icons.filled.Refresh
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.saveable.rememberSaveable
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.text.input.PasswordVisualTransformation
++import androidx.compose.ui.text.input.VisualTransformation
++import androidx.compose.ui.unit.dp
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import androidx.tv.material3.ExperimentalTvMaterial3Api
++import com.nuvio.tv.data.repository.JellyfinRepository
++import com.nuvio.tv.ui.theme.NuvioTheme
++
++/**
++ * Jellyfin fork feature (TV): the Settings → Jellyfin section, mirroring the Live TV settings
++ * pattern. Server connection (address/username/password) plus per-profile library visibility;
++ * the sidebar Jellyfin entry opens the browse UI directly.
++ */
++@Composable
++internal fun JellyfinSettingsPane(
++    initialFocusRequester: FocusRequester?,
++    modifier: Modifier = Modifier
++) {
++    val state by JellyfinRepository.uiState.collectAsStateWithLifecycle()
++    val session = state.session
++    var serverUrl by rememberSaveable { mutableStateOf("") }
++    var username by rememberSaveable { mutableStateOf("") }
++    var password by rememberSaveable { mutableStateOf("") }
++
++    LazyColumn(
++        modifier = modifier
++            .fillMaxSize()
++            .padding(end = NuvioTheme.spacing.md),
++        verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.lg)
++    ) {
++        item {
++            SettingsDetailHeader(
++                title = "Jellyfin",
++                subtitle = "Connect your Jellyfin server, then open Jellyfin from the sidebar to browse and play your libraries."
++            )
++        }
++        item {
++            SettingsGroupCard(
++                title = "Server",
++                subtitle = if (session != null) "Connected to ${session.serverName}" else "Not connected"
++            ) {
++                if (session == null) {
++                    JellyfinSettingsTextField(
++                        value = serverUrl,
++                        onValueChange = { serverUrl = it },
++                        label = "Server address (https://…)",
++                        modifier = (if (initialFocusRequester != null) {
++                            Modifier.focusRequester(initialFocusRequester)
++                        } else {
++                            Modifier
++                        }).fillMaxWidth()
++                    )
++                    JellyfinSettingsTextField(
++                        value = username,
++                        onValueChange = { username = it },
++                        label = "Username",
++                        modifier = Modifier.fillMaxWidth()
++                    )
++                    JellyfinSettingsTextField(
++                        value = password,
++                        onValueChange = { password = it },
++                        label = "Password",
++                        password = true,
++                        modifier = Modifier.fillMaxWidth()
++                    )
++                    SettingsActionRow(
++                        title = if (state.isLoadingSession) "Connecting…" else "Connect",
++                        subtitle = "Signs in and loads your server's libraries.",
++                        enabled = !state.isLoadingSession && serverUrl.isNotBlank() && username.isNotBlank(),
++                        onClick = { JellyfinRepository.signIn(serverUrl, username, password) }
++                    )
++                    if (!state.sessionError.isNullOrBlank()) {
++                        androidx.compose.material3.Text(
++                            text = state.sessionError.orEmpty(),
++                            style = androidx.compose.material3.MaterialTheme.typography.bodySmall,
++                            color = androidx.compose.material3.MaterialTheme.colorScheme.error,
++                            modifier = Modifier.padding(horizontal = 18.dp)
++                        )
++                    }
++                } else {
++                    SettingsActionRow(
++                        title = "Signed in as ${session.userName}",
++                        subtitle = session.serverUrl,
++                        onClick = {},
++                        enabled = false,
++                        trailingIcon = Icons.Default.CheckCircle
++                    )
++                    SettingsActionRow(
++                        title = "Refresh libraries",
++                        subtitle = "Reload libraries and artwork from the server.",
++                        leadingIcon = Icons.Default.Refresh,
++                        onClick = { JellyfinRepository.refresh() }
++                    )
++                    SettingsActionRow(
++                        title = "Sign out",
++                        subtitle = "Removes the saved session from this device.",
++                        leadingIcon = Icons.Default.Logout,
++                        onClick = { JellyfinRepository.signOut() }
++                    )
++                }
++            }
++        }
++        if (session != null) {
++            item {
++                SettingsGroupCard(
++                    title = "Libraries",
++                    subtitle = "Visibility applies to the active profile only — hidden libraries leave the Jellyfin screen and search."
++                ) {
++                    if (state.libraries.isEmpty()) {
++                        SettingsActionRow(
++                            title = if (state.isLoadingSession) "Loading libraries…" else "No libraries found",
++                            subtitle = null,
++                            enabled = false,
++                            onClick = {}
++                        )
++                    } else {
++                        state.libraries.forEach { library ->
++                            val visible = library.id !in state.hiddenLibraryIds
++                            SettingsToggleRow(
++                                title = library.name,
++                                subtitle = if (visible) "Visible in this profile" else "Hidden in this profile",
++                                checked = visible,
++                                onToggle = { JellyfinRepository.toggleLibraryHidden(library.id) }
++                            )
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
++
++@Composable
++private fun JellyfinSettingsTextField(
++    value: String,
++    onValueChange: (String) -> Unit,
++    label: String,
++    modifier: Modifier = Modifier,
++    password: Boolean = false
++) {
++    androidx.compose.material3.OutlinedTextField(
++        value = value,
++        onValueChange = onValueChange,
++        label = { androidx.compose.material3.Text(label) },
++        singleLine = true,
++        visualTransformation = if (password) PasswordVisualTransformation() else VisualTransformation.None,
++        modifier = modifier.padding(vertical = 2.dp)
++    )
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsCatalog.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsCatalog.kt
+index de7c3073..c651d985 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsCatalog.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsCatalog.kt
+@@ -14,6 +14,7 @@ internal enum class SettingsCategory(val group: SettingsRailGroup) {
+     APPEARANCE(SettingsRailGroup.LOOK),
+     LAYOUT(SettingsRailGroup.LOOK),
+     CONTENT_DISCOVERY(SettingsRailGroup.WATCH),
++    JELLYFIN(SettingsRailGroup.WATCH),
+     PLAYBACK(SettingsRailGroup.WATCH),
+     INTEGRATION(SettingsRailGroup.SERVICES),
+     TRACKING(SettingsRailGroup.SERVICES),
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt
+index 40d89fa1..d0a7292e 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt
+@@ -36,6 +36,7 @@ import androidx.compose.foundation.lazy.LazyListState
+ import androidx.compose.foundation.lazy.rememberLazyListState
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.rounded.PlayArrow
++import androidx.compose.material.icons.rounded.VideoLibrary
+ import androidx.compose.material.icons.filled.BugReport
+ import androidx.compose.material.icons.filled.Build
+ import androidx.compose.material.icons.filled.CloudDownload
+@@ -158,6 +159,7 @@ private fun settingsSectionSpec(category: SettingsCategory): SettingsSectionSpec
+     SettingsCategory.APPEARANCE -> SettingsSectionSpec(category, stringResource(R.string.appearance_title), Icons.Default.Palette, destination = SettingsSectionDestination.Inline)
+     SettingsCategory.LAYOUT -> SettingsSectionSpec(category, stringResource(R.string.settings_layout), Icons.Default.GridView, destination = SettingsSectionDestination.Inline)
+     SettingsCategory.CONTENT_DISCOVERY -> SettingsSectionSpec(category, stringResource(R.string.settings_content_discovery), Icons.Default.Explore, destination = SettingsSectionDestination.Inline)
++    SettingsCategory.JELLYFIN -> SettingsSectionSpec(category, "Jellyfin", Icons.Rounded.VideoLibrary, destination = SettingsSectionDestination.Inline)
+     SettingsCategory.PLAYBACK -> SettingsSectionSpec(category, stringResource(R.string.settings_playback), Icons.Rounded.PlayArrow, destination = SettingsSectionDestination.Inline)
+     SettingsCategory.INTEGRATION -> SettingsSectionSpec(category, stringResource(R.string.settings_integration), Icons.Default.Link, destination = SettingsSectionDestination.Inline)
+     SettingsCategory.TRACKING -> SettingsSectionSpec(category, stringResource(R.string.settings_tracking_title), Icons.Default.Sync, destination = SettingsSectionDestination.External)
+@@ -226,6 +228,7 @@ fun SettingsScreen(
+             SettingsCategory.PROFILES to FocusRequester(),
+             SettingsCategory.LAYOUT to FocusRequester(),
+             SettingsCategory.CONTENT_DISCOVERY to FocusRequester(),
++            SettingsCategory.JELLYFIN to FocusRequester(),
+             SettingsCategory.INTEGRATION to FocusRequester(),
+             SettingsCategory.PLAYBACK to FocusRequester(),
+             SettingsCategory.ADVANCED to FocusRequester(),
+@@ -905,6 +908,13 @@ private fun SettingsDetailPane(
+                 null
+             }
+         )
++        SettingsCategory.JELLYFIN -> JellyfinSettingsPane(
++            initialFocusRequester = if (allowDetailAutofocus) {
++                contentFocusRequesters[SettingsCategory.JELLYFIN]
++            } else {
++                null
++            }
++        )
+         SettingsCategory.ACCOUNT -> AccountSettingsInline(
+             onNavigateToAuthQrSignIn = onNavigateToAuthQrSignIn,
+             initialFocusRequester = if (allowDetailAutofocus) {
+diff --git a/app/src/main/res/raw/sidebar_jellyfin.svg b/app/src/main/res/raw/sidebar_jellyfin.svg
+new file mode 100644
+index 00000000..5727e6ec
+--- /dev/null
++++ b/app/src/main/res/raw/sidebar_jellyfin.svg
+@@ -0,0 +1,4 @@
++<?xml version="1.0" encoding="utf-8"?>
++<svg width="24px" height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
++  <path fill="#000000" d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-8 12V6l5.5 4-5.5 4z"/>
++</svg>
