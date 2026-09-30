@@ -29,6 +29,7 @@ import com.nuvio.tv.data.local.PlayerSettingsDataStore
 import com.nuvio.tv.domain.model.AuthState
 import com.nuvio.tv.domain.model.LibraryEntry
 import com.nuvio.tv.domain.model.LibraryListTab
+import com.nuvio.tv.domain.model.LiveTvCatalogs
 import com.nuvio.tv.domain.model.LibrarySourceMode
 import com.nuvio.tv.domain.model.LibraryListPrivacy
 import com.nuvio.tv.domain.repository.LibraryRepository
@@ -700,7 +701,8 @@ class LibraryViewModel @Inject constructor(
                     val updated = current.copy(
                         sourceMode = sourceMode,
                         listManagement = sourceMode.providerId?.let(trackingProviderRegistry::provider)?.listManager?.capabilities,
-                        allItems = items,
+                        // Live TV channels are shown on the Live TV screen only.
+                        allItems = items.filterNot { LiveTvCatalogs.isLiveTvType(it.mediaCategory ?: it.type) },
                         listTabs = listTabs,
                         availableSortOptions = sortOptions,
                         selectedTypeTab = nextSelectedType,

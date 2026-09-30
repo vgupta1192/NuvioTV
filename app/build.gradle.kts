@@ -148,14 +148,17 @@ android {
         buildConfigField("String", "SENTRY_DSN", buildConfigString(sentryDsn))
 
         // In-app updater (GitHub Releases)
-        buildConfigField("String", "GITHUB_OWNER", "\"NuvioMedia\"")
+        // Self-host fork patch: update from the fork's CI releases; FORK_BUILD = CI run number
+        buildConfigField("String", "GITHUB_OWNER", "\"vgupta1192\"")
         buildConfigField("String", "GITHUB_REPO", "\"NuvioTV\"")
+        buildConfigField("int", "FORK_BUILD", (env("FORK_BUILD")?.toIntOrNull() ?: 0).toString())
     }
 
     flavorDimensions += "distribution"
     productFlavors {
         create("full") {
             dimension = "distribution"
+            applicationIdSuffix = ".livetv"
             buildConfigField("boolean", "FEATURE_PLUGINS_ENABLED", "true")
             buildConfigField("boolean", "FEATURE_IN_APP_UPDATES_ENABLED", "true")
             buildConfigField("boolean", "FEATURE_IN_APP_TRAILERS_ENABLED", "true")

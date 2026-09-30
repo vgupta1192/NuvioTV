@@ -19,6 +19,26 @@ class UpdateRepository @Inject constructor(
             val owner = BuildConfig.GITHUB_OWNER
             val repo = BuildConfig.GITHUB_REPO
 
+            // Self-host fork patch: the fork publishes every CI build (as prereleases) with the
+            // CI run number in the asset names; newest build number wins, channel does not matter.
+            val forkResponse = gitHubReleaseApi.getReleases(owner = owner, repo = repo)
+            if (!forkResponse.isSuccessful) {
+                error("GitHub API error: ${forkResponse.code()}")
+            }
+            val (forkRelease, forkAsset, forkBuild) = ForkBuild
+                .newest(forkResponse.body() ?: error("Empty GitHub release response"))
+                ?: throw NoEligibleUpdateException(channel)
+            return@runCatching AppUpdate(
+                tag = ForkBuild.tag(forkBuild),
+                title = "${forkRelease.name?.takeIf { it.isNotBlank() } ?: forkRelease.tagName.orEmpty()} (build $forkBuild)".trim(),
+                notes = forkRelease.body.orEmpty(),
+                releaseUrl = forkRelease.htmlUrl,
+                assetName = forkAsset.name,
+                assetUrl = forkAsset.browserDownloadUrl,
+                assetSizeBytes = forkAsset.size
+            )
+
+            @Suppress("UNREACHABLE_CODE")
             val releases = when (channel) {
                 UpdateChannel.STABLE -> {
                     val response = gitHubReleaseApi.getLatestRelease(owner = owner, repo = repo)

@@ -27,6 +27,7 @@ import com.nuvio.tv.domain.model.FocusedPosterTrailerPlaybackTarget
 import com.nuvio.tv.domain.model.HomeLayout
 import com.nuvio.tv.domain.model.HomeImdbRatingsVisibility
 import com.nuvio.tv.domain.model.enabledAddons
+import com.nuvio.tv.domain.model.withoutLiveTvCatalogs
 import com.nuvio.tv.domain.repository.AddonRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -965,7 +966,7 @@ class LayoutSettingsViewModel @Inject constructor(
     private fun loadAvailableCatalogs() {
         viewModelScope.launch {
             addonRepository.getInstalledAddons().collectLatest { installedAddons ->
-                val addons = installedAddons.enabledAddons()
+                val addons = installedAddons.enabledAddons().withoutLiveTvCatalogs()
                 val catalogs = addons.flatMap { addon ->
                     addon.catalogs
                         .filter { catalog ->

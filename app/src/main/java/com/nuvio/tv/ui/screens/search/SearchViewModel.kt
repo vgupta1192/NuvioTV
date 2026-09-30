@@ -27,6 +27,7 @@ import com.nuvio.tv.domain.model.ContentType
 import com.nuvio.tv.domain.model.MetaPreview
 import com.nuvio.tv.domain.model.PosterShape
 import com.nuvio.tv.domain.model.enabledAddons
+import com.nuvio.tv.domain.model.withoutLiveTvCatalogs
 import com.nuvio.tv.domain.model.PLACEHOLDER_IMAGE_URL
 import com.nuvio.tv.domain.repository.CatalogRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -364,7 +365,7 @@ class SearchViewModel @Inject constructor(
             kotlinx.coroutines.delay(SUGGESTION_DEBOUNCE_MS)
 
             val addons = try {
-                addonRepository.getInstalledAddons().first().enabledAddons()
+                addonRepository.getInstalledAddons().first().enabledAddons().withoutLiveTvCatalogs()
             } catch (_: Exception) {
                 return@launch
             }
@@ -564,7 +565,7 @@ class SearchViewModel @Inject constructor(
 
         val job = viewModelScope.launch {
             val addons = try {
-                addonRepository.getInstalledAddons().first().enabledAddons()
+                addonRepository.getInstalledAddons().first().enabledAddons().withoutLiveTvCatalogs()
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -898,7 +899,7 @@ class SearchViewModel @Inject constructor(
         if (_uiState.value.discoverLocation == DiscoverLocation.OFF) return
         _uiState.update { it.copy(discoverLoading = true) }
         val addons = try {
-            addonRepository.getInstalledAddons().first().enabledAddons()
+            addonRepository.getInstalledAddons().first().enabledAddons().withoutLiveTvCatalogs()
         } catch (_: Exception) {
             _uiState.update { it.copy(discoverInitialized = true, discoverLoading = false) }
             return
