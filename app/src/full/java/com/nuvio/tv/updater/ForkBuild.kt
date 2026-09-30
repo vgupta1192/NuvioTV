@@ -30,6 +30,12 @@ internal object ForkBuild {
         return releases
             .asSequence()
             .filterNot(GitHubReleaseDto::draft)
+            // Jellyfin variant: only its own tv-jellyfin-* releases — never the main app's, Live
+            // TV's, or the Jellyfin+LiveTV combo app's (tv-jellyfin-livetv-*) builds.
+            .filter { release ->
+                val tag = release.tagName.orEmpty()
+                tag.startsWith("tv-jellyfin-") && !tag.startsWith("tv-jellyfin-livetv-")
+            }
             .mapNotNull { release ->
                 val candidates = release.assets.filter {
                     it.name.endsWith(variantSuffix, ignoreCase = true) && buildNumber(it.name) != null

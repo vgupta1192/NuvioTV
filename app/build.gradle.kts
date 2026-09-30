@@ -158,6 +158,7 @@ android {
     productFlavors {
         create("full") {
             dimension = "distribution"
+            applicationIdSuffix = ".jellyfin"
             buildConfigField("boolean", "FEATURE_PLUGINS_ENABLED", "true")
             buildConfigField("boolean", "FEATURE_IN_APP_UPDATES_ENABLED", "true")
             buildConfigField("boolean", "FEATURE_IN_APP_TRAILERS_ENABLED", "true")
