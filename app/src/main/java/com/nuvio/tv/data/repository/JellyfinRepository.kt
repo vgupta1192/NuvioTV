@@ -159,13 +159,15 @@ object JellyfinRepository {
             }
             result.fold(
                 onSuccess = { session ->
-                    prefs()?.edit()?.apply {
-                        putString(KEY_SERVER, session.serverUrl)
-                        putString(KEY_SERVER_NAME, session.serverName)
-                        putString(KEY_USER_ID, session.userId)
-                        putString(KEY_USER_NAME, session.userName)
-                        putString(KEY_TOKEN, session.accessToken)
-                    }
+                    // Chain the puts and call Editor.apply() explicitly — `edit()?.apply { … }`
+                    // with a lambda resolves to Kotlin's scope function and never commits to disk.
+                    prefs()?.edit()
+                        ?.putString(KEY_SERVER, session.serverUrl)
+                        ?.putString(KEY_SERVER_NAME, session.serverName)
+                        ?.putString(KEY_USER_ID, session.userId)
+                        ?.putString(KEY_USER_NAME, session.userName)
+                        ?.putString(KEY_TOKEN, session.accessToken)
+                        ?.apply()
                     _uiState.update {
                         JellyfinUiState(
                             session = session,
@@ -187,13 +189,13 @@ object JellyfinRepository {
         librariesJob?.cancel()
         itemsJob?.cancel()
         detailJob?.cancel()
-        prefs()?.edit()?.apply {
-            remove(KEY_SERVER)
-            remove(KEY_SERVER_NAME)
-            remove(KEY_USER_ID)
-            remove(KEY_USER_NAME)
-            remove(KEY_TOKEN)
-        }
+        prefs()?.edit()
+            ?.remove(KEY_SERVER)
+            ?.remove(KEY_SERVER_NAME)
+            ?.remove(KEY_USER_ID)
+            ?.remove(KEY_USER_NAME)
+            ?.remove(KEY_TOKEN)
+            ?.apply()
         _uiState.value = JellyfinUiState()
     }
 
