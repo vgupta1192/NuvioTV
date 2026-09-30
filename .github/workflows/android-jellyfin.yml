@@ -1,8 +1,8 @@
-name: Build NuvioTV LiveTV (upstream release sync)
+name: Build NuvioTV Jellyfin (upstream release sync)
 
 on:
   push:
-    branches: [livetv]
+    branches: [jellyfin]
     paths: ['.github/**']
   workflow_dispatch:
     # Builds are triggered by the local watcher on vgupta1192's box
@@ -16,7 +16,7 @@ permissions:
 
 # one LiveTV build at a time; separate group so it never races the main android.yml run
 concurrency:
-  group: build-nuviotv-livetv
+  group: build-nuviotv-jellyfin
   cancel-in-progress: false
 
 jobs:
@@ -31,7 +31,7 @@ jobs:
           UP=$(curl -s -H "Authorization: Bearer ${{ github.token }}" https://api.github.com/repos/NuvioMedia/NuvioTV/releases/latest | python3 -c "import json,sys;print(json.load(sys.stdin)['tag_name'])")
           VER="${UP%%-*}"
           echo "upstream tag: $UP (version $VER)"
-          BUILT=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${{ github.token }}" "https://api.github.com/repos/vgupta1192/NuvioTV/releases/tags/tv-livetv-$UP")
+          BUILT=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${{ github.token }}" "https://api.github.com/repos/vgupta1192/NuvioTV/releases/tags/tv-jellyfin-$UP")
           # workflow_dispatch or a head commit message containing [force-build] rebuilds
           # even when the release already exists
           FORCE=false
@@ -39,7 +39,7 @@ jobs:
           if echo "$HEAD_MSG" | grep -qi '\[force-build\]'; then FORCE=true; fi
           SHOULD=true
           if [ "$BUILT" = "200" ] && [ "$FORCE" != "true" ]; then
-            RENAMED=$(curl -s -H "Authorization: Bearer ${{ github.token }}" "https://api.github.com/repos/vgupta1192/NuvioTV/releases/tags/tv-livetv-$UP" | jq --arg want "NuvioTV-LiveTV-${VER}-b" '[.assets[] | select(.name | startswith($want))] | length')
+            RENAMED=$(curl -s -H "Authorization: Bearer ${{ github.token }}" "https://api.github.com/repos/vgupta1192/NuvioTV/releases/tags/tv-jellyfin-$UP" | jq --arg want "NuvioTV-Jellyfin-${VER}-b" '[.assets[] | select(.name | startswith($want))] | length')
             if [ "${RENAMED:-0}" -ge 1 ]; then echo "already built with release naming, skipping"; SHOULD=false; else echo "release exists but assets need renaming, rebuilding"; fi
           fi
           echo "should_build=$SHOULD" >> "$GITHUB_OUTPUT"
@@ -93,21 +93,29 @@ jobs:
             echo "applied=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # Live TV feature port (from vgupta1192/NuvioGTvMod), side-installed via
-      # applicationIdSuffix ".livetv" so it doesn't collide with the main app.
-      - name: Apply livetv-feature patch
-        id: patch_livetv
+
+      # jellyfin variant: its updater follows only tv-jellyfin-* releases (applied after fork-updater)
+      - name: Apply jellyfin-updater patch
         if: steps.ver.outputs.should_build == 'true'
         run: |
-          P=fork-src/.github/patches/livetv-feature.patch
-          if git apply "$P" || git apply --3way "$P"; then
-            echo "applied=true" >> "$GITHUB_OUTPUT"
-            git diff --stat
-          else
-            echo "::warning::livetv-feature.patch no longer applies to upstream dev; building without it"
-            git reset --hard -q
-            echo "applied=false" >> "$GITHUB_OUTPUT"
+          if ! git apply fork-src/.github/patches/jellyfin-updater.patch; then
+            echo "::error::jellyfin-updater.patch no longer applies to upstream dev"
+            exit 1
           fi
+
+      # Jellyfin feature (native server integration) + the side-install variant
+      # variant (applicationIdSuffix ".jellyfin"). All required: without the variant the APK would
+      # install over another Nuvio app.
+      - name: Apply feature and variant patches
+        if: steps.ver.outputs.should_build == 'true'
+        run: |
+          for F in jellyfin-feature jellyfin-variant; do
+            if ! git apply "fork-src/.github/patches/$F.patch"; then
+              echo "::error::$F.patch no longer applies to upstream dev"
+              exit 1
+            fi
+          done
+          git diff --stat
 
       - uses: actions/setup-java@v4
         if: steps.ver.outputs.should_build == 'true'
@@ -151,7 +159,7 @@ jobs:
           mkdir -p release-files
           for f in app/build/outputs/apk/full/*/*armeabi-v7a*release*.apk; do
             base="$(basename "$f")"
-            cp "$f" "release-files/NuvioTV-LiveTV-${{ steps.ver.outputs.ver }}-b${{ github.run_number }}-${base#app-full-}"
+            cp "$f" "release-files/NuvioTV-Jellyfin-${{ steps.ver.outputs.ver }}-b${{ github.run_number }}-${base#app-full-}"
           done
           ls -l release-files
 
@@ -159,7 +167,7 @@ jobs:
         if: steps.ver.outputs.should_build == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: NuvioTV-LiveTV-apks
+          name: NuvioTV-Jellyfin-apks
           path: release-files/*.apk
           if-no-files-found: error
 
@@ -167,8 +175,8 @@ jobs:
         if: steps.ver.outputs.should_build == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: tv-livetv-${{ steps.ver.outputs.tag }}
-          name: NuvioTV LiveTV ${{ steps.ver.outputs.tag }}
+          tag_name: tv-jellyfin-${ steps.ver.outputs.tag }
+          name: NuvioTV Jellyfin ${{ steps.ver.outputs.tag }}
           prerelease: true
           files: release-files/*.apk
 
@@ -176,8 +184,8 @@ jobs:
         if: steps.ver.outputs.should_build == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          KEEP: NuvioTV-LiveTV-${{ steps.ver.outputs.ver }}-b${{ github.run_number }}-
-          TAG: tv-livetv-${{ steps.ver.outputs.tag }}
+          KEEP: NuvioTV-Jellyfin-${{ steps.ver.outputs.ver }}-b${{ github.run_number }}-
+          TAG: tv-jellyfin-${ steps.ver.outputs.tag }
         run: |
           gh api "repos/${{ github.repository }}/releases/tags/$TAG" \
             | jq -r --arg keep "$KEEP" --argjson run "${{ github.run_number }}" '.assets[]
@@ -194,11 +202,10 @@ jobs:
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          REL_TAG: tv-livetv-${{ steps.ver.outputs.tag }}
+          REL_TAG: tv-jellyfin-${ steps.ver.outputs.tag }
           VER: ${{ steps.ver.outputs.tag }}
           PATCHED: ${{ steps.patch_manifest.outputs.applied }}
           UPD_PATCHED: ${{ steps.patch_updater.outputs.applied }}
-          LIVETV_PATCHED: ${{ steps.patch_livetv.outputs.applied }}
           BUILD_NO: ${{ github.run_number }}
         run: |
           if [ "$PATCHED" = "true" ]; then NOTE="Includes: addon refresh patch (refresh button + auto re-read of addon manifests)"; else NOTE="⚠️ addon refresh patch did NOT apply to this upstream version — built without it"; fi
@@ -206,9 +213,9 @@ jobs:
           Build ${BUILD_NO}: patched TVs show the update banner at app start (or Settings → check for updates) and install it in-app"; else NOTE="${NOTE}
           ⚠️ fork-updater patch did NOT apply — this build updates only by manual APK install"; fi
           if [ "$LIVETV_PATCHED" = "true" ]; then NOTE="${NOTE}
-          Live TV feature included (installs side-by-side with the main app via .livetv suffix)"; else NOTE="${NOTE}
-          ⚠️ livetv-feature patch did NOT apply — this build has no Live TV feature"; fi
-          MSG="📺 NuvioTV LiveTV ${VER} is ready
+          Jellyfin feature included (installs side-by-side via .jellyfin suffix)"; else NOTE="${NOTE}
+          ⚠️ see the build log"; fi
+          MSG="📺 NuvioTV Jellyfin ${VER} is ready
           Upstream release: ${VER}
           ${NOTE}
           Download: https://github.com/vgupta1192/NuvioTV/releases/tag/${REL_TAG}
@@ -221,7 +228,7 @@ jobs:
         if: failure()
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: tv-livetv-debug-logs
-          name: LiveTV CI debug logs
+          tag_name: tv-jellyfin-debug-logs
+          name: Jellyfin CI debug logs
           prerelease: true
           files: build-log-release.txt
