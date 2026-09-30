@@ -49,7 +49,6 @@ import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.VideoLibrary
 import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Search
@@ -1051,7 +1050,7 @@ open class MainActivity : ComponentActivity() {
                                     DrawerItem(
                                         route = Screen.Jellyfin.route,
                                         label = strNavJellyfin,
-                                        icon = Icons.Rounded.VideoLibrary
+                                        iconRes = R.raw.sidebar_jellyfin
                                     )
                             )
                             if (discoverLocation == DiscoverLocation.IN_SIDEBAR) {

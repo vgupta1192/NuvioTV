@@ -14,6 +14,7 @@ internal enum class SettingsCategory(val group: SettingsRailGroup) {
     APPEARANCE(SettingsRailGroup.LOOK),
     LAYOUT(SettingsRailGroup.LOOK),
     CONTENT_DISCOVERY(SettingsRailGroup.WATCH),
+    JELLYFIN(SettingsRailGroup.WATCH),
     PLAYBACK(SettingsRailGroup.WATCH),
     INTEGRATION(SettingsRailGroup.SERVICES),
     TRACKING(SettingsRailGroup.SERVICES),
