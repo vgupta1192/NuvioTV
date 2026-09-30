@@ -84,10 +84,7 @@ object JellyfinRepository {
     private var detailJob: Job? = null
 
     val hasSession: Boolean
-        get() {
-            initialize()
-            return _uiState.value.session != null
-        }
+        get() = _uiState.value.session != null
 
     fun initialize(context: Context) {
         if (initialized) return
