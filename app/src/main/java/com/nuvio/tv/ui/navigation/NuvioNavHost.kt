@@ -1122,6 +1122,30 @@ private fun PlaybackNavHost(
             )
         }
 
+        composable(Screen.Jellyfin.route) {
+            JellyfinScreen(
+                onPlayFullscreen = { item ->
+                    val streamUrl = JellyfinRepository.streamUrlFor(item)
+                    if (!streamUrl.isNullOrBlank()) {
+                        navController.navigate(
+                            Screen.Player.createRoute(
+                                streamUrl = streamUrl,
+                                title = if (item.isEpisode) item.seriesName ?: item.name else item.name,
+                                streamName = "Jellyfin · Direct Play",
+                                contentType = "movie",
+                                contentName = item.name,
+                                videoId = item.id,
+                                poster = JellyfinRepository.posterUrlFor(item, maxWidth = 720),
+                                addonName = "Jellyfin",
+                                returnToHomeOnBack = false
+                            )
+                        )
+                    }
+                },
+                onBack = { navController.popBackStack() }
+            )
+        }
+
         composable(Screen.Search.route) { backStackEntry ->
             val searchViewModel: com.nuvio.tv.ui.screens.search.SearchViewModel =
                 androidx.hilt.navigation.compose.hiltViewModel(backStackEntry)
@@ -1165,29 +1189,6 @@ private fun PlaybackNavHost(
         }
 
         composable(Screen.TvChannels.route) {
-        composable(Screen.Jellyfin.route) {
-            JellyfinScreen(
-                onPlayFullscreen = { item ->
-                    val streamUrl = JellyfinRepository.streamUrlFor(item)
-                    if (!streamUrl.isNullOrBlank()) {
-                        navController.navigate(
-                            Screen.Player.createRoute(
-                                streamUrl = streamUrl,
-                                title = if (item.isEpisode) item.seriesName ?: item.name else item.name,
-                                streamName = "Jellyfin · Direct Play",
-                                contentType = "movie",
-                                contentName = item.name,
-                                videoId = item.id,
-                                poster = JellyfinRepository.posterUrlFor(item, maxWidth = 720),
-                                addonName = "Jellyfin",
-                                returnToHomeOnBack = false
-                            )
-                        )
-                    }
-                },
-                onBack = { navController.popBackStack() }
-            )
-        }
             TvChannelsScreen(
                 onWatchFullscreenInMainPlayer = { channel, stream ->
                     val streamUrl = stream.playableTvUrl
