@@ -28,6 +28,8 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.ChevronLeft
+import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.Logout
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Refresh
@@ -39,9 +41,11 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -93,6 +97,14 @@ fun JellyfinScreen(
         return
     }
 
+    var leftCollapsed by rememberSaveable { mutableStateOf(false) }
+    var rightCollapsed by rememberSaveable { mutableStateOf(false) }
+    val detailItem = state.selectedDetail
+    // The details pane exists only while a title is clicked; clicking any title reopens it.
+    LaunchedEffect(detailItem?.id) {
+        if (detailItem != null) rightCollapsed = false
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -135,19 +147,31 @@ fun JellyfinScreen(
             modifier = Modifier.fillMaxSize(),
             horizontalArrangement = Arrangement.spacedBy(18.dp),
         ) {
-            JellyfinLibrariesColumn(
-                state = state,
-                modifier = Modifier.width(236.dp).fillMaxHeight(),
-            )
+            Column(modifier = Modifier.fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                TvJellyfinIconButton(
+                    icon = if (leftCollapsed) Icons.Rounded.ChevronRight else Icons.Rounded.ChevronLeft,
+                    contentDescription = if (leftCollapsed) "Show libraries" else "Hide libraries",
+                    onClick = { leftCollapsed = !leftCollapsed },
+                )
+            }
+            if (!leftCollapsed) {
+                JellyfinLibrariesColumn(
+                    state = state,
+                    modifier = Modifier.width(236.dp).fillMaxHeight(),
+                )
+            }
             JellyfinBrowseColumn(
                 state = state,
                 modifier = Modifier.weight(1f).fillMaxHeight(),
             )
-            JellyfinDetailColumn(
-                state = state,
-                onPlay = onPlayFullscreen,
-                modifier = Modifier.width(348.dp).fillMaxHeight(),
-            )
+            if (detailItem != null && !rightCollapsed) {
+                JellyfinDetailColumn(
+                    state = state,
+                    onPlay = onPlayFullscreen,
+                    onCollapse = { rightCollapsed = true },
+                    modifier = Modifier.width(348.dp).fillMaxHeight(),
+                )
+            }
         }
     }
 }
@@ -169,12 +193,15 @@ private fun TvJellyfinIconButton(
                 color = if (focused) NuvioTheme.colors.FocusRing else NuvioTheme.colors.Border,
                 shape = RoundedCornerShape(NuvioTheme.radii.md),
             )
-            .background(NuvioTheme.colors.BackgroundCard, RoundedCornerShape(NuvioTheme.radii.md)),
+            .background(
+                if (focused) Color.White else NuvioTheme.colors.BackgroundCard,
+                RoundedCornerShape(NuvioTheme.radii.md),
+            ),
     ) {
         Icon(
             imageVector = icon,
             contentDescription = contentDescription,
-            tint = if (focused) NuvioTheme.colors.TextPrimary else NuvioTheme.colors.TextSecondary,
+            tint = if (focused) Color.Black else NuvioTheme.colors.TextSecondary,
             modifier = Modifier.size(20.dp),
         )
     }
@@ -367,12 +394,15 @@ private fun TvJellyfinLibraryRow(
     onClick: (() -> Unit)?,
 ) {
     val rowShape = RoundedCornerShape(NuvioTheme.radii.md)
+    var rowFocused by remember { mutableStateOf(false) }
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .alpha(if (isDimmed) 0.55f else 1f)
+            .onFocusChanged { rowFocused = it.isFocused }
             .background(
                 when {
+                    rowFocused -> NuvioTheme.colors.BackgroundElevated
                     isSelected -> NuvioTheme.colors.Secondary.copy(alpha = 0.18f)
                     else -> NuvioTheme.colors.BackgroundCard
                 },
@@ -380,8 +410,12 @@ private fun TvJellyfinLibraryRow(
             )
             .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
             .border(
-                width = if (isSelected) 2.dp else 1.dp,
-                color = if (isSelected) NuvioTheme.colors.Secondary.copy(alpha = 0.7f) else NuvioTheme.colors.Border,
+                width = if (rowFocused || isSelected) 2.dp else 1.dp,
+                color = when {
+                    rowFocused -> NuvioTheme.colors.FocusRing
+                    isSelected -> NuvioTheme.colors.Secondary.copy(alpha = 0.7f)
+                    else -> NuvioTheme.colors.Border
+                },
                 shape = rowShape,
             )
             .padding(start = 14.dp, top = 10.dp, end = 4.dp, bottom = 10.dp),
@@ -389,8 +423,10 @@ private fun TvJellyfinLibraryRow(
     ) {
         Text(
             text = name,
-            style = MaterialTheme.typography.bodyMedium.copy(fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal),
-            color = if (isSelected) NuvioTheme.colors.TextPrimary else NuvioTheme.colors.TextSecondary,
+            style = MaterialTheme.typography.bodyMedium.copy(
+                fontWeight = if (isSelected || rowFocused) FontWeight.SemiBold else FontWeight.Normal,
+            ),
+            color = if (isSelected || rowFocused) NuvioTheme.colors.TextPrimary else NuvioTheme.colors.TextSecondary,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
@@ -621,6 +657,7 @@ private fun TvJellyfinPosterCell(
 private fun JellyfinDetailColumn(
     state: JellyfinUiState,
     onPlay: (JellyfinItem) -> Unit,
+    onCollapse: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val item = state.selectedDetail
@@ -667,7 +704,7 @@ private fun JellyfinDetailColumn(
                         )
                     }
                 }
-                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text(
                         text = item.name,
                         style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
@@ -707,6 +744,11 @@ private fun JellyfinDetailColumn(
                         )
                     }
                 }
+                TvJellyfinIconButton(
+                    icon = Icons.Rounded.ChevronRight,
+                    contentDescription = "Hide details",
+                    onClick = onCollapse,
+                )
             }
         }
         if (!item.overview.isNullOrBlank()) {
