@@ -165,6 +165,18 @@ private fun JellyfinSettingsTextField(
         label = { androidx.compose.material3.Text(label) },
         singleLine = true,
         visualTransformation = if (password) PasswordVisualTransformation() else VisualTransformation.None,
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(NuvioTheme.radii.md),
+        colors = androidx.compose.material3.TextFieldDefaults.colors(
+            focusedContainerColor = NuvioTheme.colors.BackgroundElevated,
+            unfocusedContainerColor = NuvioTheme.colors.BackgroundElevated,
+            focusedIndicatorColor = NuvioTheme.colors.FocusRing,
+            unfocusedIndicatorColor = NuvioTheme.colors.Border,
+            focusedTextColor = NuvioTheme.colors.TextPrimary,
+            unfocusedTextColor = NuvioTheme.colors.TextPrimary,
+            cursorColor = NuvioTheme.colors.FocusRing,
+            focusedLabelColor = NuvioTheme.colors.Secondary,
+            unfocusedLabelColor = NuvioTheme.colors.TextTertiary,
+        ),
         modifier = modifier.padding(vertical = 2.dp)
     )
 }
