@@ -49,6 +49,7 @@ import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.VideoLibrary
 import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Search
@@ -350,6 +351,10 @@ open class MainActivity : ComponentActivity() {
         installSplashScreen()
         super.onCreate(savedInstanceState)
         isFirstResumeAfterCreate = true
+
+        // Jellyfin fork feature: storage init + per-profile hidden libraries provider
+        com.nuvio.tv.data.repository.JellyfinRepository.initialize(applicationContext)
+        com.nuvio.tv.data.repository.JellyfinRepository.profileIdProvider = { profileManager.activeProfileId.value }
         window?.setBackgroundDrawable(ColorDrawable(android.graphics.Color.TRANSPARENT))
 
         // Wire the Activity-level launcher to the tracker
@@ -1011,6 +1016,7 @@ open class MainActivity : ComponentActivity() {
                         buildSet {
                             add(Screen.Home.route)
                             add(Screen.Search.route)
+                            add(Screen.Jellyfin.route)
                             add(Screen.Library.route)
                             add(Screen.Settings.route)
                             if (discoverLocation == DiscoverLocation.IN_SIDEBAR) {
@@ -1019,6 +1025,7 @@ open class MainActivity : ComponentActivity() {
                         }
                     }
 
+                    val strNavJellyfin = "Jellyfin"
                     val strNavHome = stringResource(R.string.nav_home)
                     val strNavDiscover = stringResource(R.string.nav_discover)
                     val strNavSearch = stringResource(R.string.nav_search)
@@ -1039,6 +1046,13 @@ open class MainActivity : ComponentActivity() {
                                     label = strNavHome,
                                     icon = Icons.Default.Home
                                 )
+                            )
+                            add(
+                                    DrawerItem(
+                                        route = Screen.Jellyfin.route,
+                                        label = strNavJellyfin,
+                                        icon = Icons.Rounded.VideoLibrary
+                                    )
                             )
                             if (discoverLocation == DiscoverLocation.IN_SIDEBAR) {
                                 add(

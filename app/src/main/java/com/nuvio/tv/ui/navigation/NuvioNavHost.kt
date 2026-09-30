@@ -24,6 +24,8 @@ import androidx.navigation.compose.composable
 import androidx.navigation.navArgument
 import com.nuvio.tv.core.build.AppFeaturePolicy
 import com.nuvio.tv.domain.model.ExperienceMode
+import com.nuvio.tv.data.repository.JellyfinRepository
+import com.nuvio.tv.ui.screens.jellyfin.JellyfinScreen
 import com.nuvio.tv.ui.screens.CatalogSeeAllScreen
 import com.nuvio.tv.ui.screens.ExperienceModeSelectionScreen
 import com.nuvio.tv.ui.screens.LayoutSelectionScreen
@@ -1115,6 +1117,30 @@ private fun PlaybackNavHost(
                         }
                     }
                 }
+            )
+        }
+
+        composable(Screen.Jellyfin.route) {
+            JellyfinScreen(
+                onPlayFullscreen = { item ->
+                    val streamUrl = JellyfinRepository.streamUrlFor(item)
+                    if (!streamUrl.isNullOrBlank()) {
+                        navController.navigate(
+                            Screen.Player.createRoute(
+                                streamUrl = streamUrl,
+                                title = if (item.isEpisode) item.seriesName ?: item.name else item.name,
+                                streamName = "Jellyfin · Direct Play",
+                                contentType = "movie",
+                                contentName = item.name,
+                                videoId = item.id,
+                                poster = JellyfinRepository.posterUrlFor(item, maxWidth = 720),
+                                addonName = "Jellyfin",
+                                returnToHomeOnBack = false
+                            )
+                        )
+                    }
+                },
+                onBack = { navController.popBackStack() }
             )
         }
 
