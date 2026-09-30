@@ -353,9 +353,16 @@ open class MainActivity : ComponentActivity() {
         isFirstResumeAfterCreate = true
         window?.setBackgroundDrawable(ColorDrawable(android.graphics.Color.TRANSPARENT))
 
-        // Jellyfin fork feature: storage init + per-profile hidden libraries provider
-        com.nuvio.tv.data.repository.JellyfinRepository.initialize(applicationContext)
+        // Jellyfin fork feature: storage init + per-profile hidden libraries. The provider is
+        // wired BEFORE initialize so the persisted session loads the right profile's hidden set,
+        // and the flow keeps the repository in sync across profile switches.
         com.nuvio.tv.data.repository.JellyfinRepository.profileIdProvider = { profileManager.activeProfileId.value }
+        com.nuvio.tv.data.repository.JellyfinRepository.initialize(applicationContext)
+        lifecycleScope.launch {
+            profileManager.activeProfileId.collect {
+                com.nuvio.tv.data.repository.JellyfinRepository.applyProfile(it)
+            }
+        }
 
         // Wire the Activity-level launcher to the tracker
         externalPlaybackTracker.activityLauncher = externalPlayerLauncher
