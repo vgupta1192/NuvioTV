@@ -1,19 +1,26 @@
 diff --git a/app/src/main/java/com/nuvio/tv/MainActivity.kt b/app/src/main/java/com/nuvio/tv/MainActivity.kt
-index 18f5a1df..09fd18c2 100644
+index 18f5a1df..47bfd8de 100644
 --- a/app/src/main/java/com/nuvio/tv/MainActivity.kt
 +++ b/app/src/main/java/com/nuvio/tv/MainActivity.kt
-@@ -353,6 +353,10 @@ open class MainActivity : ComponentActivity() {
+@@ -353,6 +353,17 @@ open class MainActivity : ComponentActivity() {
          isFirstResumeAfterCreate = true
          window?.setBackgroundDrawable(ColorDrawable(android.graphics.Color.TRANSPARENT))
  
-+        // Jellyfin fork feature: storage init + per-profile hidden libraries provider
-+        com.nuvio.tv.data.repository.JellyfinRepository.initialize(applicationContext)
++        // Jellyfin fork feature: storage init + per-profile hidden libraries. The provider is
++        // wired BEFORE initialize so the persisted session loads the right profile's hidden set,
++        // and the flow keeps the repository in sync across profile switches.
 +        com.nuvio.tv.data.repository.JellyfinRepository.profileIdProvider = { profileManager.activeProfileId.value }
++        com.nuvio.tv.data.repository.JellyfinRepository.initialize(applicationContext)
++        lifecycleScope.launch {
++            profileManager.activeProfileId.collect {
++                com.nuvio.tv.data.repository.JellyfinRepository.applyProfile(it)
++            }
++        }
 +
          // Wire the Activity-level launcher to the tracker
          externalPlaybackTracker.activityLauncher = externalPlayerLauncher
  
-@@ -1012,6 +1016,7 @@ open class MainActivity : ComponentActivity() {
+@@ -1012,6 +1023,7 @@ open class MainActivity : ComponentActivity() {
                          buildSet {
                              add(Screen.Home.route)
                              add(Screen.TvChannels.route)
@@ -21,7 +28,7 @@ index 18f5a1df..09fd18c2 100644
                              add(Screen.Search.route)
                              add(Screen.Library.route)
                              add(Screen.Settings.route)
-@@ -1024,6 +1029,7 @@ open class MainActivity : ComponentActivity() {
+@@ -1024,6 +1036,7 @@ open class MainActivity : ComponentActivity() {
                      val strNavHome = stringResource(R.string.nav_home)
                      val strNavDiscover = stringResource(R.string.nav_discover)
                      val strNavTvChannels = stringResource(R.string.nav_tv_channels)
@@ -29,7 +36,7 @@ index 18f5a1df..09fd18c2 100644
                      val strNavSearch = stringResource(R.string.nav_search)
                      val strNavLibrary = stringResource(R.string.nav_library)
                      val strNavSettings = stringResource(R.string.nav_settings)
-@@ -1061,6 +1067,13 @@ open class MainActivity : ComponentActivity() {
+@@ -1061,6 +1074,13 @@ open class MainActivity : ComponentActivity() {
                                      iconRes = R.raw.sidebar_tv_channels
                                  )
                              )
@@ -938,10 +945,10 @@ index 6208ce0d..b8509cd2 100644
      data object Tracking : Screen("trakt")
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinScreen.kt
 new file mode 100644
-index 00000000..dab50606
+index 00000000..8c37ac53
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinScreen.kt
-@@ -0,0 +1,979 @@
+@@ -0,0 +1,1088 @@
 +@file:OptIn(ExperimentalTvMaterial3Api::class)
 +
 +package com.nuvio.tv.ui.screens.jellyfin
@@ -970,6 +977,7 @@ index 00000000..dab50606
 +import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 +import androidx.compose.foundation.lazy.grid.items
 +import androidx.compose.foundation.lazy.items
++import androidx.compose.foundation.lazy.itemsIndexed
 +import androidx.compose.foundation.rememberScrollState
 +import androidx.compose.foundation.shape.RoundedCornerShape
 +import androidx.compose.material.icons.Icons
@@ -992,10 +1000,13 @@ index 00000000..dab50606
 +import androidx.compose.runtime.remember
 +import androidx.compose.runtime.saveable.rememberSaveable
 +import androidx.compose.runtime.setValue
++import androidx.compose.runtime.withFrameNanos
 +import androidx.compose.ui.Alignment
 +import androidx.compose.ui.Modifier
 +import androidx.compose.ui.draw.alpha
 +import androidx.compose.ui.draw.clip
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
 +import androidx.compose.ui.focus.onFocusChanged
 +import androidx.compose.ui.graphics.Color
 +import androidx.compose.ui.graphics.graphicsLayer
@@ -1083,19 +1094,49 @@ index 00000000..dab50606
 +        var librariesExpanded by rememberSaveable { mutableStateOf(true) }
 +        var detailsExpanded by rememberSaveable { mutableStateOf(false) }
 +        val hasSelection = state.selectedItemId != null || state.selectedDetail != null
-+        // Clicking a title always reveals the details pane again.
++        val playFocusRequester = remember { FocusRequester() }
++        val firstLibraryFocusRequester = remember { FocusRequester() }
++        // Clicking a title always reopens the details pane; opening it (or a freshly loaded
++        // detail) always moves focus to its Play button.
 +        LaunchedEffect(state.selectedItemId) {
 +            if (state.selectedItemId != null) detailsExpanded = true
++        }
++        LaunchedEffect(detailsExpanded, state.selectedDetail?.id) {
++            if (detailsExpanded && state.selectedDetail != null) {
++                withFrameNanos { }
++                runCatching { playFocusRequester.requestFocus() }
++            }
++        }
++        LaunchedEffect(librariesExpanded, state.libraries.isNotEmpty()) {
++            if (librariesExpanded && state.libraries.isNotEmpty()) {
++                withFrameNanos { }
++                runCatching { firstLibraryFocusRequester.requestFocus() }
++            }
 +        }
 +        Row(
 +            modifier = Modifier.fillMaxSize(),
 +            horizontalArrangement = Arrangement.spacedBy(10.dp),
 +        ) {
 +            if (librariesExpanded) {
-+                Box(modifier = Modifier.width(232.dp).fillMaxHeight()) {
++                var librariesHadFocus by remember { mutableStateOf(false) }
++                Box(
++                    modifier = Modifier
++                        .width(232.dp)
++                        .fillMaxHeight()
++                        .onFocusChanged {
++                            if (it.hasFocus) {
++                                librariesHadFocus = true
++                            } else if (librariesHadFocus) {
++                                // Focus moved into the grid — tuck the pane away automatically.
++                                librariesHadFocus = false
++                                librariesExpanded = false
++                            }
++                        },
++                ) {
 +                    // End padding keeps rows clear of the collapse handle on the right border.
 +                    JellyfinLibrariesColumn(
 +                        state = state,
++                        firstRowFocusRequester = firstLibraryFocusRequester,
 +                        modifier = Modifier.fillMaxHeight().padding(end = 24.dp),
 +                    )
 +                    TvJellyfinCollapseHandle(
@@ -1107,13 +1148,15 @@ index 00000000..dab50606
 +                }
 +            } else {
 +                Box(
-+                    modifier = Modifier.width(34.dp).fillMaxHeight(),
++                    modifier = Modifier.width(40.dp).fillMaxHeight().padding(start = 5.dp),
 +                    contentAlignment = Alignment.Center,
 +                ) {
 +                    TvJellyfinCollapseHandle(
 +                        icon = Icons.Rounded.ChevronRight,
 +                        contentDescription = "Expand libraries",
 +                        onClick = { librariesExpanded = true },
++                        // Navigating left from the grid onto the handle reopens the pane.
++                        onFocusGained = { librariesExpanded = true },
 +                    )
 +                }
 +            }
@@ -1121,14 +1164,28 @@ index 00000000..dab50606
 +                state = state,
 +                modifier = Modifier.weight(1f).fillMaxHeight(),
 +            )
-+            // Details pane only exists once a title has been clicked; the handle lives on the
-+            // pane's left border in both states so the grid can take the full width when hidden.
++            // Details pane only exists once a title has been clicked; focus leaving it collapses
++            // it so the grid takes the full width, and focusing the collapsed handle reopens it.
 +            if (hasSelection) {
 +                if (detailsExpanded) {
-+                    Box(modifier = Modifier.width(344.dp).fillMaxHeight()) {
++                    var detailsHadFocus by remember { mutableStateOf(false) }
++                    Box(
++                        modifier = Modifier
++                            .width(344.dp)
++                            .fillMaxHeight()
++                            .onFocusChanged {
++                                if (it.hasFocus) {
++                                    detailsHadFocus = true
++                                } else if (detailsHadFocus) {
++                                    detailsHadFocus = false
++                                    detailsExpanded = false
++                                }
++                            },
++                    ) {
 +                        JellyfinDetailColumn(
 +                            state = state,
 +                            onPlay = onPlayFullscreen,
++                            playFocusRequester = playFocusRequester,
 +                            modifier = Modifier.fillMaxHeight(),
 +                        )
 +                        TvJellyfinCollapseHandle(
@@ -1140,13 +1197,14 @@ index 00000000..dab50606
 +                    }
 +                } else {
 +                    Box(
-+                        modifier = Modifier.width(34.dp).fillMaxHeight(),
++                        modifier = Modifier.width(40.dp).fillMaxHeight().padding(end = 5.dp),
 +                        contentAlignment = Alignment.Center,
 +                    ) {
 +                        TvJellyfinCollapseHandle(
 +                            icon = Icons.Rounded.ChevronLeft,
 +                            contentDescription = "Expand details",
 +                            onClick = { detailsExpanded = true },
++                            onFocusGained = { detailsExpanded = true },
 +                        )
 +                    }
 +                }
@@ -1161,10 +1219,11 @@ index 00000000..dab50606
 +    contentDescription: String,
 +    onClick: () -> Unit,
 +    modifier: Modifier = Modifier,
++    onFocusGained: (() -> Unit)? = null,
 +) {
 +    Surface(
 +        onClick = onClick,
-+        modifier = modifier,
++        modifier = modifier.onFocusChanged { if (it.isFocused) onFocusGained?.invoke() },
 +        shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(NuvioTheme.radii.sm)),
 +        scale = ClickableSurfaceDefaults.scale(focusedScale = 1.1f),
 +        colors = ClickableSurfaceDefaults.colors(
@@ -1185,13 +1244,13 @@ index 00000000..dab50606
 +        ),
 +    ) {
 +        Box(
-+            modifier = Modifier.width(26.dp).height(64.dp),
++            modifier = Modifier.width(22.dp).height(44.dp),
 +            contentAlignment = Alignment.Center,
 +        ) {
 +            Icon(
 +                imageVector = icon,
 +                contentDescription = contentDescription,
-+                modifier = Modifier.size(18.dp),
++                modifier = Modifier.size(16.dp),
 +            )
 +        }
 +    }
@@ -1348,7 +1407,11 @@ index 00000000..dab50606
 +}
 +
 +@Composable
-+private fun JellyfinLibrariesColumn(state: JellyfinUiState, modifier: Modifier = Modifier) {
++private fun JellyfinLibrariesColumn(
++    state: JellyfinUiState,
++    modifier: Modifier = Modifier,
++    firstRowFocusRequester: FocusRequester? = null,
++) {
 +    var showHidden by remember { mutableStateOf(false) }
 +    Column(modifier = modifier) {
 +        Text(
@@ -1360,13 +1423,14 @@ index 00000000..dab50606
 +        LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
 +            val visible = state.libraries.filter { it.id !in state.hiddenLibraryIds }
 +            val hidden = state.libraries.filter { it.id in state.hiddenLibraryIds }
-+            items(visible, key = { it.id }) { library ->
++            itemsIndexed(visible, key = { _, library -> library.id }) { index, library ->
 +                TvJellyfinLibraryRow(
 +                    name = library.name,
 +                    isSelected = state.selectedLibraryId == library.id,
 +                    isDimmed = false,
 +                    onToggleVisibility = { JellyfinRepository.toggleLibraryHidden(library.id) },
 +                    onClick = { JellyfinRepository.selectLibrary(library.id) },
++                    focusRequester = if (index == 0) firstRowFocusRequester else null,
 +                )
 +            }
 +            if (state.libraries.isEmpty() && state.isLoadingItems) {
@@ -1381,16 +1445,10 @@ index 00000000..dab50606
 +            }
 +            if (hidden.isNotEmpty()) {
 +                item("jellyfin_hidden_toggle") {
-+                    var focused by remember { mutableStateOf(false) }
-+                    Text(
-+                        text = (if (showHidden) "▾ " else "▸ ") + "Hidden (${hidden.size})",
-+                        style = MaterialTheme.typography.labelMedium,
-+                        color = if (focused) NuvioTheme.colors.TextPrimary else NuvioTheme.colors.TextTertiary,
-+                        modifier = Modifier
-+                            .onFocusChanged { focused = it.isFocused }
-+                            .clip(RoundedCornerShape(NuvioTheme.radii.sm))
-+                            .clickable { showHidden = !showHidden }
-+                            .padding(horizontal = 10.dp, vertical = 6.dp),
++                    TvJellyfinHiddenExpander(
++                        expanded = showHidden,
++                        hiddenCount = hidden.size,
++                        onToggle = { showHidden = !showHidden },
 +                    )
 +                }
 +                if (showHidden) {
@@ -1410,62 +1468,117 @@ index 00000000..dab50606
 +}
 +
 +@Composable
++private fun TvJellyfinHiddenExpander(
++    expanded: Boolean,
++    hiddenCount: Int,
++    onToggle: () -> Unit,
++) {
++    val shape = RoundedCornerShape(NuvioTheme.radii.sm)
++    Surface(
++        onClick = onToggle,
++        shape = ClickableSurfaceDefaults.shape(shape),
++        colors = ClickableSurfaceDefaults.colors(
++            containerColor = NuvioTheme.colors.BackgroundElevated,
++            contentColor = NuvioTheme.colors.TextTertiary,
++            focusedContainerColor = Color.White,
++            focusedContentColor = Color.Black,
++        ),
++        border = ClickableSurfaceDefaults.border(
++            border = Border(BorderStroke(1.dp, NuvioTheme.colors.Border), shape),
++            focusedBorder = Border(BorderStroke(2.dp, NuvioTheme.colors.FocusRing), shape),
++        ),
++    ) {
++        Text(
++            text = (if (expanded) "▾ " else "▸ ") + "Hidden ($hiddenCount)",
++            style = MaterialTheme.typography.labelMedium,
++            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
++        )
++    }
++}
++
++/**
++ * One library = two SEPARATE focusable surfaces (select + visibility toggle), so D-pad focus can
++ * reach the Hide/Show control directly instead of the whole row swallowing it.
++ */
++@Composable
 +private fun TvJellyfinLibraryRow(
 +    name: String,
 +    isSelected: Boolean,
 +    isDimmed: Boolean,
 +    onToggleVisibility: () -> Unit,
 +    onClick: (() -> Unit)?,
++    focusRequester: FocusRequester? = null,
 +) {
 +    val rowShape = RoundedCornerShape(NuvioTheme.radii.md)
 +    Row(
 +        modifier = Modifier
 +            .fillMaxWidth()
-+            .alpha(if (isDimmed) 0.55f else 1f)
-+            .background(
-+                when {
-+                    isSelected -> NuvioTheme.colors.Secondary.copy(alpha = 0.18f)
-+                    else -> NuvioTheme.colors.BackgroundCard
-+                },
-+                rowShape,
-+            )
-+            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
-+            .border(
-+                width = if (isSelected) 2.dp else 1.dp,
-+                color = if (isSelected) NuvioTheme.colors.Secondary.copy(alpha = 0.7f) else NuvioTheme.colors.Border,
-+                shape = rowShape,
-+            )
-+            .padding(start = 14.dp, top = 10.dp, end = 4.dp, bottom = 10.dp),
++            .alpha(if (isDimmed) 0.55f else 1f),
++        horizontalArrangement = Arrangement.spacedBy(6.dp),
 +        verticalAlignment = Alignment.CenterVertically,
 +    ) {
-+        Text(
-+            text = name,
-+            style = MaterialTheme.typography.bodyMedium.copy(fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal),
-+            color = if (isSelected) NuvioTheme.colors.TextPrimary else NuvioTheme.colors.TextSecondary,
-+            maxLines = 1,
-+            overflow = TextOverflow.Ellipsis,
-+            modifier = Modifier.weight(1f),
-+        )
-+        Text(
-+            text = if (isDimmed) "Show" else "Hide",
-+            style = MaterialTheme.typography.labelSmall,
-+            color = NuvioTheme.colors.Secondary,
++        Surface(
++            onClick = onClick ?: {},
++            enabled = onClick != null,
 +            modifier = Modifier
-+                .clip(RoundedCornerShape(NuvioTheme.radii.sm))
-+                .clickable(onClick = onToggleVisibility)
-+                .padding(horizontal = 10.dp, vertical = 6.dp),
-+        )
++                .weight(1f)
++                .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier),
++            shape = ClickableSurfaceDefaults.shape(rowShape),
++            colors = ClickableSurfaceDefaults.colors(
++                containerColor = if (isSelected) NuvioTheme.colors.Secondary.copy(alpha = 0.18f) else NuvioTheme.colors.BackgroundCard,
++                contentColor = if (isSelected) NuvioTheme.colors.TextPrimary else NuvioTheme.colors.TextSecondary,
++                focusedContainerColor = Color.White.copy(alpha = 0.12f),
++                focusedContentColor = Color.White,
++                disabledContainerColor = NuvioTheme.colors.BackgroundCard,
++                disabledContentColor = NuvioTheme.colors.TextTertiary,
++            ),
++            border = ClickableSurfaceDefaults.border(
++                border = Border(
++                    border = BorderStroke(
++                        1.dp,
++                        if (isSelected) NuvioTheme.colors.Secondary.copy(alpha = 0.7f) else NuvioTheme.colors.Border,
++                    ),
++                    shape = rowShape,
++                ),
++                focusedBorder = Border(BorderStroke(2.dp, NuvioTheme.colors.FocusRing), rowShape),
++            ),
++        ) {
++            Text(
++                text = name,
++                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal),
++                maxLines = 1,
++                overflow = TextOverflow.Ellipsis,
++                modifier = Modifier
++                    .fillMaxWidth()
++                    .padding(horizontal = 14.dp, vertical = 12.dp),
++            )
++        }
++        Surface(
++            onClick = onToggleVisibility,
++            shape = ClickableSurfaceDefaults.shape(rowShape),
++            colors = ClickableSurfaceDefaults.colors(
++                containerColor = NuvioTheme.colors.BackgroundElevated,
++                contentColor = NuvioTheme.colors.Secondary,
++                focusedContainerColor = Color.White,
++                focusedContentColor = Color.Black,
++            ),
++            border = ClickableSurfaceDefaults.border(
++                border = Border(BorderStroke(1.dp, NuvioTheme.colors.Border), rowShape),
++                focusedBorder = Border(BorderStroke(2.dp, NuvioTheme.colors.FocusRing), rowShape),
++            ),
++        ) {
++            Text(
++                text = if (isDimmed) "Show" else "Hide",
++                style = MaterialTheme.typography.labelSmall,
++                modifier = Modifier.padding(horizontal = 12.dp, vertical = 16.dp),
++            )
++        }
 +    }
 +}
 +
 +@Composable
 +private fun JellyfinBrowseColumn(state: JellyfinUiState, modifier: Modifier = Modifier) {
 +    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(10.dp)) {
-+        JellyfinTvTextField(
-+            value = state.searchQuery,
-+            onValueChange = JellyfinRepository::setSearchQuery,
-+            label = "Search your Jellyfin server…",
-+        )
 +        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
 +            TvSortChip(label = "A–Z", isSelected = !state.sortLatestFirst, onClick = { JellyfinRepository.setSortLatestFirst(false) })
 +            TvSortChip(label = "Latest", isSelected = state.sortLatestFirst, onClick = { JellyfinRepository.setSortLatestFirst(true) })
@@ -1673,6 +1786,7 @@ index 00000000..dab50606
 +    state: JellyfinUiState,
 +    onPlay: (JellyfinItem) -> Unit,
 +    modifier: Modifier = Modifier,
++    playFocusRequester: FocusRequester? = null,
 +) {
 +    val item = state.selectedDetail
 +    val panelShape = RoundedCornerShape(NuvioTheme.radii.lg)
@@ -1747,7 +1861,7 @@ index 00000000..dab50606
 +                        )
 +                    }
 +                    Spacer(modifier = Modifier.height(4.dp))
-+                    TvJellyfinPlayButton(item = item, state = state, onPlay = onPlay)
++                    TvJellyfinPlayButton(item = item, state = state, onPlay = onPlay, focusRequester = playFocusRequester)
 +                    if (item.resumePositionMs > 0) {
 +                        Text(
 +                            text = "Resumes at ${formatPosition(item.resumePositionMs)}",
@@ -1817,6 +1931,7 @@ index 00000000..dab50606
 +    item: JellyfinItem,
 +    state: JellyfinUiState,
 +    onPlay: (JellyfinItem) -> Unit,
++    focusRequester: FocusRequester? = null,
 +) {
 +    val playable: JellyfinItem? = when {
 +        item.isSeries || item.isFolder ->
@@ -1827,6 +1942,7 @@ index 00000000..dab50606
 +    Button(
 +        enabled = playable != null,
 +        onClick = { playable?.let(onPlay) },
++        modifier = if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier,
 +        shape = ButtonDefaults.shape(shape = RoundedCornerShape(NuvioTheme.radii.sm)),
 +        colors = ButtonDefaults.colors(
 +            containerColor = NuvioTheme.colors.Secondary,
