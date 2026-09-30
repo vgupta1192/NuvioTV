@@ -53,7 +53,6 @@ import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.rounded.Tv
-import androidx.compose.material.icons.rounded.VideoLibrary
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
@@ -1072,7 +1071,7 @@ open class MainActivity : ComponentActivity() {
                                     DrawerItem(
                                         route = Screen.Jellyfin.route,
                                         label = strNavJellyfin,
-                                        icon = Icons.Rounded.VideoLibrary
+                                        iconRes = R.raw.sidebar_jellyfin
                                     )
                             )
                             add(
