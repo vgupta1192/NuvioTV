@@ -1,0 +1,3516 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/AviAudioClock.kt b/app/src/main/java/com/nuvio/tv/core/player/AviAudioClock.kt
+new file mode 100644
+index 0000000..757a454
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/player/AviAudioClock.kt
+@@ -0,0 +1,238 @@
++package com.nuvio.tv.core.player
++
++import java.util.Arrays
++import kotlin.math.abs
++
++/**
++ * Times the audio chunks of one AVI stream by what comes before them in the stream: the bytes for a stream with a
++ * sample size (constant bitrate), otherwise the chunks, one block of scale / rate each.
++ *
++ * The stock reader spreads the stream's duration evenly over its chunks. That only holds when every chunk is the same
++ * size, and muxers usually put about half a second of audio into the first chunk, so every later chunk was stamped
++ * that much early. After a seek its chunk number is also one too low, as it points at the chunk before the seek
++ * position.
++ *
++ * A chunk is found in the stream's idx1 entries by the file position of its data. A chunk the index does not list
++ * follows on from the chunk before it, or takes the reader's time when there is none.
++ */
++internal class AviAudioClock private constructor(
++    val countsBytes: Boolean,
++    private val usNumerator: Long,
++    private val usDenominator: Long,
++) {
++    private var dataPositions = LongArray(0)
++    private var bytesBefore: LongArray? = null
++    private var running = false
++    private var nextUnits = 0L
++
++    /** Chunks listed in the index, 0 without one. */
++    var indexedChunks = 0
++        private set
++
++    /** Whether the last chunk was found in the index. */
++    var lastChunkIndexed = false
++        private set
++
++    /** Takes the stream's idx1 entries; false (and no index) when the positions do not run in file order. */
++    fun useIndex(entries: AviIndex.Entries): Boolean {
++        val positions = entries.dataPositions
++        for (i in 1 until positions.size) {
++            if (positions[i] <= positions[i - 1]) return false
++        }
++        bytesBefore = if (countsBytes) {
++            LongArray(entries.sizes.size).also { before ->
++                var sum = 0L
++                for (i in entries.sizes.indices) {
++                    before[i] = sum
++                    sum += entries.sizes[i]
++                }
++            }
++        } else {
++            null
++        }
++        dataPositions = positions
++        indexedChunks = positions.size
++        return true
++    }
++
++    /** The reader moved: the next chunk is placed by the index or by the reader's time, not by the last chunk. */
++    fun reset() {
++        running = false
++    }
++
++    /**
++     * The time of the chunk whose data starts at [dataPosition] (negative when unknown) and is [size] bytes long,
++     * which the stock reader stamped [readerTimeUs].
++     */
++    fun chunkTimeUs(dataPosition: Long, size: Int, readerTimeUs: Long): Long {
++        val index = if (dataPosition >= 0 && dataPositions.isNotEmpty()) {
++            Arrays.binarySearch(dataPositions, dataPosition)
++        } else {
++            -1
++        }
++        lastChunkIndexed = index >= 0
++        val units = when {
++            index >= 0 -> bytesBefore?.get(index) ?: index.toLong()
++            running -> nextUnits
++            else -> scale(readerTimeUs.coerceAtLeast(0L), usDenominator, usNumerator)
++        }
++        running = true
++        nextUnits = units + if (countsBytes) size.toLong() else 1L
++        return scale(units, usNumerator, usDenominator)
++    }
++
++    companion object {
++        private const val MICROS_PER_SECOND = 1_000_000L
++        private const val MIN_BYTES_PER_SECOND = 1_000L
++        private const val MAX_BYTES_PER_SECOND = 20_000_000L
++        private const val MAX_HEADER_MISMATCH = 0.1
++        private const val MIN_BLOCK_US = 1_000L
++        private const val MAX_BLOCK_US = 2_000_000L
++
++        /** A clock for [stream], or null when its header gives no usable rate. */
++        fun forStream(stream: AviHeader.Stream): AviAudioClock? {
++            if (!stream.isAudio) return null
++            if (stream.sampleSize > 0) {
++                val strhUsable = stream.scale > 0 && stream.rate > 0
++                val strhBytesPerSecond =
++                    if (strhUsable) stream.rate * stream.sampleSize / stream.scale.toDouble() else 0.0
++                val avg = stream.avgBytesPerSecond.toDouble()
++                if (strhUsable && avg > 0 && abs(strhBytesPerSecond - avg) > avg * MAX_HEADER_MISMATCH) return null
++                val bytesPerSecond = if (strhUsable) strhBytesPerSecond else avg
++                if (bytesPerSecond < MIN_BYTES_PER_SECOND || bytesPerSecond > MAX_BYTES_PER_SECOND) return null
++                return if (strhUsable) {
++                    reduced(true, stream.scale * MICROS_PER_SECOND, stream.rate * stream.sampleSize)
++                } else {
++                    reduced(true, MICROS_PER_SECOND, stream.avgBytesPerSecond)
++                }
++            }
++            if (stream.scale <= 0 || stream.rate <= 0) return null
++            val blockUs = stream.scale * MICROS_PER_SECOND / stream.rate
++            if (blockUs < MIN_BLOCK_US || blockUs > MAX_BLOCK_US) return null
++            return reduced(false, stream.scale * MICROS_PER_SECOND, stream.rate)
++        }
++
++        private fun reduced(countsBytes: Boolean, numerator: Long, denominator: Long): AviAudioClock {
++            val divisor = gcd(numerator, denominator)
++            return AviAudioClock(countsBytes, numerator / divisor, denominator / divisor)
++        }
++
++        private tailrec fun gcd(a: Long, b: Long): Long = if (b == 0L) a else gcd(b, a % b)
++
++        /** value * multiplier / divisor, rounded down, without overflowing for the sizes found in AVI files. */
++        internal fun scale(value: Long, multiplier: Long, divisor: Long): Long {
++            val whole = value / divisor
++            val rest = value % divisor
++            val restScaled = if (rest != 0L && multiplier > Long.MAX_VALUE / rest) {
++                (rest.toDouble() * multiplier / divisor).toLong()
++            } else {
++                rest * multiplier / divisor
++            }
++            return whole * multiplier + restScaled
++        }
++    }
++}
++
++/** Reads the entries of an AVI idx1 chunk the way the stock reader does. */
++internal object AviIndex {
++
++    /** Where the data of each chunk of a stream starts in the file, and its size, in index order. */
++    class Entries(val dataPositions: LongArray, val sizes: IntArray)
++
++    private const val ENTRY_BYTES = 16
++    private const val CHUNK_HEADER_BYTES = 8
++    private const val KEY_FRAME_FLAG = 0x10L
++
++    /**
++     * The audio ('##wb') entries of [streams] in the idx1 body [body] ([length] bytes from [offset]).
++     * [moviListPosition] is where the movi LIST header starts: the offsets count from its list type unless the
++     * first offset lies beyond it, in which case they are file positions.
++     */
++    fun audioEntries(
++        body: ByteArray,
++        offset: Int,
++        length: Int,
++        moviListPosition: Long,
++        streams: Collection<Int>,
++    ): Map<Int, Entries> {
++        val end = offset + minOf(length, body.size - offset) / ENTRY_BYTES * ENTRY_BYTES
++        if (end <= offset || moviListPosition < 0 || streams.isEmpty()) return emptyMap()
++        val base = base(body, offset, moviListPosition)
++        val counts = HashMap<Int, Int>()
++        forEachEntry(body, offset, end, 'w', 'b', streams) { stream, _ -> counts[stream] = (counts[stream] ?: 0) + 1 }
++        val positions = counts.mapValues { LongArray(it.value) }
++        val sizes = counts.mapValues { IntArray(it.value) }
++        val filled = HashMap<Int, Int>()
++        forEachEntry(body, offset, end, 'w', 'b', streams) { stream, at ->
++            val i = filled[stream] ?: 0
++            positions.getValue(stream)[i] = base + u32(body, at + 8) + CHUNK_HEADER_BYTES
++            sizes.getValue(stream)[i] = u32(body, at + 12).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
++            filled[stream] = i + 1
++        }
++        return counts.keys.associateWith { Entries(positions.getValue(it), sizes.getValue(it)) }
++    }
++
++    /** The key frames of a video stream: their number among the stream's chunks, and where their chunk starts. */
++    class KeyFrames(val chunkIndices: IntArray, val positions: LongArray)
++
++    /** The key frame entries ('##dc' or '##db') of video [stream], as the stock reader keeps them. */
++    fun videoKeyFrames(body: ByteArray, offset: Int, length: Int, moviListPosition: Long, stream: Int): KeyFrames? {
++        val end = offset + minOf(length, body.size - offset) / ENTRY_BYTES * ENTRY_BYTES
++        if (end <= offset || moviListPosition < 0) return null
++        val base = base(body, offset, moviListPosition)
++        val indices = ArrayList<Int>()
++        val positions = ArrayList<Long>()
++        var chunks = 0
++        var at = offset
++        while (at < end) {
++            val type1 = body[at + 3].toInt()
++            if (body[at + 2].toInt() == 'd'.code && (type1 == 'c'.code || type1 == 'b'.code) &&
++                streamNumber(body, at) == stream
++            ) {
++                if (u32(body, at + 4) and KEY_FRAME_FLAG != 0L) {
++                    indices += chunks
++                    positions += base + u32(body, at + 8)
++                }
++                chunks++
++            }
++            at += ENTRY_BYTES
++        }
++        if (indices.isEmpty()) return null
++        return KeyFrames(indices.toIntArray(), positions.toLongArray())
++    }
++
++    // As the stock reader: the first entry's offset, read as a signed int, decides between the two bases.
++    private fun base(body: ByteArray, offset: Int, moviListPosition: Long): Long {
++        val firstOffset = u32(body, offset + 8).toInt().toLong()
++        return if (firstOffset > moviListPosition) 0L else moviListPosition + CHUNK_HEADER_BYTES
++    }
++
++    private inline fun forEachEntry(
++        body: ByteArray,
++        offset: Int,
++        end: Int,
++        type0: Char,
++        type1: Char,
++        streams: Collection<Int>,
++        action: (stream: Int, at: Int) -> Unit,
++    ) {
++        var at = offset
++        while (at < end) {
++            if (body[at + 2].toInt() == type0.code && body[at + 3].toInt() == type1.code) {
++                val stream = streamNumber(body, at)
++                if (stream >= 0 && stream in streams) action(stream, at)
++            }
++            at += ENTRY_BYTES
++        }
++    }
++
++    private fun streamNumber(body: ByteArray, at: Int): Int {
++        val tens = body[at].toInt() - '0'.code
++        val units = body[at + 1].toInt() - '0'.code
++        return if (tens in 0..9 && units in 0..9) tens * 10 + units else -1
++    }
++
++    private fun u32(b: ByteArray, at: Int): Long =
++        (b[at].toLong() and 0xFF) or ((b[at + 1].toLong() and 0xFF) shl 8) or
++            ((b[at + 2].toLong() and 0xFF) shl 16) or ((b[at + 3].toLong() and 0xFF) shl 24)
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/AviAudioFramer.kt b/app/src/main/java/com/nuvio/tv/core/player/AviAudioFramer.kt
+new file mode 100644
+index 0000000..b16ba31
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/player/AviAudioFramer.kt
+@@ -0,0 +1,260 @@
++package com.nuvio.tv.core.player
++
++import androidx.media3.common.MimeTypes
++import androidx.media3.common.util.UnstableApi
++import androidx.media3.extractor.Ac3Util
++import androidx.media3.extractor.DtsUtil
++import kotlin.math.abs
++
++/**
++ * Splits the audio chunks of an AVI stream into single AC-3 or DTS syncframes.
++ *
++ * AVI muxers pack several syncframes into one chunk, often cutting a frame across two chunks, and the stock reader
++ * hands each chunk on as one sample. A passthrough sink counts every sample as one syncframe, so its clock falls
++ * behind the sample times and it resyncs over and over. Each frame is timed from the audio before it, anchored to
++ * the chunk times after a start or seek and again whenever the two drift apart by more than [RESYNC_US].
++ * A stream without recognisable syncframes is passed on chunk by chunk, as before.
++ */
++@UnstableApi
++internal class AviAudioFramer(private val codec: Codec, private val streamSampleRate: Int) {
++
++    enum class Codec { AC3, DTS }
++
++    fun interface FrameSink {
++        fun frame(data: ByteArray, offset: Int, size: Int, timeUs: Long)
++    }
++
++    var engaged = false
++        private set
++    var passingThrough = false
++        private set
++    var framesOut = 0L
++        private set
++    var firstChunkFrames = 0
++        private set
++    var firstFrameBytes = 0
++        private set
++    var firstFrameBitrate = 0
++        private set
++    var reanchors = 0
++        private set
++    var lastReanchorDriftUs = 0L
++        private set
++    var bytesDropped = 0L
++        private set
++
++    private var buffer = ByteArray(INITIAL_CAPACITY)
++    private var size = 0
++    private var chunkBytes = 0
++    private var pendingStartTimeUs = UNSET
++    private var locked = false
++    private var lockConfirmed = false
++    private var anchorUs = UNSET
++    private var anchorSamples = 0L
++    private var anchorRate = 0
++    private var parsedSamples = 0
++    private var parsedRate = 0
++    private val header = ByteArray(HEADER_BYTES)
++
++    /** Takes up to [length] bytes of the current chunk from [read], which works like DataReader.read. */
++    fun append(length: Int, read: (ByteArray, Int, Int) -> Int): Int {
++        val wanted = minOf(length, MAX_READ_BYTES)
++        if (buffer.size - size < wanted) buffer = buffer.copyOf(maxOf(buffer.size * 2, size + wanted))
++        val count = read(buffer, size, wanted)
++        if (count > 0) {
++            size += count
++            chunkBytes += count
++        }
++        return count
++    }
++
++    /** The chunk whose bytes were appended since the last call ends here, stamped [chunkTimeUs] by the reader. */
++    fun endChunk(chunkTimeUs: Long, sink: FrameSink) {
++        val chunkStart = size - chunkBytes
++        chunkBytes = 0
++        if (pendingStartTimeUs == UNSET) pendingStartTimeUs = chunkTimeUs
++        if (passingThrough) {
++            flushWhole(sink)
++            return
++        }
++        val framesBefore = framesOut
++        var pos = 0
++        while (true) {
++            if (!locked) {
++                val at = findLock(pos)
++                if (at < 0) {
++                    if (engaged) pos = drop(pos, maxOf(pos, size - (HEADER_BYTES - 1)))
++                    break
++                }
++                if (!lockConfirmed) {
++                    if (engaged) pos = drop(pos, at)
++                    break
++                }
++                pos = drop(pos, at)
++                engaged = true
++                locked = true
++            }
++            if (pos + HEADER_BYTES > size) break
++            val frameSize = frameSizeAt(pos)
++            if (frameSize <= 0) {
++                locked = false
++                continue
++            }
++            if (pos + frameSize > size) break
++            emit(pos, frameSize, chunkStart, chunkTimeUs, sink)
++            pos += frameSize
++        }
++        if (firstChunkFrames == 0) firstChunkFrames = (framesOut - framesBefore).toInt()
++        compact(pos)
++        if (!engaged && size > MAX_SEARCH_BYTES) {
++            passingThrough = true
++            flushWhole(sink)
++        } else if (size == 0 || framesOut > framesBefore) {
++            pendingStartTimeUs = UNSET
++        }
++    }
++
++    /** The reader moved (seek or restart): bytes held from before belong to another place in the file. */
++    fun reset() {
++        size = 0
++        chunkBytes = 0
++        pendingStartTimeUs = UNSET
++        locked = false
++        anchorUs = UNSET
++        anchorSamples = 0L
++    }
++
++    private fun emit(pos: Int, frameSize: Int, chunkStart: Int, chunkTimeUs: Long, sink: FrameSink) {
++        val samples = parsedSamples
++        val rate = parsedRate
++        val frameDurationUs = samples * MICROS_PER_SECOND / rate
++        val chunkDerivedUs = chunkTimeUs + (pos - chunkStart) * frameDurationUs / frameSize
++        if (anchorUs == UNSET) {
++            anchorUs = chunkDerivedUs
++            anchorSamples = 0L
++            anchorRate = rate
++        } else {
++            val predictedUs = anchorUs + anchorSamples * MICROS_PER_SECOND / anchorRate
++            if (abs(predictedUs - chunkDerivedUs) > RESYNC_US) {
++                reanchors++
++                lastReanchorDriftUs = chunkDerivedUs - predictedUs
++                anchorUs = chunkDerivedUs
++                anchorSamples = 0L
++                anchorRate = rate
++            } else if (rate != anchorRate) {
++                anchorUs = predictedUs
++                anchorSamples = 0L
++                anchorRate = rate
++            }
++        }
++        val timeUs = anchorUs + anchorSamples * MICROS_PER_SECOND / anchorRate
++        anchorSamples += samples
++        if (framesOut == 0L) {
++            firstFrameBytes = frameSize
++            firstFrameBitrate = (frameSize * 8L * rate / samples).toInt()
++        }
++        framesOut++
++        sink.frame(buffer, pos, frameSize, timeUs)
++    }
++
++    private fun flushWhole(sink: FrameSink) {
++        if (size > 0) sink.frame(buffer, 0, size, pendingStartTimeUs)
++        size = 0
++        pendingStartTimeUs = UNSET
++    }
++
++    // The first frame start at or after [from] whose header is followed by another frame header. [lockConfirmed]
++    // is false when the candidate looks right but the bytes that would confirm it have not arrived yet.
++    private fun findLock(from: Int): Int {
++        var at = from
++        while (at + HEADER_BYTES <= size) {
++            val frameSize = frameSizeAt(at)
++            if (frameSize > 0) {
++                val next = at + frameSize
++                if (next + HEADER_BYTES > size) {
++                    lockConfirmed = false
++                    return at
++                }
++                if (frameSizeAt(next) > 0) {
++                    lockConfirmed = true
++                    return at
++                }
++            }
++            at++
++        }
++        return -1
++    }
++
++    private fun drop(from: Int, to: Int): Int {
++        bytesDropped += to - from
++        return to
++    }
++
++    private fun compact(pos: Int) {
++        if (pos <= 0) return
++        System.arraycopy(buffer, pos, buffer, 0, size - pos)
++        size -= pos
++    }
++
++    /** Size of the syncframe starting at [at], or -1; sets [parsedSamples] and [parsedRate] for it. */
++    private fun frameSizeAt(at: Int): Int {
++        if (at + HEADER_BYTES > size) return -1
++        return when (codec) {
++            Codec.AC3 -> ac3FrameSizeAt(at)
++            Codec.DTS -> dtsFrameSizeAt(at)
++        }
++    }
++
++    private fun ac3FrameSizeAt(at: Int): Int {
++        if (buffer[at] != AC3_SYNC_0 || buffer[at + 1] != AC3_SYNC_1) return -1
++        val bsid = (buffer[at + 5].toInt() and 0xFF) shr 3
++        if (bsid > AC3_MAX_BSID) return -1
++        val fscod = (buffer[at + 4].toInt() and 0xFF) shr 6
++        if (fscod >= AC3_SAMPLE_RATES.size) return -1
++        System.arraycopy(buffer, at, header, 0, HEADER_BYTES)
++        val frameSize = Ac3Util.parseAc3SyncframeSize(header)
++        if (frameSize < AC3_MIN_FRAME_BYTES) return -1
++        parsedSamples = AC3_SAMPLES_PER_FRAME
++        parsedRate = AC3_SAMPLE_RATES[fscod]
++        return frameSize
++    }
++
++    private fun dtsFrameSizeAt(at: Int): Int {
++        if (streamSampleRate <= 0) return -1
++        val word = ((buffer[at].toInt() and 0xFF) shl 24) or ((buffer[at + 1].toInt() and 0xFF) shl 16) or
++            ((buffer[at + 2].toInt() and 0xFF) shl 8) or (buffer[at + 3].toInt() and 0xFF)
++        if (DtsUtil.getFrameType(word) != DtsUtil.FRAME_TYPE_CORE) return -1
++        System.arraycopy(buffer, at, header, 0, HEADER_BYTES)
++        val frameSize = DtsUtil.getDtsFrameSize(header)
++        val samples = DtsUtil.parseDtsAudioSampleCount(header)
++        if (frameSize !in DTS_MIN_FRAME_BYTES..DTS_MAX_FRAME_BYTES || samples <= 0) return -1
++        parsedSamples = samples
++        parsedRate = streamSampleRate
++        return frameSize
++    }
++
++    companion object {
++        const val RESYNC_US = 1_000_000L
++        const val MAX_SEARCH_BYTES = 64 * 1024
++        private const val MAX_READ_BYTES = 64 * 1024
++        private const val INITIAL_CAPACITY = 16 * 1024
++        private const val HEADER_BYTES = 16
++        private const val MICROS_PER_SECOND = 1_000_000L
++        private const val UNSET = Long.MIN_VALUE
++        private const val AC3_SYNC_0 = 0x0B.toByte()
++        private const val AC3_SYNC_1 = 0x77.toByte()
++        private const val AC3_MAX_BSID = 10
++        private const val AC3_MIN_FRAME_BYTES = 128
++        private const val AC3_SAMPLES_PER_FRAME = 1536
++        private val AC3_SAMPLE_RATES = intArrayOf(48_000, 44_100, 32_000)
++        private const val DTS_MIN_FRAME_BYTES = 96
++        private const val DTS_MAX_FRAME_BYTES = 32 * 1024
++
++        /** The codec to split for an AVI audio track, or null to leave the track as the reader delivers it. */
++        fun codecFor(sampleMimeType: String?, sampleRate: Int): Codec? = when (sampleMimeType) {
++            MimeTypes.AUDIO_AC3 -> Codec.AC3
++            MimeTypes.AUDIO_DTS -> if (sampleRate > 0) Codec.DTS else null
++            else -> null
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/AviTrackFormatExtractorsFactory.kt b/app/src/main/java/com/nuvio/tv/core/player/AviTrackFormatExtractorsFactory.kt
+new file mode 100644
+index 0000000..def6d01
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/player/AviTrackFormatExtractorsFactory.kt
+@@ -0,0 +1,484 @@
++package com.nuvio.tv.core.player
++
++import android.net.Uri
++import android.util.Log
++import androidx.media3.common.C
++import androidx.media3.common.DataReader
++import androidx.media3.common.Format
++import androidx.media3.common.MimeTypes
++import androidx.media3.common.util.ParsableByteArray
++import androidx.media3.common.util.UnstableApi
++import androidx.media3.extractor.Extractor
++import androidx.media3.extractor.ExtractorInput
++import androidx.media3.extractor.ExtractorOutput
++import androidx.media3.extractor.ExtractorsFactory
++import androidx.media3.extractor.ForwardingExtractorInput
++import androidx.media3.extractor.ForwardingSeekMap
++import androidx.media3.extractor.ForwardingTrackOutput
++import androidx.media3.extractor.PositionHolder
++import androidx.media3.extractor.SeekMap
++import androidx.media3.extractor.TrackOutput
++import androidx.media3.extractor.avi.AviExtractor
++import java.io.EOFException
++import java.io.IOException
++
++/**
++ * Completes the video track format of AVI files: the stock AVI extractor reports neither the frame rate nor the
++ * container, so frame rate matching and the decode-order time repair had nothing to work with. A video stream the
++ * extractor drops because it does not know the codec (DivX 3 and other old FourCCs) is reported as an unknown
++ * video track, so the player can tell there is a picture it cannot decode instead of playing sound only.
++ * AC-3 and DTS audio chunks are split into single syncframes, see [AviAudioFramer].
++ */
++@UnstableApi
++internal class AviTrackFormatExtractorsFactory(private val delegate: ExtractorsFactory) : ExtractorsFactory {
++
++    override fun createExtractors(): Array<Extractor> =
++        delegate.createExtractors().map(::wrap).toTypedArray()
++
++    override fun createExtractors(uri: Uri, responseHeaders: Map<String, List<String>>): Array<Extractor> =
++        delegate.createExtractors(uri, responseHeaders).map(::wrap).toTypedArray()
++
++    private fun wrap(extractor: Extractor): Extractor =
++        if (extractor is AviExtractor) AviTrackFormatExtractor(extractor) else extractor
++}
++
++@UnstableApi
++private class AviTrackFormatExtractor(private val delegate: AviExtractor) : Extractor {
++
++    private var headerRead = false
++    private var video: AviHeader.Video? = null
++    private var streams: List<AviHeader.Stream> = emptyList()
++    private val audioTracks = ArrayList<AudioFrameTrackOutput>()
++    private var watchingIndex = true
++    private var moviListPosition = C.INDEX_UNSET.toLong()
++    private var indexBodyPosition = C.INDEX_UNSET.toLong()
++    private var indexBodySize = 0L
++    private var videoStreamId = C.INDEX_UNSET
++    @Volatile private var videoSeekTable: AviVideoSeekTable? = null
++
++    override fun init(output: ExtractorOutput) {
++        delegate.init(object : ExtractorOutput {
++            private var videoTrackSeen = false
++
++            override fun track(id: Int, type: Int): TrackOutput {
++                val track = output.track(id, type)
++                if (type == C.TRACK_TYPE_AUDIO) {
++                    val clock = streams.getOrNull(id)?.let(AviAudioClock::forStream)
++                    return AudioFrameTrackOutput(track, id, clock).also { audioTracks += it }
++                }
++                if (type != C.TRACK_TYPE_VIDEO) return track
++                videoTrackSeen = true
++                if (videoStreamId == C.INDEX_UNSET) videoStreamId = id
++                return VideoTrackOutput(track)
++            }
++
++            override fun endTracks() {
++                val dropped = video
++                if (!videoTrackSeen && dropped != null) {
++                    output.track(UNKNOWN_VIDEO_TRACK_ID, C.TRACK_TYPE_VIDEO).format(
++                        Format.Builder()
++                            .setContainerMimeType(MimeTypes.VIDEO_AVI)
++                            .setSampleMimeType(MimeTypes.VIDEO_UNKNOWN)
++                            .setCodecs(dropped.fourCc)
++                            .build()
++                    )
++                }
++                output.endTracks()
++            }
++
++            override fun seekMap(seekMap: SeekMap) {
++                watchingIndex = false
++                output.seekMap(VideoSeekMap(seekMap))
++            }
++        })
++    }
++
++    @Throws(IOException::class)
++    override fun sniff(input: ExtractorInput): Boolean = delegate.sniff(input)
++
++    @Throws(IOException::class)
++    override fun read(input: ExtractorInput, seekPosition: PositionHolder): Int {
++        if (!headerRead && input.position == 0L) {
++            peekHeader(input)
++            headerRead = true
++        }
++        return delegate.read(if (watchingIndex) IndexWatchingInput(input) else input, seekPosition)
++    }
++
++    // The header list can be longer than a few KB when an audio stream with an index block comes first.
++    @Throws(IOException::class)
++    private fun peekHeader(input: ExtractorInput) {
++        try {
++            val start = ByteArray(AviHeader.LIST_START_BYTES)
++            val startLength = peekUpTo(input, start)
++            input.resetPeekPosition()
++            val head = ByteArray(AviHeader.probeBytes(start, startLength))
++            val length = peekUpTo(input, head)
++            video = AviHeader.read(head, length)
++            streams = AviHeader.streams(head, length)
++        } finally {
++            input.resetPeekPosition()
++        }
++    }
++
++    private fun onIndexRead(body: ByteArray, offset: Int, length: Int) {
++        val entries = AviIndex.audioEntries(body, offset, length, moviListPosition, audioTracks.map { it.id })
++        audioTracks.forEach { track -> entries[track.id]?.let(track::useIndex) }
++        val videoStream = streams.getOrNull(videoStreamId) ?: return
++        videoSeekTable = AviIndex.videoKeyFrames(body, offset, length, moviListPosition, videoStreamId)
++            ?.let { AviVideoSeekTable.create(videoStream, it) }
++    }
++
++    /** Keeps the stock answer when the video reader can start there, see [AviVideoSeekTable]. */
++    private inner class VideoSeekMap(seekMap: SeekMap) : ForwardingSeekMap(seekMap) {
++        override fun getSeekPoints(timeUs: Long): SeekMap.SeekPoints {
++            val points = super.getSeekPoints(timeUs)
++            val table = videoSeekTable ?: return points
++            return if (table.isSafeStart(points.first.position)) points else table.seekPoints(timeUs)
++        }
++    }
++
++    /** Sees the reader find the movi list and read the idx1 body, which it does before the first sample. */
++    private inner class IndexWatchingInput(private val input: ExtractorInput) : ForwardingExtractorInput(input) {
++        override fun peekFully(target: ByteArray, offset: Int, length: Int, allowEndOfInput: Boolean): Boolean {
++            val at = input.peekPosition
++            val peeked = input.peekFully(target, offset, length, allowEndOfInput)
++            if (peeked) onPeeked(at, target, offset, length)
++            return peeked
++        }
++
++        override fun peekFully(target: ByteArray, offset: Int, length: Int) {
++            val at = input.peekPosition
++            input.peekFully(target, offset, length)
++            onPeeked(at, target, offset, length)
++        }
++
++        override fun readFully(target: ByteArray, offset: Int, length: Int, allowEndOfInput: Boolean): Boolean {
++            val at = input.position
++            val read = input.readFully(target, offset, length, allowEndOfInput)
++            if (read) onRead(at, target, offset, length)
++            return read
++        }
++
++        override fun readFully(target: ByteArray, offset: Int, length: Int) {
++            val at = input.position
++            input.readFully(target, offset, length)
++            onRead(at, target, offset, length)
++        }
++
++        private fun onPeeked(at: Long, data: ByteArray, offset: Int, length: Int) {
++            if (length >= 12 && tag(data, offset) == "LIST" && tag(data, offset + 8) == "movi") moviListPosition = at
++        }
++
++        private fun onRead(at: Long, data: ByteArray, offset: Int, length: Int) {
++            if (length == 8 && tag(data, offset) == "idx1") {
++                indexBodyPosition = at + 8
++                indexBodySize = (data[offset + 4].toLong() and 0xFF) or ((data[offset + 5].toLong() and 0xFF) shl 8) or
++                    ((data[offset + 6].toLong() and 0xFF) shl 16) or ((data[offset + 7].toLong() and 0xFF) shl 24)
++            } else if (at == indexBodyPosition && length.toLong() == indexBodySize) {
++                indexBodyPosition = C.INDEX_UNSET.toLong()
++                onIndexRead(data, offset, length)
++            }
++        }
++
++        private fun tag(data: ByteArray, at: Int) = String(data, at, 4, Charsets.ISO_8859_1)
++    }
++
++    @Throws(IOException::class)
++    private fun peekUpTo(input: ExtractorInput, target: ByteArray): Int {
++        var length = 0
++        while (length < target.size) {
++            val read = input.peek(target, length, target.size - length)
++            if (read == C.RESULT_END_OF_INPUT) break
++            length += read
++        }
++        return length
++    }
++
++    override fun seek(position: Long, timeUs: Long) {
++        audioTracks.forEach { it.reset() }
++        delegate.seek(position, timeUs)
++    }
++
++    override fun release() = delegate.release()
++    override fun getUnderlyingImplementation(): Extractor = delegate
++
++    private inner class VideoTrackOutput(track: TrackOutput) : ForwardingTrackOutput(track) {
++        override fun format(format: Format) {
++            val builder = format.buildUpon()
++            if (format.containerMimeType == null) builder.setContainerMimeType(MimeTypes.VIDEO_AVI)
++            val frameRate = video?.frameRate ?: Format.NO_VALUE.toFloat()
++            if (format.frameRate <= 0f && frameRate > 0f) builder.setFrameRate(frameRate)
++            super.format(builder.build())
++        }
++    }
++
++    private class AudioFrameTrackOutput(
++        private val track: TrackOutput,
++        val id: Int,
++        private val clock: AviAudioClock?,
++    ) : TrackOutput {
++        private var framer: AviAudioFramer? = null
++        private var sampleMimeType: String? = null
++        private val frame = ParsableByteArray()
++        private var chunkDataPosition = NO_POSITION
++        private var seeked = false
++        private var loggedClock = false
++        private var loggedSeek = false
++        private var loggedEngaged = false
++        private var loggedPassthrough = false
++        private var loggedReanchors = 0
++        private val sink = AviAudioFramer.FrameSink { data, offset, size, timeUs ->
++            frame.reset(data, offset + size)
++            frame.setPosition(offset)
++            track.sampleData(frame, size)
++            track.sampleMetadata(timeUs, C.BUFFER_FLAG_KEY_FRAME, size, 0, null)
++        }
++
++        fun reset() {
++            framer?.reset()
++            clock?.reset()
++            chunkDataPosition = NO_POSITION
++            seeked = true
++        }
++
++        fun useIndex(entries: AviIndex.Entries) {
++            if (clock?.useIndex(entries) == false) {
++                Log.w(TAG, "stream=$id idx1 entries out of file order, timing by the reader after seeks")
++            }
++        }
++
++        private fun noteChunkStart(input: DataReader, length: Int) {
++            if (chunkDataPosition == NO_POSITION && length > 0) {
++                chunkDataPosition = (input as? ExtractorInput)?.position ?: UNKNOWN_POSITION
++            }
++        }
++
++        private fun chunkTimeUs(readerTimeUs: Long, size: Int): Long {
++            if (clock == null) {
++                if (!loggedClock) {
++                    loggedClock = true
++                    Log.i(TAG, "clock stream=$id off, header gives no usable rate")
++                }
++                return readerTimeUs
++            }
++            val timeUs = clock.chunkTimeUs(chunkDataPosition, size, readerTimeUs)
++            if (!loggedClock) {
++                loggedClock = true
++                Log.i(
++                    TAG,
++                    "clock stream=$id by=${if (clock.countsBytes) "bytes" else "chunks"} " +
++                        "indexChunks=${clock.indexedChunks} shiftUs=${timeUs - readerTimeUs}"
++                )
++            } else if (seeked && !loggedSeek) {
++                loggedSeek = true
++                Log.i(TAG, "after seek stream=$id shiftUs=${timeUs - readerTimeUs} indexed=${clock.lastChunkIndexed}")
++            }
++            seeked = false
++            return timeUs
++        }
++
++        override fun format(format: Format) {
++            if (framer == null && sampleMimeType == null) {
++                framer = AviAudioFramer.codecFor(format.sampleMimeType, format.sampleRate)
++                    ?.let { AviAudioFramer(it, format.sampleRate) }
++            }
++            sampleMimeType = format.sampleMimeType
++            track.format(format)
++        }
++
++        override fun durationUs(durationUs: Long) = track.durationUs(durationUs)
++
++        @Throws(IOException::class)
++        override fun sampleData(input: DataReader, length: Int, allowEndOfInput: Boolean, sampleDataPart: Int): Int {
++            noteChunkStart(input, length)
++            val framer = framer ?: return track.sampleData(input, length, allowEndOfInput, sampleDataPart)
++            val read = framer.append(length) { target, offset, count -> input.read(target, offset, count) }
++            if (read == C.RESULT_END_OF_INPUT) {
++                if (allowEndOfInput) return C.RESULT_END_OF_INPUT
++                throw EOFException()
++            }
++            return read
++        }
++
++        override fun sampleData(data: ParsableByteArray, length: Int, sampleDataPart: Int) {
++            val framer = framer ?: return track.sampleData(data, length, sampleDataPart)
++            var remaining = length
++            while (remaining > 0) {
++                remaining -= framer.append(remaining) { target, offset, count ->
++                    data.readBytes(target, offset, count)
++                    count
++                }
++            }
++        }
++
++        override fun sampleMetadata(
++            timeUs: Long,
++            flags: Int,
++            size: Int,
++            offset: Int,
++            cryptoData: TrackOutput.CryptoData?
++        ) {
++            val chunkTimeUs = chunkTimeUs(timeUs, size)
++            chunkDataPosition = NO_POSITION
++            val framer = framer ?: return track.sampleMetadata(chunkTimeUs, flags, size, offset, cryptoData)
++            framer.endChunk(chunkTimeUs, sink)
++            logChanges(framer)
++        }
++
++        private fun logChanges(framer: AviAudioFramer) {
++            if (framer.engaged && !loggedEngaged) {
++                loggedEngaged = true
++                Log.i(
++                    TAG,
++                    "split codec=$sampleMimeType frameBytes=${framer.firstFrameBytes} " +
++                        "bitrate=${framer.firstFrameBitrate} framesPerChunk=${framer.firstChunkFrames} " +
++                        "skippedBytes=${framer.bytesDropped}"
++                )
++            }
++            if (framer.passingThrough && !loggedPassthrough) {
++                loggedPassthrough = true
++                Log.w(TAG, "no syncframes found codec=$sampleMimeType, chunks passed on unchanged")
++            }
++            if (framer.reanchors > loggedReanchors && loggedReanchors < MAX_REANCHOR_LOGS) {
++                loggedReanchors = framer.reanchors
++                Log.i(TAG, "re-anchor driftUs=${framer.lastReanchorDriftUs} count=${framer.reanchors}")
++            }
++        }
++    }
++
++    private companion object {
++        const val UNKNOWN_VIDEO_TRACK_ID = 0x7FFF
++        const val TAG = "AVI_AUDIO_TIME"
++        const val MAX_REANCHOR_LOGS = 5
++        const val NO_POSITION = -1L
++        const val UNKNOWN_POSITION = -2L
++    }
++}
++
++/** Reads the first video stream's frame rate and FourCC from the first bytes of an AVI file (hdrl list). */
++internal object AviHeader {
++    const val LIST_START_BYTES = 24
++    private const val MIN_PROBE_BYTES = 4096
++    private const val MAX_PROBE_BYTES = 256 * 1024
++
++    /** How much of the file to look at: the whole hdrl list when its size is known, within sane bounds. */
++    fun probeBytes(start: ByteArray, length: Int): Int {
++        if (length < LIST_START_BYTES || fourCc(start, 0) != "RIFF" || fourCc(start, 8) != "AVI " ||
++            fourCc(start, 12) != "LIST" || fourCc(start, 20) != "hdrl"
++        ) {
++            return MIN_PROBE_BYTES
++        }
++        val headerListEnd = 20L + u32(start, 16)
++        return headerListEnd.coerceIn(MIN_PROBE_BYTES.toLong(), MAX_PROBE_BYTES.toLong()).toInt()
++    }
++    private const val MIN_FPS = 5f
++    private const val MAX_FPS = 121f
++    private const val STREAM_HEADER_BYTES = 48
++
++    /** [frameRate] is [Format.NO_VALUE] when the header carries no usable rate. */
++    data class Video(val frameRate: Float, val fourCc: String?)
++
++    /** One stream header, numbered in file order as the chunk ids number them; [avgBytesPerSecond] is for audio. */
++    data class Stream(
++        val number: Int,
++        val type: String,
++        val scale: Long,
++        val rate: Long,
++        val length: Long,
++        val sampleSize: Long,
++        val avgBytesPerSecond: Long = 0,
++    ) {
++        val isAudio: Boolean get() = type == "auds"
++    }
++
++    fun streams(head: ByteArray, length: Int): List<Stream> {
++        val end = minOf(length, head.size)
++        if (end < 12 || fourCc(head, 0) != "RIFF" || fourCc(head, 8) != "AVI ") return emptyList()
++        val streams = ArrayList<Stream>()
++        var at = 12
++        while (at + 8 <= end) {
++            val id = fourCc(head, at)
++            val size = u32(head, at + 4)
++            if (id == "LIST" && at + 12 <= end) {
++                val type = fourCc(head, at + 8)
++                if (type == "movi") break
++                if (type == "hdrl" || type == "strl") {
++                    at += 12
++                    continue
++                }
++            } else if (id == "strh" && at + 12 <= end) {
++                val complete = size >= STREAM_HEADER_BYTES && at + 8 + STREAM_HEADER_BYTES <= end
++                streams += Stream(
++                    number = streams.size,
++                    type = fourCc(head, at + 8),
++                    scale = if (complete) u32(head, at + 28) else 0,
++                    rate = if (complete) u32(head, at + 32) else 0,
++                    length = if (complete) u32(head, at + 40) else 0,
++                    sampleSize = if (complete) u32(head, at + 52) else 0,
++                )
++            } else if (id == "strf" && size >= 12 && at + 20 <= end && streams.lastOrNull()?.isAudio == true) {
++                streams[streams.lastIndex] = streams.last().copy(avgBytesPerSecond = u32(head, at + 16))
++            }
++            val next = at + 8L + size + (size and 1L)
++            if (next >= end) break
++            at = next.toInt()
++        }
++        return streams
++    }
++
++    fun read(head: ByteArray, length: Int): Video? {
++        val end = minOf(length, head.size)
++        if (end < 12 || fourCc(head, 0) != "RIFF" || fourCc(head, 8) != "AVI ") return null
++        var mainHeaderFps = Format.NO_VALUE.toFloat()
++        var streamFps = Format.NO_VALUE.toFloat()
++        var videoFourCc: String? = null
++        var inVideoStream = false
++        var videoStreamSeen = false
++        var at = 12
++        while (at + 8 <= end) {
++            val id = fourCc(head, at)
++            val size = u32(head, at + 4)
++            if (id == "LIST" && at + 12 <= end) {
++                val type = fourCc(head, at + 8)
++                if (type == "movi" || (type == "strl" && videoStreamSeen)) break
++                if (type == "hdrl" || type == "strl") {
++                    at += 12
++                    continue
++                }
++            } else if (id == "avih" && at + 12 <= end) {
++                val microsPerFrame = u32(head, at + 8)
++                if (microsPerFrame > 0) mainHeaderFps = plausible(1_000_000f / microsPerFrame)
++            } else if (id == "strh" && at + 16 <= end) {
++                inVideoStream = fourCc(head, at + 8) == "vids"
++                if (inVideoStream) {
++                    videoStreamSeen = true
++                    videoFourCc = printable(fourCc(head, at + 12))
++                    if (at + 36 <= end) {
++                        val scale = u32(head, at + 28)
++                        val rate = u32(head, at + 32)
++                        if (scale > 0 && rate > 0) streamFps = plausible(rate.toFloat() / scale)
++                    }
++                }
++            } else if (id == "strf" && inVideoStream && at + 28 <= end) {
++                printable(fourCc(head, at + 24))?.let { videoFourCc = it }
++            }
++            val next = at + 8L + size + (size and 1L)
++            if (next >= end) break
++            at = next.toInt()
++        }
++        if (!videoStreamSeen) return null
++        return Video(if (streamFps > 0f) streamFps else mainHeaderFps, videoFourCc)
++    }
++
++    private fun plausible(fps: Float): Float = if (fps in MIN_FPS..MAX_FPS) fps else Format.NO_VALUE.toFloat()
++
++    private fun printable(fourCc: String): String? =
++        fourCc.takeIf { it.isNotBlank() && it.all { c -> c in ' '..'~' } }
++
++    private fun fourCc(b: ByteArray, at: Int): String = String(b, at, 4, Charsets.ISO_8859_1)
++
++    private fun u32(b: ByteArray, at: Int): Long =
++        (b[at].toLong() and 0xFF) or ((b[at + 1].toLong() and 0xFF) shl 8) or
++            ((b[at + 2].toLong() and 0xFF) shl 16) or ((b[at + 3].toLong() and 0xFF) shl 24)
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/AviVideoSeekTable.kt b/app/src/main/java/com/nuvio/tv/core/player/AviVideoSeekTable.kt
+new file mode 100644
+index 0000000..fd47b99
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/player/AviVideoSeekTable.kt
+@@ -0,0 +1,51 @@
++package com.nuvio.tv.core.player
++
++import androidx.media3.common.util.UnstableApi
++import androidx.media3.extractor.SeekMap
++import androidx.media3.extractor.SeekPoint
++import java.util.Arrays
++
++/**
++ * The seek points of an AVI file's video stream, the same ones the stock reader gives for it.
++ *
++ * The stock seek map answers with whichever stream's seek point comes first in the file. Every audio chunk counts as
++ * a seek point there, so for a time on or just after a key frame the audio chunk stored before that key frame wins.
++ * The video reader then starts from the key frame before that position and numbers the frames from there, so the
++ * picture is stamped up to a whole group of pictures early. Only a key frame, or a place before the first one, is a
++ * safe start for the video reader.
++ */
++@UnstableApi
++internal class AviVideoSeekTable private constructor(
++    private val frameDurationUs: Long,
++    private val chunkIndices: IntArray,
++    private val positions: LongArray,
++) {
++    /** Whether the video reader numbers its frames right when reading starts at [position]. */
++    fun isSafeStart(position: Long): Boolean = position < positions[0] || Arrays.binarySearch(positions, position) >= 0
++
++    fun seekPoints(timeUs: Long): SeekMap.SeekPoints {
++        val frame = (timeUs / frameDurationUs).toInt()
++        var at = Arrays.binarySearch(chunkIndices, frame)
++        if (at < 0) at = maxOf(0, -at - 2)
++        val first = point(at)
++        if (chunkIndices[at] == frame || at + 1 >= chunkIndices.size) return SeekMap.SeekPoints(first)
++        return SeekMap.SeekPoints(first, point(at + 1))
++    }
++
++    private fun point(at: Int) = SeekPoint(chunkIndices[at] * frameDurationUs, positions[at])
++
++    companion object {
++        fun create(stream: AviHeader.Stream, keyFrames: AviIndex.KeyFrames): AviVideoSeekTable? {
++            if (stream.scale <= 0 || stream.rate <= 0 || stream.length <= 0 || keyFrames.positions.isEmpty()) return null
++            val indices = keyFrames.chunkIndices
++            val positions = keyFrames.positions
++            for (i in 1 until indices.size) {
++                if (indices[i] <= indices[i - 1] || positions[i] <= positions[i - 1]) return null
++            }
++            val durationUs = AviAudioClock.scale(stream.length, stream.scale * 1_000_000L, stream.rate)
++            val frameDurationUs = durationUs / stream.length
++            if (frameDurationUs <= 0) return null
++            return AviVideoSeekTable(frameDurationUs, indices, positions)
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/FrameRateUtils.kt b/app/src/main/java/com/nuvio/tv/core/player/FrameRateUtils.kt
+index 7eb6a82..f0739e8 100644
+--- a/app/src/main/java/com/nuvio/tv/core/player/FrameRateUtils.kt
++++ b/app/src/main/java/com/nuvio/tv/core/player/FrameRateUtils.kt
+@@ -1,6 +1,7 @@
+ package com.nuvio.tv.core.player
+ 
+ import android.app.Activity
++import com.nuvio.tv.core.logging.redactedUrlForLog
+ import android.content.Context
+ import android.media.MediaExtractor
+ import android.net.Uri
+@@ -39,6 +40,8 @@ object FrameRateUtils {
+     private const val MKV_EXTENSION = ".mkv"
+     private const val SWITCH_POLL_INTERVAL_MS = 60L
+     private const val SWITCH_REQUIRED_STABLE_POLLS = 2
++    /** Below this the reported rate is not real content; never switch the panel for it. */
++    private const val MIN_AFR_SWITCH_FPS = 20f
+     private const val RESOLUTION_MATCH_MIN_SHORT_SIDE = 720
+ 
+     data class DisplayModeSwitchResult(
+@@ -54,6 +57,129 @@ object FrameRateUtils {
+         }
+     }
+ 
++    // Disk persistence for the fps cache, so a cold start can switch the
++    // display mode before prepare instead of mid-prepare.
++    //  - Inert until initFrameRateCachePersistence is called (unit tests
++    //    never call it).
++    //  - Only SHA-256(key) is written; keys can embed header tokens.
++    //  - Entries expire after 30 days: a stale entry cannot be corrected
++    //    within a play.
++    //  - Writes are debounced 2 s onto one daemon thread, temp file + rename.
++    private const val PERSIST_CAP = 256
++    private const val PERSIST_TTL_MS = 30L * 24 * 60 * 60 * 1000
++    private const val PERSIST_FLUSH_DELAY_MS = 2000L
++    private const val PERSIST_FILE_NAME = "afr_fps_cache_v1.txt"
++
++    private class PersistedDetection(
++        val detection: FrameRateDetection,
++        val storedAtMs: Long
++    )
++
++    @Volatile private var persistFile: java.io.File? = null
++    private val persistFlushPending = java.util.concurrent.atomic.AtomicBoolean(false)
++    private val persistExecutor: java.util.concurrent.ScheduledExecutorService by lazy {
++        java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
++            Thread(r, "AfrCachePersist").apply { isDaemon = true }
++        }
++    }
++
++    // SHA-256(cache key) -> detection + store time. Guarded by the
++    // frameRateCache lock so reader promotion, writer insertion and flush
++    // snapshots cannot interleave.
++    private val persistedCache = object : LinkedHashMap<String, PersistedDetection>(PERSIST_CAP, 0.75f, true) {
++        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, PersistedDetection>?): Boolean {
++            return size > PERSIST_CAP
++        }
++    }
++
++    /** Idempotent; call once from Application.onCreate. Loads off-thread. */
++    fun initFrameRateCachePersistence(context: android.content.Context) {
++        if (persistFile != null) return
++        val file = java.io.File(context.filesDir, PERSIST_FILE_NAME)
++        persistFile = file
++        persistExecutor.execute { loadPersistedCache(file) }
++    }
++
++    private fun hashKey(key: String): String {
++        val digest = java.security.MessageDigest.getInstance("SHA-256")
++        val bytes = digest.digest(key.toByteArray(Charsets.UTF_8))
++        val sb = StringBuilder(bytes.size * 2)
++        for (b in bytes) {
++            val v = b.toInt() and 0xFF
++            if (v < 0x10) sb.append('0')
++            sb.append(Integer.toHexString(v))
++        }
++        return sb.toString()
++    }
++
++    private fun loadPersistedCache(file: java.io.File) {
++        val now = System.currentTimeMillis()
++        val loaded = ArrayList<Pair<String, PersistedDetection>>()
++        try {
++            if (!file.exists()) return
++            file.bufferedReader().useLines { lines ->
++                lines.forEach { line ->
++                    val parts = line.split('|')
++                    if (parts.size != 6) return@forEach
++                    val hash = parts[0]
++                    val storedAt = parts[1].toLongOrNull() ?: return@forEach
++                    if (now - storedAt > PERSIST_TTL_MS) return@forEach
++                    val raw = parts[2].toFloatOrNull() ?: return@forEach
++                    val snapped = parts[3].toFloatOrNull() ?: return@forEach
++                    val w = parts[4].toIntOrNull()
++                    val h = parts[5].toIntOrNull()
++                    loaded.add(hash to PersistedDetection(FrameRateDetection(raw, snapped, w, h), storedAt))
++                }
++            }
++        } catch (e: Exception) {
++            Log.w(TAG, "AFR fps cache load failed (starting empty): ${e.message}")
++            return
++        }
++        if (loaded.isEmpty()) return
++        synchronized(frameRateCache) {
++            loaded.forEach { (hash, entry) ->
++                if (!persistedCache.containsKey(hash)) persistedCache[hash] = entry
++            }
++        }
++        Log.i(TAG, "AFR fps cache hydrated: ${loaded.size} persisted detection(s)")
++    }
++
++    private fun schedulePersistFlush() {
++        if (persistFile == null) return
++        if (!persistFlushPending.compareAndSet(false, true)) return
++        persistExecutor.schedule({
++            persistFlushPending.set(false)
++            flushPersistedCache()
++        }, PERSIST_FLUSH_DELAY_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
++    }
++
++    private fun flushPersistedCache() {
++        val file = persistFile ?: return
++        val snapshot: List<Pair<String, PersistedDetection>> = synchronized(frameRateCache) {
++            persistedCache.entries.map { it.key to it.value }
++        }
++        try {
++            val tmp = java.io.File(file.parentFile, file.name + ".tmp")
++            tmp.bufferedWriter().use { w ->
++                snapshot.forEach { (hash, e) ->
++                    w.append(hash).append('|')
++                    w.append(e.storedAtMs.toString()).append('|')
++                    w.append(e.detection.raw.toString()).append('|')
++                    w.append(e.detection.snapped.toString()).append('|')
++                    w.append(e.detection.videoWidth?.toString() ?: "").append('|')
++                    w.append(e.detection.videoHeight?.toString() ?: "")
++                    w.newLine()
++                }
++            }
++            if (!tmp.renameTo(file)) {
++                file.delete()
++                tmp.renameTo(file)
++            }
++        } catch (e: Exception) {
++            Log.w(TAG, "AFR fps cache flush failed: ${e.message}")
++        }
++    }
++
+     private fun sanitizeHeaders(headers: Map<String, String>?): Map<String, String> {
+         val raw = headers ?: return emptyMap()
+         if (raw.isEmpty()) return emptyMap()
+@@ -102,8 +228,13 @@ object FrameRateUtils {
+ 
+     internal fun buildCacheKey(url: String, headers: Map<String, String>, filename: String?): String {
+         val sanitized = sanitizeHeaders(headers)
++        // The resolved CDN host rotates per debrid resolve (one title can land on
++        // several edges), so a key with the host would miss whenever a fresh
++        // resolve landed on a different edge.
++        // The filename identifies the content; the host is transport. Reader and
++        // writer both come through here, so the two sides cannot disagree.
+         val baseKey = if (!filename.isNullOrBlank()) {
+-            "file://${parseUriHost(url)}/$filename"
++            "file://$filename"
+         } else {
+             url.substringBefore('?')
+         }
+@@ -125,8 +256,21 @@ object FrameRateUtils {
+ 
+     fun getCachedFrameRate(url: String, headers: Map<String, String>, filename: String? = null): FrameRateDetection? {
+         val key = buildCacheKey(url, headers, filename)
+-        return synchronized(frameRateCache) {
+-            frameRateCache[key]
++        synchronized(frameRateCache) {
++            val inMemory = frameRateCache[key]
++            if (inMemory != null) return inMemory
++            if (persistedCache.isEmpty()) return null
++            val hash = hashKey(key)
++            val persisted = persistedCache[hash] ?: return null
++            if (System.currentTimeMillis() - persisted.storedAtMs > PERSIST_TTL_MS) {
++                persistedCache.remove(hash)
++                return null
++            }
++            // Promote so LRU ordering and later writes behave exactly as a
++            // same-process detection would.
++            frameRateCache[key] = persisted.detection
++            Log.i(TAG, "AFR fps cache: served from persisted entry")
++            return persisted.detection
+         }
+     }
+ 
+@@ -134,13 +278,18 @@ object FrameRateUtils {
+         val key = buildCacheKey(url, headers, filename)
+         synchronized(frameRateCache) {
+             frameRateCache[key] = detection
++            if (persistFile != null) {
++                persistedCache[hashKey(key)] = PersistedDetection(detection, System.currentTimeMillis())
++            }
+         }
++        schedulePersistFlush()
+     }
+ 
+     /** Test-only: wipe the in-memory FPS cache between unit tests. */
+     internal fun clearFrameRateCache() {
+         synchronized(frameRateCache) {
+             frameRateCache.clear()
++            persistedCache.clear()
+         }
+     }
+ 
+@@ -249,16 +398,44 @@ object FrameRateUtils {
+         }
+     }
+ 
++    /**
++     * How well a chosen mode actually serves the content's frame rate.
++     * EXACT and DOUBLE are clean cadences; PULLDOWN is 2:3 judder that merely
++     * happens to divide evenly; FALLBACK is the least-bad of a bad set.
++     * Callers use it to tell a clean match from a judder-inducing one.
++     */
++    internal enum class ModeMatchQuality { EXACT, DOUBLE, PULLDOWN, FALLBACK }
++
++    internal data class ModeChoice(val mode: DisplayModeSpec, val quality: ModeMatchQuality)
++
++    /** True for cadences worth giving up a resolution match to obtain. */
++    private fun ModeMatchQuality.isCleanCadence() =
++        this == ModeMatchQuality.EXACT || this == ModeMatchQuality.DOUBLE
++
++    /** 25 and 30 fps look smoother at 50 and 60 Hz on most TVs: each frame shown twice, same motion. */
++    internal fun prefersDoubleRefresh(frameRate: Float): Boolean = frameRate in 24.5f..30.5f
++
+     private fun chooseBestModeForFrameRate(
+         activeMode: DisplayModeSpec,
+         modes: List<DisplayModeSpec>,
+         frameRate: Float
+-    ): DisplayModeSpec {
+-        val modeExact = pickBestForTarget(modes, frameRate)
+-        val modeDouble = pickBestForTarget(modes, frameRate * 2f)
+-        val modePulldown = pickBestForTarget(modes, frameRate * 2.5f)
++    ): ModeChoice {
++        if (prefersDoubleRefresh(frameRate)) {
++            pickBestForTarget(modes, frameRate * 2f)?.let {
++                return ModeChoice(it, ModeMatchQuality.DOUBLE)
++            }
++        }
++        pickBestForTarget(modes, frameRate)?.let {
++            return ModeChoice(it, ModeMatchQuality.EXACT)
++        }
++        pickBestForTarget(modes, frameRate * 2f)?.let {
++            return ModeChoice(it, ModeMatchQuality.DOUBLE)
++        }
++        pickBestForTarget(modes, frameRate * 2.5f)?.let {
++            return ModeChoice(it, ModeMatchQuality.PULLDOWN)
++        }
+         val modeFallback = modes.minByOrNull { refreshWeight(it.refreshRate, frameRate) }
+-        return modeExact ?: modeDouble ?: modePulldown ?: modeFallback ?: activeMode
++        return ModeChoice(modeFallback ?: activeMode, ModeMatchQuality.FALLBACK)
+     }
+ 
+     private fun hasValidVideoSize(videoWidth: Int?, videoHeight: Int?): Boolean {
+@@ -269,6 +446,19 @@ object FrameRateUtils {
+         return if (width >= height) width to height else height to width
+     }
+ 
++    internal fun selectResolutionCandidates(
++        modeSizes: List<Pair<Int, Int>>,
++        videoWidth: Int,
++        videoHeight: Int
++    ): List<Pair<Int, Int>> = resolutionCandidateGroups(
++        modes = modeSizes.mapIndexed { index, (width, height) -> DisplayModeSpec(index, width, height, 0f) },
++        videoWidth = videoWidth,
++        videoHeight = videoHeight
++    ).firstOrNull().orEmpty().map { it.width to it.height }
++
++    private fun floorEligibleModes(modes: List<DisplayModeSpec>): List<DisplayModeSpec> =
++        modes.filter { min(it.width, it.height) >= RESOLUTION_MATCH_MIN_SHORT_SIDE }.ifEmpty { modes }
++
+     private fun resolutionCandidateGroups(
+         modes: List<DisplayModeSpec>,
+         videoWidth: Int,
+@@ -288,8 +478,7 @@ object FrameRateUtils {
+         }
+ 
+         // Never below 720p when the display offers 720p or larger.
+-        val eligible = modes.filter { min(it.width, it.height) >= RESOLUTION_MATCH_MIN_SHORT_SIDE }
+-            .ifEmpty { modes }
++        val eligible = floorEligibleModes(modes)
+         val fitting = eligible.filter { fits(it) }
+         if (fitting.isNotEmpty()) {
+             return fitting.groupBy { area(it) }.toSortedMap().values.toList()
+@@ -306,28 +495,87 @@ object FrameRateUtils {
+         videoWidth: Int?,
+         videoHeight: Int?,
+         resolutionMatchingEnabled: Boolean
+-    ): DisplayModeSpec? {
++    ): DisplayModeSpec? = planDisplayMode(
++        modes = modes,
++        activeMode = activeMode,
++        frameRate = frameRate,
++        videoWidth = videoWidth,
++        videoHeight = videoHeight,
++        resolutionMatchingEnabled = resolutionMatchingEnabled
++    ).choice?.mode
++
++    private class DisplayModePlan(val choice: ModeChoice?, val candidateCount: Int)
++
++    private fun planDisplayMode(
++        modes: List<DisplayModeSpec>,
++        activeMode: DisplayModeSpec,
++        frameRate: Float,
++        videoWidth: Int?,
++        videoHeight: Int?,
++        resolutionMatchingEnabled: Boolean
++    ): DisplayModePlan {
+         if (resolutionMatchingEnabled && hasValidVideoSize(videoWidth, videoHeight)) {
+             val sizeGroups = resolutionCandidateGroups(
+                 modes = modes,
+                 videoWidth = videoWidth ?: activeMode.width,
+                 videoHeight = videoHeight ?: activeMode.height
+             )
+-            if (sizeGroups.isEmpty()) return null
+-            // Frame rate first: the smallest size that shows the rate exactly or doubled.
++            if (sizeGroups.isEmpty()) {
++                Log.d(
++                    TAG,
++                    "No candidate display modes; leaving the display at " +
++                        "${activeMode.refreshRate}Hz for ${frameRate}fps"
++                )
++                return DisplayModePlan(null, 0)
++            }
++            // Frame rate first: the smallest size that shows the rate cleanly (exact or doubled).
+             for (group in sizeGroups) {
+-                (pickBestForTarget(group, frameRate) ?: pickBestForTarget(group, frameRate * 2f))
+-                    ?.let { return it }
++                val choice = chooseBestModeForFrameRate(activeMode, group, frameRate)
++                if (choice.quality.isCleanCadence()) return DisplayModePlan(choice, group.size)
+             }
+-            return chooseBestModeForFrameRate(activeMode, sizeGroups.first(), frameRate)
++            // An exact or double frame-rate match beats a resolution match; a pulldown or
++            // fallback match does not. So when no size that fits the video can serve the
++            // cadence cleanly, look at every size above the floor before settling.
++            val nearest = chooseBestModeForFrameRate(activeMode, sizeGroups.first(), frameRate)
++            val eligible = floorEligibleModes(modes)
++            val wider = chooseBestModeForFrameRate(activeMode, eligible, frameRate)
++            if (wider.quality.isCleanCadence()) {
++                Log.d(
++                    TAG,
++                    "Resolution-matched modes offer only a ${nearest.quality} match for " +
++                        "${frameRate}fps; widening to all display modes for a " +
++                        "${wider.quality} match at ${wider.mode.refreshRate}Hz " +
++                        "(${wider.mode.width}x${wider.mode.height})"
++                )
++                return DisplayModePlan(wider, eligible.size)
++            }
++            return DisplayModePlan(nearest, sizeGroups.first().size)
+         }
+ 
+         val sameSizeModes = modes.filter {
+             it.width == activeMode.width && it.height == activeMode.height
+         }
+-        if (sameSizeModes.isEmpty()) return null
+-        if (!resolutionMatchingEnabled && sameSizeModes.size <= 1) return null
+-        return chooseBestModeForFrameRate(activeMode, sameSizeModes, frameRate)
++        if (sameSizeModes.isEmpty()) {
++            Log.d(
++                TAG,
++                "No candidate display modes; leaving the display at " +
++                    "${activeMode.refreshRate}Hz for ${frameRate}fps"
++            )
++            return DisplayModePlan(null, 0)
++        }
++        if (!resolutionMatchingEnabled && sameSizeModes.size <= 1) {
++            Log.d(
++                TAG,
++                "Display offers a single mode at ${activeMode.width}x${activeMode.height} " +
++                    "(${activeMode.refreshRate}Hz): no app-side frame rate matching is " +
++                    "possible for ${frameRate}fps"
++            )
++            return DisplayModePlan(null, sameSizeModes.size)
++        }
++        return DisplayModePlan(
++            chooseBestModeForFrameRate(activeMode, sameSizeModes, frameRate),
++            sameSizeModes.size
++        )
+     }
+ 
+     suspend fun matchFrameRateAndWait(
+@@ -339,6 +587,15 @@ object FrameRateUtils {
+     ): DisplayModeSwitchResult? {
+         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return null
+         if (frameRate <= 0f) return null
++        // Sanity floor. A broken source can report an absurd rate (for example a
++        // 30 s 1280x720 error stub at frameRate=1.0), and switching the panel for it
++        // costs a switch, a settle and an exit blank. snapToStandardRate
++        // recognises nothing below 23.90 fps, so anything under this floor cannot be
++        // matched meaningfully anyway; leave the display alone.
++        if (frameRate < MIN_AFR_SWITCH_FPS) {
++            Log.w(TAG, "Refusing display-mode switch for implausible frame rate ${frameRate}fps")
++            return null
++        }
+ 
+         val switchPlan = withContext(Dispatchers.Main) {
+             val window = activity.window ?: return@withContext null
+@@ -346,7 +603,7 @@ object FrameRateUtils {
+             val activeMode = display.mode
+             val supportedModes = display.supportedModes.toList()
+ 
+-            val selected = selectDisplayMode(
++            val plan = planDisplayMode(
+                 modes = supportedModes.map { it.toSpec() },
+                 activeMode = activeMode.toSpec(),
+                 frameRate = frameRate,
+@@ -354,9 +611,10 @@ object FrameRateUtils {
+                 videoHeight = videoHeight,
+                 resolutionMatchingEnabled = resolutionMatchingEnabled
+             )
+-            val modeBest = selected?.let { spec ->
+-                supportedModes.firstOrNull { it.modeId == spec.modeId }
+-                    ?: activeMode.takeIf { it.modeId == spec.modeId }
++            val candidateCount = plan.candidateCount
++            val modeBest = plan.choice?.let { choice ->
++                supportedModes.firstOrNull { it.modeId == choice.mode.modeId }
++                    ?: activeMode.takeIf { it.modeId == choice.mode.modeId }
+             }
+             if (modeBest == null) {
+                 return@withContext Pair<Display.Mode?, DisplayModeSwitchResult?>(
+@@ -366,7 +624,22 @@ object FrameRateUtils {
+             }
+             recordOriginalMode(display)
+             if (modeBest.modeId == activeMode.modeId) {
+-                Log.d(TAG, "Display already at optimal rate ${activeMode.refreshRate}Hz for ${frameRate}fps")
++                // Not necessarily optimal: very often it is simply the only mode on offer,
++                // and calling 60Hz "optimal" for 25fps content is a plain untruth. Say
++                // which of the two it is.
++                val alternatives = candidateCount - 1
++                Log.d(
++                    TAG,
++                    if (alternatives <= 0) {
++                        "No alternative display mode at " +
++                            "${activeMode.physicalWidth}x${activeMode.physicalHeight}: staying at " +
++                            "${activeMode.refreshRate}Hz for ${frameRate}fps. The panel may still be " +
++                            "matching the content on its own. Android cannot report that."
++                    } else {
++                        "Keeping ${activeMode.refreshRate}Hz for ${frameRate}fps: best of " +
++                            "$candidateCount candidate modes"
++                    }
++                )
+                 return@withContext Pair<Display.Mode?, DisplayModeSwitchResult?>(
+                     null,
+                     DisplayModeSwitchResult(activeMode)
+@@ -457,6 +730,26 @@ object FrameRateUtils {
+         }
+     }
+ 
++    // An explicit proximity gate for the pre-seed. snapToStandardRate is
++    // NOT usable for this test -- an input already equal to a ladder value
++    // returns unchanged, so "snap changed the value" cannot distinguish an
++    // on-ladder rate from an off-ladder one. Only a rate this close to a known
++    // standard is trusted enough to switch the panel before prepare; anything
++    // else (a torn/misparsed head, an audio DefaultDuration mistaken for video)
++    // is left to the post-prepare track-format path.
++    private val STANDARD_RATES = floatArrayOf(
++        NTSC_FILM_FPS, CINEMA_24_FPS, 25f, 30000f / 1001f, 30f, 50f, 60000f / 1001f, 60f
++    )
++    private const val STANDARD_RATE_TOLERANCE_FPS = 0.05f
++
++    internal fun isNearStandardRate(fps: Float): Boolean {
++        if (!fps.isFinite() || fps < MIN_AFR_SWITCH_FPS) return false
++        for (r in STANDARD_RATES) {
++            if (abs(fps - r) <= STANDARD_RATE_TOLERANCE_FPS) return true
++        }
++        return false
++    }
++
+     fun snapToStandardRate(formatFrameRate: Float): Float {
+         if (formatFrameRate <= 0f) return formatFrameRate
+         return when {
+@@ -1292,7 +1585,7 @@ object FrameRateUtils {
+             }
+         } catch (e: Exception) {
+             call.cancel()
+-            Log.w(TAG, "fetchHttpRangeToFile failed for url=$url range=$rangeHeader: ${e.message}")
++            Log.w(TAG, "fetchHttpRangeToFile failed for url=${url.redactedUrlForLog()} range=$rangeHeader: ${e.message}")
+             HttpRangeFetchResult(success = false)
+         }
+     }
+@@ -1430,6 +1723,9 @@ object FrameRateUtils {
+         return null
+     }
+ 
++    /** Hard deadline after which a stuck extractor probe is force-released. */
++    private const val EXTRACTOR_PROBE_HARD_DEADLINE_MS = 6_000L
++
+     private fun detectFrameRateWithExtractor(
+         context: Context,
+         sourceUrl: String,
+@@ -1438,6 +1734,29 @@ object FrameRateUtils {
+     ): FrameRateDetection? {
+         val safeHeaders = headers
+         val extractor = MediaExtractor()
++        // MediaExtractor.setDataSource() is a blocking native call
++        // that cooperative withTimeoutOrNull cancellation cannot interrupt. On a
++        // non-faststart MP4 (moov atom at the tail) it reads toward end-of-file
++        // and can block for minutes. Releasing the extractor from a
++        // watchdog thread aborts the native open, making the probe budget real.
++        val probeFinished = java.util.concurrent.atomic.AtomicBoolean(false)
++        val watchdog = Thread({
++            try {
++                Thread.sleep(EXTRACTOR_PROBE_HARD_DEADLINE_MS)
++            } catch (_: InterruptedException) {
++                return@Thread
++            }
++            if (!probeFinished.get()) {
++                Log.w(TAG, "AFR extractor probe exceeded ${EXTRACTOR_PROBE_HARD_DEADLINE_MS} ms; force-releasing extractor")
++                try {
++                    extractor.release()
++                } catch (_: Throwable) {
++                }
++            }
++        }, "afr-probe-watchdog").apply {
++            isDaemon = true
++            start()
++        }
+         return try {
+             val uri = Uri.parse(sourceUrl)
+             when (uri.scheme?.lowercase()) {
+@@ -1524,6 +1843,8 @@ object FrameRateUtils {
+             Log.w(TAG, "Frame rate probe failed: ${e.message}")
+             null
+         } finally {
++            probeFinished.set(true)
++            watchdog.interrupt()
+             try {
+                 extractor.release()
+             } catch (_: Exception) {
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/MatroskaAfrProbe.kt b/app/src/main/java/com/nuvio/tv/core/player/MatroskaAfrProbe.kt
+index 3acb31b..ea65479 100644
+--- a/app/src/main/java/com/nuvio/tv/core/player/MatroskaAfrProbe.kt
++++ b/app/src/main/java/com/nuvio/tv/core/player/MatroskaAfrProbe.kt
+@@ -467,4 +467,113 @@ internal object MatroskaAfrProbe {
+     fun buildSegmentUnknownSize(payload: ByteArray): ByteArray {
+         return elementIdBytes(ID_SEGMENT) + encodeUnknownSizeVint8() + payload
+     }
++
++    // ------------------------------------------------------------------
++    // Parse the first VIDEO track's frame rate directly
++    // from a Matroska head window, reusing the readElement/readVint model
++    // above. Original fork work, not derived from Stremio's MediaExtractor
++    // second-reader probe. The prewarm already
++    // holds the first 256 KiB of the file, and mkvmerge writes SeekHead ->
++    // Info -> Tracks well inside that window, so the fps the display switch
++    // needs is already in memory. Keys strictly on TrackType == 1 so an audio
++    // track's DefaultDuration (AC-3 32 ms => 31.25, DTS 10.67 ms => 93.75,
++    // both observed in real remuxes) can never be mistaken for the video rate.
++    //
++    // Upstream: NuvioMedia/NuvioTV. Licensed under GPL-3.0.
++    private const val ID_TRACK_ENTRY = 0xAEL
++    private const val ID_TRACK_TYPE = 0x83L
++    private const val ID_DEFAULT_DURATION = 0x23E383L
++    private const val ID_VIDEO = 0xE0L
++    private const val ID_PIXEL_WIDTH = 0xB0L
++    private const val ID_PIXEL_HEIGHT = 0xBAL
++    private const val TRACK_TYPE_VIDEO = 1L
++    private const val NS_PER_SECOND = 1_000_000_000.0
++
++    data class VideoFrameRateHint(
++        val rawFps: Float,
++        val width: Int?,
++        val height: Int?
++    )
++
++    /** Iterate direct EBML children in [start, end); stop at the first torn,
++     *  unknown-size, or window-overrunning child (the safe-prefix rule). */
++    private inline fun forEachChild(bytes: ByteArray, start: Long, end: Long, action: (EbmlElement) -> Unit) {
++        var pos = start
++        while (pos < end) {
++            val child = readElement(bytes, pos) ?: return
++            if (child.unknownSize) return
++            val childEnd = child.endExclusiveOrNull() ?: return
++            if (childEnd > end) return
++            action(child)
++            pos = childEnd
++        }
++    }
++
++    private fun readUintElement(bytes: ByteArray, element: EbmlElement): Long? {
++        if (element.unknownSize || element.dataSize <= 0L || element.dataSize > 8L) return null
++        val start = element.dataOffset.toInt()
++        val end = (element.dataOffset + element.dataSize).toInt()
++        if (start < 0 || end > bytes.size) return null
++        var value = 0L
++        for (i in start until end) {
++            value = (value shl 8) or (bytes[i].toLong() and 0xFFL)
++        }
++        return value
++    }
++
++    /**
++     * Parse the first video TrackEntry's frame rate + pixel dimensions from a
++     * Matroska head [bytes] (the prewarm's 256 KiB window). Returns null when
++     * the head is not Matroska, has no complete Tracks in the window, or the
++     * video track carries no DefaultDuration (some VFR/odd muxes) -- every one
++     * of those falls through to the post-prepare track-format AFR.
++     */
++    fun parseVideoFrameRateFromHead(bytes: ByteArray): VideoFrameRateHint? {
++        if (bytes.size < 4) return null
++        val limit = bytes.size.toLong()
++        val ebml = readElement(bytes, 0L) ?: return null
++        if (ebml.id != ID_EBML) return null
++        val ebmlEnd = ebml.endExclusiveOrNull() ?: return null
++        if (ebmlEnd > limit) return null
++        val segment = readElement(bytes, ebmlEnd) ?: return null
++        if (segment.id != ID_SEGMENT) return null
++        val segEnd = (segment.endExclusiveOrNull() ?: limit).coerceAtMost(limit)
++
++        var tracks: EbmlElement? = null
++        forEachChild(bytes, segment.dataOffset, segEnd) { child ->
++            if (child.id == ID_TRACKS) tracks = child
++        }
++        val tracksEl = tracks ?: return null
++
++        var hint: VideoFrameRateHint? = null
++        forEachChild(bytes, tracksEl.dataOffset, tracksEl.dataOffset + tracksEl.dataSize) { entry ->
++            if (entry.id != ID_TRACK_ENTRY || hint != null) return@forEachChild
++            var type: Long? = null
++            var defaultDuration: Long? = null
++            var width: Int? = null
++            var height: Int? = null
++            forEachChild(bytes, entry.dataOffset, entry.dataOffset + entry.dataSize) { field ->
++                when (field.id) {
++                    ID_TRACK_TYPE -> type = readUintElement(bytes, field)
++                    ID_DEFAULT_DURATION -> defaultDuration = readUintElement(bytes, field)
++                    ID_VIDEO -> forEachChild(bytes, field.dataOffset, field.dataOffset + field.dataSize) { v ->
++                        when (v.id) {
++                            ID_PIXEL_WIDTH -> width = readUintElement(bytes, v)?.toInt()
++                            ID_PIXEL_HEIGHT -> height = readUintElement(bytes, v)?.toInt()
++                        }
++                    }
++                }
++            }
++            val dd = defaultDuration
++            if (type == TRACK_TYPE_VIDEO && dd != null && dd > 0L) {
++                val fps = (NS_PER_SECOND / dd.toDouble()).toFloat()
++                hint = VideoFrameRateHint(
++                    rawFps = fps,
++                    width = width?.takeIf { it > 0 },
++                    height = height?.takeIf { it > 0 }
++                )
++            }
++        }
++        return hint
++    }
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/dvmkv/MatroskaExtractor.java b/app/src/main/java/com/nuvio/tv/core/player/dvmkv/MatroskaExtractor.java
+index 1ba499f..8df026e 100644
+--- a/app/src/main/java/com/nuvio/tv/core/player/dvmkv/MatroskaExtractor.java
++++ b/app/src/main/java/com/nuvio/tv/core/player/dvmkv/MatroskaExtractor.java
+@@ -188,6 +188,12 @@ public class MatroskaExtractor implements Extractor {
+       return 0;
+     }
+ 
++    /**
++     * Media time (us) of the block whose sample the next {@link #transformHevcSample} call carries
++     * (diagnostics only; laced blocks report the block time).
++     */
++    default void onSampleTimeUs(long timeUs) {}
++
+     /**
+      * Optionally rewrites Dolby Vision codec signaling for output {@link Format}.
+      *
+@@ -243,6 +249,7 @@ public class MatroskaExtractor implements Extractor {
+   // Bounds for the early DTS mime scan that peeks ahead right after the Tracks element.
+   private static final int MAX_EARLY_DTS_SCAN_BYTES = 8 * 1024 * 1024;
+   private static final int MAX_EARLY_DTS_FRAME_BYTES = 256 * 1024;
++  private static final int MAX_EARLY_DTS_BLOCK_HEADER_BYTES = 4096;
+   private static final int MAX_EBML_HEADER_SIZE = 12; // 4-byte id + 8-byte data size.
+   private static final int MAX_SEEK_HEAD_FOLLOWS = 4;
+ 
+@@ -301,6 +308,15 @@ public class MatroskaExtractor implements Extractor {
+   private static final int ID_TIMECODE_SCALE = 0x2AD7B1;
+   private static final int ID_DURATION = 0x4489;
+   private static final int ID_CLUSTER = 0x1F43B675;
++  // NuvioTV fork: malformed-container (Usenet zero-fill) recovery. Budget of
++  // resync attempts per extractor instance, and the forward byte span each
++  // resync scans looking for the next Cluster before giving up.
++  private static final int MAX_RESYNC_ATTEMPTS = 8;
++  private static final long MAX_RESYNC_SCAN_BYTES = 64L * 1024 * 1024;
++  // NuvioTV fork: in-memory search window for the malformed-container resync
++  // scan (see resyncToNextCluster). Bulk-peeked and scanned for the Cluster ID
++  // instead of walking one byte at a time - ~100x faster on device.
++  private static final int RESYNC_BLOCK_BYTES = 64 * 1024;
+   private static final int ID_TIME_CODE = 0xE7;
+   private static final int ID_SIMPLE_BLOCK = 0xA3;
+   private static final int ID_BLOCK_GROUP = 0xA0;
+@@ -415,6 +431,12 @@ public class MatroskaExtractor implements Extractor {
+   private static final int LACING_EBML = 3;
+ 
+   private static final int FOURCC_COMPRESSION_DIVX = 0x58564944;
++  private static final int FOURCC_COMPRESSION_DIVX_LOWER = 0x78766964;
++  private static final int FOURCC_COMPRESSION_DX50 = 0x30355844;
++  private static final int FOURCC_COMPRESSION_XVID = 0x44495658;
++  private static final int FOURCC_COMPRESSION_XVID_LOWER = 0x64697678;
++  private static final int FOURCC_COMPRESSION_FMP4 = 0x34504D46;
++  private static final int FOURCC_COMPRESSION_MP4V = 0x5634504D;
+   private static final int FOURCC_COMPRESSION_H263 = 0x33363248;
+   private static final int FOURCC_COMPRESSION_VC1 = 0x31435657;
+ 
+@@ -559,6 +581,12 @@ public class MatroskaExtractor implements Extractor {
+   private final ParsableByteArray nalStartCode;
+   private final ParsableByteArray nalLength;
+   private final ParsableByteArray scratch;
++  // NuvioTV fork: 4-byte peek buffer and remaining resync budget for
++  // malformed-container recovery (see read() / resyncToNextCluster()).
++  private final byte[] resyncScratch = new byte[4];
++  private final byte[] resyncBlock = new byte[RESYNC_BLOCK_BYTES];
++  private int resyncBudget = MAX_RESYNC_ATTEMPTS;
++  private long ebmlFailurePosition = C.POSITION_UNSET;
+   private final ParsableByteArray vorbisNumPageSamples;
+   private final ParsableByteArray seekEntryIdBytes;
+   private final ParsableByteArray sampleStrippedBytes;
+@@ -776,6 +804,12 @@ public class MatroskaExtractor implements Extractor {
+   @CallSuper
+   @Override
+   public void seek(long position, long timeUs) {
++    resetParsingState();
++  }
++
++  // NuvioTV fork: extracted verbatim from the original seek() body so the
++  // malformed-container resync path can reuse the exact same clean-slate reset.
++  private void resetParsingState() {
+     clusterTimecodeUs = C.TIME_UNSET;
+     blockState = BLOCK_STATE_START;
+     reader.reset();
+@@ -797,6 +831,58 @@ public class MatroskaExtractor implements Extractor {
+     }
+   }
+ 
++  // NuvioTV fork: byte-scan forward from the current read position to the next
++  // Cluster (level-1) element, leaving the input positioned at the Cluster ID so
++  // the reader parses it fresh. Targets Cluster specifically (not any level-1 ID)
++  // because a Matroska cluster opens on a keyframe, giving the decoder a clean
++  // entry after the skipped hole. Bounded by MAX_RESYNC_SCAN_BYTES.
++  private boolean resyncToNextCluster(ExtractorInput input) throws IOException {
++    long scanned = 0;
++    while (scanned < MAX_RESYNC_SCAN_BYTES) {
++      input.resetPeekPosition();
++      int want = (int) Math.min((long) RESYNC_BLOCK_BYTES, MAX_RESYNC_SCAN_BYTES - scanned);
++      // Bulk-peek up to a full block from the current read position. peek() may
++      // return short, so loop until the block is full or the input ends.
++      int got = 0;
++      while (got < want) {
++        int r = input.peek(resyncBlock, got, want - got);
++        if (r == C.RESULT_END_OF_INPUT) {
++          break;
++        }
++        got += r;
++      }
++      if (got < 4) {
++        return false;
++      }
++      // Scan the block for the Cluster ID's canonical 4-byte encoding
++      // (0x1F 0x43 0xB6 0x75). The leading-byte compare short-circuits on the
++      // vast majority of positions, so this is far cheaper than a per-byte
++      // peekFully()/skipFully() round-trip through ExtractorInput.
++      for (int i = 0; i + 4 <= got; i++) {
++        if (resyncBlock[i] == (byte) 0x1F
++            && resyncBlock[i + 1] == (byte) 0x43
++            && resyncBlock[i + 2] == (byte) 0xB6
++            && resyncBlock[i + 3] == (byte) 0x75) {
++          // Advance the read position to the Cluster ID so the reader parses it
++          // fresh, exactly as the old byte-walk left it.
++          input.skipFully(i);
++          return true;
++        }
++      }
++      if (got < want) {
++        // Short read means we reached the input end; the whole tail was scanned
++        // above, so there is no further Cluster to find.
++        return false;
++      }
++      // Advance by (block - 3) so a Cluster ID straddling the block boundary is
++      // caught on the next pass.
++      int advance = got - 3;
++      input.skipFully(advance);
++      scanned += advance;
++    }
++    return false;
++  }
++
+   @Override
+   public final void release() {
+     zlibSampleDecompressor.release();
+@@ -804,6 +890,7 @@ public class MatroskaExtractor implements Extractor {
+ 
+   @Override
+   public final int read(ExtractorInput input, PositionHolder seekPosition) throws IOException {
++    ebmlFailurePosition = C.POSITION_UNSET;
+     try {
+       return readFromInput(input, seekPosition);
+     } catch (EOFException e) {
+@@ -831,7 +918,37 @@ public class MatroskaExtractor implements Extractor {
+     haveOutputSample = false;
+     boolean continueReading = true;
+     while (continueReading && !haveOutputSample) {
+-      continueReading = reader.read(input);
++      try {
++        continueReading = reader.read(input);
++      } catch (ParserException | IllegalStateException malformed) {
++        // Preserve the parse failure location: a failed fork recovery scan can move
++        // tens of MB toward EOF, but must not turn mid-file corruption into a tail.
++        ebmlFailurePosition = input.getPosition();
++        // NuvioTV fork: Usenet zero-fill holes corrupt an element header or size
++        // varint mid-stream, surfacing here as ParserException (3001) or a varint
++        // IllegalStateException (2000). Skip the padded region and resync to the
++        // next Cluster instead of killing playback. Gated on sentSeekMap so this
++        // only runs past the header (inside cluster data), and budgeted so a
++        // pervasively-damaged stream still fails over via the caller.
++        if (!sentSeekMap || resyncBudget <= 0) {
++          throw malformed;
++        }
++        long failPosition = input.getPosition();
++        resyncBudget--;
++        resetParsingState();
++        if (!resyncToNextCluster(input)) {
++          throw malformed;
++        }
++        Log.w(
++            TAG,
++            "MKV_RESYNC: skipped malformed data near byte "
++                + failPosition
++                + " to next cluster (budget left "
++                + resyncBudget
++                + ")");
++        continueReading = true;
++        continue;
++      }
+       if (pendingFinishTracks) {
+         pendingFinishTracks = false;
+         // Input is positioned right after the Tracks element (typically the first cluster),
+@@ -867,7 +984,8 @@ public class MatroskaExtractor implements Extractor {
+       return false;
+     }
+     long length = input.getLength();
+-    long position = input.getPosition();
++    long position = ebmlFailurePosition != C.POSITION_UNSET
++        ? ebmlFailurePosition : input.getPosition();
+     if (length == C.LENGTH_UNSET || length <= 0L) {
+       return true;
+     }
+@@ -1945,7 +2063,7 @@ public class MatroskaExtractor implements Extractor {
+       input.readFully(blockAdditionalData, 0, contentSize);
+       track.pendingDolbyVisionBlockAdditionalData = blockAdditionalData;
+ 
+-      if (dolbyVisionSampleTransformer != null) {
++      if (dolbyVisionSampleTransformer != null && !track.hasContentEncryption) {
+         try {
+           byte[] transformed =
+               dolbyVisionSampleTransformer.onDolbyVisionBlockAdditionalData(
+@@ -2214,7 +2332,7 @@ public class MatroskaExtractor implements Extractor {
+         // If there is supplemental data, the structure of the sample data is:
+         // encryption data (if any) || sample size (4 bytes) || sample data || supplemental data
+         deferSupplementalMainSampleSizePrefix =
+-            track.isHevc && track.requiresDolbyVisionTransform && dolbyVisionSampleTransformer != null;
++            track.isHevc && !track.hasContentEncryption && track.requiresDolbyVisionTransform && dolbyVisionSampleTransformer != null;
+         if (!deferSupplementalMainSampleSizePrefix) {
+           int sampleSize = size + sampleStrippedBytes.limit() - sampleBytesRead;
+           writeSupplementalMainSampleSizePrefix(output, sampleSize);
+@@ -2225,7 +2343,7 @@ public class MatroskaExtractor implements Extractor {
+       sampleEncodingHandled = true;
+     }
+     size += sampleStrippedBytes.limit();
+-    if (track.isHevc && track.requiresDolbyVisionTransform && dolbyVisionSampleTransformer != null) {
++    if (track.isHevc && !track.hasContentEncryption && track.requiresDolbyVisionTransform && dolbyVisionSampleTransformer != null) {
+       try {
+         // Phase-2 seam: sample event is surfaced here. Payload replacement is added in a later
+         // step once DV conversion is wired for full HEVC access units.
+@@ -2236,7 +2354,7 @@ public class MatroskaExtractor implements Extractor {
+       }
+     }
+ 
+-    if (track.isHevc && track.requiresDolbyVisionTransform && dolbyVisionSampleTransformer != null) {
++    if (track.isHevc && !track.hasContentEncryption && track.requiresDolbyVisionTransform && dolbyVisionSampleTransformer != null) {
+       int remainingSampleBytes = size - sampleBytesRead;
+       if (dolbyVisionSampleBuffer.length < remainingSampleBytes) {
+         int newSize = Math.max(remainingSampleBytes, dolbyVisionSampleBuffer.length * 2);
+@@ -2250,6 +2368,7 @@ public class MatroskaExtractor implements Extractor {
+       byte[] payloadToWrite = sampleLengthDelimitedData;
+       int payloadLength = remainingSampleBytes;
+       try {
++        dolbyVisionSampleTransformer.onSampleTimeUs(blockTimeUs);
+         byte[] transformedPayload =
+             dolbyVisionSampleTransformer.transformHevcSample(
+                 sampleLengthDelimitedData,
+@@ -2817,6 +2936,7 @@ public class MatroskaExtractor implements Extractor {
+       }
+       earlyDtsScanBuffer = Arrays.copyOf(earlyDtsScanBuffer, newSize);
+     }
++    input.resetPeekPosition();
+     return input.peekFully(earlyDtsScanBuffer, 0, length, true);
+   }
+ 
+@@ -2883,57 +3003,35 @@ public class MatroskaExtractor implements Extractor {
+     if (track == null || !track.waitingForDtsAnalysis) {
+       return;
+     }
+-    int pos = dataStart + trackNumberLength;
+-    if (pos + 3 > dataEnd) {
++    int searchStart = dataStart + trackNumberLength + 3;
++    int searchEnd =
++        (int) Math.min((long) dataEnd, (long) searchStart + MAX_EARLY_DTS_BLOCK_HEADER_BYTES);
++    if (searchStart + 4 > dataEnd || !ensureScanBytes(input, searchEnd)) {
+       return;
+     }
+-    int flags = earlyDtsScanBuffer[pos + 2] & 0xFF;
+-    pos += 3; // Skip the 2-byte timecode and the flags byte.
+-    switch ((flags & 0x06) >> 1) {
+-      case 1: { // Xiph lacing.
+-        if (pos >= dataEnd) {
+-          return;
+-        }
+-        int laces = earlyDtsScanBuffer[pos++] & 0xFF;
+-        for (int i = 0; i < laces && pos < dataEnd; i++) {
+-          while (pos < dataEnd && (earlyDtsScanBuffer[pos] & 0xFF) == 0xFF) {
+-            pos++;
+-          }
+-          pos++;
+-        }
++    int syncPos = -1;
++    for (int p = searchStart; p + 4 <= searchEnd; p++) {
++      int word =
++          (earlyDtsScanBuffer[p] & 0xFF) << 24
++              | (earlyDtsScanBuffer[p + 1] & 0xFF) << 16
++              | (earlyDtsScanBuffer[p + 2] & 0xFF) << 8
++              | (earlyDtsScanBuffer[p + 3] & 0xFF);
++      if (androidx.media3.extractor.DtsUtil.getFrameType(word)
++          != androidx.media3.extractor.DtsUtil.FRAME_TYPE_UNKNOWN) {
++        syncPos = p;
+         break;
+       }
+-      case 2: { // EBML lacing.
+-        if (pos >= dataEnd) {
+-          return;
+-        }
+-        pos++; // Lace count.
+-        if (pos >= dataEnd) {
+-          return;
+-        }
+-        int firstSizeLength = ebmlVintLength(earlyDtsScanBuffer[pos] & 0xFF);
+-        if (firstSizeLength == 0) {
+-          return;
+-        }
+-        pos += firstSizeLength; // First frame's signed size; frame data follows.
+-        break;
+-      }
+-      case 3: { // Fixed-size lacing.
+-        if (pos >= dataEnd) {
+-          return;
+-        }
+-        pos++; // Lace count.
+-        break;
+-      }
+-      default:
+-        break; // No lacing.
+     }
+-    int frameLength = Math.min(dataEnd - pos, MAX_EARLY_DTS_FRAME_BYTES);
+-    if (frameLength < 16 || !ensureScanBytes(input, pos + frameLength)) {
++    if (syncPos < 0) {
++      return;
++    }
++    int frameLength = Math.min(dataEnd - syncPos, MAX_EARLY_DTS_FRAME_BYTES);
++    if (frameLength < 16 || !ensureScanBytes(input, syncPos + frameLength)) {
+       return;
+     }
+     String mimeType =
+-        DtsUtil.getDtsAudioMimeType(Arrays.copyOfRange(earlyDtsScanBuffer, pos, pos + frameLength));
++        DtsUtil.getDtsAudioMimeType(
++            Arrays.copyOfRange(earlyDtsScanBuffer, syncPos, syncPos + frameLength));
+     if (mimeType != null && !mimeType.equals(track.format.sampleMimeType)) {
+       track.format = track.format.buildUpon().setSampleMimeType(mimeType).build();
+     }
+@@ -3321,7 +3419,7 @@ public class MatroskaExtractor implements Extractor {
+           } else {
+           codecs = dolbyVisionConfig.codecs;
+           mimeType = MimeTypes.VIDEO_DOLBY_VISION;
+-          if (dolbyVisionSampleTransformer != null) {
++          if (dolbyVisionSampleTransformer != null && !hasContentEncryption) {
+             @Nullable
+             String transformedCodecs =
+                     dolbyVisionSampleTransformer.onDolbyVisionCodecString(
+@@ -3344,7 +3442,7 @@ public class MatroskaExtractor implements Extractor {
+           }
+           }
+         }
+-      } else if (dolbyVisionSampleTransformer != null && codecs != null) {
++      } else if (dolbyVisionSampleTransformer != null && !hasContentEncryption && codecs != null) {
+         String lower = codecs.toLowerCase(Locale.ROOT);
+         if (lower.startsWith("dvhe.")
+             || lower.startsWith("dvh1.")
+@@ -3429,6 +3527,18 @@ public class MatroskaExtractor implements Extractor {
+             rotationDegrees = 270;
+           }
+         }
++        // Fork: surface the container-declared frame rate. Matroska's
++        // TrackEntry DefaultDuration is nanoseconds per frame for fixed-rate
++        // video; media3 parses it into defaultSampleDurationNs but never feeds
++        // Format.frameRate, so MKV (unlike MP4, whose BoxParser sets it)
++        // cannot otherwise trigger the track-format AFR path on ExoPlayer. The
++        // bounds reject malformed values and still-image tracks.
++        if (defaultSampleDurationNs > 0) {
++          float declaredFrameRate = 1_000_000_000f / defaultSampleDurationNs;
++          if (declaredFrameRate >= 5f && declaredFrameRate <= 121f) {
++            formatBuilder.setFrameRate(declaredFrameRate);
++          }
++        }
+         formatBuilder
+             .setWidth(width)
+             .setHeight(height)
+@@ -3465,7 +3575,7 @@ public class MatroskaExtractor implements Extractor {
+               .setDrmInitData(drmInitData)
+               .build();
+       requiresDolbyVisionTransform =
+-          dolbyVisionSampleTransformer != null
++          dolbyVisionSampleTransformer != null && !hasContentEncryption
+               && dolbyVisionSampleTransformer.shouldTransform(codecs, dolbyVisionConfigBytes);
+       isHevc = CODEC_ID_H265.equals(codecId);
+     }
+@@ -3639,8 +3749,15 @@ public class MatroskaExtractor implements Extractor {
+       try {
+         buffer.skipBytes(16); // size(4), width(4), height(4), planes(2), bitcount(2).
+         long compression = buffer.readLittleEndianUnsignedInt();
+-        if (compression == FOURCC_COMPRESSION_DIVX) {
+-          return new Pair<>(MimeTypes.VIDEO_DIVX, null);
++        if (compression == FOURCC_COMPRESSION_DIVX
++            || compression == FOURCC_COMPRESSION_DIVX_LOWER
++            || compression == FOURCC_COMPRESSION_DX50
++            || compression == FOURCC_COMPRESSION_XVID
++            || compression == FOURCC_COMPRESSION_XVID_LOWER
++            || compression == FOURCC_COMPRESSION_FMP4
++            || compression == FOURCC_COMPRESSION_MP4V) {
++          // MPEG-4 ASP stored the VFW way; the VOL header is in-band.
++          return new Pair<>(MimeTypes.VIDEO_MP4V, null);
+         } else if (compression == FOURCC_COMPRESSION_H263) {
+           return new Pair<>(MimeTypes.VIDEO_H263, null);
+         } else if (compression == FOURCC_COMPRESSION_VC1) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAfrPreflight.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAfrPreflight.kt
+index 6e4109d..90dcbad 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAfrPreflight.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAfrPreflight.kt
+@@ -26,6 +26,141 @@ internal const val AFR_PREFLIGHT_TOTAL_TIMEOUT_MS = 18_000L
+ /** Minimum remaining time to attempt NextLib / extractor after OkHttp. */
+ internal const val AFR_PREFLIGHT_MIN_STAGE_MS = 2_000L
+ 
++/**
++ * ExoPlayer engine path: cache-only preflight.
++ *
++ * Applies a display-mode switch before prepare() ONLY when a cached detection
++ * exists (instant). No NextLib probe, no MediaExtractor probe: on a cache miss
++ * the frame rate comes from ExoPlayer's own track format after prepare (see
++ * PlayerRuntimeControllerAfrTrack.kt), so the blocking-native-probe hang on
++ * non-faststart MP4s is structurally impossible on this path. The full probing
++ * preflight below remains in use for the MPV engine only.
++ */
++/**
++ * Derives a video frame rate from the prewarm's already-held head bytes
++ * (MKV only). Returns a provisional FrameRateDetection and records the seeded
++ * raw rate on the controller so the track-format path can validate it against
++ * ExoPlayer's reported rate after prepare (see maybeRunTrackFormatAfr). Gated
++ * on ladder proximity: a rate that is not close to a standard rate is not
++ * trusted to switch the panel, so it is left to the post-prepare path. The
++ * entry is provisional only -- it is NOT written to the persistent cache here;
++ * the track-format path promotes it after validation.
++ */
++private fun PlayerRuntimeController.seedFrameRateFromPrewarmedHead(url: String, headers: Map<String, String>): FrameRateUtils.FrameRateDetection? {
++    val head = com.nuvio.tv.ui.screens.player.PrefetchWindowStore.peekHead(
++        android.net.Uri.parse(url), PlaybackPrewarmIdentity.from(url, headers, mapOf("Icy-MetaData" to "1"))
++    )
++        ?: return null
++    val hint = com.nuvio.tv.core.player.MatroskaAfrProbe.parseVideoFrameRateFromHead(head) ?: return null
++    if (!FrameRateUtils.isNearStandardRate(hint.rawFps)) {
++        Log.d(PlayerRuntimeController.TAG, "AFR seed rejected: fps=${hint.rawFps} not near a standard rate")
++        return null
++    }
++    val snapped = FrameRateUtils.snapToStandardRate(hint.rawFps)
++    afrSeededRateRaw = hint.rawFps
++    Log.i(PlayerRuntimeController.TAG, "AFR seed: fps=${hint.rawFps} snapped=$snapped ${hint.width}x${hint.height} (provisional, from prewarm head)")
++    return FrameRateUtils.FrameRateDetection(
++        raw = hint.rawFps,
++        snapped = snapped,
++        videoWidth = hint.width,
++        videoHeight = hint.height
++    )
++}
++
++internal suspend fun PlayerRuntimeController.runAfrCachePreflightIfEnabled(
++    url: String,
++    headers: Map<String, String>,
++    frameRateMatchingMode: FrameRateMatchingMode,
++    resolutionMatchingEnabled: Boolean
++) {
++    mpvDelayStartAfterAfrSwitch = false
++    exoDelayStartAfterAfrSwitch = false
++
++    if (frameRateMatchingMode == FrameRateMatchingMode.OFF) {
++        _uiState.update {
++            it.copy(
++                detectedFrameRateRaw = 0f,
++                detectedFrameRate = 0f,
++                detectedFrameRateSource = null,
++                afrProbeRunning = false
++            )
++        }
++        return
++    }
++
++    val activity = currentHostActivity()
++    if (activity == null) {
++        Log.w(PlayerRuntimeController.TAG, "AFR cache preflight skipped: host activity unavailable")
++        return
++    }
++
++    if (_uiState.value.afrProbeRunning || _uiState.value.detectedFrameRateSource != null) {
++        Log.d(PlayerRuntimeController.TAG, "AFR cache preflight: already running or completed, skipping")
++        return
++    }
++
++    // Keyed with the filename, as the cache writers key it, so their entries
++    // are visible here. Falls back to the URL-based key when no filename is
++    // known, the same rule the writers use, so the two sides never disagree.
++    val cached = FrameRateUtils.getCachedFrameRate(url, headers, currentFilename)
++        ?: seedFrameRateFromPrewarmedHead(url, headers)
++        ?: run {
++            Log.d(PlayerRuntimeController.TAG, "AFR cache preflight: miss; deferring to track-format AFR after prepare")
++            return
++        }
++
++    Log.d(PlayerRuntimeController.TAG, "AFR cache preflight: cache hit! Using cached FPS=${cached.snapped}")
++    _uiState.update {
++        it.copy(
++            detectedFrameRateRaw = cached.raw,
++            detectedFrameRate = cached.snapped,
++            detectedFrameRateSource = FrameRateSource.PROBE
++        )
++    }
++    val prefer23976ProbeBias = cached.raw in 23.95f..23.999f
++    val targetFrameRate = FrameRateUtils.refineFrameRateForDisplay(
++        activity = activity,
++        detectedFps = cached.snapped,
++        prefer23976Near24 = prefer23976ProbeBias
++    )
++    val initialDisplayModeId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
++        withContext(Dispatchers.Main) {
++            activity.window?.decorView?.display?.mode?.modeId
++        }
++    } else {
++        null
++    }
++
++    val result = FrameRateUtils.matchFrameRateAndWait(
++        activity = activity,
++        frameRate = targetFrameRate,
++        videoWidth = cached.videoWidth,
++        videoHeight = cached.videoHeight,
++        resolutionMatchingEnabled = resolutionMatchingEnabled
++    )
++
++    if (result != null) {
++        val switchedDisplayMode = initialDisplayModeId != null &&
++            initialDisplayModeId != result.appliedMode.modeId
++        mpvDelayStartAfterAfrSwitch = switchedDisplayMode
++        exoDelayStartAfterAfrSwitch = switchedDisplayMode
++        // Track-format AFR stands down when the cache path already ran a
++        // mode selection for this stream (whether or not the mode changed).
++        afrModeAppliedPreStart = true
++
++        _uiState.update {
++            it.copy(
++                displayModeInfo = DisplayModeInfo(
++                    width = result.appliedMode.physicalWidth,
++                    height = result.appliedMode.physicalHeight,
++                    refreshRate = result.appliedMode.refreshRate
++                ),
++                showDisplayModeInfo = true
++            )
++        }
++    }
++}
++
+ internal suspend fun PlayerRuntimeController.runAfrPreflightIfEnabled(
+     url: String,
+     headers: Map<String, String>,
+@@ -34,6 +169,7 @@ internal suspend fun PlayerRuntimeController.runAfrPreflightIfEnabled(
+     mimeType: String? = null
+ ) {
+     mpvDelayStartAfterAfrSwitch = false
++    exoDelayStartAfterAfrSwitch = false
+ 
+     if (frameRateMatchingMode == FrameRateMatchingMode.OFF) {
+         _uiState.update {
+@@ -116,6 +252,7 @@ internal suspend fun PlayerRuntimeController.runAfrPreflightIfEnabled(
+                 val switchedDisplayMode = initialDisplayModeId != null &&
+                     initialDisplayModeId != result.appliedMode.modeId
+                 mpvDelayStartAfterAfrSwitch = switchedDisplayMode
++                exoDelayStartAfterAfrSwitch = switchedDisplayMode
+ 
+                 _uiState.update {
+                     it.copy(
+@@ -244,6 +381,7 @@ internal suspend fun PlayerRuntimeController.runAfrPreflightIfEnabled(
+             val switchedDisplayMode = initialDisplayModeId != null &&
+                 initialDisplayModeId != result.appliedMode.modeId
+             mpvDelayStartAfterAfrSwitch = switchedDisplayMode
++            exoDelayStartAfterAfrSwitch = switchedDisplayMode
+ 
+             _uiState.update {
+                 it.copy(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAfrTrack.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAfrTrack.kt
+new file mode 100644
+index 0000000..c38b1eb
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAfrTrack.kt
+@@ -0,0 +1,279 @@
++@file:androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
++
++package com.nuvio.tv.ui.screens.player
++
++import android.os.Build
++import android.util.Log
++import androidx.media3.common.C
++import androidx.media3.common.Format
++import com.nuvio.tv.core.player.FrameRateUtils
++import com.nuvio.tv.data.local.FrameRateMatchingMode
++import com.nuvio.tv.data.local.InternalPlayerEngine
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.flow.update
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import kotlinx.coroutines.withTimeoutOrNull
++
++// Absolute ceiling on the whole track-AFR step (mode switch wait + settle
++// hold). Timer-released, never event-gated, so it cannot deadlock startup.
++// 8 s covers the worst case (~4 s mode-switch wait + 2 s settle hold)
++// with margin; 7 s could clip a slow HDMI mode change mid-settle.
++private const val TRACK_AFR_ABSOLUTE_DEADLINE_MS = 8_000L
++
++// Settle hold after a real display-mode switch, mirroring
++// AFR_EXO_SETTLE_HOLD_MS on the preflight path: don't start the A/V pipeline
++// inside the mode transition.
++private const val TRACK_AFR_SETTLE_HOLD_MS = 2_000L
++
++/**
++ * Frame-rate matching from ExoPlayer's reported track format instead of a
++ * network probe. Called from the tracks-changed handler as soon as the selected
++ * video format's frameRate is known, before the first frame renders.
++ *
++ * The player is built with playWhenReady true, so arming the gate also pauses
++ * it for the switch window. While a switch is in flight the start sites stand
++ * down (afrTrackSwitchInFlight); when it settles,
++ * resumePlaybackAfterTrackAfrIfHeld() starts playback if the first frame
++ * arrived during the hold. The finally block releases the gate at the deadline.
++ */
++internal fun PlayerRuntimeController.maybeRunTrackFormatAfr(rawFps: Float, format: Format) {
++    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
++    if (currentInternalPlayerEngine != InternalPlayerEngine.EXOPLAYER) return
++    if (trackAfrAttemptedForCurrentStream) return
++    if (afrModeAppliedPreStart) {
++        // Validate and correct: if the applied mode came from a provisional
++        // head seed, check ExoPlayer's real reported rate against it. Match ->
++        // promote the seed to the persistent cache so the next play is a real
++        // hit even unwarmed. Mismatch -> clear the pre-start flags and fall
++        // through into the switch body below to correct the panel (the clean
++        // pre-prepare switch to the wrong rate is discarded; the correction is
++        // the normal miss-path switch). rawFps <= 0 / < 20 is unvalidatable: keep
++        // the seed rather than tear down a plausibly-correct mode.
++        val seeded = afrSeededRateRaw
++        if (seeded <= 0f) return
++        if (rawFps < 20f) {
++            Log.w(PlayerRuntimeController.TAG, "AFR seed: cannot validate (track rawFps=$rawFps); keeping seeded mode")
++            return
++        }
++        val snappedSeed = FrameRateUtils.snapToStandardRate(seeded)
++        val snappedTrack = FrameRateUtils.snapToStandardRate(rawFps)
++        if (snappedSeed == snappedTrack) {
++            Log.i(PlayerRuntimeController.TAG, "AFR seed validated: seeded=$seeded track=$rawFps (promoting to cache)")
++            FrameRateUtils.cacheFrameRate(
++                currentStreamUrl,
++                currentHeaders,
++                FrameRateUtils.FrameRateDetection(
++                    raw = rawFps,
++                    snapped = snappedTrack,
++                    videoWidth = format.width.takeIf { it > 0 },
++                    videoHeight = format.height.takeIf { it > 0 }
++                ),
++                currentFilename
++            )
++            return
++        }
++        Log.w(
++            PlayerRuntimeController.TAG,
++            "AFR seed MISMATCH: seeded=$seeded ($snappedSeed) track=$rawFps ($snappedTrack); correcting via track-format switch"
++        )
++        afrModeAppliedPreStart = false
++        afrSeededRateRaw = 0f
++    }
++    if (rawFps <= 0f) return
++    // Mirror of the FrameRateUtils floor, applied before the cache write below so a
++    // bogus rate from a broken source is never persisted for the next play.
++    if (rawFps < 20f) {
++        Log.w(PlayerRuntimeController.TAG, "Track AFR: ignoring implausible frame rate ${rawFps}fps")
++        trackAfrAttemptedForCurrentStream = true
++        return
++    }
++    if (_uiState.value.frameRateMatchingMode == FrameRateMatchingMode.OFF) return
++    if (_uiState.value.afrProbeRunning) return
++    // Too late: playback is already running. A mid-playback mode switch is the
++    // known black-screen/stutter risk this design avoids; skip rather than
++    // switch under a live pipeline.
++    if (hasRenderedFirstFrame && _exoPlayer?.isPlaying == true) {
++        Log.d(
++            PlayerRuntimeController.TAG,
++            "Track AFR: playback already running, skipping display-mode switch (fps=$rawFps)"
++        )
++        trackAfrAttemptedForCurrentStream = true
++        return
++    }
++    val activity = currentHostActivity()
++    if (activity == null) {
++        Log.w(PlayerRuntimeController.TAG, "Track AFR skipped: host activity unavailable")
++        return
++    }
++
++    trackAfrAttemptedForCurrentStream = true
++    afrTrackSwitchInFlight = true
++    // Engage the gate for real: playWhenReady is true from player build on
++    // the normal path, so without this the player auto-starts at STATE_READY
++    // and the stand-down at the start sites gates nothing. The guards above
++    // ensure playback is not already running; setting an already-false value
++    // is a no-op on the paused/startPaused flows.
++    _exoPlayer?.playWhenReady = false
++    // Stamp this attempt with the current stream's generation; the
++    // finally block stands down if a per-stream reset happened meanwhile.
++    val startGeneration = afrTrackGeneration
++    // Set true only if we actually disable audio for the switch, so
++    // the finally re-enables exactly what was disabled and can never latch a
++    // muted state on an unrelated exit path.
++    var audioQuiesced = false
++    var switchStartElapsedMs = 0L
++
++    scope.launch {
++        try {
++            withTimeoutOrNull(TRACK_AFR_ABSOLUTE_DEADLINE_MS) {
++                val playerSettings = playerSettingsDataStore.playerSettings.first()
++                val snapped = FrameRateUtils.snapToStandardRate(rawFps)
++                val prefer23976TrackBias = rawFps in 23.95f..23.999f
++                val targetFrameRate = FrameRateUtils.refineFrameRateForDisplay(
++                    activity = activity,
++                    detectedFps = snapped,
++                    prefer23976Near24 = prefer23976TrackBias
++                )
++                val initialDisplayModeId = withContext(Dispatchers.Main) {
++                    activity.window?.decorView?.display?.mode?.modeId
++                }
++
++                Log.d(
++                    PlayerRuntimeController.TAG,
++                    "Track AFR: raw=$rawFps snapped=$snapped target=$targetFrameRate " +
++                        "size=${format.width}x${format.height}"
++                )
++
++                // The ExoPlayer preflight only reads the frame-rate cache, so
++                // without this write the cache is never populated on that
++                // engine and every play pays the full post-prepare mode switch
++                // and settle.
++                //
++                // Writing here costs nothing on this play and lets the NEXT
++                // play of the same title take the preflight's hit path, where
++                // the switch happens before prepare and the settle overlaps
++                // loading instead of following it. Dimensions come from the
++                // same format used for the switch below, so a later hit
++                // preflights with the size that actually applied.
++                FrameRateUtils.cacheFrameRate(
++                    currentStreamUrl,
++                    currentHeaders,
++                    FrameRateUtils.FrameRateDetection(
++                        raw = rawFps,
++                        snapped = snapped,
++                        videoWidth = format.width.takeIf { it > 0 },
++                        videoHeight = format.height.takeIf { it > 0 }
++                    ),
++                    currentFilename
++                )
++
++                // Quiesce audio across the HDMI mode switch. On the
++                // Shield, switching display mode tears the audio output down
++                // under a live AudioTrack, producing AudioSink write failures
++                // (-6) that media3 recovers from but which are the fragile
++                // window for passthrough corruption. Releasing the AudioTrack
++                // before the switch removes the live-track teardown entirely.
++                // Skip under an already-audio-disabled stream (don't fight the
++                // existing state machine) and under tunneling (the tunnel
++                // clock is the audio track).
++                if (!isAudioDisabledForCurrentPlayback && !playerSettings.effectiveTunnelingEnabled) {
++                    withContext(Dispatchers.Main) {
++                        _exoPlayer?.let { p ->
++                            p.trackSelectionParameters = p.trackSelectionParameters
++                                .buildUpon()
++                                .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, true)
++                                .build()
++                        }
++                    }
++                    audioQuiesced = true
++                    switchStartElapsedMs = android.os.SystemClock.elapsedRealtime()
++                }
++
++                val result = FrameRateUtils.matchFrameRateAndWait(
++                    activity = activity,
++                    frameRate = targetFrameRate,
++                    videoWidth = format.width.takeIf { it > 0 },
++                    videoHeight = format.height.takeIf { it > 0 },
++                    resolutionMatchingEnabled = playerSettings.resolutionMatchingEnabled
++                )
++
++                if (result != null) {
++                    val switchedDisplayMode = initialDisplayModeId != null &&
++                        initialDisplayModeId != result.appliedMode.modeId
++                    _uiState.update {
++                        it.copy(
++                            displayModeInfo = DisplayModeInfo(
++                                width = result.appliedMode.physicalWidth,
++                                height = result.appliedMode.physicalHeight,
++                                refreshRate = result.appliedMode.refreshRate
++                            ),
++                            showDisplayModeInfo = true
++                        )
++                    }
++                    if (switchedDisplayMode) {
++                        Log.d(
++                            PlayerRuntimeController.TAG,
++                            "Track AFR: display mode switched; holding playback start ${TRACK_AFR_SETTLE_HOLD_MS}ms"
++                        )
++                        delay(TRACK_AFR_SETTLE_HOLD_MS)
++                        val sinceSwitchMs = if (switchStartElapsedMs > 0L) {
++                            android.os.SystemClock.elapsedRealtime() - switchStartElapsedMs
++                        } else {
++                            -1L
++                        }
++                        Log.d(
++                            PlayerRuntimeController.TAG,
++                            "Track AFR settle complete: elapsedSinceSwitchMs=" + sinceSwitchMs +
++                                " audioQuiesced=" + audioQuiesced +
++                                " firstFrame=" + hasRenderedFirstFrame
++                        )
++                    }
++                }
++            } ?: Log.w(
++                PlayerRuntimeController.TAG,
++                "Track AFR exceeded absolute deadline (${TRACK_AFR_ABSOLUTE_DEADLINE_MS}ms); releasing start gate"
++            )
++        } finally {
++            // Act only if this coroutine still belongs to the current
++            // stream: an old stream's finally otherwise collapses the new
++            // stream's start-hold (and could start held playback early).
++            if (afrTrackGeneration == startGeneration) {
++                afrTrackSwitchInFlight = false
++                // Symmetric re-enable. Only touch audio if we disabled
++                // it above; runs on every exit path (success, deadline, reset).
++                if (audioQuiesced) {
++                    withContext(Dispatchers.Main) {
++                        _exoPlayer?.let { p ->
++                            p.trackSelectionParameters = p.trackSelectionParameters
++                                .buildUpon()
++                                .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
++                                .build()
++                        }
++                    }
++                }
++                resumePlaybackAfterTrackAfrIfHeld()
++            }
++        }
++    }
++}
++
++/**
++ * If the first frame rendered (or tunneled READY fired) while the track-AFR
++ * gate held playback paused, start playback now with the same guards the
++ * normal start sites use. If the frame hasn't arrived yet, do nothing: the
++ * normal onRenderedFirstFrame / tunneled READY path starts playback, its gate
++ * now open.
++ */
++internal fun PlayerRuntimeController.resumePlaybackAfterTrackAfrIfHeld() {
++    val player = _exoPlayer ?: return
++    if (!hasRenderedFirstFrame) return
++    if (userPausedManually) return
++    if (isReleasingPlayer) return
++    if (player.playWhenReady) return
++    Log.d(PlayerRuntimeController.TAG, "Track AFR: settle complete; starting held playback")
++    player.playWhenReady = true
++    player.play()
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/Vc1VideoFormatHeuristics.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/Vc1VideoFormatHeuristics.kt
+index 8eb94da..82e3881 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/Vc1VideoFormatHeuristics.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/Vc1VideoFormatHeuristics.kt
+@@ -50,6 +50,10 @@ internal object Vc1VideoFormatHeuristics {
+         currentVideoTrackIsLikelyVc1: Boolean,
+         currentStreamName: String? = null
+     ): Boolean {
++        // A VC-1 track/title does not make an HTTP, parser, audio-sink or DRM
++        // failure a video decoder failure. Leave those to their existing ladders.
++        if (error.errorCode !in 4000..4005) return false
++
+         // 1. If we already know the stream's video track is VC-1
+         if (currentVideoTrackIsLikelyVc1) {
+             val rendererFormat = (error as? ExoPlaybackException)?.rendererFormat
+diff --git a/app/src/test/java/com/nuvio/tv/core/player/AviAudioClockTest.kt b/app/src/test/java/com/nuvio/tv/core/player/AviAudioClockTest.kt
+new file mode 100644
+index 0000000..dcfb564
+--- /dev/null
++++ b/app/src/test/java/com/nuvio/tv/core/player/AviAudioClockTest.kt
+@@ -0,0 +1,177 @@
++package com.nuvio.tv.core.player
++
++import java.io.ByteArrayOutputStream
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNotNull
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class AviAudioClockTest {
++
++    // The MP3 stream of the XviD sample: 128 kbit/s, a 504 ms first chunk, then 48, 48 and 24 ms chunks.
++    private val mp3Stream = AviHeader.Stream(
++        number = 1, type = "auds", scale = 384, rate = 16_000, length = 298_226, sampleSize = 384,
++        avgBytesPerSecond = 16_000,
++    )
++    private val mp3Sizes = IntArray(178_924) { i -> if (i == 0) 8064 else if (i % 3 == 0) 384 else 768 }
++    private val mp3DurationUs = 298_226L * 384 * 1_000_000 / 16_000
++
++    private fun positions(sizes: IntArray, first: Long = 10_260L): LongArray {
++        var at = first
++        return LongArray(sizes.size) { i -> at.also { at += sizes[i] + 8 + 1_000 } }
++    }
++
++    private fun stockTimeUs(index: Int) = mp3DurationUs * index / mp3Sizes.size
++
++    private fun mp3Clock(): Pair<AviAudioClock, LongArray> {
++        val clock = assertNotNullAndGet(AviAudioClock.forStream(mp3Stream))
++        val positions = positions(mp3Sizes)
++        assertTrue(clock.useIndex(AviIndex.Entries(positions, mp3Sizes)))
++        return clock to positions
++    }
++
++    private fun <T> assertNotNullAndGet(value: T?): T {
++        assertNotNull(value)
++        return value!!
++    }
++
++    @Test
++    fun timesChunksByTheBytesBeforeThem() {
++        val (clock, positions) = mp3Clock()
++        assertTrue(clock.countsBytes)
++        assertEquals(0L, clock.chunkTimeUs(positions[0], 8064, stockTimeUs(0)))
++        assertEquals(504_000L, clock.chunkTimeUs(positions[1], 768, stockTimeUs(1)))
++        assertEquals(552_000L, clock.chunkTimeUs(positions[2], 768, stockTimeUs(2)))
++        assertEquals(600_000L, clock.chunkTimeUs(positions[3], 384, stockTimeUs(3)))
++        assertEquals(40_002L, stockTimeUs(1))
++    }
++
++    @Test
++    fun theStockTimeIsAboutHalfASecondEarlyThroughTheFile() {
++        val (clock, positions) = mp3Clock()
++        // Chunk 1501 starts at 60.504 s; the stock reader says 60.044 s, and only 0.016 s early at the end.
++        assertEquals(60_504_000L, clock.chunkTimeUs(positions[1501], 768, stockTimeUs(1501)))
++        assertEquals(-460L, (stockTimeUs(1501) - 60_504_000L) / 1_000)
++        val last = mp3Sizes.size - 1
++        assertEquals(mp3DurationUs - 24_000L, clock.chunkTimeUs(positions[last], 384, stockTimeUs(last)))
++        assertTrue(mp3DurationUs - 24_000L - stockTimeUs(last) in 0L..30_000L)
++    }
++
++    @Test
++    fun afterASeekTheChunkIsFoundByItsPositionNotByTheReadersNumber() {
++        val (clock, positions) = mp3Clock()
++        clock.chunkTimeUs(positions[0], 8064, 0L)
++        clock.reset()
++        // The reader numbers the first chunk after the seek one too low.
++        assertEquals(60_504_000L, clock.chunkTimeUs(positions[1501], 768, stockTimeUs(1500)))
++        assertTrue(clock.lastChunkIndexed)
++        assertEquals(60_552_000L, clock.chunkTimeUs(positions[1502], 768, stockTimeUs(1501)))
++    }
++
++    @Test
++    fun aChunkTheIndexDoesNotListFollowsOnFromTheOneBefore() {
++        val clock = assertNotNullAndGet(AviAudioClock.forStream(mp3Stream))
++        val sizes = mp3Sizes.copyOf(3)
++        val positions = positions(sizes)
++        clock.useIndex(AviIndex.Entries(positions, sizes))
++        clock.chunkTimeUs(positions[2], 768, 0L)
++        assertEquals(600_000L, clock.chunkTimeUs(positions[2] + 2_000, 384, 999L))
++        assertFalse(clock.lastChunkIndexed)
++        assertEquals(624_000L, clock.chunkTimeUs(-1L, 384, 999L))
++    }
++
++    @Test
++    fun withoutAnIndexTheClockStartsFromTheReadersTime() {
++        val clock = assertNotNullAndGet(AviAudioClock.forStream(mp3Stream))
++        assertEquals(0, clock.indexedChunks)
++        assertEquals(0L, clock.chunkTimeUs(10_260L, 8064, 0L))
++        assertEquals(504_000L, clock.chunkTimeUs(20_000L, 768, 40_002L))
++        clock.reset()
++        assertEquals(1_000_000L, clock.chunkTimeUs(30_000L, 768, 1_000_000L))
++        assertEquals(1_048_000L, clock.chunkTimeUs(31_000L, 768, 1_040_000L))
++    }
++
++    @Test
++    fun ac3WithByteSamplesUsesTheByteRate() {
++        // 448 kbit/s AC-3 as DVD rips write it: scale 1, rate 56000, sample size 1.
++        val stream = AviHeader.Stream(1, "auds", 1, 56_000, 373_382_912, 1, 56_000)
++        val clock = assertNotNullAndGet(AviAudioClock.forStream(stream))
++        val sizes = IntArray(4) { if (it == 0) 26_880 else 3_584 }
++        val positions = positions(sizes)
++        clock.useIndex(AviIndex.Entries(positions, sizes))
++        assertEquals(480_000L, clock.chunkTimeUs(positions[1], 3_584, 64_000L))
++        assertEquals(544_000L, clock.chunkTimeUs(positions[2], 3_584, 128_000L))
++    }
++
++    @Test
++    fun streamsWithoutASampleSizeCountOneBlockPerChunk() {
++        val stream = AviHeader.Stream(1, "auds", 1152, 48_000, 1000, 0, 16_000)
++        val clock = assertNotNullAndGet(AviAudioClock.forStream(stream))
++        assertFalse(clock.countsBytes)
++        val sizes = IntArray(10) { 417 }
++        val positions = positions(sizes)
++        clock.useIndex(AviIndex.Entries(positions, sizes))
++        assertEquals(168_000L, clock.chunkTimeUs(positions[7], 417, 144_000L))
++        assertEquals(192_000L, clock.chunkTimeUs(-1L, 417, 0L))
++    }
++
++    @Test
++    fun unusableHeadersGiveNoClock() {
++        assertNull(AviAudioClock.forStream(mp3Stream.copy(type = "vids")))
++        assertNull(AviAudioClock.forStream(mp3Stream.copy(scale = 0, rate = 0, avgBytesPerSecond = 0)))
++        assertNull(AviAudioClock.forStream(mp3Stream.copy(avgBytesPerSecond = 24_000)))
++        assertNull(AviAudioClock.forStream(mp3Stream.copy(sampleSize = 0, scale = 1, rate = 48_000)))
++        assertNotNull(AviAudioClock.forStream(mp3Stream.copy(scale = 0, rate = 0)))
++    }
++
++    @Test
++    fun anIndexOutOfFileOrderIsNotUsed() {
++        val clock = assertNotNullAndGet(AviAudioClock.forStream(mp3Stream))
++        assertFalse(clock.useIndex(AviIndex.Entries(longArrayOf(100, 90), intArrayOf(768, 768))))
++        assertEquals(0, clock.indexedChunks)
++    }
++
++    @Test
++    fun scaleKeepsLargeValuesExact() {
++        assertEquals(7_157_424_000_000L / 1_000, AviAudioClock.scale(114_518_784L, 125, 2))
++        assertEquals(3_000_000_000_000L, AviAudioClock.scale(3_000_000_000_000L, 1_000_000, 1_000_000))
++    }
++
++    private fun ByteArrayOutputStream.tag(s: String) = write(s.toByteArray(Charsets.ISO_8859_1))
++
++    private fun ByteArrayOutputStream.u32(v: Long) {
++        for (shift in 0 until 32 step 8) write(((v shr shift) and 0xFF).toInt())
++    }
++
++    private fun idx1(vararg entries: Triple<String, Int, Int>): ByteArray = ByteArrayOutputStream().apply {
++        entries.forEach { (id, offset, size) ->
++            tag(id); u32(0x10); u32(offset.toLong()); u32(size.toLong())
++        }
++    }.toByteArray()
++
++    @Test
++    fun indexOffsetsCountFromTheMoviListType() {
++        val body = idx1(
++            Triple("01wb", 4, 8064),
++            Triple("00dc", 8076, 5000),
++            Triple("01wb", 13084, 768),
++            Triple("02wb", 13860, 400),
++        )
++        val entries = AviIndex.audioEntries(body, 0, body.size, 10_240L, listOf(1))
++        assertEquals(setOf(1), entries.keys)
++        val stream = entries.getValue(1)
++        assertEquals(listOf(10_260L, 23_340L), stream.dataPositions.toList())
++        assertEquals(listOf(8064, 768), stream.sizes.toList())
++    }
++
++    @Test
++    fun indexOffsetsBeyondTheMoviListAreFilePositions() {
++        val body = idx1(Triple("00dc", 20_000, 5000), Triple("01wb", 25_008, 768))
++        val prefix = ByteArray(7)
++        val entries = AviIndex.audioEntries(prefix + body, 7, body.size, 10_240L, listOf(1, 3))
++        assertEquals(listOf(25_016L), entries.getValue(1).dataPositions.toList())
++        assertTrue(AviIndex.audioEntries(body, 0, body.size, -1L, listOf(1)).isEmpty())
++    }
++}
+diff --git a/app/src/test/java/com/nuvio/tv/core/player/AviAudioFramerTest.kt b/app/src/test/java/com/nuvio/tv/core/player/AviAudioFramerTest.kt
+new file mode 100644
+index 0000000..a421f5d
+--- /dev/null
++++ b/app/src/test/java/com/nuvio/tv/core/player/AviAudioFramerTest.kt
+@@ -0,0 +1,170 @@
++package com.nuvio.tv.core.player
++
++import androidx.media3.common.MimeTypes
++import androidx.media3.extractor.Ac3Util
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class AviAudioFramerTest {
++
++    private data class Sample(val size: Int, val timeUs: Long, val head: Int)
++
++    private val ac3FrameBytes = 1792
++    private val ac3FrameUs = 32_000L
++
++    // 448 kbit/s at 48 kHz, bsid 8.
++    private fun ac3Frame(): ByteArray = ByteArray(ac3FrameBytes) { 0x55 }.also {
++        it[0] = 0x0B
++        it[1] = 0x77
++        it[4] = 30
++        it[5] = (8 shl 3).toByte()
++    }
++
++    // Core frame, 512 samples, 1024 bytes.
++    private fun dtsFrame(): ByteArray = ByteArray(1024) { 0x55 }.also {
++        it[0] = 0x7F
++        it[1] = 0xFE.toByte()
++        it[2] = 0x80.toByte()
++        it[3] = 0x01
++        it[4] = 0xFC.toByte()
++        it[5] = 0x3C
++        it[6] = 0x3F
++        it[7] = 0xF0.toByte()
++    }
++
++    private fun frames(count: Int, frame: () -> ByteArray): ByteArray =
++        (0 until count).fold(ByteArray(0)) { acc, _ -> acc + frame() }
++
++    private fun AviAudioFramer.chunk(bytes: ByteArray, timeUs: Long, out: MutableList<Sample>) {
++        var at = 0
++        while (at < bytes.size) {
++            at += append(bytes.size - at) { target, offset, count ->
++                System.arraycopy(bytes, at, target, offset, count)
++                count
++            }
++        }
++        endChunk(timeUs) { data, offset, size, frameTimeUs ->
++            val head = ((data[offset].toInt() and 0xFF) shl 8) or (data[offset + 1].toInt() and 0xFF)
++            out += Sample(size, frameTimeUs, head)
++        }
++    }
++
++    @Test
++    fun testFrame_hasTheExpectedSize() {
++        assertEquals(ac3FrameBytes, Ac3Util.parseAc3SyncframeSize(ac3Frame()))
++    }
++
++    @Test
++    fun chunksOfThreeFrames_areSplitIntoSingleFrames() {
++        val framer = AviAudioFramer(AviAudioFramer.Codec.AC3, 48_000)
++        val out = ArrayList<Sample>()
++        for (i in 0 until 4) framer.chunk(frames(3, ::ac3Frame), i * 3 * ac3FrameUs, out)
++
++        assertEquals(12, out.size)
++        assertTrue(out.all { it.size == ac3FrameBytes && it.head == 0x0B77 })
++        assertEquals((0 until 12).map { it * ac3FrameUs }, out.map { it.timeUs })
++        assertTrue(framer.engaged)
++        assertEquals(3, framer.firstChunkFrames)
++        assertEquals(448_000, framer.firstFrameBitrate)
++    }
++
++    @Test
++    fun framesCutAcrossChunks_comeOutWholeWithSteadyTimes() {
++        val framer = AviAudioFramer(AviAudioFramer.Codec.AC3, 48_000)
++        val stream = frames(20, ::ac3Frame)
++        val out = ArrayList<Sample>()
++        var at = 0
++        while (at < stream.size) {
++            val end = minOf(stream.size, at + 2500)
++            framer.chunk(stream.copyOfRange(at, end), at * ac3FrameUs / ac3FrameBytes, out)
++            at = end
++        }
++
++        assertEquals(20, out.size)
++        assertTrue(out.all { it.size == ac3FrameBytes && it.head == 0x0B77 })
++        assertEquals((0 until 20).map { it * ac3FrameUs }, out.map { it.timeUs })
++        assertEquals(0L, framer.bytesDropped)
++    }
++
++    @Test
++    fun chunkTimesWanderingUnderOneSecond_areIgnored() {
++        val framer = AviAudioFramer(AviAudioFramer.Codec.AC3, 48_000)
++        val out = ArrayList<Sample>()
++        for (i in 0 until 6) {
++            val wander = if (i % 2 == 1) 200_000L else -150_000L
++            framer.chunk(frames(3, ::ac3Frame), maxOf(0L, i * 3 * ac3FrameUs + wander), out)
++        }
++
++        assertEquals((0 until 18).map { it * ac3FrameUs }, out.map { it.timeUs })
++        assertEquals(0, framer.reanchors)
++    }
++
++    @Test
++    fun jumpOverOneSecond_reanchorsToTheChunkTime() {
++        val framer = AviAudioFramer(AviAudioFramer.Codec.AC3, 48_000)
++        val out = ArrayList<Sample>()
++        for (i in 0 until 4) framer.chunk(frames(3, ::ac3Frame), i * 3 * ac3FrameUs, out)
++        val jumpedUs = 4 * 3 * ac3FrameUs + 5_000_000L
++        framer.chunk(frames(3, ::ac3Frame), jumpedUs, out)
++
++        val expectedUs = listOf(jumpedUs, jumpedUs + ac3FrameUs, jumpedUs + 2 * ac3FrameUs)
++        assertEquals(expectedUs, out.takeLast(3).map { it.timeUs })
++        assertEquals(1, framer.reanchors)
++        assertEquals(5_000_000L, framer.lastReanchorDriftUs)
++    }
++
++    @Test
++    fun seek_dropsTheHeldPartialFrameAndFollowsTheNewChunk() {
++        val framer = AviAudioFramer(AviAudioFramer.Codec.AC3, 48_000)
++        val out = ArrayList<Sample>()
++        framer.chunk(frames(2, ::ac3Frame).copyOf(ac3FrameBytes + ac3FrameBytes / 2), 0L, out)
++        assertEquals(1, out.size)
++
++        framer.reset()
++        out.clear()
++        val tail = ac3Frame().copyOfRange(ac3FrameBytes - 1000, ac3FrameBytes)
++        framer.chunk(tail + frames(3, ::ac3Frame), 10_000_000L, out)
++
++        val firstUs = 10_000_000L + 1000 * ac3FrameUs / ac3FrameBytes
++        assertEquals(listOf(firstUs, firstUs + ac3FrameUs, firstUs + 2 * ac3FrameUs), out.map { it.timeUs })
++        assertTrue(out.all { it.size == ac3FrameBytes && it.head == 0x0B77 })
++        assertEquals(1000L, framer.bytesDropped)
++    }
++
++    @Test
++    fun streamWithoutSyncframes_isPassedOnChunkByChunk() {
++        val framer = AviAudioFramer(AviAudioFramer.Codec.AC3, 48_000)
++        val out = ArrayList<Sample>()
++        for (i in 0 until 5) framer.chunk(ByteArray(20_000) { 0x55 }, i * 100_000L, out)
++
++        assertTrue(framer.passingThrough)
++        assertFalse(framer.engaged)
++        assertEquals(listOf(80_000 to 0L, 20_000 to 400_000L), out.map { it.size to it.timeUs })
++    }
++
++    @Test
++    fun dtsCoreFrames_areSplitAndTimedFromTheirSampleCount() {
++        val framer = AviAudioFramer(AviAudioFramer.Codec.DTS, 48_000)
++        val out = ArrayList<Sample>()
++        framer.chunk(frames(3, ::dtsFrame), 0L, out)
++        framer.chunk(frames(3, ::dtsFrame), 32_000L, out)
++
++        assertEquals(6, out.size)
++        assertTrue(out.all { it.size == 1024 && it.head == 0x7FFE })
++        assertEquals((0 until 6).map { it * 512 * 1_000_000L / 48_000 }, out.map { it.timeUs })
++    }
++
++    @Test
++    fun onlyAc3AndDtsTracks_areSplit() {
++        assertEquals(AviAudioFramer.Codec.AC3, AviAudioFramer.codecFor(MimeTypes.AUDIO_AC3, 48_000))
++        assertEquals(AviAudioFramer.Codec.DTS, AviAudioFramer.codecFor(MimeTypes.AUDIO_DTS, 48_000))
++        assertNull(AviAudioFramer.codecFor(MimeTypes.AUDIO_DTS, -1))
++        assertNull(AviAudioFramer.codecFor(MimeTypes.AUDIO_MPEG, 48_000))
++        assertNull(AviAudioFramer.codecFor(MimeTypes.AUDIO_RAW, 48_000))
++        assertNull(AviAudioFramer.codecFor(MimeTypes.AUDIO_AAC, 48_000))
++        assertNull(AviAudioFramer.codecFor(null, 48_000))
++    }
++}
+diff --git a/app/src/test/java/com/nuvio/tv/core/player/AviHeaderTest.kt b/app/src/test/java/com/nuvio/tv/core/player/AviHeaderTest.kt
+new file mode 100644
+index 0000000..bc0730d
+--- /dev/null
++++ b/app/src/test/java/com/nuvio/tv/core/player/AviHeaderTest.kt
+@@ -0,0 +1,144 @@
++package com.nuvio.tv.core.player
++
++import androidx.media3.common.Format
++import java.io.ByteArrayOutputStream
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Test
++
++class AviHeaderTest {
++
++    private fun ByteArrayOutputStream.tag(s: String) = write(s.toByteArray(Charsets.ISO_8859_1))
++
++    private fun ByteArrayOutputStream.u32(v: Long) {
++        write((v and 0xFF).toInt())
++        write(((v shr 8) and 0xFF).toInt())
++        write(((v shr 16) and 0xFF).toInt())
++        write(((v shr 24) and 0xFF).toInt())
++    }
++
++    private fun streamHeader(type: String, scale: Long, rate: Long, handler: String = "XVID"): ByteArray =
++        ByteArrayOutputStream().apply {
++            tag("strh"); u32(56)
++            tag(type); tag(handler); u32(0); u32(0); u32(0)
++            u32(scale); u32(rate)
++            repeat(7) { u32(0) }
++        }.toByteArray()
++
++    private fun videoFormat(compression: String): ByteArray =
++        ByteArrayOutputStream().apply {
++            tag("strf"); u32(40)
++            u32(40); u32(640); u32(480); u32(0x00180001)
++            tag(compression)
++            repeat(5) { u32(0) }
++        }.toByteArray()
++
++    private fun streamList(vararg chunks: ByteArray): ByteArray {
++        val body = chunks.fold(ByteArray(0)) { acc, c -> acc + c }
++        return ByteArrayOutputStream().apply {
++            tag("LIST"); u32(4L + body.size); tag("strl"); write(body)
++        }.toByteArray()
++    }
++
++    private fun avi(microsPerFrame: Long, vararg streams: ByteArray): ByteArray {
++        val mainHeader = ByteArrayOutputStream().apply {
++            tag("avih"); u32(56); u32(microsPerFrame)
++            repeat(13) { u32(0) }
++        }.toByteArray()
++        val headerBody = streams.fold(mainHeader) { acc, s -> acc + s }
++        return ByteArrayOutputStream().apply {
++            tag("RIFF"); u32(0); tag("AVI ")
++            tag("LIST"); u32(4L + headerBody.size); tag("hdrl"); write(headerBody)
++            tag("LIST"); u32(4); tag("movi")
++        }.toByteArray()
++    }
++
++    private fun frameRate(bytes: ByteArray) =
++        AviHeader.read(bytes, bytes.size)?.frameRate ?: Format.NO_VALUE.toFloat()
++
++    @Test
++    fun readsRateAndScaleOfTheVideoStream() {
++        assertEquals(25f, frameRate(avi(40_000, streamList(streamHeader("vids", 1, 25)))), 0.001f)
++        assertEquals(23.976f, frameRate(avi(41_708, streamList(streamHeader("vids", 1001, 24000)))), 0.001f)
++    }
++
++    @Test
++    fun skipsAudioStreamsAndOtherChunks() {
++        val junk = ByteArrayOutputStream().apply { tag("JUNK"); u32(5); write(ByteArray(6)) }.toByteArray()
++        val bytes = avi(
++            33_367,
++            streamList(streamHeader("auds", 1152, 48000)),
++            junk,
++            streamList(streamHeader("vids", 1001, 30000))
++        )
++        assertEquals(29.97f, frameRate(bytes), 0.001f)
++    }
++
++    @Test
++    fun fallsBackToTheMainHeaderWhenTheStreamHeaderHasNoRate() {
++        assertEquals(25f, frameRate(avi(40_000, streamList(streamHeader("vids", 0, 0)))), 0.001f)
++    }
++
++    @Test
++    fun rejectsOtherFilesTruncatedHeadersAndAbsurdRates() {
++        val unset = Format.NO_VALUE.toFloat()
++        assertEquals(unset, frameRate(ByteArray(64)), 0f)
++        assertEquals(unset, frameRate("RIFF....WAVEfmt ".toByteArray(Charsets.ISO_8859_1)), 0f)
++        assertEquals(unset, frameRate(avi(0, streamList(streamHeader("vids", 1, 1000)))), 0f)
++        val whole = avi(40_000, streamList(streamHeader("vids", 1, 25)))
++        assertNull(AviHeader.read(whole, 20))
++        val audioOnly = avi(40_000, streamList(streamHeader("auds", 1152, 48000)))
++        assertNull(AviHeader.read(audioOnly, audioOnly.size))
++    }
++
++    @Test
++    fun reportsTheVideoFourCc_preferringTheStreamFormat() {
++        val handlerOnly = avi(40_000, streamList(streamHeader("vids", 1, 25, handler = "divx")))
++        assertEquals("divx", AviHeader.read(handlerOnly, handlerOnly.size)?.fourCc)
++
++        val both = avi(40_000, streamList(streamHeader("vids", 1, 25, handler = "divx"), videoFormat("DIV3")))
++        assertEquals("DIV3", AviHeader.read(both, both.size)?.fourCc)
++
++        val blank = String(CharArray(4))
++        val blankHandler = avi(40_000, streamList(streamHeader("vids", 1, 25, handler = blank)))
++        assertNull(AviHeader.read(blankHandler, blankHandler.size)?.fourCc)
++    }
++
++    private fun fullStreamHeader(type: String, scale: Long, rate: Long, length: Long, sampleSize: Long): ByteArray =
++        ByteArrayOutputStream().apply {
++            tag("strh"); u32(56)
++            tag(type); u32(0); u32(0); u32(0); u32(0)
++            u32(scale); u32(rate); u32(0); u32(length); u32(0); u32(0xFFFFFFFFL); u32(sampleSize)
++            u32(0); u32(0)
++        }.toByteArray()
++
++    private fun audioFormat(formatTag: Int, sampleRate: Long, avgBytesPerSecond: Long, blockAlign: Int): ByteArray =
++        ByteArrayOutputStream().apply {
++            tag("strf"); u32(18)
++            write(formatTag and 0xFF); write(formatTag shr 8); write(2); write(0)
++            u32(sampleRate); u32(avgBytesPerSecond)
++            write(blockAlign and 0xFF); write(blockAlign shr 8); write(0); write(0); write(0); write(0)
++        }.toByteArray()
++
++    @Test
++    fun listsEveryStreamWithItsTimingFields() {
++        val bytes = avi(
++            40_000,
++            streamList(fullStreamHeader("vids", 1, 25, 178_944, 0), videoFormat("XVID")),
++            streamList(fullStreamHeader("auds", 384, 16_000, 298_226, 384), audioFormat(0x55, 48_000, 16_000, 384)),
++        )
++        val streams = AviHeader.streams(bytes, bytes.size)
++        assertEquals(2, streams.size)
++        assertEquals(AviHeader.Stream(0, "vids", 1, 25, 178_944, 0), streams[0])
++        assertEquals(AviHeader.Stream(1, "auds", 384, 16_000, 298_226, 384, 16_000), streams[1])
++        assertEquals(25f, frameRate(bytes), 0.001f)
++    }
++
++    @Test
++    fun aTruncatedStreamHeaderKeepsTheNumbering() {
++        val bytes = avi(40_000, streamList(fullStreamHeader("vids", 1, 25, 100, 0)))
++        val streams = AviHeader.streams(bytes, bytes.size - 30)
++        assertEquals(listOf(AviHeader.Stream(0, "vids", 0, 0, 0, 0)), streams)
++        assertEquals(emptyList<AviHeader.Stream>(), AviHeader.streams(ByteArray(64), 64))
++    }
++}
+diff --git a/app/src/test/java/com/nuvio/tv/core/player/AviVideoSeekTableTest.kt b/app/src/test/java/com/nuvio/tv/core/player/AviVideoSeekTableTest.kt
+new file mode 100644
+index 0000000..db7ae2d
+--- /dev/null
++++ b/app/src/test/java/com/nuvio/tv/core/player/AviVideoSeekTableTest.kt
+@@ -0,0 +1,74 @@
++package com.nuvio.tv.core.player
++
++import androidx.media3.extractor.SeekPoint
++import java.io.ByteArrayOutputStream
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class AviVideoSeekTableTest {
++
++    // 25 fps XviD, key frames at frames 0, 4342 and 4407 as in the sample around 176 s.
++    private val video = AviHeader.Stream(0, "vids", 1, 25, 178_944, 0)
++    private val keyFrames = AviIndex.KeyFrames(intArrayOf(0, 4342, 4407), longArrayOf(10_268, 5_000_000, 5_100_000))
++    private val table = AviVideoSeekTable.create(video, keyFrames)!!
++
++    @Test
++    fun aKeyFrameTimeGivesThatKeyFrameAlone() {
++        val points = table.seekPoints(176_280_000)
++        assertEquals(SeekPoint(176_280_000, 5_100_000), points.first)
++        assertEquals(points.first, points.second)
++    }
++
++    @Test
++    fun aTimeBetweenKeyFramesGivesBothNeighbours() {
++        val points = table.seekPoints(176_249_000)
++        assertEquals(SeekPoint(173_680_000, 5_000_000), points.first)
++        assertEquals(SeekPoint(176_280_000, 5_100_000), points.second)
++        assertEquals(SeekPoint(176_280_000, 5_100_000), table.seekPoints(200_000_000).first)
++    }
++
++    @Test
++    fun onlyKeyFramesAndPlacesBeforeTheFirstAreSafeStarts() {
++        assertTrue(table.isSafeStart(5_100_000))
++        assertTrue(table.isSafeStart(10_252))
++        // The audio chunk stored just before the key frame at 176.28 s, which the stock seek map picks.
++        assertFalse(table.isSafeStart(5_099_000))
++    }
++
++    @Test
++    fun unusableHeadersOrKeyFramesGiveNoTable() {
++        assertNull(AviVideoSeekTable.create(video.copy(rate = 0), keyFrames))
++        assertNull(AviVideoSeekTable.create(video.copy(length = 0), keyFrames))
++        assertNull(AviVideoSeekTable.create(video, AviIndex.KeyFrames(intArrayOf(5, 2), longArrayOf(1, 2))))
++        assertNull(AviVideoSeekTable.create(video, AviIndex.KeyFrames(IntArray(0), LongArray(0))))
++    }
++
++    private fun ByteArrayOutputStream.tag(s: String) = write(s.toByteArray(Charsets.ISO_8859_1))
++
++    private fun ByteArrayOutputStream.u32(v: Long) {
++        for (shift in 0 until 32 step 8) write(((v shr shift) and 0xFF).toInt())
++    }
++
++    @Test
++    fun keyFramesAreNumberedAmongAllChunksOfTheVideoStream() {
++        val body = ByteArrayOutputStream().apply {
++            listOf(
++                Triple("01wb", 0x10L, 4L),
++                Triple("00dc", 0x10L, 8_076L),
++                Triple("00db", 0L, 9_000L),
++                Triple("01wb", 0x10L, 9_500L),
++                Triple("00dc", 0L, 10_000L),
++                Triple("00dc", 0x10L, 11_000L),
++            ).forEach { (id, flags, offset) ->
++                tag(id); u32(flags); u32(offset); u32(100)
++            }
++        }.toByteArray()
++        val frames = AviIndex.videoKeyFrames(body, 0, body.size, 10_240L, 0)!!
++        assertEquals(listOf(0, 3), frames.chunkIndices.toList())
++        assertEquals(listOf(18_324L, 21_248L), frames.positions.toList())
++        assertNull(AviIndex.videoKeyFrames(body, 0, body.size, 10_240L, 2))
++    }
++}
+diff --git a/app/src/test/java/com/nuvio/tv/core/player/FrameRateDoubleRefreshTest.kt b/app/src/test/java/com/nuvio/tv/core/player/FrameRateDoubleRefreshTest.kt
+new file mode 100644
+index 0000000..9461be4
+--- /dev/null
++++ b/app/src/test/java/com/nuvio/tv/core/player/FrameRateDoubleRefreshTest.kt
+@@ -0,0 +1,22 @@
++package com.nuvio.tv.core.player
++
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class FrameRateDoubleRefreshTest {
++    @Test
++    fun `25 and 30 fps prefer the double refresh rate`() {
++        assertTrue(FrameRateUtils.prefersDoubleRefresh(25f))
++        assertTrue(FrameRateUtils.prefersDoubleRefresh(29.97f))
++        assertTrue(FrameRateUtils.prefersDoubleRefresh(30f))
++    }
++
++    @Test
++    fun `film and high frame rates keep the exact match`() {
++        assertFalse(FrameRateUtils.prefersDoubleRefresh(23.976f))
++        assertFalse(FrameRateUtils.prefersDoubleRefresh(24f))
++        assertFalse(FrameRateUtils.prefersDoubleRefresh(50f))
++        assertFalse(FrameRateUtils.prefersDoubleRefresh(59.94f))
++    }
++}
+diff --git a/app/src/test/java/com/nuvio/tv/core/player/FrameRateModeSelectionTest.kt b/app/src/test/java/com/nuvio/tv/core/player/FrameRateModeSelectionTest.kt
+index cefa665..691876e 100644
+--- a/app/src/test/java/com/nuvio/tv/core/player/FrameRateModeSelectionTest.kt
++++ b/app/src/test/java/com/nuvio/tv/core/player/FrameRateModeSelectionTest.kt
+@@ -89,10 +89,10 @@ class FrameRateModeSelectionTest {
+ 
+     @Test
+     fun `hd and uhd content that already matched is unchanged`() {
+-        assertEquals(16, pick(stick, 25f, 1920, 1080))
++        assertEquals(12, pick(stick, 25f, 1920, 1080))
+         assertEquals(11, pick(stick, film, 3840, 2160))
+         assertEquals(18, pick(stick, 25f, 1280, 720))
+-        assertEquals(17, pick(am9, 25f, 1920, 1080))
++        assertEquals(14, pick(am9, 25f, 1920, 1080))
+         assertEquals(9, pick(am9, film, 3840, 2160))
+         assertEquals(22, pick(am9, 25f, 1280, 720))
+     }
+@@ -105,8 +105,8 @@ class FrameRateModeSelectionTest {
+ 
+     @Test
+     fun `resolution matching off keeps the same-size choice`() {
+-        assertEquals(9, pick(stick, 25f, 640, 480, resolutionMatching = false))
+-        assertEquals(8, pick(am9, 25f, 640, 480, resolutionMatching = false))
++        assertEquals(5, pick(stick, 25f, 640, 480, resolutionMatching = false))
++        assertEquals(5, pick(am9, 25f, 640, 480, resolutionMatching = false))
+         assertEquals(11, pick(stick, film, 1920, 1080, resolutionMatching = false))
+     }
+ 
+@@ -118,7 +118,7 @@ class FrameRateModeSelectionTest {
+ 
+     @Test
+     fun `unknown video size uses the same-size modes`() {
+-        assertEquals(9, pick(stick, 25f, null, null))
++        assertEquals(5, pick(stick, 25f, null, null))
+     }
+ 
+     @Test
+diff --git a/app/src/test/java/com/nuvio/tv/core/player/FrameRateResolutionIntegrationTest.kt b/app/src/test/java/com/nuvio/tv/core/player/FrameRateResolutionIntegrationTest.kt
+new file mode 100644
+index 0000000..418a71e
+--- /dev/null
++++ b/app/src/test/java/com/nuvio/tv/core/player/FrameRateResolutionIntegrationTest.kt
+@@ -0,0 +1,32 @@
++package com.nuvio.tv.core.player
++
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++class FrameRateResolutionIntegrationTest {
++    private val modes = listOf(720 to 480, 1280 to 720, 1920 to 1080, 3840 to 2160)
++
++    @Test fun `4 by 3 full HD stays at full HD rather than downscaling to 720p`() {
++        assertEquals(listOf(1920 to 1080), FrameRateUtils.selectResolutionCandidates(modes, 1440, 1080))
++    }
++
++    @Test fun `SD content retains the fork 720p output floor`() {
++        assertEquals(listOf(1280 to 720), FrameRateUtils.selectResolutionCandidates(modes, 720, 480))
++    }
++
++    @Test fun `ultrawide source requires a mode that fits both dimensions`() {
++        assertEquals(listOf(3840 to 2160), FrameRateUtils.selectResolutionCandidates(modes, 2560, 1080))
++    }
++
++    @Test fun `content larger than display uses largest supported mode`() {
++        assertEquals(listOf(3840 to 2160), FrameRateUtils.selectResolutionCandidates(modes, 7680, 4320))
++    }
++
++    @Test fun `SD only display keeps its available mode`() {
++        assertEquals(listOf(720 to 480), FrameRateUtils.selectResolutionCandidates(listOf(720 to 480), 1920, 1080))
++    }
++
++    @Test fun `rotated dimensions select the same resolution family`() {
++        assertEquals(listOf(1920 to 1080), FrameRateUtils.selectResolutionCandidates(modes, 1080, 1440))
++    }
++}
+diff --git a/app/src/test/java/com/nuvio/tv/core/player/FrameRateUtilsAfrTest.kt b/app/src/test/java/com/nuvio/tv/core/player/FrameRateUtilsAfrTest.kt
+index 682a526..9cd235d 100644
+--- a/app/src/test/java/com/nuvio/tv/core/player/FrameRateUtilsAfrTest.kt
++++ b/app/src/test/java/com/nuvio/tv/core/player/FrameRateUtilsAfrTest.kt
+@@ -464,7 +464,7 @@ class FrameRateUtilsAfrTest {
+     }
+ 
+     @Test
+-    fun `cache with filename keys by host and filename not full url`() {
++    fun `cache with filename keys by filename not full url`() {
+         val det = detection(23.976f)
+         val filename = "Movie.2024.1080p.mkv"
+         FrameRateUtils.cacheFrameRate(
+@@ -483,7 +483,11 @@ class FrameRateUtilsAfrTest {
+     }
+ 
+     @Test
+-    fun `cache with same filename on different host is a miss`() {
++    fun `cache with same filename on a different host is a hit`() {
++        // The resolved debrid edge host rotates per resolve, so the filename branch of
++        // buildCacheKey deliberately excludes it -- the filename identifies the
++        // content, the host is transport. Same content on a different edge must
++        // therefore reuse the entry.
+         val det = detection(24f)
+         val filename = "SameName.mkv"
+         FrameRateUtils.cacheFrameRate(
+@@ -492,13 +496,13 @@ class FrameRateUtilsAfrTest {
+             det,
+             filename
+         )
+-        assertNull(
+-            FrameRateUtils.getCachedFrameRate(
+-                "https://host-b.example.com/a",
+-                emptyMap(),
+-                filename
+-            )
++        val hit = FrameRateUtils.getCachedFrameRate(
++            "https://host-b.example.com/a",
++            emptyMap(),
++            filename
+         )
++        assertNotNull(hit)
++        assertEquals(det.raw, hit!!.raw, 0.0001f)
+     }
+ 
+     @Test
+@@ -565,13 +569,13 @@ class FrameRateUtilsAfrTest {
+     }
+ 
+     @Test
+-    fun `buildCacheKey with filename uses file host scheme`() {
++    fun `buildCacheKey with filename excludes the rotating host`() {
+         val key = FrameRateUtils.buildCacheKey(
+             "https://download.real-debrid.com/d/TOKEN/file",
+             emptyMap(),
+             "Film.mkv"
+         )
+-        assertEquals("file://download.real-debrid.com/Film.mkv", key)
++        assertEquals("file://Film.mkv", key)
+     }
+ 
+     @Test
+@@ -789,10 +793,17 @@ class FrameRateUtilsAfrTest {
+ 
+             // 2. Sparse File (Head at 0, Seek to tailStart, Write Tail)
+             val sparseFile = java.io.File(tempDir, "sparse.mp4")
+-            java.io.RandomAccessFile(sparseFile, "rw").use { raf ->
+-                raf.write(headBytes)
+-                raf.seek(tailStart)
+-                raf.write(tailBytes)
++            // Seeking alone does not create a sparse file on NTFS: explicitly request
++            // sparse allocation so this host-side test does not allocate nearly 10 GB.
++            java.nio.channels.FileChannel.open(
++                sparseFile.toPath(),
++                java.nio.file.StandardOpenOption.CREATE_NEW,
++                java.nio.file.StandardOpenOption.WRITE,
++                java.nio.file.StandardOpenOption.SPARSE
++            ).use { channel ->
++                channel.write(java.nio.ByteBuffer.wrap(headBytes))
++                channel.position(tailStart)
++                channel.write(java.nio.ByteBuffer.wrap(tailBytes))
+             }
+             assertEquals(tailStart + tailBytes.size, sparseFile.length())
+             assertTrue(sparseFile.length() >= tailStart)
+diff --git a/app/src/test/java/com/nuvio/tv/core/player/MatroskaAfrProbeTest.kt b/app/src/test/java/com/nuvio/tv/core/player/MatroskaAfrProbeTest.kt
+index 216fcad..a857334 100644
+--- a/app/src/test/java/com/nuvio/tv/core/player/MatroskaAfrProbeTest.kt
++++ b/app/src/test/java/com/nuvio/tv/core/player/MatroskaAfrProbeTest.kt
+@@ -198,6 +198,7 @@ class MatroskaAfrProbeTest {
+ 
+             val patched = file.readBytes()
+             val stub = MatroskaAfrProbe.buildMinimalStubCluster()
++            assertEquals(prefix + stub.size, patchedLength)
+             assertArrayEquals(stub, patched.copyOfRange(patched.size - stub.size, patched.size))
+ 
+             // The rewritten Segment must end exactly at EOF instead of the original remote length.
+diff --git a/app/src/test/java/com/nuvio/tv/core/player/MatroskaAfrProbeVideoFpsTest.kt b/app/src/test/java/com/nuvio/tv/core/player/MatroskaAfrProbeVideoFpsTest.kt
+new file mode 100644
+index 0000000..27beb23
+--- /dev/null
++++ b/app/src/test/java/com/nuvio/tv/core/player/MatroskaAfrProbeVideoFpsTest.kt
+@@ -0,0 +1,89 @@
++package com.nuvio.tv.core.player
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNotNull
++import org.junit.Assert.assertNull
++import org.junit.Test
++
++/**
++ * parseVideoFrameRateFromHead picks the VIDEO track's frame rate
++ * from a Matroska head, skipping audio tracks, tolerating a torn tail, and
++ * rejecting non-Matroska input. Built from MatroskaAfrProbe's own element
++ * primitives so it needs no on-device bytes.
++ *
++ * Upstream: NuvioMedia/NuvioTV. Licensed under GPL-3.0.
++ */
++class MatroskaAfrProbeVideoFpsTest {
++
++    private fun uintEl(id: Long, value: Long, width: Int): ByteArray {
++        val payload = ByteArray(width)
++        var v = value
++        for (i in width - 1 downTo 0) { payload[i] = (v and 0xFFL).toByte(); v = v ushr 8 }
++        return MatroskaAfrProbe.buildElement(id, payload)
++    }
++
++    private fun trackEntry(type: Long, defaultDurationNs: Long?, w: Int?, h: Int?): ByteArray {
++        var payload = uintEl(0x83L, type, 1)
++        if (defaultDurationNs != null) payload += uintEl(0x23E383L, defaultDurationNs, 4)
++        if (w != null && h != null) {
++            val video = uintEl(0xB0L, w.toLong(), 2) + uintEl(0xBAL, h.toLong(), 2)
++            payload += MatroskaAfrProbe.buildElement(0xE0L, video)
++        }
++        return MatroskaAfrProbe.buildElement(0xAEL, payload)
++    }
++
++    private fun mkvHead(tracksPayload: ByteArray): ByteArray {
++        val ebml = MatroskaAfrProbe.buildElement(
++            MatroskaAfrProbe.ID_EBML,
++            byteArrayOf(0x42.toByte(), 0x86.toByte(), 0x81.toByte(), 0x01)
++        )
++        val tracks = MatroskaAfrProbe.buildElement(MatroskaAfrProbe.ID_TRACKS, tracksPayload)
++        val segment = MatroskaAfrProbe.buildElement(MatroskaAfrProbe.ID_SEGMENT, tracks)
++        return ebml + segment
++    }
++
++    @Test
++    fun `picks 23976 from a single video track`() {
++        val head = mkvHead(trackEntry(1L, 41_708_333L, 3840, 2160))
++        val hint = MatroskaAfrProbe.parseVideoFrameRateFromHead(head)
++        assertNotNull(hint)
++        assertEquals(23.976025f, hint!!.rawFps, 0.0005f)
++        assertEquals(3840, hint.width)
++        assertEquals(2160, hint.height)
++    }
++
++    @Test
++    fun `skips an audio track ordered before the video track`() {
++        // AC-3 track (type 2, DefaultDuration 32 ms => 31.25 fps) FIRST, then video.
++        val payload = trackEntry(2L, 32_000_000L, null, null) +
++            trackEntry(1L, 41_708_333L, 1920, 1080)
++        val hint = MatroskaAfrProbe.parseVideoFrameRateFromHead(mkvHead(payload))
++        assertNotNull(hint)
++        assertEquals(23.976025f, hint!!.rawFps, 0.0005f)
++        assertEquals(1920, hint.width)
++    }
++
++    @Test
++    fun `returns null when the video track has no DefaultDuration`() {
++        val hint = MatroskaAfrProbe.parseVideoFrameRateFromHead(
++            mkvHead(trackEntry(1L, null, 1920, 1080))
++        )
++        assertNull(hint)
++    }
++
++    @Test
++    fun `tolerates a head truncated after Tracks`() {
++        // Full head, then chop the byte array to just past Tracks (no Cluster).
++        val head = mkvHead(trackEntry(1L, 41_708_333L, 3840, 2160))
++        val truncated = head.copyOf(head.size) // already Cluster-less here
++        val hint = MatroskaAfrProbe.parseVideoFrameRateFromHead(truncated)
++        assertNotNull(hint)
++        assertEquals(23.976025f, hint!!.rawFps, 0.0005f)
++    }
++
++    @Test
++    fun `rejects non-Matroska bytes`() {
++        assertNull(MatroskaAfrProbe.parseVideoFrameRateFromHead(ByteArray(300) { 0x7A }))
++        assertNull(MatroskaAfrProbe.parseVideoFrameRateFromHead(byteArrayOf(0, 0, 0, 0)))
++    }
++}
+diff --git a/app/src/test/java/com/nuvio/tv/ui/screens/player/Vc1VideoFormatHeuristicsTest.kt b/app/src/test/java/com/nuvio/tv/ui/screens/player/Vc1VideoFormatHeuristicsTest.kt
+index e1a4d9b..6c907e2 100644
+--- a/app/src/test/java/com/nuvio/tv/ui/screens/player/Vc1VideoFormatHeuristicsTest.kt
++++ b/app/src/test/java/com/nuvio/tv/ui/screens/player/Vc1VideoFormatHeuristicsTest.kt
+@@ -149,4 +149,12 @@ class Vc1VideoFormatHeuristicsTest {
+             )
+         )
+     }
++    @Test
++    fun knownVc1DoesNotHijackNetworkParserAudioOrDrmErrors() {
++        for (code in listOf(2000, 2004, 3001, 5001, 6006)) {
++            val error = PlaybackException("VC-1 source failed", null, code)
++            assertFalse(Vc1VideoFormatHeuristics.isVc1PlaybackFailure(error, true, "Movie.VC-1.mkv"))
++        }
++    }
++
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/core/logging/UrlRedaction.kt b/app/src/main/java/com/nuvio/tv/core/logging/UrlRedaction.kt
+new file mode 100644
+index 00000000..dce6325a
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/logging/UrlRedaction.kt
+@@ -0,0 +1,40 @@
++package com.nuvio.tv.core.logging
++
++private val CREDENTIAL_PARAMETERS = listOf("api_key", "apikey", "token", "secret", "x-emby-token", "x-mediabrowser-token")
++private val SERVER_KEY_PARAMETERS = setOf("api_key", "apikey")
++
++private val URL_CREDENTIAL = Regex(
++    """([?&](?:${CREDENTIAL_PARAMETERS.joinToString("|")})=)[^&#\s"']*""",
++    RegexOption.IGNORE_CASE
++)
++
++/** Masks access tokens carried in URL query strings, keeping the rest of the text readable. */
++fun String.redactUrlCredentials(): String =
++    URL_CREDENTIAL.replace(this) { match -> match.groupValues[1] + "REDACTED" }
++
++fun String?.redactedUrlForLog(): String = this?.redactUrlCredentials() ?: "(null)"
++
++/** Drops access token parameters from a single URL, keeping the other parameters and any fragment. */
++fun String.withoutUrlCredentials(): String = filterQuery { name -> name.lowercase() !in CREDENTIAL_PARAMETERS }
++
++/** The URL to keep for diagnostics: media server streams lose their token, other links stay as they are. */
++fun String.diagnosticStreamUrl(isServerStream: Boolean): String {
++    val carriesServerKey = queryParameterNames().any { it.lowercase() in SERVER_KEY_PARAMETERS }
++    return if (isServerStream || carriesServerKey) withoutUrlCredentials() else this
++}
++
++private fun String.queryParameterNames(): List<String> {
++    val queryStart = indexOf('?').takeIf { it >= 0 } ?: return emptyList()
++    val fragmentStart = indexOf('#', queryStart).takeIf { it >= 0 } ?: length
++    return substring(queryStart + 1, fragmentStart).split('&').map { it.substringBefore('=') }
++}
++
++private fun String.filterQuery(keep: (String) -> Boolean): String {
++    val queryStart = indexOf('?').takeIf { it >= 0 } ?: return this
++    val fragmentStart = indexOf('#', queryStart).takeIf { it >= 0 } ?: length
++    val kept = substring(queryStart + 1, fragmentStart)
++        .split('&')
++        .filter { it.isNotEmpty() && keep(it.substringBefore('=')) }
++    val query = if (kept.isEmpty()) "" else kept.joinToString("&", prefix = "?")
++    return substring(0, queryStart) + query + substring(fragmentStart)
++}
