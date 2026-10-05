@@ -1,0 +1,451 @@
+diff --git a/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt b/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
+index 6a6d174..d2b0159 100644
+--- a/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
++++ b/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
+@@ -141,6 +141,7 @@ data class SubtitleStyleSettings(
+     val preferredLanguage: String = "en",
+     val isPreferredLanguageSystemDefault: Boolean = true,
+     val secondaryPreferredLanguage: String? = null,
++    val tertiaryPreferredLanguage: String? = null,
+     val useForcedSubtitles: Boolean = true,
+     val showOnlyPreferredLanguages: Boolean = false,
+     val stripSdh: Boolean = true,
+@@ -575,6 +576,7 @@ class PlayerSettingsDataStore @Inject constructor(
+     // Subtitle style keys
+     private val subtitlePreferredLanguageKey = stringPreferencesKey("subtitle_preferred_language")
+     private val subtitleSecondaryLanguageKey = stringPreferencesKey("subtitle_secondary_language")
++    private val subtitleTertiaryLanguageKey = stringPreferencesKey("subtitle_tertiary_language")
+     private val subtitleUseForcedSubtitlesKey = booleanPreferencesKey("subtitle_use_forced_subtitles")
+     private val subtitleShowOnlyPreferredLanguagesKey = booleanPreferencesKey("subtitle_show_only_preferred_languages")
+     private val subtitleStripSdhKey = booleanPreferencesKey("subtitle_strip_sdh")
+@@ -814,10 +816,21 @@ class PlayerSettingsDataStore @Inject constructor(
+                 }
+             }
+ 
++            val tertiarySubtitleLanguage = prefs[subtitleTertiaryLanguageKey]
++            if (tertiarySubtitleLanguage != null) {
++                val normalizedTertiarySubtitleLanguage =
++                    normalizeSelectableLanguageCode(tertiarySubtitleLanguage)
++                if (normalizedTertiarySubtitleLanguage != tertiarySubtitleLanguage) {
++                    prefs[subtitleTertiaryLanguageKey] = normalizedTertiarySubtitleLanguage
++                }
++            }
++
+             val normalizedPreferredSubtitleLanguage =
+                 preferredSubtitleLanguage?.let(::normalizeSelectableLanguageCode)
+             val normalizedSecondarySubtitleLanguage =
+                 secondarySubtitleLanguage?.let(::normalizeSelectableLanguageCode)
++            val normalizedTertiarySubtitleLanguage =
++                tertiarySubtitleLanguage?.let(::normalizeSelectableLanguageCode)
+             when {
+                 normalizedPreferredSubtitleLanguage == SUBTITLE_LANGUAGE_FORCED -> {
+                     prefs[subtitleUseForcedSubtitlesKey] = true
+@@ -831,6 +844,10 @@ class PlayerSettingsDataStore @Inject constructor(
+                     prefs[subtitleUseForcedSubtitlesKey] = true
+                     prefs.remove(subtitleSecondaryLanguageKey)
+                 }
++                normalizedTertiarySubtitleLanguage == SUBTITLE_LANGUAGE_FORCED -> {
++                    prefs[subtitleUseForcedSubtitlesKey] = true
++                    prefs.remove(subtitleTertiaryLanguageKey)
++                }
+             }
+         }
+     }
+@@ -1009,9 +1026,13 @@ class PlayerSettingsDataStore @Inject constructor(
+                         secondaryPreferredLanguage = prefs[subtitleSecondaryLanguageKey]
+                             ?.let(::normalizeSelectableLanguageCode)
+                             ?.takeUnless { it == SUBTITLE_LANGUAGE_FORCED },
++                        tertiaryPreferredLanguage = prefs[subtitleTertiaryLanguageKey]
++                            ?.let(::normalizeSelectableLanguageCode)
++                            ?.takeUnless { it == SUBTITLE_LANGUAGE_FORCED },
+                         useForcedSubtitles = (prefs[subtitleUseForcedSubtitlesKey] ?: false) ||
+                             prefs[subtitlePreferredLanguageKey]?.let(::normalizeSelectableLanguageCode) == SUBTITLE_LANGUAGE_FORCED ||
+-                            prefs[subtitleSecondaryLanguageKey]?.let(::normalizeSelectableLanguageCode) == SUBTITLE_LANGUAGE_FORCED,
++                            prefs[subtitleSecondaryLanguageKey]?.let(::normalizeSelectableLanguageCode) == SUBTITLE_LANGUAGE_FORCED ||
++                            prefs[subtitleTertiaryLanguageKey]?.let(::normalizeSelectableLanguageCode) == SUBTITLE_LANGUAGE_FORCED,
+                         showOnlyPreferredLanguages = prefs[subtitleShowOnlyPreferredLanguagesKey] ?: false,
+                         stripSdh = prefs[subtitleStripSdhKey] ?: false,
+                         size = prefs[subtitleSizeKey] ?: 100,
+@@ -1558,6 +1579,13 @@ class PlayerSettingsDataStore @Inject constructor(
+             else prefs.remove(subtitleSecondaryLanguageKey)
+         }
+     }
++    suspend fun setSubtitleTertiaryLanguage(language: String?) {
++        store().edit { prefs ->
++            val normalizedLanguage = language?.takeIf { it.isNotBlank() }?.let(::normalizeSelectableLanguageCode)
++            if (normalizedLanguage != null) prefs[subtitleTertiaryLanguageKey] = normalizedLanguage
++            else prefs.remove(subtitleTertiaryLanguageKey)
++        }
++    }
+     suspend fun setSubtitleSize(size: Int) { store().edit { it[subtitleSizeKey] = size.coerceIn(50, 200) } }
+     suspend fun setSubtitleVerticalOffset(offset: Int) { store().edit { it[subtitleVerticalOffsetKey] = offset.coerceIn(-20, 50) } }
+     suspend fun setSubtitleBold(bold: Boolean) { store().edit { it[subtitleBoldKey] = bold } }
+diff --git a/app/src/main/java/com/nuvio/tv/data/remote/dto/PlaybackIssueReportDto.kt b/app/src/main/java/com/nuvio/tv/data/remote/dto/PlaybackIssueReportDto.kt
+index 41631db..ddc2dbb 100644
+--- a/app/src/main/java/com/nuvio/tv/data/remote/dto/PlaybackIssueReportDto.kt
++++ b/app/src/main/java/com/nuvio/tv/data/remote/dto/PlaybackIssueReportDto.kt
+@@ -187,6 +187,7 @@ data class PlaybackIssuePlaybackSettingsDto(
+     @Json(name = "secondaryPreferredAudioLanguage") val secondaryPreferredAudioLanguage: String?,
+     @Json(name = "preferredSubtitleLanguage") val preferredSubtitleLanguage: String,
+     @Json(name = "secondaryPreferredSubtitleLanguage") val secondaryPreferredSubtitleLanguage: String?,
++    @Json(name = "tertiaryPreferredSubtitleLanguage") val tertiaryPreferredSubtitleLanguage: String? = null,
+     @Json(name = "useForcedSubtitles") val useForcedSubtitles: Boolean,
+     @Json(name = "showOnlyPreferredSubtitleLanguages") val showOnlyPreferredSubtitleLanguages: Boolean,
+     @Json(name = "useLibass") val useLibass: Boolean,
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/PlaybackIssueReportRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/PlaybackIssueReportRepository.kt
+index fd10096..c87fbdb 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/PlaybackIssueReportRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/PlaybackIssueReportRepository.kt
+@@ -131,6 +131,7 @@ data class PlaybackIssuePlaybackSettingsInput(
+     val secondaryPreferredAudioLanguage: String?,
+     val preferredSubtitleLanguage: String,
+     val secondaryPreferredSubtitleLanguage: String?,
++    val tertiaryPreferredSubtitleLanguage: String? = null,
+     val useForcedSubtitles: Boolean,
+     val showOnlyPreferredSubtitleLanguages: Boolean,
+     val useLibass: Boolean,
+@@ -374,6 +375,7 @@ class PlaybackIssueReportRepository @Inject constructor(
+             secondaryPreferredAudioLanguage = secondaryPreferredAudioLanguage.cleanText(40),
+             preferredSubtitleLanguage = preferredSubtitleLanguage.limit(40),
+             secondaryPreferredSubtitleLanguage = secondaryPreferredSubtitleLanguage.cleanText(40),
++            tertiaryPreferredSubtitleLanguage = tertiaryPreferredSubtitleLanguage.cleanText(40),
+             useForcedSubtitles = useForcedSubtitles,
+             showOnlyPreferredSubtitleLanguages = showOnlyPreferredSubtitleLanguages,
+             useLibass = useLibass,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioMpvSurfaceView.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioMpvSurfaceView.kt
+index 04b7ec4..0628a74 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioMpvSurfaceView.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioMpvSurfaceView.kt
+@@ -539,11 +539,12 @@ class NuvioMpvSurfaceView @JvmOverloads constructor(
+         }
+     }
+ 
+-    fun applySubtitleLanguagePreferences(preferred: String, secondary: String?) {
++    fun applySubtitleLanguagePreferences(preferred: String, secondary: String?, tertiary: String? = null) {
+         if (!initialized) return
+         val languages = listOfNotNull(
+             preferred.takeIf { it.isNotBlank() && !it.equals("none", ignoreCase = true) },
+-            secondary?.takeIf { it.isNotBlank() && !it.equals("none", ignoreCase = true) }
++            secondary?.takeIf { it.isNotBlank() && !it.equals("none", ignoreCase = true) },
++            tertiary?.takeIf { it.isNotBlank() && !it.equals("none", ignoreCase = true) }
+         )
+         if (languages.isEmpty()) {
+             disableSubtitles()
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
+index 3a6b9b2..d0a7cb8 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
+@@ -516,6 +516,7 @@ class PlayerRuntimeController(
+     internal var isUserExplicitSubtitleSelection: Boolean = false
+     internal var lastSubtitlePreferredLanguage: String? = null
+     internal var lastSubtitleSecondaryLanguage: String? = null
++    internal var lastSubtitleTertiaryLanguage: String? = null
+     internal var lastUseForcedSubtitles: Boolean? = null
+     internal var pendingAddonSubtitleLanguage: String? = null
+     internal var pendingAddonSubtitleTrackId: String? = null
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+index c19816f..b68a53b 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+@@ -1047,7 +1047,8 @@ internal fun PlayerRuntimeController.initializePlayer(
+ 
+                 val preferred = playerSettings.subtitleStyle.preferredLanguage
+                 val secondary = playerSettings.subtitleStyle.secondaryPreferredLanguage
+-                applySubtitlePreferences(preferred, secondary)
++                val tertiary = playerSettings.subtitleStyle.tertiaryPreferredLanguage
++                applySubtitlePreferences(preferred, secondary, tertiary)
+                 applyStartupSubtitlePreparation(startupSubtitlePreparation)
+                 val startupSubtitleConfigurations = buildStartupSubtitleConfigurations(startupSubtitlePreparation)
+                 val initialResumePosition = resolvePendingInitialResumePosition()
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerMpv.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerMpv.kt
+index ab11dd3..380906b 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerMpv.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerMpv.kt
+@@ -32,7 +32,8 @@ internal fun PlayerRuntimeController.attachMpvView(view: NuvioMpvSurfaceView?) {
+         view.applyAudioLanguagePreferences(mpvPreferredAudioLanguages)
+         view.applySubtitleLanguagePreferences(
+             preferred = _uiState.value.subtitleStyle.preferredLanguage,
+-            secondary = _uiState.value.subtitleStyle.secondaryPreferredLanguage
++            secondary = _uiState.value.subtitleStyle.secondaryPreferredLanguage,
++            tertiary = _uiState.value.subtitleStyle.tertiaryPreferredLanguage
+         )
+         view.applySubtitleStyle(_uiState.value.subtitleStyle)
+         view.setSubtitleDelayMs(_uiState.value.subtitleDelayMs)
+@@ -149,7 +150,8 @@ internal fun PlayerRuntimeController.initializeMpvPlayer(
+         view.applyAudioLanguagePreferences(mpvPreferredAudioLanguages)
+         view.applySubtitleLanguagePreferences(
+             preferred = _uiState.value.subtitleStyle.preferredLanguage,
+-            secondary = _uiState.value.subtitleStyle.secondaryPreferredLanguage
++            secondary = _uiState.value.subtitleStyle.secondaryPreferredLanguage,
++            tertiary = _uiState.value.subtitleStyle.tertiaryPreferredLanguage
+         )
+         view.applySubtitleStyle(_uiState.value.subtitleStyle)
+         view.setSubtitleDelayMs(_uiState.value.subtitleDelayMs)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerObservers.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerObservers.kt
+index 850ad85..1abc1af 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerObservers.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerObservers.kt
+@@ -232,6 +232,7 @@ internal fun PlayerRuntimeController.filterToVisibleAddonSubtitles(
+     val preferredTargets = when (PlayerSubtitleUtils.normalizeLanguageCode(style.preferredLanguage)) {
+         "none" -> listOfNotNull(
+             style.secondaryPreferredLanguage?.takeIf { it.isNotBlank() },
++            style.tertiaryPreferredLanguage?.takeIf { it.isNotBlank() },
+             if (style.useForcedSubtitles) {
+                 selectedAudioTrackForSubtitleMatching(_uiState.value)
+                     ?.takeIf { selectedAudioMatchesResolvedPreferredAudio(it) }
+@@ -242,7 +243,8 @@ internal fun PlayerRuntimeController.filterToVisibleAddonSubtitles(
+         )
+         else -> listOfNotNull(
+             style.preferredLanguage,
+-            style.secondaryPreferredLanguage?.takeIf { it.isNotBlank() }
++            style.secondaryPreferredLanguage?.takeIf { it.isNotBlank() },
++            style.tertiaryPreferredLanguage?.takeIf { it.isNotBlank() }
+         )
+     }.map { PlayerSubtitleUtils.normalizeLanguageCode(it) }
+         .distinct()
+@@ -438,16 +440,19 @@ internal fun PlayerRuntimeController.observeSubtitleSettings() {
+ 
+             applySubtitlePreferences(
+                 settings.subtitleStyle.preferredLanguage,
+-                settings.subtitleStyle.secondaryPreferredLanguage
++                settings.subtitleStyle.secondaryPreferredLanguage,
++                settings.subtitleStyle.tertiaryPreferredLanguage
+             )
+             val subtitlePreferenceChanged =
+                 lastSubtitlePreferredLanguage != settings.subtitleStyle.preferredLanguage ||
+                     lastSubtitleSecondaryLanguage != settings.subtitleStyle.secondaryPreferredLanguage ||
++                    lastSubtitleTertiaryLanguage != settings.subtitleStyle.tertiaryPreferredLanguage ||
+                     lastUseForcedSubtitles != settings.subtitleStyle.useForcedSubtitles
+             if (subtitlePreferenceChanged) {
+                 if (!subtitleDisabledByPersistedPreference && !subtitleAddonRestoredByPersistedPreference) autoSubtitleSelected = false
+                 lastSubtitlePreferredLanguage = settings.subtitleStyle.preferredLanguage
+                 lastSubtitleSecondaryLanguage = settings.subtitleStyle.secondaryPreferredLanguage
++                lastSubtitleTertiaryLanguage = settings.subtitleStyle.tertiaryPreferredLanguage
+                 lastUseForcedSubtitles = settings.subtitleStyle.useForcedSubtitles
+                 tryAutoSelectPreferredSubtitleFromAvailableTracks()
+             }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
+index dd2dcf1..64511e0 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
+@@ -537,6 +537,7 @@ private fun PlayerRuntimeController.buildPlaybackIssuePlaybackSettingsInput(): P
+         secondaryPreferredAudioLanguage = settings.secondaryPreferredAudioLanguage,
+         preferredSubtitleLanguage = settings.subtitleStyle.preferredLanguage,
+         secondaryPreferredSubtitleLanguage = settings.subtitleStyle.secondaryPreferredLanguage,
++        tertiaryPreferredSubtitleLanguage = settings.subtitleStyle.tertiaryPreferredLanguage,
+         useForcedSubtitles = settings.subtitleStyle.useForcedSubtitles,
+         showOnlyPreferredSubtitleLanguages = settings.subtitleStyle.showOnlyPreferredLanguages,
+         useLibass = settings.useLibass,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt
+index 214c6d6..18441f2 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt
+@@ -12,6 +12,7 @@ import androidx.media3.common.util.UnstableApi
+ import com.nuvio.tv.core.player.FrameRateUtils
+ import com.nuvio.tv.data.local.AVAILABLE_SUBTITLE_LANGUAGES
+ import com.nuvio.tv.data.local.InternalPlayerEngine
++import com.nuvio.tv.data.local.SubtitleStyleSettings
+ import com.nuvio.tv.domain.model.Subtitle
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.NonCancellable
+@@ -1187,11 +1188,15 @@ internal fun PlayerRuntimeController.applyPersistedTrackPreference(
+     }
+ }
+ 
+-internal fun PlayerRuntimeController.subtitleLanguageTargets(): List<String> {
+-    val preferred = _uiState.value.subtitleStyle.preferredLanguage.lowercase()
++internal fun PlayerRuntimeController.subtitleLanguageTargets(): List<String> =
++    subtitleLanguageTargets(_uiState.value.subtitleStyle)
++
++internal fun subtitleLanguageTargets(style: SubtitleStyleSettings): List<String> {
++    val preferred = style.preferredLanguage.lowercase()
+     if (preferred == "none") return emptyList()
+-    val secondary = _uiState.value.subtitleStyle.secondaryPreferredLanguage?.lowercase()
+-    return listOfNotNull(preferred, secondary)
++    val secondary = style.secondaryPreferredLanguage?.lowercase()
++    val tertiary = style.tertiaryPreferredLanguage?.lowercase()
++    return listOfNotNull(preferred, secondary, tertiary)
+ }
+ 
+ internal fun PlayerRuntimeController.findBestInternalSubtitleTrackIndex(
+@@ -1683,11 +1688,12 @@ internal fun PlayerRuntimeController.tryAutoSelectPreferredSubtitleFromAvailable
+             )
+             return
+         }
+-        // If internal match is secondary and a primary addon match exists, prefer the addon.
++        // If an addon matches a language ranked above the internal match, prefer the addon.
+         if (matchedTargetPosition > 0 && addonSubtitlesLoaded) {
+-            val primaryTarget = targets.first()
+-            val primaryAddonMatch = state.addonSubtitles.firstOrNull { subtitle ->
+-                PlayerSubtitleUtils.matchesLanguageCode(subtitle.lang, primaryTarget)
++            val primaryAddonMatch = targets.take(matchedTargetPosition).firstNotNullOfOrNull { higherTarget ->
++                state.addonSubtitles.firstOrNull { subtitle ->
++                    PlayerSubtitleUtils.matchesLanguageCode(subtitle.lang, higherTarget)
++                }
+             }
+             if (primaryAddonMatch != null) {
+                 autoSubtitleSelected = true
+@@ -1892,10 +1898,14 @@ internal fun PlayerRuntimeController.startFrameRateProbe(
+     }
+ }
+ 
+-internal fun PlayerRuntimeController.applySubtitlePreferences(preferred: String, secondary: String?) {
++internal fun PlayerRuntimeController.applySubtitlePreferences(
++    preferred: String,
++    secondary: String?,
++    tertiary: String? = null
++) {
+     if (isUserExplicitSubtitleSelection) return
+     if (isUsingMpvEngine()) {
+-        mpvView?.applySubtitleLanguagePreferences(preferred, secondary)
++        mpvView?.applySubtitleLanguagePreferences(preferred, secondary, tertiary)
+         if (preferred == "none") {
+             mpvView?.disableSubtitles()
+             _uiState.update {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/SubtitleSelectionOverlay.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/SubtitleSelectionOverlay.kt
+index 52bc374..3634005 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/SubtitleSelectionOverlay.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/SubtitleSelectionOverlay.kt
+@@ -122,6 +122,7 @@ internal fun SubtitleSelectionOverlay(
+     var persistedStyleFocusKey by rememberSaveable { mutableStateOf<String?>(null) }
+     val sessionPreferredLanguage = remember(visible) { subtitleStyle.preferredLanguage }
+     val sessionSecondaryPreferredLanguage = remember(visible) { subtitleStyle.secondaryPreferredLanguage }
++    val sessionTertiaryPreferredLanguage = remember(visible) { subtitleStyle.tertiaryPreferredLanguage }
+     val sessionShowOnlyPreferredLanguages = remember(visible) { subtitleStyle.showOnlyPreferredLanguages }
+     val sessionSelectedInternalIndex = remember(visible) { selectedInternalIndex }
+     val sessionInternalTracks = remember(visible) { internalTracks.map(TrackInfo::copy) }
+@@ -142,6 +143,7 @@ internal fun SubtitleSelectionOverlay(
+             addonSubtitles = sessionAddonSubtitles,
+             preferredLanguage = sessionPreferredLanguage,
+             secondaryPreferredLanguage = sessionSecondaryPreferredLanguage,
++            tertiaryPreferredLanguage = sessionTertiaryPreferredLanguage,
+             showOnlyPreferredLanguages = sessionShowOnlyPreferredLanguages,
+             currentLanguageKey = sessionSelectedSubtitleLanguageKey,
+             noneLabel = noneLabel,
+@@ -1778,6 +1780,7 @@ private fun buildSubtitleLanguageRailItems(
+     addonSubtitles: List<Subtitle>,
+     preferredLanguage: String,
+     secondaryPreferredLanguage: String?,
++    tertiaryPreferredLanguage: String?,
+     showOnlyPreferredLanguages: Boolean,
+     currentLanguageKey: String,
+     noneLabel: String,
+@@ -1795,7 +1798,8 @@ private fun buildSubtitleLanguageRailItems(
+ 
+     val preferredOrder = preferredOverlayLanguageOrder(
+         preferredLanguage = preferredLanguage,
+-        secondaryPreferredLanguage = secondaryPreferredLanguage
++        secondaryPreferredLanguage = secondaryPreferredLanguage,
++        tertiaryPreferredLanguage = tertiaryPreferredLanguage
+     )
+ 
+     val languageEntries = if (showOnlyPreferredLanguages) {
+@@ -1836,7 +1840,8 @@ private fun buildSubtitleLanguageRailItems(
+ 
+ private fun preferredOverlayLanguageOrder(
+     preferredLanguage: String,
+-    secondaryPreferredLanguage: String?
++    secondaryPreferredLanguage: String?,
++    tertiaryPreferredLanguage: String?
+ ): List<String> {
+     fun toOverlayLanguageKey(language: String?): String? {
+         if (language.isNullOrBlank()) return null
+@@ -1848,7 +1853,8 @@ private fun preferredOverlayLanguageOrder(
+ 
+     return listOfNotNull(
+         toOverlayLanguageKey(preferredLanguage),
+-        toOverlayLanguageKey(secondaryPreferredLanguage)
++        toOverlayLanguageKey(secondaryPreferredLanguage),
++        toOverlayLanguageKey(tertiaryPreferredLanguage)
+     ).distinct()
+ }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSettingsModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSettingsModel.kt
+index 107cd4f..7b48772 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSettingsModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSettingsModel.kt
+@@ -65,6 +65,7 @@ internal enum class PlaybackDialog {
+     AUDIO_OUTPUT_CHANNELS,
+     SUBTITLE_LANGUAGE,
+     SECONDARY_SUBTITLE_LANGUAGE,
++    TERTIARY_SUBTITLE_LANGUAGE,
+     SUBTITLE_TEXT_COLOR,
+     SUBTITLE_BACKGROUND_COLOR,
+     SUBTITLE_OUTLINE_COLOR,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSettingsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSettingsViewModel.kt
+index 437ba77..b7f0507 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSettingsViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSettingsViewModel.kt
+@@ -254,6 +254,10 @@ class PlaybackSettingsViewModel @Inject constructor(
+         playerSettingsDataStore.setSubtitleSecondaryLanguage(language)
+     }
+ 
++    suspend fun setSubtitleTertiaryLanguage(language: String?) {
++        playerSettingsDataStore.setSubtitleTertiaryLanguage(language)
++    }
++
+     suspend fun setUseForcedSubtitles(enabled: Boolean) {
+         playerSettingsDataStore.setUseForcedSubtitles(enabled)
+     }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSubtitleSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSubtitleSettings.kt
+index b800537..53bad0e 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSubtitleSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSubtitleSettings.kt
+@@ -68,6 +68,15 @@ internal fun PlaybackSubtitlesSection(
+         enabled = languageSelectionEnabled,
+         onClick = { onOpenDialog(PlaybackDialog.SECONDARY_SUBTITLE_LANGUAGE) }
+     )
++    SettingsActionRow(
++        title = stringResource(R.string.sub_tertiary_lang),
++        subtitle = null,
++        value = style.tertiaryPreferredLanguage
++            ?.let { code -> AVAILABLE_SUBTITLE_LANGUAGES.find { it.code == code }?.displayName }
++            ?: stringResource(R.string.sub_not_set),
++        enabled = languageSelectionEnabled,
++        onClick = { onOpenDialog(PlaybackDialog.TERTIARY_SUBTITLE_LANGUAGE) }
++    )
+     autoSyncSettingsItems(enabled = enabled) // AutoSync hook
+ 
+     SettingsToggleRow(
+@@ -238,6 +247,16 @@ internal fun SubtitleSettingsDialogs(
+             },
+             onDismiss = onDismiss
+         )
++        PlaybackDialog.TERTIARY_SUBTITLE_LANGUAGE -> LanguageSelectionDialog(
++            title = stringResource(R.string.sub_tertiary_lang),
++            selectedLanguage = style.tertiaryPreferredLanguage,
++            showNoneOption = true,
++            onLanguageSelected = { language ->
++                onUpdate { setSubtitleTertiaryLanguage(language) }
++                onDismiss()
++            },
++            onDismiss = onDismiss
++        )
+         PlaybackDialog.SUBTITLE_TEXT_COLOR -> ColorSelectionDialog(
+             title = stringResource(R.string.sub_text_color),
+             colors = subtitleColors,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
+index 55fc075..99ca958 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
+@@ -1750,6 +1750,8 @@ class StreamScreenViewModel @Inject constructor(
+         val preferredLanguages = listOfNotNull(
+             preferred,
+             settings.subtitleStyle.secondaryPreferredLanguage?.trim()?.lowercase()
++                ?.takeIf { it != "none" && it.isNotBlank() },
++            settings.subtitleStyle.tertiaryPreferredLanguage?.trim()?.lowercase()
+                 ?.takeIf { it != "none" && it.isNotBlank() }
+         ).distinct()
+ 
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index ff8441a..ddab77d 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -875,6 +875,7 @@
+     <string name="sub_forced_lang">Forced</string>
+     <string name="sub_preferred_lang">Preferred Language</string>
+     <string name="sub_secondary_lang">Secondary Preferred Language</string>
++    <string name="sub_tertiary_lang">Third Preferred Language</string>
+     <string name="sub_use_forced_subtitles">Use Forced Subtitles</string>
+     <string name="sub_use_forced_subtitles_desc">Prefer forced subtitles when audio matches subtitle language; if unavailable, select nothing</string>
+     <string name="sub_show_only_preferred_languages">Show Only Preferred Languages</string>
