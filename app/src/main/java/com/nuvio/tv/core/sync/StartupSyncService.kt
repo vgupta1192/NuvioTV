@@ -34,6 +34,8 @@ private const val FULL_STARTUP_PULL_TTL_MS = 6 * 60 * 60 * 1000L
 private const val FOREGROUND_ACTIVITY_PULL_DELAY_MS = 2_500L
 private const val FOREGROUND_ACTIVITY_PULL_MIN_INTERVAL_MS = 2 * 60_000L
 private const val PERIODIC_SURFACE_PULL_INTERVAL_MS = 15 * 60_000L
+// Self-host fork patch: re-read addon manifests on foreground / periodic pulls when older than this
+private const val AUTO_MANIFEST_REFRESH_MAX_AGE_MS = 30 * 60_000L
 
 internal data class SurfacePullFreshness(
     val key: String? = null,
@@ -128,6 +130,7 @@ class StartupSyncService @Inject constructor(
             while (true) {
                 delay(PERIODIC_SURFACE_PULL_INTERVAL_MS)
                 scheduleActivityPull(reason = "periodic")
+                refreshAddonManifests(AUTO_MANIFEST_REFRESH_MAX_AGE_MS)
             }
         }
     }
@@ -159,6 +162,21 @@ class StartupSyncService @Inject constructor(
             delayMs = FOREGROUND_ACTIVITY_PULL_DELAY_MS,
             minIntervalMs = FOREGROUND_ACTIVITY_PULL_MIN_INTERVAL_MS
         )
+        scope.launch {
+            delay(FOREGROUND_ACTIVITY_PULL_DELAY_MS)
+            refreshAddonManifests(AUTO_MANIFEST_REFRESH_MAX_AGE_MS)
+        }
+    }
+
+    /** Self-host fork patch: new addon versions reach a running app (see refreshInstalledManifests). */
+    private suspend fun refreshAddonManifests(maxAgeMs: Long) {
+        try {
+            addonRepository.refreshInstalledManifests(maxAgeMs)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Addon manifest refresh failed", e)
+        }
     }
 
     private val _manualAddonRefreshes = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
@@ -186,6 +204,9 @@ class StartupSyncService @Inject constructor(
                 Log.e(TAG, "Manual addon sync failed for profile $profileId", e)
             } finally {
                 addonRepository.isSyncingFromRemote = false
+                // Self-host fork patch: the refresh also re-reads every addon manifest, so new
+                // addon versions at an unchanged URL load without restarting the app.
+                refreshAddonManifests(maxAgeMs = 0L)
                 // The user asked for a refresh, so let screens holding catalogs re-request them
                 // even when the addon list itself came back unchanged.
                 _manualAddonRefreshes.tryEmit(Unit)

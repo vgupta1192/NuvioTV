@@ -11,6 +11,7 @@ import com.nuvio.tv.domain.model.Collection
 import com.nuvio.tv.domain.model.HomeLayout
 import com.nuvio.tv.domain.model.catalogRowStableKey
 import com.nuvio.tv.domain.model.enabledAddons
+import com.nuvio.tv.domain.model.withoutLiveTvCatalogs
 import com.nuvio.tv.domain.model.legacyKey
 import com.nuvio.tv.domain.model.mergeCatalogPage
 import com.nuvio.tv.domain.model.nextCatalogSkip
@@ -132,7 +133,8 @@ internal fun HomeViewModel.observeInstalledAddonsPipeline() {
         addonRepository.getInstalledAddons()
             .distinctUntilChanged()
             .collectLatest { installedAddons ->
-                val addons = installedAddons.enabledAddons()
+                // Live TV catalogs belong on the Live TV screen only.
+                val addons = installedAddons.enabledAddons().withoutLiveTvCatalogs()
                 addonsCache = addons
                 loadAllCatalogsPipeline(addons)
             }

@@ -1750,6 +1750,8 @@ class StreamScreenViewModel @Inject constructor(
         val preferredLanguages = listOfNotNull(
             preferred,
             settings.subtitleStyle.secondaryPreferredLanguage?.trim()?.lowercase()
+                ?.takeIf { it != "none" && it.isNotBlank() },
+            settings.subtitleStyle.tertiaryPreferredLanguage?.trim()?.lowercase()
                 ?.takeIf { it != "none" && it.isNotBlank() }
         ).distinct()
 
