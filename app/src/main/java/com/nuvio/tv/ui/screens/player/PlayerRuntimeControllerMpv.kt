@@ -32,7 +32,8 @@ internal fun PlayerRuntimeController.attachMpvView(view: NuvioMpvSurfaceView?) {
         view.applyAudioLanguagePreferences(mpvPreferredAudioLanguages)
         view.applySubtitleLanguagePreferences(
             preferred = _uiState.value.subtitleStyle.preferredLanguage,
-            secondary = _uiState.value.subtitleStyle.secondaryPreferredLanguage
+            secondary = _uiState.value.subtitleStyle.secondaryPreferredLanguage,
+            tertiary = _uiState.value.subtitleStyle.tertiaryPreferredLanguage
         )
         view.applySubtitleStyle(_uiState.value.subtitleStyle)
         view.setSubtitleDelayMs(_uiState.value.subtitleDelayMs)
@@ -149,7 +150,8 @@ internal fun PlayerRuntimeController.initializeMpvPlayer(
         view.applyAudioLanguagePreferences(mpvPreferredAudioLanguages)
         view.applySubtitleLanguagePreferences(
             preferred = _uiState.value.subtitleStyle.preferredLanguage,
-            secondary = _uiState.value.subtitleStyle.secondaryPreferredLanguage
+            secondary = _uiState.value.subtitleStyle.secondaryPreferredLanguage,
+            tertiary = _uiState.value.subtitleStyle.tertiaryPreferredLanguage
         )
         view.applySubtitleStyle(_uiState.value.subtitleStyle)
         view.setSubtitleDelayMs(_uiState.value.subtitleDelayMs)

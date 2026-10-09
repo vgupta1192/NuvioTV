@@ -52,6 +52,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.rounded.Tv
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
@@ -355,6 +356,17 @@ open class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         isFirstResumeAfterCreate = true
         window?.setBackgroundDrawable(ColorDrawable(android.graphics.Color.TRANSPARENT))
+
+        // Jellyfin fork feature: storage init + per-profile hidden libraries. The provider is
+        // wired BEFORE initialize so the persisted session loads the right profile's hidden set,
+        // and the flow keeps the repository in sync across profile switches.
+        com.nuvio.tv.data.repository.JellyfinRepository.profileIdProvider = { profileManager.activeProfileId.value }
+        com.nuvio.tv.data.repository.JellyfinRepository.initialize(applicationContext)
+        lifecycleScope.launch {
+            profileManager.activeProfileId.collect {
+                com.nuvio.tv.data.repository.JellyfinRepository.applyProfile(it)
+            }
+        }
 
         // Wire the Activity-level launcher to the tracker
         externalPlaybackTracker.activityLauncher = externalPlayerLauncher
@@ -1024,6 +1036,8 @@ open class MainActivity : ComponentActivity() {
                     val rootRoutes = remember(discoverLocation) {
                         buildSet {
                             add(Screen.Home.route)
+                            add(Screen.TvChannels.route)
+                            add(Screen.Jellyfin.route)
                             add(Screen.Search.route)
                             add(Screen.Library.route)
                             add(Screen.Settings.route)
@@ -1035,12 +1049,15 @@ open class MainActivity : ComponentActivity() {
 
                     val strNavHome = stringResource(R.string.nav_home)
                     val strNavDiscover = stringResource(R.string.nav_discover)
+                    val strNavTvChannels = stringResource(R.string.nav_tv_channels)
+                    val strNavJellyfin = "Jellyfin"
                     val strNavSearch = stringResource(R.string.nav_search)
                     val strNavLibrary = stringResource(R.string.nav_library)
                     val strNavSettings = stringResource(R.string.nav_settings)
                     val drawerItems = remember(
                         strNavHome,
                         strNavDiscover,
+                        strNavTvChannels,
                         strNavSearch,
                         strNavLibrary,
                         strNavSettings,
@@ -1063,6 +1080,21 @@ open class MainActivity : ComponentActivity() {
                                     )
                                 )
                             }
+                            add(
+                                DrawerItem(
+                                    route = Screen.TvChannels.route,
+                                    label = strNavTvChannels,
+                                    icon = Icons.Rounded.Tv,
+                                    iconRes = R.raw.sidebar_tv_channels
+                                )
+                            )
+                            add(
+                                    DrawerItem(
+                                        route = Screen.Jellyfin.route,
+                                        label = strNavJellyfin,
+                                        iconRes = R.raw.sidebar_jellyfin
+                                    )
+                            )
                             add(
                                 DrawerItem(
                                     route = Screen.Search.route,

@@ -122,6 +122,7 @@ internal fun SubtitleSelectionOverlay(
     var persistedStyleFocusKey by rememberSaveable { mutableStateOf<String?>(null) }
     val sessionPreferredLanguage = remember(visible) { subtitleStyle.preferredLanguage }
     val sessionSecondaryPreferredLanguage = remember(visible) { subtitleStyle.secondaryPreferredLanguage }
+    val sessionTertiaryPreferredLanguage = remember(visible) { subtitleStyle.tertiaryPreferredLanguage }
     val sessionShowOnlyPreferredLanguages = remember(visible) { subtitleStyle.showOnlyPreferredLanguages }
     val sessionSelectedInternalIndex = remember(visible) { selectedInternalIndex }
     val sessionInternalTracks = remember(visible) { internalTracks.map(TrackInfo::copy) }
@@ -142,6 +143,7 @@ internal fun SubtitleSelectionOverlay(
             addonSubtitles = sessionAddonSubtitles,
             preferredLanguage = sessionPreferredLanguage,
             secondaryPreferredLanguage = sessionSecondaryPreferredLanguage,
+            tertiaryPreferredLanguage = sessionTertiaryPreferredLanguage,
             showOnlyPreferredLanguages = sessionShowOnlyPreferredLanguages,
             currentLanguageKey = sessionSelectedSubtitleLanguageKey,
             noneLabel = noneLabel,
@@ -1778,6 +1780,7 @@ private fun buildSubtitleLanguageRailItems(
     addonSubtitles: List<Subtitle>,
     preferredLanguage: String,
     secondaryPreferredLanguage: String?,
+    tertiaryPreferredLanguage: String?,
     showOnlyPreferredLanguages: Boolean,
     currentLanguageKey: String,
     noneLabel: String,
@@ -1795,7 +1798,8 @@ private fun buildSubtitleLanguageRailItems(
 
     val preferredOrder = preferredOverlayLanguageOrder(
         preferredLanguage = preferredLanguage,
-        secondaryPreferredLanguage = secondaryPreferredLanguage
+        secondaryPreferredLanguage = secondaryPreferredLanguage,
+        tertiaryPreferredLanguage = tertiaryPreferredLanguage
     )
 
     val languageEntries = if (showOnlyPreferredLanguages) {
@@ -1836,7 +1840,8 @@ private fun buildSubtitleLanguageRailItems(
 
 private fun preferredOverlayLanguageOrder(
     preferredLanguage: String,
-    secondaryPreferredLanguage: String?
+    secondaryPreferredLanguage: String?,
+    tertiaryPreferredLanguage: String?
 ): List<String> {
     fun toOverlayLanguageKey(language: String?): String? {
         if (language.isNullOrBlank()) return null
@@ -1848,7 +1853,8 @@ private fun preferredOverlayLanguageOrder(
 
     return listOfNotNull(
         toOverlayLanguageKey(preferredLanguage),
-        toOverlayLanguageKey(secondaryPreferredLanguage)
+        toOverlayLanguageKey(secondaryPreferredLanguage),
+        toOverlayLanguageKey(tertiaryPreferredLanguage)
     ).distinct()
 }
 

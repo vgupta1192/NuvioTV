@@ -295,6 +295,30 @@ class AddonRepositoryImpl(
 
     override fun getInstalledAddons(): Flow<List<Addon>> = installedAddonsFlow
 
+    /**
+     * Self-host fork patch: re-read the manifest of every enabled installed addon now, so a new
+     * addon version (same URL) shows up without restarting the app. The regular sweep above only
+     * runs when the addon list itself changes after the 6h TTL. With [maxAgeMs] > 0 nothing happens
+     * while the last sweep is younger than that; 0 always refreshes (the addon manager's refresh).
+     * Changed manifests go through fetchAddon -> putCachedManifestIfChanged, which bumps the cache
+     * revision, so installedAddonsFlow re-emits and screens reload catalogs.
+     */
+    suspend fun refreshInstalledManifests(maxAgeMs: Long = 0L): Unit = kotlinx.coroutines.withContext<Unit>(dispatcher) {
+        synchronized(manifestRefreshLock) {
+            if (manifestRefreshJob?.isActive == true) return@withContext
+            if (maxAgeMs > 0L && clock() - lastManifestRefreshAttemptTime <= maxAgeMs) return@withContext
+            lastManifestRefreshAttemptTime = clock()
+        }
+        val enabledByUrl = preferences.addonEnabledStates.first().mapKeys { (url, _) -> canonicalizeUrl(url) }
+        val urls = preferences.installedAddonUrls.first()
+            .map { canonicalizeUrl(it) }
+            .distinct()
+            .filter { enabledByUrl[it] ?: true }
+        if (urls.isEmpty()) return@withContext
+        val results = coroutineScope { urls.map { url -> async { fetchAddon(url) } }.awaitAll() }
+        Log.d(TAG, "Manifest refresh: ${results.count { it is NetworkResult.Success }}/${urls.size} addon(s) re-read")
+    }
+
     override suspend fun fetchAddon(baseUrl: String): NetworkResult<Addon> {
         val cleanBaseUrl = canonicalizeUrl(baseUrl)
         val queryStart = cleanBaseUrl.indexOf('?')

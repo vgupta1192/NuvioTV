@@ -148,14 +148,17 @@ android {
         buildConfigField("String", "SENTRY_DSN", buildConfigString(sentryDsn))
 
         // In-app updater (GitHub Releases)
-        buildConfigField("String", "GITHUB_OWNER", "\"NuvioMedia\"")
+        // Self-host fork patch: update from the fork's CI releases; FORK_BUILD = CI run number
+        buildConfigField("String", "GITHUB_OWNER", "\"vgupta1192\"")
         buildConfigField("String", "GITHUB_REPO", "\"NuvioTV\"")
+        buildConfigField("int", "FORK_BUILD", (env("FORK_BUILD")?.toIntOrNull() ?: 0).toString())
     }
 
     flavorDimensions += "distribution"
     productFlavors {
         create("full") {
             dimension = "distribution"
+            applicationIdSuffix = ".jellyfintv"
             buildConfigField("boolean", "FEATURE_PLUGINS_ENABLED", "true")
             buildConfigField("boolean", "FEATURE_IN_APP_UPDATES_ENABLED", "true")
             buildConfigField("boolean", "FEATURE_IN_APP_TRAILERS_ENABLED", "true")
@@ -276,8 +279,8 @@ android {
         abi {
             isEnable = !buildingAppBundle
             reset()
-            include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
-            isUniversalApk = true
+            include("armeabi-v7a") // fork: the workflow publishes only the v7a APK - skip building the other ABIs + universal
+            isUniversalApk = false
         }
     }
 

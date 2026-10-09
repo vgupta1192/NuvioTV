@@ -2259,7 +2259,6 @@ private fun MetaDetailsContent(
     Box(
         modifier = modifier
             .fillMaxSize()
-            .background(backgroundColor)
             .onPreviewKeyEvent { randomEpisodePlaybackPending }
     ) {
         // Sticky background — backdrop or trailer
