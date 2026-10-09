@@ -57,7 +57,8 @@ class UpdateViewModel @Inject constructor(
                     updateChannel = channel
                 )
             }
-            if (enabled && !BuildConfig.IS_DEBUG_BUILD) {
+            // Self-host fork patch: the fork's debug variant is a normal install, check it too
+            if (enabled) {
                 checkForUpdates(force = false, showNoUpdateFeedback = false)
             }
         }
@@ -85,7 +86,7 @@ class UpdateViewModel @Inject constructor(
 
             result
                 .onSuccess { update ->
-                    val remoteNewer = VersionUtils.isRemoteNewer(update.tag, BuildConfig.VERSION_NAME)
+                    val remoteNewer = ForkBuild.isNewer(update.tag) // self-host fork patch
                     val shouldShow = UpdateBannerPolicy.shouldShow(
                         isRemoteNewer = remoteNewer,
                         force = force,
