@@ -1,6 +1,52 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/logging/UrlRedaction.kt b/app/src/main/java/com/nuvio/tv/core/logging/UrlRedaction.kt
+new file mode 100644
+index 00000000..dce6325a
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/logging/UrlRedaction.kt
+@@ -0,0 +1,40 @@
++package com.nuvio.tv.core.logging
++
++private val CREDENTIAL_PARAMETERS = listOf("api_key", "apikey", "token", "secret", "x-emby-token", "x-mediabrowser-token")
++private val SERVER_KEY_PARAMETERS = setOf("api_key", "apikey")
++
++private val URL_CREDENTIAL = Regex(
++    """([?&](?:${CREDENTIAL_PARAMETERS.joinToString("|")})=)[^&#\s"']*""",
++    RegexOption.IGNORE_CASE
++)
++
++/** Masks access tokens carried in URL query strings, keeping the rest of the text readable. */
++fun String.redactUrlCredentials(): String =
++    URL_CREDENTIAL.replace(this) { match -> match.groupValues[1] + "REDACTED" }
++
++fun String?.redactedUrlForLog(): String = this?.redactUrlCredentials() ?: "(null)"
++
++/** Drops access token parameters from a single URL, keeping the other parameters and any fragment. */
++fun String.withoutUrlCredentials(): String = filterQuery { name -> name.lowercase() !in CREDENTIAL_PARAMETERS }
++
++/** The URL to keep for diagnostics: media server streams lose their token, other links stay as they are. */
++fun String.diagnosticStreamUrl(isServerStream: Boolean): String {
++    val carriesServerKey = queryParameterNames().any { it.lowercase() in SERVER_KEY_PARAMETERS }
++    return if (isServerStream || carriesServerKey) withoutUrlCredentials() else this
++}
++
++private fun String.queryParameterNames(): List<String> {
++    val queryStart = indexOf('?').takeIf { it >= 0 } ?: return emptyList()
++    val fragmentStart = indexOf('#', queryStart).takeIf { it >= 0 } ?: length
++    return substring(queryStart + 1, fragmentStart).split('&').map { it.substringBefore('=') }
++}
++
++private fun String.filterQuery(keep: (String) -> Boolean): String {
++    val queryStart = indexOf('?').takeIf { it >= 0 } ?: return this
++    val fragmentStart = indexOf('#', queryStart).takeIf { it >= 0 } ?: length
++    val kept = substring(queryStart + 1, fragmentStart)
++        .split('&')
++        .filter { it.isNotEmpty() && keep(it.substringBefore('=')) }
++    val query = if (kept.isEmpty()) "" else kept.joinToString("&", prefix = "?")
++    return substring(0, queryStart) + query + substring(fragmentStart)
++}
 diff --git a/app/src/main/java/com/nuvio/tv/core/player/AviAudioClock.kt b/app/src/main/java/com/nuvio/tv/core/player/AviAudioClock.kt
 new file mode 100644
-index 0000000..757a454
+index 00000000..757a454f
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/player/AviAudioClock.kt
 @@ -0,0 +1,238 @@
@@ -244,7 +290,7 @@ index 0000000..757a454
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/core/player/AviAudioFramer.kt b/app/src/main/java/com/nuvio/tv/core/player/AviAudioFramer.kt
 new file mode 100644
-index 0000000..b16ba31
+index 00000000..b16ba31d
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/player/AviAudioFramer.kt
 @@ -0,0 +1,260 @@
@@ -510,7 +556,7 @@ index 0000000..b16ba31
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/core/player/AviTrackFormatExtractorsFactory.kt b/app/src/main/java/com/nuvio/tv/core/player/AviTrackFormatExtractorsFactory.kt
 new file mode 100644
-index 0000000..def6d01
+index 00000000..def6d012
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/player/AviTrackFormatExtractorsFactory.kt
 @@ -0,0 +1,484 @@
@@ -1000,7 +1046,7 @@ index 0000000..def6d01
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/core/player/AviVideoSeekTable.kt b/app/src/main/java/com/nuvio/tv/core/player/AviVideoSeekTable.kt
 new file mode 100644
-index 0000000..fd47b99
+index 00000000..fd47b990
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/player/AviVideoSeekTable.kt
 @@ -0,0 +1,51 @@
@@ -1056,7 +1102,7 @@ index 0000000..fd47b99
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/core/player/FrameRateUtils.kt b/app/src/main/java/com/nuvio/tv/core/player/FrameRateUtils.kt
-index 7eb6a82..f0739e8 100644
+index a91ad862..cd85cedd 100644
 --- a/app/src/main/java/com/nuvio/tv/core/player/FrameRateUtils.kt
 +++ b/app/src/main/java/com/nuvio/tv/core/player/FrameRateUtils.kt
 @@ -1,6 +1,7 @@
@@ -1067,16 +1113,16 @@ index 7eb6a82..f0739e8 100644
  import android.content.Context
  import android.media.MediaExtractor
  import android.net.Uri
-@@ -39,6 +40,8 @@ object FrameRateUtils {
+@@ -40,6 +41,8 @@ object FrameRateUtils {
      private const val MKV_EXTENSION = ".mkv"
      private const val SWITCH_POLL_INTERVAL_MS = 60L
      private const val SWITCH_REQUIRED_STABLE_POLLS = 2
 +    /** Below this the reported rate is not real content; never switch the panel for it. */
 +    private const val MIN_AFR_SWITCH_FPS = 20f
      private const val RESOLUTION_MATCH_MIN_SHORT_SIDE = 720
- 
-     data class DisplayModeSwitchResult(
-@@ -54,6 +57,129 @@ object FrameRateUtils {
+     private val CLEAN_REFRESH_MULTIPLES = listOf(3f, 4f, 5f, 6f)
+     private const val REFRESH_ERROR_SLACK = 0.0001f
+@@ -57,6 +60,129 @@ object FrameRateUtils {
          }
      }
  
@@ -1206,7 +1252,7 @@ index 7eb6a82..f0739e8 100644
      private fun sanitizeHeaders(headers: Map<String, String>?): Map<String, String> {
          val raw = headers ?: return emptyMap()
          if (raw.isEmpty()) return emptyMap()
-@@ -102,8 +228,13 @@ object FrameRateUtils {
+@@ -105,8 +231,13 @@ object FrameRateUtils {
  
      internal fun buildCacheKey(url: String, headers: Map<String, String>, filename: String?): String {
          val sanitized = sanitizeHeaders(headers)
@@ -1221,7 +1267,7 @@ index 7eb6a82..f0739e8 100644
          } else {
              url.substringBefore('?')
          }
-@@ -125,8 +256,21 @@ object FrameRateUtils {
+@@ -128,8 +259,21 @@ object FrameRateUtils {
  
      fun getCachedFrameRate(url: String, headers: Map<String, String>, filename: String? = null): FrameRateDetection? {
          val key = buildCacheKey(url, headers, filename)
@@ -1245,7 +1291,7 @@ index 7eb6a82..f0739e8 100644
          }
      }
  
-@@ -134,13 +278,18 @@ object FrameRateUtils {
+@@ -137,13 +281,18 @@ object FrameRateUtils {
          val key = buildCacheKey(url, headers, filename)
          synchronized(frameRateCache) {
              frameRateCache[key] = detection
@@ -1264,23 +1310,23 @@ index 7eb6a82..f0739e8 100644
          }
      }
  
-@@ -249,16 +398,44 @@ object FrameRateUtils {
+@@ -254,24 +403,51 @@ object FrameRateUtils {
          }
      }
  
 +    /**
 +     * How well a chosen mode actually serves the content's frame rate.
-+     * EXACT and DOUBLE are clean cadences; PULLDOWN is 2:3 judder that merely
++     * EXACT, DOUBLE and MULTIPLE are clean cadences; PULLDOWN is 2:3 judder that merely
 +     * happens to divide evenly; FALLBACK is the least-bad of a bad set.
 +     * Callers use it to tell a clean match from a judder-inducing one.
 +     */
-+    internal enum class ModeMatchQuality { EXACT, DOUBLE, PULLDOWN, FALLBACK }
++    internal enum class ModeMatchQuality { EXACT, DOUBLE, MULTIPLE, PULLDOWN, FALLBACK }
 +
 +    internal data class ModeChoice(val mode: DisplayModeSpec, val quality: ModeMatchQuality)
 +
 +    /** True for cadences worth giving up a resolution match to obtain. */
 +    private fun ModeMatchQuality.isCleanCadence() =
-+        this == ModeMatchQuality.EXACT || this == ModeMatchQuality.DOUBLE
++        this == ModeMatchQuality.EXACT || this == ModeMatchQuality.DOUBLE || this == ModeMatchQuality.MULTIPLE
 +
 +    /** 25 and 30 fps look smoother at 50 and 60 Hz on most TVs: each frame shown twice, same motion. */
 +    internal fun prefersDoubleRefresh(frameRate: Float): Boolean = frameRate in 24.5f..30.5f
@@ -1292,7 +1338,6 @@ index 7eb6a82..f0739e8 100644
 -    ): DisplayModeSpec {
 -        val modeExact = pickBestForTarget(modes, frameRate)
 -        val modeDouble = pickBestForTarget(modes, frameRate * 2f)
--        val modePulldown = pickBestForTarget(modes, frameRate * 2.5f)
 +    ): ModeChoice {
 +        if (prefersDoubleRefresh(frameRate)) {
 +            pickBestForTarget(modes, frameRate * 2f)?.let {
@@ -1305,16 +1350,27 @@ index 7eb6a82..f0739e8 100644
 +        pickBestForTarget(modes, frameRate * 2f)?.let {
 +            return ModeChoice(it, ModeMatchQuality.DOUBLE)
 +        }
-+        pickBestForTarget(modes, frameRate * 2.5f)?.let {
-+            return ModeChoice(it, ModeMatchQuality.PULLDOWN)
-+        }
+         val modePulldown = pickBestForTarget(modes, frameRate * 2.5f)
+         val pulldownError = modePulldown?.let { refreshError(it.refreshRate, frameRate * 2.5f) } ?: Float.MAX_VALUE
+-        // Lowest clean multiple first (24 fps: 72, 96, 120, 144 Hz), before 3:2 pulldown at 60 Hz,
+-        // but only when it matches the frame rate at least as closely as the pulldown mode does.
+-        val modeMultiple = CLEAN_REFRESH_MULTIPLES.firstNotNullOfOrNull { multiple ->
++        // Upstream: lowest clean multiple first (24 fps: 72, 96, 120, 144 Hz), before 3:2 pulldown
++        // at 60 Hz, but only when it matches the frame rate at least as closely as pulldown does.
++        CLEAN_REFRESH_MULTIPLES.firstNotNullOfOrNull { multiple ->
+             val target = frameRate * multiple
+             pickBestForTarget(modes, target)
+                 ?.takeIf { refreshError(it.refreshRate, target) <= pulldownError + REFRESH_ERROR_SLACK }
+-        }
++        }?.let { return ModeChoice(it, ModeMatchQuality.MULTIPLE) }
++        modePulldown?.let { return ModeChoice(it, ModeMatchQuality.PULLDOWN) }
          val modeFallback = modes.minByOrNull { refreshWeight(it.refreshRate, frameRate) }
--        return modeExact ?: modeDouble ?: modePulldown ?: modeFallback ?: activeMode
+-        return modeExact ?: modeDouble ?: modeMultiple ?: modePulldown ?: modeFallback ?: activeMode
 +        return ModeChoice(modeFallback ?: activeMode, ModeMatchQuality.FALLBACK)
      }
  
      private fun hasValidVideoSize(videoWidth: Int?, videoHeight: Int?): Boolean {
-@@ -269,6 +446,19 @@ object FrameRateUtils {
+@@ -282,6 +458,19 @@ object FrameRateUtils {
          return if (width >= height) width to height else height to width
      }
  
@@ -1334,7 +1390,7 @@ index 7eb6a82..f0739e8 100644
      private fun resolutionCandidateGroups(
          modes: List<DisplayModeSpec>,
          videoWidth: Int,
-@@ -288,8 +478,7 @@ object FrameRateUtils {
+@@ -301,8 +490,7 @@ object FrameRateUtils {
          }
  
          // Never below 720p when the display offers 720p or larger.
@@ -1344,7 +1400,7 @@ index 7eb6a82..f0739e8 100644
          val fitting = eligible.filter { fits(it) }
          if (fitting.isNotEmpty()) {
              return fitting.groupBy { area(it) }.toSortedMap().values.toList()
-@@ -306,28 +495,87 @@ object FrameRateUtils {
+@@ -319,28 +507,87 @@ object FrameRateUtils {
          videoWidth: Int?,
          videoHeight: Int?,
          resolutionMatchingEnabled: Boolean
@@ -1441,7 +1497,7 @@ index 7eb6a82..f0739e8 100644
      }
  
      suspend fun matchFrameRateAndWait(
-@@ -339,6 +587,15 @@ object FrameRateUtils {
+@@ -352,6 +599,15 @@ object FrameRateUtils {
      ): DisplayModeSwitchResult? {
          if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return null
          if (frameRate <= 0f) return null
@@ -1457,7 +1513,7 @@ index 7eb6a82..f0739e8 100644
  
          val switchPlan = withContext(Dispatchers.Main) {
              val window = activity.window ?: return@withContext null
-@@ -346,7 +603,7 @@ object FrameRateUtils {
+@@ -359,7 +615,7 @@ object FrameRateUtils {
              val activeMode = display.mode
              val supportedModes = display.supportedModes.toList()
  
@@ -1466,7 +1522,7 @@ index 7eb6a82..f0739e8 100644
                  modes = supportedModes.map { it.toSpec() },
                  activeMode = activeMode.toSpec(),
                  frameRate = frameRate,
-@@ -354,9 +611,10 @@ object FrameRateUtils {
+@@ -367,9 +623,10 @@ object FrameRateUtils {
                  videoHeight = videoHeight,
                  resolutionMatchingEnabled = resolutionMatchingEnabled
              )
@@ -1480,7 +1536,7 @@ index 7eb6a82..f0739e8 100644
              }
              if (modeBest == null) {
                  return@withContext Pair<Display.Mode?, DisplayModeSwitchResult?>(
-@@ -366,7 +624,22 @@ object FrameRateUtils {
+@@ -379,7 +636,22 @@ object FrameRateUtils {
              }
              recordOriginalMode(display)
              if (modeBest.modeId == activeMode.modeId) {
@@ -1504,7 +1560,7 @@ index 7eb6a82..f0739e8 100644
                  return@withContext Pair<Display.Mode?, DisplayModeSwitchResult?>(
                      null,
                      DisplayModeSwitchResult(activeMode)
-@@ -457,6 +730,26 @@ object FrameRateUtils {
+@@ -470,6 +742,26 @@ object FrameRateUtils {
          }
      }
  
@@ -1531,7 +1587,7 @@ index 7eb6a82..f0739e8 100644
      fun snapToStandardRate(formatFrameRate: Float): Float {
          if (formatFrameRate <= 0f) return formatFrameRate
          return when {
-@@ -1292,7 +1585,7 @@ object FrameRateUtils {
+@@ -1317,7 +1609,7 @@ object FrameRateUtils {
              }
          } catch (e: Exception) {
              call.cancel()
@@ -1540,7 +1596,7 @@ index 7eb6a82..f0739e8 100644
              HttpRangeFetchResult(success = false)
          }
      }
-@@ -1430,6 +1723,9 @@ object FrameRateUtils {
+@@ -1455,6 +1747,9 @@ object FrameRateUtils {
          return null
      }
  
@@ -1550,7 +1606,7 @@ index 7eb6a82..f0739e8 100644
      private fun detectFrameRateWithExtractor(
          context: Context,
          sourceUrl: String,
-@@ -1438,6 +1734,29 @@ object FrameRateUtils {
+@@ -1463,6 +1758,29 @@ object FrameRateUtils {
      ): FrameRateDetection? {
          val safeHeaders = headers
          val extractor = MediaExtractor()
@@ -1580,7 +1636,7 @@ index 7eb6a82..f0739e8 100644
          return try {
              val uri = Uri.parse(sourceUrl)
              when (uri.scheme?.lowercase()) {
-@@ -1524,6 +1843,8 @@ object FrameRateUtils {
+@@ -1539,6 +1857,8 @@ object FrameRateUtils {
              Log.w(TAG, "Frame rate probe failed: ${e.message}")
              null
          } finally {
@@ -1590,7 +1646,7 @@ index 7eb6a82..f0739e8 100644
                  extractor.release()
              } catch (_: Exception) {
 diff --git a/app/src/main/java/com/nuvio/tv/core/player/MatroskaAfrProbe.kt b/app/src/main/java/com/nuvio/tv/core/player/MatroskaAfrProbe.kt
-index 3acb31b..ea65479 100644
+index 3acb31bd..ea654799 100644
 --- a/app/src/main/java/com/nuvio/tv/core/player/MatroskaAfrProbe.kt
 +++ b/app/src/main/java/com/nuvio/tv/core/player/MatroskaAfrProbe.kt
 @@ -467,4 +467,113 @@ internal object MatroskaAfrProbe {
@@ -1708,7 +1764,7 @@ index 3acb31b..ea65479 100644
 +    }
  }
 diff --git a/app/src/main/java/com/nuvio/tv/core/player/dvmkv/MatroskaExtractor.java b/app/src/main/java/com/nuvio/tv/core/player/dvmkv/MatroskaExtractor.java
-index 1ba499f..8df026e 100644
+index 1ba499f9..8df026ee 100644
 --- a/app/src/main/java/com/nuvio/tv/core/player/dvmkv/MatroskaExtractor.java
 +++ b/app/src/main/java/com/nuvio/tv/core/player/dvmkv/MatroskaExtractor.java
 @@ -188,6 +188,12 @@ public class MatroskaExtractor implements Extractor {
@@ -2099,7 +2155,7 @@ index 1ba499f..8df026e 100644
            return new Pair<>(MimeTypes.VIDEO_H263, null);
          } else if (compression == FOURCC_COMPRESSION_VC1) {
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/Vc1VideoFormatHeuristics.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/Vc1VideoFormatHeuristics.kt
-index 8eb94da..82e3881 100644
+index 8eb94da4..82e3881a 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/Vc1VideoFormatHeuristics.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/Vc1VideoFormatHeuristics.kt
 @@ -50,6 +50,10 @@ internal object Vc1VideoFormatHeuristics {
@@ -2115,7 +2171,7 @@ index 8eb94da..82e3881 100644
              val rendererFormat = (error as? ExoPlaybackException)?.rendererFormat
 diff --git a/app/src/test/java/com/nuvio/tv/core/player/AviAudioClockTest.kt b/app/src/test/java/com/nuvio/tv/core/player/AviAudioClockTest.kt
 new file mode 100644
-index 0000000..dcfb564
+index 00000000..dcfb5640
 --- /dev/null
 +++ b/app/src/test/java/com/nuvio/tv/core/player/AviAudioClockTest.kt
 @@ -0,0 +1,177 @@
@@ -2298,7 +2354,7 @@ index 0000000..dcfb564
 +}
 diff --git a/app/src/test/java/com/nuvio/tv/core/player/AviAudioFramerTest.kt b/app/src/test/java/com/nuvio/tv/core/player/AviAudioFramerTest.kt
 new file mode 100644
-index 0000000..a421f5d
+index 00000000..a421f5dc
 --- /dev/null
 +++ b/app/src/test/java/com/nuvio/tv/core/player/AviAudioFramerTest.kt
 @@ -0,0 +1,170 @@
@@ -2474,7 +2530,7 @@ index 0000000..a421f5d
 +}
 diff --git a/app/src/test/java/com/nuvio/tv/core/player/AviHeaderTest.kt b/app/src/test/java/com/nuvio/tv/core/player/AviHeaderTest.kt
 new file mode 100644
-index 0000000..bc0730d
+index 00000000..bc0730d0
 --- /dev/null
 +++ b/app/src/test/java/com/nuvio/tv/core/player/AviHeaderTest.kt
 @@ -0,0 +1,144 @@
@@ -2624,7 +2680,7 @@ index 0000000..bc0730d
 +}
 diff --git a/app/src/test/java/com/nuvio/tv/core/player/AviVideoSeekTableTest.kt b/app/src/test/java/com/nuvio/tv/core/player/AviVideoSeekTableTest.kt
 new file mode 100644
-index 0000000..db7ae2d
+index 00000000..db7ae2d4
 --- /dev/null
 +++ b/app/src/test/java/com/nuvio/tv/core/player/AviVideoSeekTableTest.kt
 @@ -0,0 +1,74 @@
@@ -2704,7 +2760,7 @@ index 0000000..db7ae2d
 +}
 diff --git a/app/src/test/java/com/nuvio/tv/core/player/FrameRateDoubleRefreshTest.kt b/app/src/test/java/com/nuvio/tv/core/player/FrameRateDoubleRefreshTest.kt
 new file mode 100644
-index 0000000..9461be4
+index 00000000..9461be46
 --- /dev/null
 +++ b/app/src/test/java/com/nuvio/tv/core/player/FrameRateDoubleRefreshTest.kt
 @@ -0,0 +1,22 @@
@@ -2731,7 +2787,7 @@ index 0000000..9461be4
 +    }
 +}
 diff --git a/app/src/test/java/com/nuvio/tv/core/player/FrameRateModeSelectionTest.kt b/app/src/test/java/com/nuvio/tv/core/player/FrameRateModeSelectionTest.kt
-index cefa665..691876e 100644
+index 9ce64b45..a5203fad 100644
 --- a/app/src/test/java/com/nuvio/tv/core/player/FrameRateModeSelectionTest.kt
 +++ b/app/src/test/java/com/nuvio/tv/core/player/FrameRateModeSelectionTest.kt
 @@ -89,10 +89,10 @@ class FrameRateModeSelectionTest {
@@ -2769,7 +2825,7 @@ index cefa665..691876e 100644
      @Test
 diff --git a/app/src/test/java/com/nuvio/tv/core/player/FrameRateResolutionIntegrationTest.kt b/app/src/test/java/com/nuvio/tv/core/player/FrameRateResolutionIntegrationTest.kt
 new file mode 100644
-index 0000000..418a71e
+index 00000000..418a71e3
 --- /dev/null
 +++ b/app/src/test/java/com/nuvio/tv/core/player/FrameRateResolutionIntegrationTest.kt
 @@ -0,0 +1,32 @@
@@ -2806,7 +2862,7 @@ index 0000000..418a71e
 +    }
 +}
 diff --git a/app/src/test/java/com/nuvio/tv/core/player/FrameRateUtilsAfrTest.kt b/app/src/test/java/com/nuvio/tv/core/player/FrameRateUtilsAfrTest.kt
-index 682a526..9cd235d 100644
+index 682a526c..9cd235d2 100644
 --- a/app/src/test/java/com/nuvio/tv/core/player/FrameRateUtilsAfrTest.kt
 +++ b/app/src/test/java/com/nuvio/tv/core/player/FrameRateUtilsAfrTest.kt
 @@ -464,7 +464,7 @@ class FrameRateUtilsAfrTest {
@@ -2890,7 +2946,7 @@ index 682a526..9cd235d 100644
              assertEquals(tailStart + tailBytes.size, sparseFile.length())
              assertTrue(sparseFile.length() >= tailStart)
 diff --git a/app/src/test/java/com/nuvio/tv/core/player/MatroskaAfrProbeTest.kt b/app/src/test/java/com/nuvio/tv/core/player/MatroskaAfrProbeTest.kt
-index 216fcad..a857334 100644
+index 216fcadc..a857334d 100644
 --- a/app/src/test/java/com/nuvio/tv/core/player/MatroskaAfrProbeTest.kt
 +++ b/app/src/test/java/com/nuvio/tv/core/player/MatroskaAfrProbeTest.kt
 @@ -198,6 +198,7 @@ class MatroskaAfrProbeTest {
@@ -2903,7 +2959,7 @@ index 216fcad..a857334 100644
              // The rewritten Segment must end exactly at EOF instead of the original remote length.
 diff --git a/app/src/test/java/com/nuvio/tv/core/player/MatroskaAfrProbeVideoFpsTest.kt b/app/src/test/java/com/nuvio/tv/core/player/MatroskaAfrProbeVideoFpsTest.kt
 new file mode 100644
-index 0000000..27beb23
+index 00000000..27beb23a
 --- /dev/null
 +++ b/app/src/test/java/com/nuvio/tv/core/player/MatroskaAfrProbeVideoFpsTest.kt
 @@ -0,0 +1,89 @@
@@ -2997,7 +3053,7 @@ index 0000000..27beb23
 +    }
 +}
 diff --git a/app/src/test/java/com/nuvio/tv/ui/screens/player/Vc1VideoFormatHeuristicsTest.kt b/app/src/test/java/com/nuvio/tv/ui/screens/player/Vc1VideoFormatHeuristicsTest.kt
-index e1a4d9b..6c907e2 100644
+index e1a4d9bb..6c907e2a 100644
 --- a/app/src/test/java/com/nuvio/tv/ui/screens/player/Vc1VideoFormatHeuristicsTest.kt
 +++ b/app/src/test/java/com/nuvio/tv/ui/screens/player/Vc1VideoFormatHeuristicsTest.kt
 @@ -149,4 +149,12 @@ class Vc1VideoFormatHeuristicsTest {
@@ -3013,49 +3069,3 @@ index e1a4d9b..6c907e2 100644
 +    }
 +
  }
-diff --git a/app/src/main/java/com/nuvio/tv/core/logging/UrlRedaction.kt b/app/src/main/java/com/nuvio/tv/core/logging/UrlRedaction.kt
-new file mode 100644
-index 00000000..dce6325a
---- /dev/null
-+++ b/app/src/main/java/com/nuvio/tv/core/logging/UrlRedaction.kt
-@@ -0,0 +1,40 @@
-+package com.nuvio.tv.core.logging
-+
-+private val CREDENTIAL_PARAMETERS = listOf("api_key", "apikey", "token", "secret", "x-emby-token", "x-mediabrowser-token")
-+private val SERVER_KEY_PARAMETERS = setOf("api_key", "apikey")
-+
-+private val URL_CREDENTIAL = Regex(
-+    """([?&](?:${CREDENTIAL_PARAMETERS.joinToString("|")})=)[^&#\s"']*""",
-+    RegexOption.IGNORE_CASE
-+)
-+
-+/** Masks access tokens carried in URL query strings, keeping the rest of the text readable. */
-+fun String.redactUrlCredentials(): String =
-+    URL_CREDENTIAL.replace(this) { match -> match.groupValues[1] + "REDACTED" }
-+
-+fun String?.redactedUrlForLog(): String = this?.redactUrlCredentials() ?: "(null)"
-+
-+/** Drops access token parameters from a single URL, keeping the other parameters and any fragment. */
-+fun String.withoutUrlCredentials(): String = filterQuery { name -> name.lowercase() !in CREDENTIAL_PARAMETERS }
-+
-+/** The URL to keep for diagnostics: media server streams lose their token, other links stay as they are. */
-+fun String.diagnosticStreamUrl(isServerStream: Boolean): String {
-+    val carriesServerKey = queryParameterNames().any { it.lowercase() in SERVER_KEY_PARAMETERS }
-+    return if (isServerStream || carriesServerKey) withoutUrlCredentials() else this
-+}
-+
-+private fun String.queryParameterNames(): List<String> {
-+    val queryStart = indexOf('?').takeIf { it >= 0 } ?: return emptyList()
-+    val fragmentStart = indexOf('#', queryStart).takeIf { it >= 0 } ?: length
-+    return substring(queryStart + 1, fragmentStart).split('&').map { it.substringBefore('=') }
-+}
-+
-+private fun String.filterQuery(keep: (String) -> Boolean): String {
-+    val queryStart = indexOf('?').takeIf { it >= 0 } ?: return this
-+    val fragmentStart = indexOf('#', queryStart).takeIf { it >= 0 } ?: length
-+    val kept = substring(queryStart + 1, fragmentStart)
-+        .split('&')
-+        .filter { it.isNotEmpty() && keep(it.substringBefore('=')) }
-+    val query = if (kept.isEmpty()) "" else kept.joinToString("&", prefix = "?")
-+    return substring(0, queryStart) + query + substring(fragmentStart)
-+}
