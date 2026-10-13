@@ -1,0 +1,419 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSpotSampler.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSpotSampler.kt
+index 868e0e123..c261d94e5 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSpotSampler.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSpotSampler.kt
+@@ -15,7 +15,6 @@ import java.util.concurrent.atomic.AtomicBoolean
+ import java.util.concurrent.atomic.AtomicInteger
+ import java.util.concurrent.atomic.AtomicLong
+ import java.util.concurrent.atomic.AtomicReference
+-import kotlin.math.abs
+ 
+ /**
+  * Reads a few short stretches of a film's audio far from the playhead, over its own connection, so
+@@ -35,6 +34,8 @@ internal class AudioSpotSampler(
+     private val targetBytes: Long,
+     private val maxBytes: Long,
+     private val minSpotMs: Long,
++    /** How far before its target a seek may land and still be read from there (sparse indexes). */
++    private val maxEarlySeekMs: Long = MAX_SEEK_MISS_MS,
+     /** An extra connection was refused by the host; sampling carries on over the others. */
+     private val onRefused: (String) -> Unit = {},
+ ) {
+@@ -110,7 +111,8 @@ internal class AudioSpotSampler(
+                     val spotStartBytes = connectionBytes.get()
+                     extractor.seekTo(spotStartMs * 1_000L, MediaExtractorCompat.SEEK_TO_PREVIOUS_SYNC)
+                     val firstUs = extractor.sampleTime
+-                    if (firstUs < 0 || abs(firstUs / 1_000L - spotStartMs) > MAX_SEEK_MISS_MS) {
++                    val missMs = firstUs / 1_000L - spotStartMs
++                    if (firstUs < 0 || missMs > MAX_SEEK_MISS_MS || -missMs > maxEarlySeekMs) {
+                         failure.compareAndSet(null, "stream cannot seek")
+                         return
+                     }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSubtitleSyncController.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSubtitleSyncController.kt
+index 54b2e3124..505ad2034 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSubtitleSyncController.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSubtitleSyncController.kt
+@@ -423,7 +423,6 @@ internal class AudioSubtitleSyncController(
+         val unavailable = when {
+             localEngine -> "not used for torrent streams (would slow playback)"
+             uri == null || (uri.scheme != "http" && uri.scheme != "https") -> "not available for this stream"
+-            path.endsWith(".mpd") -> "not available for DASH streams"
+             else -> null
+         }
+         val hls = path.endsWith(".m3u8")
+@@ -447,7 +446,9 @@ internal class AudioSubtitleSyncController(
+         }
+         val heardEnough = timeline.knownFrameCount() >= SAMPLE_AFTER_FRAMES
+         // Playlist audio is often heard only through the playback tap; that must not hold HLS sampling back.
+-        val waitedEnough = source.hls && sessionStartedAtMs > 0 &&
++        // Playlist audio (also behind addresses without ".m3u8") is often heard only through the
++        // playback tap; that must not hold sampling back.
++        val waitedEnough = sessionStartedAtMs > 0 &&
+             SystemClock.elapsedRealtime() - sessionStartedAtMs >= HLS_SAMPLE_AFTER_MS
+         if (!heardEnough && !waitedEnough) {
+             noteSpotWait("waiting for playback audio")
+@@ -528,8 +529,17 @@ internal class AudioSubtitleSyncController(
+                 val seconds = (SystemClock.elapsedRealtime() - startedAt) / 1_000
+                 spotStatus = "sampled $sampled of ${spots.size} dialogue spots in ${seconds}s (${bytes / 1_000_000} MB)"
+             }
+-            val result = if (source.hls) {
+-                HlsAudioSpotSampler(source.uri, source.dataSourceFactory, maxBytes).run(
++            // Playlists and manifests also hide behind other addresses: the first bytes tell.
++            val kind = HlsAudioSpotSampler.manifestKind(source.uri, source.dataSourceFactory)
++            if (kind != null && !source.hls) SyncLog.i("spot source: ${kind.uppercase()} manifest (by content)")
++            val result = if (kind != null) {
++                HlsAudioSpotSampler(
++                    source.uri,
++                    source.dataSourceFactory,
++                    maxBytes,
++                    dash = kind == HlsAudioSpotSampler.KIND_DASH,
++                    preferredLanguage = (selectedAudioFormat ?: provisionalAudioFormat)?.language,
++                ).run(
+                     spotsMs = spots,
+                     spotMs = SPOT_MS,
+                     sinks = List(maxConnections) { SpotSink(newDecoder(), anyAudio = true) },
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/HlsAudioSpotSampler.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/HlsAudioSpotSampler.kt
+index 22fa79085..8f898fb16 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/HlsAudioSpotSampler.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/HlsAudioSpotSampler.kt
+@@ -20,6 +20,8 @@ import androidx.media3.extractor.PositionHolder
+ import androidx.media3.extractor.SeekMap
+ import androidx.media3.extractor.TrackOutput
+ import androidx.media3.extractor.text.SubtitleParser
++import androidx.media3.exoplayer.dash.DashUtil
++import androidx.media3.extractor.mp4.FragmentedMp4Extractor
+ import androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory
+ import androidx.media3.extractor.ts.TsExtractor
+ import java.util.concurrent.ConcurrentHashMap
+@@ -31,7 +33,7 @@ import javax.crypto.spec.IvParameterSpec
+ import javax.crypto.spec.SecretKeySpec
+ 
+ /**
+- * [AudioSpotSampler] for HLS VOD streams (MPEG-TS segments, optionally AES-128): reads the
++ * [AudioSpotSampler] for HLS VOD streams (MPEG-TS or fMP4 segments, optionally AES-128): reads the
+  * playlist, downloads the segments that cover each spot and demuxes their audio to the workers'
+  * sinks, so a playlist stream gets the same look-ahead across the film as a single file.
+  *
+@@ -43,6 +45,12 @@ internal class HlsAudioSpotSampler(
+     private val uri: Uri,
+     private val dataSourceFactory: DataSource.Factory,
+     private val maxBytes: Long,
++    /** [uri] is a DASH manifest (MPD) instead of an HLS playlist. */
++    private val dash: Boolean = false,
++    /** Language of the playing audio track, to pick the matching DASH audio set. */
++    private val preferredLanguage: String? = null,
++    /** Seek previews hook: read the lowest-bitrate video instead of audio. */
++    private val video: Boolean = false,
+ ) {
+     private class Key(val uri: String, val iv: ByteArray?)
+ 
+@@ -55,11 +63,19 @@ internal class HlsAudioSpotSampler(
+         val key: Key?,
+         val byteOffset: Long,
+         val byteLength: Long,
++        /** fMP4 initialization section (EXT-X-MAP), prepended to the segment for demuxing. */
++        val init: InitSection? = null,
+     )
+ 
++    private data class InitSection(val uri: String, val offset: Long, val length: Long)
++
+     private val bytes = AtomicLong()
++
++    @Volatile
++    private var cachedSegments: List<Segment>? = null
+     private val keys = ConcurrentHashMap<String, ByteArray>()
+     private val adjusters = ConcurrentHashMap<Int, TimestampAdjuster>()
++    private val inits = ConcurrentHashMap<InitSection, ByteArray>()
+ 
+     fun run(
+         spotsMs: List<Long>,
+@@ -68,8 +84,10 @@ internal class HlsAudioSpotSampler(
+         isCancelled: () -> Boolean,
+         onSpot: (sampled: Int, bytes: Long) -> Unit,
+     ): AudioSpotSampler.Result {
++        // A sampler may be run again for later stretches (generated subtitles): the budget is per run.
++        bytes.set(0L)
+         val segments = try {
+-            loadSegments()
++            cachedSegments ?: (if (dash) loadDashSegments() else loadSegments()).also { cachedSegments = it }
+         } catch (error: Exception) {
+             return AudioSpotSampler.Result(0, bytes.get(), error.message ?: error.javaClass.simpleName, sinks.size)
+         }
+@@ -124,7 +142,6 @@ internal class HlsAudioSpotSampler(
+             text = loaded.second
+         }
+         if (!text.contains("#EXT-X-ENDLIST")) throw IllegalStateException("live playlist")
+-        if (text.contains("#EXT-X-MAP")) throw IllegalStateException("fMP4 segments not supported")
+         val base = playlistUri.toString()
+         val segments = ArrayList<Segment>()
+         var mediaSequence = 0L
+@@ -134,6 +151,7 @@ internal class HlsAudioSpotSampler(
+         var key: Key? = null
+         var nextByteOffset = 0L
+         var byteRange: Pair<Long, Long>? = null
++        var init: InitSection? = null
+         for (raw in text.lineSequence()) {
+             val line = raw.trim()
+             when {
+@@ -156,6 +174,15 @@ internal class HlsAudioSpotSampler(
+                         else -> throw IllegalStateException("${attributes["METHOD"]} encryption not supported")
+                     }
+                 }
++                line.startsWith("#EXT-X-MAP:") -> {
++                    val attributes = attributes(line)
++                    val range = attributes["BYTERANGE"]
++                    init = InitSection(
++                        uri = UriUtil.resolve(base, attributes["URI"] ?: throw IllegalStateException("map without URI")),
++                        offset = range?.takeIf { '@' in it }?.substringAfter('@')?.toLongOrNull() ?: 0L,
++                        length = range?.substringBefore('@')?.toLongOrNull() ?: C.LENGTH_UNSET.toLong(),
++                    )
++                }
+                 line.startsWith("#EXT-X-BYTERANGE:") -> {
+                     val value = line.substringAfter(':').trim()
+                     val length = value.substringBefore('@').toLong()
+@@ -175,6 +202,7 @@ internal class HlsAudioSpotSampler(
+                         key = key,
+                         byteOffset = range?.second ?: 0L,
+                         byteLength = range?.first ?: C.LENGTH_UNSET.toLong(),
++                        init = init,
+                     )
+                     nextByteOffset = range?.let { it.second + it.first } ?: 0L
+                     byteRange = null
+@@ -187,6 +215,77 @@ internal class HlsAudioSpotSampler(
+         return segments
+     }
+ 
++    /**
++     * The audio segments of a VOD DASH manifest: the audio set in [preferredLanguage] (else the
++     * first), its lowest-bitrate representation, fMP4 only. Each segment gets its own timestamp
++     * mapping (start from the manifest), like a discontinuity.
++     */
++    private fun loadDashSegments(): List<Segment> {
++        val manifest = DashUtil.loadManifest(dataSourceFactory.createDataSource(), uri)
++        if (manifest.dynamic) throw IllegalStateException("live DASH stream")
++        val segments = ArrayList<Segment>()
++        val wanted = preferredLanguage?.lowercase()?.substringBefore('-')
++        for (periodIndex in 0 until manifest.periodCount) {
++            val period = manifest.getPeriod(periodIndex)
++            val periodStartUs = period.startMs * 1_000L
++            val periodDurationUs = manifest.getPeriodDurationUs(periodIndex)
++            val trackType = if (video) C.TRACK_TYPE_VIDEO else C.TRACK_TYPE_AUDIO
++            val sets = period.adaptationSets.filter { it.type == trackType && it.representations.isNotEmpty() }
++            val set = (if (video) sets.firstOrNull() else sets.firstOrNull { set ->
++                val language = set.representations[0].format.language?.lowercase()?.substringBefore('-')
++                wanted != null && language != null && (language == wanted || language.startsWith(wanted) || wanted.startsWith(language))
++            }) ?: sets.firstOrNull() ?: continue
++            val representation = set.representations.minByOrNull { it.format.bitrate.takeIf { rate -> rate > 0 } ?: Int.MAX_VALUE }
++                ?: continue
++            val container = representation.format.containerMimeType.orEmpty()
++            if (container.isNotEmpty() && !container.endsWith("/mp4")) {
++                throw IllegalStateException("$container DASH audio not supported")
++            }
++            val base = representation.baseUrls.firstOrNull()?.url ?: continue
++            val init = representation.initializationUri?.let {
++                InitSection(it.resolveUriString(base), it.start, it.length)
++            }
++            val index = representation.index
++            if (index != null) {
++                val first = index.firstSegmentNum
++                val count = index.getSegmentCount(periodDurationUs)
++                if (count == C.INDEX_UNSET.toLong() || count < 0) throw IllegalStateException("unbounded DASH index")
++                for (number in first until first + count) {
++                    val ranged = index.getSegmentUrl(number)
++                    segments += Segment(
++                        uri = ranged.resolveUriString(base),
++                        startUs = periodStartUs + index.getTimeUs(number),
++                        durationUs = index.getDurationUs(number, periodDurationUs),
++                        discontinuity = segments.size,
++                        mediaSequence = number,
++                        key = null,
++                        byteOffset = ranged.start,
++                        byteLength = ranged.length,
++                        init = init,
++                    )
++                }
++            } else {
++                val chunks = DashUtil.loadChunkIndex(dataSourceFactory.createDataSource(), trackType, representation)
++                    ?: throw IllegalStateException("DASH audio without a segment index")
++                for (chunk in 0 until chunks.length) {
++                    segments += Segment(
++                        uri = base,
++                        startUs = periodStartUs + chunks.timesUs[chunk],
++                        durationUs = chunks.durationsUs[chunk],
++                        discontinuity = segments.size,
++                        mediaSequence = chunk.toLong(),
++                        key = null,
++                        byteOffset = chunks.offsets[chunk],
++                        byteLength = chunks.sizes[chunk].toLong(),
++                        init = init,
++                    )
++                }
++            }
++        }
++        if (segments.isEmpty()) throw IllegalStateException("no audio in DASH manifest")
++        return segments
++    }
++
+     /**
+      * The media playlist to read: a separate audio rendition when the stream has one (audio only, so
+      * cheap), otherwise the lowest-bandwidth variant (same audio as the others, least video).
+@@ -197,7 +296,9 @@ internal class HlsAudioSpotSampler(
+         val audio = lines.filter { it.startsWith("#EXT-X-MEDIA:") }
+             .map(::attributes)
+             .filter { it["TYPE"] == "AUDIO" && it["URI"] != null }
+-        (audio.firstOrNull { it["DEFAULT"] == "YES" } ?: audio.firstOrNull())?.let { return UriUtil.resolve(base, it["URI"]!!) }
++        if (!video) {
++            (audio.firstOrNull { it["DEFAULT"] == "YES" } ?: audio.firstOrNull())?.let { return UriUtil.resolve(base, it["URI"]!!) }
++        }
+         var best: Pair<Long, String>? = null
+         for ((index, line) in lines.withIndex()) {
+             if (!line.startsWith("#EXT-X-STREAM-INF:")) continue
+@@ -208,36 +309,79 @@ internal class HlsAudioSpotSampler(
+         return best?.let { UriUtil.resolve(base, it.second) }
+     }
+ 
++    /** Seek previews hook: start times (µs, player timeline) of the segments; loads the playlist once. */
++    fun segmentStartsUs(): LongArray {
++        val segments = cachedSegments ?: (if (dash) loadDashSegments() else loadSegments()).also { cachedSegments = it }
++        return LongArray(segments.size) { segments[it].startUs }
++    }
++
++    /**
++     * Seek previews hook: downloads the first [limitBytes] of segment [index] (whole segment when
++     * encrypted or too short) and demuxes it through [wrap], so a tap there sees its first video
++     * keyframe on the player's timeline. Blocking.
++     */
++    fun readSegmentStart(index: Int, limitBytes: Long, wrap: (ExtractorsFactory) -> ExtractorsFactory, isDone: () -> Boolean) {
++        val segment = cachedSegments?.getOrNull(index) ?: return
++        val limit = when {
++            segment.key != null -> segment.byteLength
++            segment.byteLength == C.LENGTH_UNSET.toLong() -> limitBytes
++            else -> minOf(segment.byteLength, limitBytes)
++        }
++        demuxWith(segment, limit, wrap, isDone)
++    }
++
+     /** Downloads [segment] and passes its audio, on the player's timeline, to [sink]. */
+-    private fun demux(segment: Segment, sink: AudioSampleSink) {
++    private fun demux(segment: Segment, sink: AudioSampleSink) =
++        demuxWith(segment, segment.byteLength, { factory -> AudioSyncExtractorsFactory(factory, sink) }, { false })
++
++    private fun demuxWith(
++        segment: Segment,
++        length: Long,
++        wrap: (ExtractorsFactory) -> ExtractorsFactory,
++        isDone: () -> Boolean,
++    ) {
+         var data = fetch(DataSpec.Builder()
+             .setUri(segment.uri)
+             .setPosition(segment.byteOffset)
+-            .setLength(segment.byteLength)
++            .setLength(length)
+             .build())
+         segment.key?.let { key -> data = decrypt(data, key, segment.mediaSequence) }
+-        if (data.isEmpty() || data[0] != TS_SYNC_BYTE) throw IllegalStateException("segments are not MPEG-TS")
+         val adjuster = adjusters.computeIfAbsent(segment.discontinuity) { TimestampAdjuster(segment.startUs) }
+-        val tsFactory = ExtractorsFactory {
++        val fragmented = segment.init != null
++        if (fragmented) {
++            val init = segment.init!!
++            val header = inits.getOrPut(init) {
++                fetch(DataSpec.Builder().setUri(init.uri).setPosition(init.offset).setLength(init.length).build())
++            }
++            data = header + data
++        } else if (data.isEmpty() || data[0] != TS_SYNC_BYTE) {
++            throw IllegalStateException("segments are neither MPEG-TS nor fMP4")
++        }
++        val tsFactory = if (fragmented) {
++            ExtractorsFactory { arrayOf(FragmentedMp4Extractor(0, adjuster)) }
++        } else ExtractorsFactory {
+             arrayOf(
+                 TsExtractor(
+                     TsExtractor.MODE_HLS,
+                     TsExtractor.FLAG_EMIT_RAW_SUBTITLE_DATA,
+                     SubtitleParser.Factory.UNSUPPORTED,
+                     adjuster,
+-                    DefaultTsPayloadReaderFactory(0),
++                    DefaultTsPayloadReaderFactory(
++                        // Seek previews: playlists may start segments on an I-frame that is not an IDR.
++                        if (video) DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES else 0,
++                    ),
+                     TsExtractor.DEFAULT_TIMESTAMP_SEARCH_BYTES,
+                 ),
+             )
+         }
+-        val extractor: Extractor = AudioSyncExtractorsFactory(tsFactory, sink).createExtractors()[0]
++        val extractor: Extractor = wrap(tsFactory).createExtractors()[0]
+         val source = ByteArrayDataSource(data)
+         try {
+             source.open(DataSpec(Uri.EMPTY))
+             val input = DefaultExtractorInput(source, 0L, data.size.toLong())
+             extractor.init(DiscardingOutput)
+             val position = PositionHolder()
+-            while (extractor.read(input, position) == Extractor.RESULT_CONTINUE) Unit
++            while (!isDone() && extractor.read(input, position) == Extractor.RESULT_CONTINUE) Unit
+         } finally {
+             extractor.release()
+             source.close()
+@@ -286,16 +430,56 @@ internal class HlsAudioSpotSampler(
+         override fun seekMap(seekMap: SeekMap) = Unit
+     }
+ 
+-    private companion object {
+-        const val TS_SYNC_BYTE: Byte = 0x47
+-        val attribute = Regex("""([A-Z0-9-]+)=("[^"]*"|[^,]*)""")
++    companion object {
++        const val KIND_HLS = "hls"
++        const val KIND_DASH = "dash"
++
++        /** [KIND_HLS] or [KIND_DASH] when [uri] serves such a manifest, by address or first bytes; else null. */
++        fun manifestKind(uri: Uri, dataSourceFactory: DataSource.Factory): String? {
++            val path = uri.path.orEmpty().lowercase()
++            if (path.endsWith(".m3u8")) return KIND_HLS
++            if (path.endsWith(".mpd")) return KIND_DASH
++            val head = sniff(uri, dataSourceFactory) ?: return null
++            return when {
++                head.trimStart('\uFEFF', ' ', '\r', '\n', '\t').startsWith("#EXTM3U") -> KIND_HLS
++                head.contains("<MPD") -> KIND_DASH
++                else -> null
++            }
++        }
++
++        /** Whether [uri] serves an HLS playlist even though its address doesn't say so. Blocking. */
++        fun looksLikePlaylist(uri: Uri, dataSourceFactory: DataSource.Factory): Boolean =
++            sniff(uri, dataSourceFactory)?.trimStart('\uFEFF', ' ', '\r', '\n', '\t')?.startsWith("#EXTM3U") == true
++
++        private fun sniff(uri: Uri, dataSourceFactory: DataSource.Factory): String? {
++            val source = dataSourceFactory.createDataSource()
++            return try {
++                source.open(DataSpec.Builder().setUri(uri).setLength(SNIFF_BYTES.toLong()).build())
++                val buffer = ByteArray(SNIFF_BYTES)
++                var read = 0
++                while (read < buffer.size) {
++                    val count = source.read(buffer, read, buffer.size - read)
++                    if (count <= 0) break
++                    read += count
++                }
++                String(buffer, 0, read, Charsets.UTF_8)
++            } catch (_: Exception) {
++                null
++            } finally {
++                runCatching { source.close() }
++            }
++        }
++
++        private const val SNIFF_BYTES = 512
++        private const val TS_SYNC_BYTE: Byte = 0x47
++        private val attribute = Regex("""([A-Z0-9-]+)=("[^"]*"|[^,]*)""")
+ 
+-        fun attributes(line: String): Map<String, String> =
++        private fun attributes(line: String): Map<String, String> =
+             attribute.findAll(line.substringAfter(':')).associate { match ->
+                 match.groupValues[1] to match.groupValues[2].removeSurrounding("\"")
+             }
+ 
+-        fun parseIv(value: String): ByteArray {
++        private fun parseIv(value: String): ByteArray {
+             val hex = value.removePrefix("0x").removePrefix("0X").padStart(32, '0')
+             return ByteArray(16) { index -> hex.substring(index * 2, index * 2 + 2).toInt(16).toByte() }
+         }

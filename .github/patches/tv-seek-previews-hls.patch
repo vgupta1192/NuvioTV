@@ -1,0 +1,287 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt
+index 8dd73667d..94d2ba89b 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt
+@@ -77,6 +77,7 @@ internal fun PlayerRuntimeController.autoSyncExtractorsFactory(
+         context = context,
+         sourceKey = url,
+         factory = AudioSyncTaps.wrapExtractors(delegate, url),
++        headers = headers,
+     )
+     AutoSyncPreferences.ensureLoaded(context)
+     if (!AutoSyncPreferences.isEnabled(context)) return tapped
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/LocalPreviewSources.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/LocalPreviewSources.kt
+index 5ea2b41d1..fd6d93cc7 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/LocalPreviewSources.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/LocalPreviewSources.kt
+@@ -19,6 +19,8 @@ internal class LocalPreviewSource(
+     val owner: Any,
+     val sourceKey: String,
+     val context: Context,
++    /** Nuvio fork: the stream's request headers, for reading HLS/DASH segments (StreamPreviewFiller). */
++    val headers: Map<String, String> = emptyMap(),
+ ) {
+     @Volatile var released = false
+     @Volatile var track: LocalPreviewTrack? = null
+@@ -61,8 +63,14 @@ internal object LocalPreviewSources {
+      * Registers [sourceKey] as [owner]'s playing stream and returns [factory] wrapped so its
+      * video keyframes reach that stream's preview track while playback demuxes them.
+      */
+-    fun register(owner: Any, context: Context, sourceKey: String, factory: ExtractorsFactory): ExtractorsFactory {
+-        val source = LocalPreviewSource(owner, sourceKey, context.applicationContext)
++    fun register(
++        owner: Any,
++        context: Context,
++        sourceKey: String,
++        factory: ExtractorsFactory,
++        headers: Map<String, String> = emptyMap(),
++    ): ExtractorsFactory {
++        val source = LocalPreviewSource(owner, sourceKey, context.applicationContext, headers)
+         current.value?.let { stale ->
+             stale.released = true
+             stale.track = null
+@@ -109,6 +117,11 @@ internal object LocalPreviewSources {
+         val track = LocalPreviewTrack(source.context, cacheKey, durationMs, source::keyframeNear)
+         source.track = track
+         track.start()
++        // Nuvio fork: playlists are read by ExoPlayer's HLS/DASH loaders, which the tap does not see.
++        if (source.sourceKey.startsWith("http", ignoreCase = true)) {
++            val factory = com.nuvio.tv.ui.screens.player.PlayerPlaybackNetworking.createDataSourceFactory(source.context, source.headers)
++            StreamPreviewFiller(android.net.Uri.parse(source.sourceKey), factory, track) { track.playbackActive }.start()
++        }
+         return track
+     }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/LocalPreviewTrack.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/LocalPreviewTrack.kt
+index 3a3f7da76..5d4c7dd8f 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/LocalPreviewTrack.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/LocalPreviewTrack.kt
+@@ -159,6 +159,8 @@ internal class LocalPreviewTrack(
+     private val drainScheduled = AtomicBoolean(false)
+     /** Slot the viewer last looked at, so its keyframes are decoded first. */
+     @Volatile private var focusSlot = -1
++    /** Nuvio fork: when the viewer last looked up a thumbnail (playlist filler focus). */
++    @Volatile private var lastLookupAtMs = 0L
+ 
+     /**
+      * +1 while the viewer scrubs forward, -1 backward, 0 otherwise (set by the owner from the
+@@ -208,6 +210,7 @@ internal class LocalPreviewTrack(
+         val slot = (corrected / SLOT_MS).toInt().coerceIn(0, slotCount - 1)
+         if (focus) {
+             focusSlot = slot
++            lastLookupAtMs = SystemClock.elapsedRealtime()
+             if (synchronized(lock) { spooled.isNotEmpty() }) scheduleDrain()
+         }
+         val exact = synchronized(lock) { exactFrameFor(corrected) }
+@@ -480,6 +483,40 @@ internal class LocalPreviewTrack(
+         }?.forEach { it.delete() }
+     }
+ 
++    // ---- Playlist filler (Nuvio fork: HLS/DASH streams, see StreamPreviewFiller) ------------
++
++    val isClosed: Boolean get() = closed
++
++    val totalDurationMs: Long get() = durationMs
++
++    /** The slot time the viewer scrubbed to within the last few seconds, else null. */
++    fun recentScrubMs(): Long? {
++        val slot = focusSlot
++        if (slot < 0 || SystemClock.elapsedRealtime() - lastLookupAtMs > FILL_FOCUS_MS) return null
++        return slot * SLOT_MS
++    }
++
++    /** Whether a keyframe at [positionMs] would fill a missing thumbnail. */
++    fun wantsFrameAt(positionMs: Long): Boolean {
++        if (closed) return false
++        val slot = slotFor(positionMs) ?: return false
++        return synchronized(lock) { isOpen(slot) && positionMs !in keyframeSlots }
++    }
++
++    /** The decoder queue is full; a filler should wait before reading more. */
++    fun isBusy(): Boolean = closed || tapExecutor.queue.remainingCapacity() == 0
++
++    /**
++     * A keyframe read on purpose for a missing thumbnail (not from playback, so not in playback
++     * order): stored in its nearest slot straight away instead of waiting as a candidate.
++     */
++    fun offerKeyframe(format: Format, timeUs: Long, data: ByteArray, offset: Int, size: Int) {
++        val keyMs = timeUs / 1_000L
++        val slot = slotFor(keyMs) ?: return
++        if (!wantsFrameAt(keyMs)) return
++        submit(Candidate(slot, format, timeUs, data.copyOfRange(offset, offset + size)))
++    }
++
+     /** Nearest slot to a keyframe, or null when the keyframe is closer to no slot start. */
+     private fun slotFor(keyMs: Long): Int? {
+         if (keyMs < 0 || keyMs > durationMs + SLOT_MS) return null
+@@ -619,6 +656,7 @@ internal class LocalPreviewTrack(
+     companion object {
+         private const val TAG = "NuvioLocalPreviews"
+         const val SLOT_MS = 10_000L
++        private const val FILL_FOCUS_MS = 4_000L
+         /**
+          * How far past the latest sample time the next keyframe is looked for. In decode order a
+          * keyframe's time is later than every sample before it, by at most the B-frame reorder span
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/StreamPreviewFiller.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/StreamPreviewFiller.kt
+new file mode 100644
+index 000000000..4d070395e
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/StreamPreviewFiller.kt
+@@ -0,0 +1,157 @@
++@file:OptIn(androidx.media3.common.util.UnstableApi::class)
++
++package com.nuvio.tv.ui.screens.player.seekpreview.local
++
++import android.net.Uri
++import android.os.Process
++import android.util.Log
++import androidx.media3.common.Format
++import androidx.media3.datasource.DataSource
++import androidx.media3.extractor.SeekMap
++import com.nuvio.tv.ui.screens.player.audiosync.HlsAudioSpotSampler
++import kotlin.math.abs
++
++/**
++ * Seek-preview thumbnails for HLS and DASH streams (Nuvio fork). ExoPlayer reads playlists with
++ * its own extractors, which the buffer tap does not see, and their segments are cheap to reach
++ * one by one. So this reads them on purpose: the lowest-bitrate video rendition, only the start
++ * of each segment (where its first keyframe is), only while the viewer scrubs or has paused.
++ *
++ * Order: slots around the scrub position first; while paused, also a coarse grid across the
++ * title, so a first scrub anywhere already lands near a frame.
++ */
++internal class StreamPreviewFiller(
++    private val uri: Uri,
++    private val dataSourceFactory: DataSource.Factory,
++    private val track: LocalPreviewTrack,
++    private val playbackActive: () -> Boolean,
++) {
++    @Volatile private var stopped = false
++
++    fun start() {
++        Thread({
++            Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
++            runCatching { run() }.onFailure { Log.w(TAG, "playlist previews stopped: ${it.message}") }
++        }, "NuvioPreviewFill").apply {
++            isDaemon = true
++            start()
++        }
++    }
++
++    fun stop() {
++        stopped = true
++    }
++
++    private fun done() = stopped || track.isClosed
++
++    private fun run() {
++        val kind = HlsAudioSpotSampler.manifestKind(uri, dataSourceFactory) ?: return
++        val sampler = HlsAudioSpotSampler(
++            uri = uri,
++            dataSourceFactory = dataSourceFactory,
++            maxBytes = Long.MAX_VALUE,
++            dash = kind == HlsAudioSpotSampler.KIND_DASH,
++            video = true,
++        )
++        val startsUs = sampler.segmentStartsUs()
++        if (startsUs.isEmpty()) return
++        val tried = BooleanArray(startsUs.size)
++        var failures = 0
++        Log.i(TAG, "playlist previews: $kind, ${startsUs.size} segments")
++        while (!done()) {
++            if (track.isBusy()) {
++                Thread.sleep(IDLE_MS)
++                continue
++            }
++            val index = nextSegment(startsUs, tried)
++            if (index == null) {
++                Thread.sleep(IDLE_MS)
++                continue
++            }
++            tried[index] = true
++            val got = runCatching { read(sampler, index, FIRST_READ_BYTES) || read(sampler, index, SECOND_READ_BYTES) }
++                .onFailure { Log.w(TAG, "segment $index not read: ${it.message}") }
++                .getOrDefault(false)
++            if (got) {
++                failures = 0
++            } else if (++failures >= MAX_FAILURES_IN_A_ROW) {
++                Log.w(TAG, "playlist previews: $failures segments in a row without a keyframe, giving up")
++                return
++            }
++        }
++    }
++
++    /** The untried segment whose first keyframe would fill the most useful missing thumbnail. */
++    private fun nextSegment(startsUs: LongArray, tried: BooleanArray): Int? {
++        val durationMs = track.totalDurationMs
++        val focusMs = track.recentScrubMs()
++        if (focusMs != null) {
++            for (distance in 0..FOCUS_RADIUS_SLOTS) {
++                for (sign in intArrayOf(1, -1)) {
++                    if (distance == 0 && sign < 0) continue
++                    val targetMs = focusMs + sign * distance * LocalPreviewTrack.SLOT_MS
++                    if (targetMs < 0 || targetMs > durationMs) continue
++                    candidate(startsUs, tried, targetMs)?.let { return it }
++                }
++            }
++        }
++        if (playbackActive()) return null
++        var targetMs = 0L
++        while (targetMs <= durationMs) {
++            candidate(startsUs, tried, targetMs)?.let { return it }
++            targetMs += GRID_MS
++        }
++        return null
++    }
++
++    private fun candidate(startsUs: LongArray, tried: BooleanArray, targetMs: Long): Int? {
++        val index = nearestStart(startsUs, targetMs * 1_000L)
++        if (tried[index]) return null
++        val startMs = startsUs[index] / 1_000L
++        // Only when that segment's keyframe lands near the target and its slot still needs one.
++        if (abs(startMs - targetMs) > LocalPreviewTrack.SLOT_MS) return null
++        if (!track.wantsFrameAt(startMs)) {
++            tried[index] = true
++            return null
++        }
++        return index
++    }
++
++    private fun nearestStart(startsUs: LongArray, targetUs: Long): Int {
++        var low = 0
++        var high = startsUs.size - 1
++        while (low < high) {
++            val mid = (low + high) / 2
++            if (startsUs[mid] < targetUs) low = mid + 1 else high = mid
++        }
++        return if (low > 0 && abs(startsUs[low - 1] - targetUs) <= abs(startsUs[low] - targetUs)) low - 1 else low
++    }
++
++    /** Reads the start of segment [index]; true once its first keyframe went to the track. */
++    private fun read(sampler: HlsAudioSpotSampler, index: Int, limitBytes: Long): Boolean {
++        var got = false
++        val sink = object : KeyframeSink {
++            override fun wantsKeyframes(): Boolean = !got
++            override fun wantsKeyframe(timeUs: Long): Boolean = !got
++            override fun onKeyframe(format: Format, timeUs: Long, data: ByteArray, offset: Int, size: Int) {
++                got = true
++                track.offerKeyframe(format, timeUs, data, offset, size)
++            }
++            override fun onSeekMap(seekMap: SeekMap) = Unit
++        }
++        runCatching {
++            sampler.readSegmentStart(index, limitBytes, { factory -> VideoKeyframeExtractorsFactory(factory, sink) }) { got || done() }
++        }.onFailure { if (!got) throw it }
++        return got
++    }
++
++    companion object {
++        private const val TAG = "NuvioLocalPreviews"
++        private const val IDLE_MS = 250L
++        private const val FOCUS_RADIUS_SLOTS = 6
++        private const val GRID_MS = 60_000L
++        private const val FIRST_READ_BYTES = 1_500_000L
++        private const val SECOND_READ_BYTES = 6_000_000L
++        private const val MAX_FAILURES_IN_A_ROW = 8
++    }
++}

@@ -1,0 +1,1058 @@
+diff --git a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
+index 5311352a0..3b18f59e3 100644
+--- a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
++++ b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
+@@ -85,6 +85,7 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+         super.onCreate()
+         SentryInitializer.start(this, sentrySettingsDataStore)
+         PluginRuntimeHooks.onApplicationCreate(this)
++        com.nuvio.tv.reshaped.subtitlefont.SubtitleFontStore.warmUp(this) // Nuvio fork: custom subtitle font, loaded off the main thread
+         androidTvChannelSyncService.start()
+         serverUserStateProjection.start()
+         serverMatcher.start()
+diff --git a/app/src/main/java/com/nuvio/tv/reshaped/subtitlefont/SubtitleFontStore.kt b/app/src/main/java/com/nuvio/tv/reshaped/subtitlefont/SubtitleFontStore.kt
+new file mode 100644
+index 000000000..48bb490be
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/reshaped/subtitlefont/SubtitleFontStore.kt
+@@ -0,0 +1,329 @@
++package com.nuvio.tv.reshaped.subtitlefont
++
++import android.content.Context
++import android.graphics.Typeface
++import android.net.Uri
++import android.util.Log
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.ensureActive
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import java.io.File
++import java.io.IOException
++import java.io.InputStream
++import java.io.RandomAccessFile
++import java.util.concurrent.TimeUnit
++import kotlin.coroutines.CoroutineContext
++import kotlin.coroutines.EmptyCoroutineContext
++
++internal class CustomSubtitleFont(
++    val file: File,
++    /** Family name from the font's `name` table; libass (mpv) matches fonts by it. */
++    val familyName: String,
++    val typeface: Typeface,
++)
++
++internal enum class SubtitleFontImportResult {
++    IMPORTED,
++    TOO_LARGE,
++    INVALID,
++    DOWNLOAD_FAILED,
++}
++
++/**
++ * Keeps at most one user-imported subtitle font in app storage. The font file itself is the
++ * persisted setting: no file means the default system font. Every import is validated (size,
++ * TrueType/OpenType signature, Android can load it, the family name can be read) before it
++ * replaces the current font, and a font that stops loading falls back to the default.
++ */
++internal object SubtitleFontStore {
++    private const val TAG = "SubtitleFontStore"
++    const val MAX_FONT_BYTES = 20L * 1024 * 1024
++    private const val FONTS_DIR = "subtitle_fonts"
++    private const val STAGING_PREFIX = ".import"
++
++    private val _font = MutableStateFlow<CustomSubtitleFont?>(null)
++    val font: StateFlow<CustomSubtitleFont?> = _font.asStateFlow()
++
++    @Volatile
++    private var loaded = false
++
++    private val warmUpScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++
++    private val httpClient: OkHttpClient by lazy {
++        OkHttpClient.Builder()
++            .connectTimeout(15, TimeUnit.SECONDS)
++            .readTimeout(30, TimeUnit.SECONDS)
++            .callTimeout(60, TimeUnit.SECONDS)
++            .followRedirects(true)
++            .followSslRedirects(true)
++            .build()
++    }
++
++    fun fontsDir(context: Context): File =
++        File(context.applicationContext.filesDir, FONTS_DIR).apply { mkdirs() }
++
++    /** The imported font, loaded from disk on first use; null for the default font. */
++    fun current(context: Context): CustomSubtitleFont? {
++        if (!loaded) {
++            synchronized(this) {
++                if (!loaded) {
++                    val files = fontsDir(context).listFiles().orEmpty()
++                    // Staging files left behind by an import that was killed mid-copy.
++                    files.filter { it.isFile && it.name.startsWith(STAGING_PREFIX) }.forEach { it.delete() }
++                    val file = files.firstOrNull { it.isFile && !it.name.startsWith(".") }
++                    val font = file?.let(::loadFont)
++                    if (file != null && font == null) {
++                        // A font that no longer loads: drop it so playback uses the default font.
++                        file.delete()
++                    }
++                    _font.value = font
++                    loaded = true
++                }
++            }
++        }
++        return _font.value
++    }
++
++    /** At launch: loads the font off the main thread so playback never parses it there. */
++    fun warmUp(context: Context) {
++        if (loaded) return
++        val appContext = context.applicationContext
++        warmUpScope.launch { runCatching { current(appContext) } }
++    }
++
++    /** The font if already loaded; never touches disk (starts the load instead). */
++    private fun cached(context: Context): CustomSubtitleFont? {
++        if (!loaded) warmUp(context)
++        return _font.value
++    }
++
++    /**
++     * The ExoPlayer subtitle typeface, keeping the bold setting; null for the default font.
++     * Non-blocking: the player re-applies its style when [font] emits.
++     */
++    fun exoTypeface(context: Context, bold: Boolean): Typeface? {
++        val custom = runCatching { cached(context)?.typeface }.getOrNull() ?: return null
++        return if (bold) Typeface.create(custom, Typeface.BOLD) else custom
++    }
++
++    /**
++     * libmpv options that make libass use the imported font; empty for the default font.
++     * Non-blocking: relies on [warmUp] having run at app start.
++     */
++    fun mpvOptions(context: Context): List<Pair<String, String>> {
++        val custom = runCatching { cached(context) }.getOrNull() ?: return emptyList()
++        return listOf(
++            "sub-fonts-dir" to fontsDir(context).path,
++            "sub-font" to custom.familyName,
++        )
++    }
++
++    suspend fun importFromUri(context: Context, uri: Uri): SubtitleFontImportResult =
++        withContext(Dispatchers.IO) {
++            val input = runCatching { context.contentResolver.openInputStream(uri) }.getOrNull()
++                ?: return@withContext SubtitleFontImportResult.INVALID
++            input.use { importFromStream(context, it, declaredLength = null, coroutineContext = coroutineContext) }
++        }
++
++    suspend fun importFromUrl(context: Context, url: String): SubtitleFontImportResult =
++        withContext(Dispatchers.IO) {
++            val trimmed = url.trim()
++            if (!trimmed.startsWith("http://", ignoreCase = true) &&
++                !trimmed.startsWith("https://", ignoreCase = true)
++            ) {
++                return@withContext SubtitleFontImportResult.DOWNLOAD_FAILED
++            }
++            val callContext = coroutineContext
++            try {
++                val request = Request.Builder().url(trimmed).get().build()
++                val call = httpClient.newCall(request)
++                // Closing the dialog cancels the coroutine: abort the socket so nothing imports later.
++                val cancelHandle = callContext[kotlinx.coroutines.Job]?.invokeOnCompletion { call.cancel() }
++                try {
++                    call.execute().use { response ->
++                        if (!response.isSuccessful) return@withContext SubtitleFontImportResult.DOWNLOAD_FAILED
++                        val body = response.body ?: return@withContext SubtitleFontImportResult.DOWNLOAD_FAILED
++                        val length = body.contentLength()
++                        if (length > MAX_FONT_BYTES) return@withContext SubtitleFontImportResult.TOO_LARGE
++                        body.byteStream().use {
++                            importFromStream(context, it, declaredLength = null, coroutineContext = callContext)
++                        }
++                    }
++                } finally {
++                    cancelHandle?.dispose()
++                }
++            } catch (error: IllegalArgumentException) {
++                Log.w(TAG, "Bad font URL", error)
++                SubtitleFontImportResult.DOWNLOAD_FAILED
++            } catch (error: IOException) {
++                Log.w(TAG, "Font download failed", error)
++                SubtitleFontImportResult.DOWNLOAD_FAILED
++            }
++        }
++
++    /**
++     * Copies [input] to a staging file, validates it and makes it the subtitle font. Blocking.
++     * With [declaredLength], exactly that many bytes are read (an HTTP request body).
++     */
++    fun importFromStream(
++        context: Context,
++        input: InputStream,
++        declaredLength: Long?,
++        coroutineContext: CoroutineContext = EmptyCoroutineContext,
++    ): SubtitleFontImportResult {
++        if (declaredLength != null && declaredLength > MAX_FONT_BYTES) {
++            return SubtitleFontImportResult.TOO_LARGE
++        }
++        val dir = fontsDir(context)
++        val staging = try {
++            File.createTempFile(STAGING_PREFIX, ".tmp", dir)
++        } catch (error: IOException) {
++            Log.w(TAG, "Font staging failed", error)
++            return SubtitleFontImportResult.INVALID
++        }
++        try {
++            val copied = try {
++                copyLimited(input, staging, declaredLength, coroutineContext)
++            } catch (error: IOException) {
++                Log.w(TAG, "Font copy failed", error)
++                return SubtitleFontImportResult.DOWNLOAD_FAILED
++            }
++            if (copied == null) return SubtitleFontImportResult.TOO_LARGE
++            val extension = fontExtension(staging) ?: return SubtitleFontImportResult.INVALID
++            loadFont(staging) ?: return SubtitleFontImportResult.INVALID
++            coroutineContext.ensureActive()
++            synchronized(this) {
++                dir.listFiles()
++                    ?.filter { it.isFile && !it.name.startsWith(".") }
++                    ?.forEach { it.delete() }
++                val target = File(dir, "subtitle_font.$extension")
++                if (!staging.renameTo(target)) return SubtitleFontImportResult.INVALID
++                val font = loadFont(target)
++                if (font == null) target.delete()
++                _font.value = font
++                loaded = true
++                return if (font != null) SubtitleFontImportResult.IMPORTED else SubtitleFontImportResult.INVALID
++            }
++        } finally {
++            if (staging.exists()) staging.delete()
++        }
++    }
++
++    fun clear(context: Context) {
++        synchronized(this) {
++            fontsDir(context).listFiles()
++                ?.filter { it.isFile && !it.name.startsWith(".") }
++                ?.forEach { it.delete() }
++            _font.value = null
++            loaded = true
++        }
++    }
++
++    /** Copies at most [MAX_FONT_BYTES]; returns the byte count, or null when the file is too large. */
++    private fun copyLimited(
++        input: InputStream,
++        target: File,
++        declaredLength: Long?,
++        coroutineContext: CoroutineContext,
++    ): Long? {
++        var total = 0L
++        target.outputStream().use { output ->
++            val buffer = ByteArray(64 * 1024)
++            while (declaredLength == null || total < declaredLength) {
++                coroutineContext.ensureActive()
++                val wanted = if (declaredLength == null) {
++                    buffer.size
++                } else {
++                    minOf(buffer.size.toLong(), declaredLength - total).toInt()
++                }
++                val read = input.read(buffer, 0, wanted)
++                if (read < 0) break
++                total += read
++                if (total > MAX_FONT_BYTES) return null
++                output.write(buffer, 0, read)
++            }
++        }
++        if (declaredLength != null && total < declaredLength) throw IOException("Upload ended early")
++        return total
++    }
++
++    private fun loadFont(file: File): CustomSubtitleFont? = runCatching {
++        if (fontExtension(file) == null) return@runCatching null
++        val typeface = Typeface.createFromFile(file)
++        if (typeface == null || typeface == Typeface.DEFAULT) return@runCatching null
++        val family = readFontFamilyName(file) ?: return@runCatching null
++        CustomSubtitleFont(file = file, familyName = family, typeface = typeface)
++    }.getOrElse {
++        Log.w(TAG, "Unusable font ${file.name}", it)
++        null
++    }
++}
++
++/** "ttf" or "otf" from the file's sfnt signature; null when it is not a single TrueType/OpenType font. */
++private fun fontExtension(file: File): String? {
++    if (file.length() < 12) return null
++    val signature = RandomAccessFile(file, "r").use { it.readInt() }
++    return when (signature) {
++        0x00010000, 0x74727565 -> "ttf" // TrueType, "true"
++        0x4F54544F -> "otf" // "OTTO"
++        else -> null
++    }
++}
++
++/** Reads name ID 1 (font family) from a TrueType/OpenType `name` table. */
++private fun readFontFamilyName(file: File): String? = RandomAccessFile(file, "r").use { raf ->
++    val fileLength = raf.length()
++    val version = raf.readInt()
++    if (version != 0x00010000 && version != 0x4F54544F && version != 0x74727565) return null
++    val numTables = raf.readUnsignedShort()
++    if (numTables > 512) return null
++    raf.skipBytes(6)
++    var nameOffset = -1L
++    repeat(numTables) {
++        val tag = raf.readInt()
++        raf.skipBytes(4)
++        val offset = raf.readInt().toLong() and 0xFFFFFFFFL
++        raf.skipBytes(4)
++        if (tag == 0x6E616D65) nameOffset = offset // "name"
++    }
++    if (nameOffset < 0 || nameOffset >= fileLength) return null
++    raf.seek(nameOffset)
++    raf.skipBytes(2)
++    val count = raf.readUnsignedShort()
++    val stringsOffset = nameOffset + raf.readUnsignedShort()
++    var macFallback: String? = null
++    for (i in 0 until count) {
++        raf.seek(nameOffset + 6 + i * 12L)
++        val platformId = raf.readUnsignedShort()
++        val encodingId = raf.readUnsignedShort()
++        val languageId = raf.readUnsignedShort()
++        val nameId = raf.readUnsignedShort()
++        val length = raf.readUnsignedShort()
++        val offset = raf.readUnsignedShort()
++        if (nameId != 1 || length == 0) continue
++        if (stringsOffset + offset + length > fileLength) continue
++        val bytes = ByteArray(length)
++        raf.seek(stringsOffset + offset)
++        raf.readFully(bytes)
++        when {
++            platformId == 3 || platformId == 0 -> {
++                val name = String(bytes, Charsets.UTF_16BE).trim()
++                if (name.isNotEmpty() && (platformId == 0 || languageId == 0x0409 || encodingId == 0)) {
++                    return name
++                }
++                if (name.isNotEmpty() && macFallback == null) macFallback = name
++            }
++            platformId == 1 && encodingId == 0 && macFallback == null ->
++                macFallback = String(bytes, Charsets.ISO_8859_1).trim().ifEmpty { null }
++        }
++    }
++    macFallback
++}
+diff --git a/app/src/main/java/com/nuvio/tv/reshaped/subtitlefont/SubtitleFontUploadServer.kt b/app/src/main/java/com/nuvio/tv/reshaped/subtitlefont/SubtitleFontUploadServer.kt
+new file mode 100644
+index 000000000..fe54f563d
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/reshaped/subtitlefont/SubtitleFontUploadServer.kt
+@@ -0,0 +1,212 @@
++package com.nuvio.tv.reshaped.subtitlefont
++
++import android.content.Context
++import com.nuvio.tv.R
++import fi.iki.elonen.NanoHTTPD
++import java.security.SecureRandom
++
++/**
++ * Local web page for sending a subtitle font from a phone or computer to the TV: many Android TV
++ * devices have no usable document picker. The page posts the raw font file to `/<token>/api/font`.
++ * Every path carries a random per-session [token] (it is in the QR code), so only someone who
++ * can see the TV screen can reach the page or upload.
++ */
++internal class SubtitleFontUploadServer(
++    private val context: Context,
++    private val onImported: (SubtitleFontImportResult) -> Unit,
++    port: Int,
++) : NanoHTTPD(port) {
++
++    val token: String = newToken()
++    private val pagePath = "/$token/"
++    private val fontPath = "/$token/api/font"
++
++    override fun serve(session: IHTTPSession): Response = when {
++        session.method == Method.GET && (session.uri == pagePath || session.uri == "/$token") ->
++            newFixedLengthResponse(
++                Response.Status.OK,
++                "text/html; charset=utf-8",
++                SubtitleFontUploadWebPage.html(context, fontPath),
++            )
++        session.method == Method.GET && session.uri == fontPath -> json(
++            Response.Status.OK,
++            """{"font":${jsonString(SubtitleFontStore.current(context)?.familyName)}}""",
++        )
++        session.method == Method.POST && session.uri == fontPath -> handleUpload(session)
++        else -> newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "Forbidden")
++            .apply { closeConnection(true) }
++    }
++
++    private fun handleUpload(session: IHTTPSession): Response {
++        // A browser page from another site may post here: its Origin then differs from our Host.
++        val origin = session.headers["origin"]
++        val host = session.headers["host"]
++        if (origin != null && (host == null || !origin.equals("http://$host", ignoreCase = true))) {
++            return json(Response.Status.FORBIDDEN, """{"error":"forbidden"}""").apply { closeConnection(true) }
++        }
++        val length = session.headers["content-length"]?.toLongOrNull()
++        val early = when {
++            length == null || length <= 0L -> SubtitleFontImportResult.INVALID
++            length > SubtitleFontStore.MAX_FONT_BYTES -> SubtitleFontImportResult.TOO_LARGE
++            else -> null
++        }
++        val result = early
++            ?: SubtitleFontStore.importFromStream(context, session.inputStream, declaredLength = length)
++        onImported(result)
++        return if (result == SubtitleFontImportResult.IMPORTED) {
++            json(
++                Response.Status.OK,
++                """{"status":"imported","font":${jsonString(SubtitleFontStore.current(context)?.familyName)}}""",
++            )
++        } else {
++            json(Response.Status.BAD_REQUEST, """{"error":"${result.name.lowercase()}"}""").apply {
++                // The unread request body would otherwise be parsed as the next request.
++                if (early != null) closeConnection(true)
++            }
++        }
++    }
++
++    private fun json(status: Response.Status, body: String): Response =
++        newFixedLengthResponse(status, "application/json; charset=utf-8", body)
++
++    private fun jsonString(value: String?): String {
++        if (value == null) return "null"
++        val escaped = buildString {
++            value.forEach { char ->
++                when {
++                    char == '"' -> append("\\\"")
++                    char == '\\' -> append("\\\\")
++                    char < ' ' -> append(' ')
++                    else -> append(char)
++                }
++            }
++        }
++        return "\"$escaped\""
++    }
++
++    companion object {
++        private const val START_PORT = 8100
++        private const val MAX_ATTEMPTS = 10
++
++        private fun newToken(): String {
++            val bytes = ByteArray(16)
++            SecureRandom().nextBytes(bytes)
++            return bytes.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
++        }
++
++        fun startOnAvailablePort(
++            context: Context,
++            onImported: (SubtitleFontImportResult) -> Unit,
++        ): SubtitleFontUploadServer? {
++            for (port in START_PORT until START_PORT + MAX_ATTEMPTS) {
++                try {
++                    val server = SubtitleFontUploadServer(context.applicationContext, onImported, port)
++                    server.start(SOCKET_READ_TIMEOUT, false)
++                    return server
++                } catch (_: Exception) {
++                }
++            }
++            return null
++        }
++    }
++}
++
++private object SubtitleFontUploadWebPage {
++    fun html(context: Context, fontPath: String): String {
++        // For HTML markup.
++        fun text(id: Int): String = context.getString(id)
++            .replace("&", "&amp;")
++            .replace("<", "&lt;")
++            .replace(">", "&gt;")
++            .replace("'", "&#39;")
++            .replace("\"", "&quot;")
++
++        // For single-quoted JavaScript string literals inside <script>.
++        fun js(value: String): String = buildString {
++            value.forEach { char ->
++                when (char) {
++                    '\\' -> append("\\\\")
++                    '\'' -> append("\\'")
++                    '"' -> append("\\\"")
++                    '<' -> append("\\u003c")
++                    '>' -> append("\\u003e")
++                    '&' -> append("\\u0026")
++                    '\n' -> append("\\n")
++                    '\r' -> append("\\r")
++                    '\u2028' -> append("\\u2028")
++                    '\u2029' -> append("\\u2029")
++                    else -> if (char < ' ') append("\\u%04x".format(char.code)) else append(char)
++                }
++            }
++        }
++        fun jsText(id: Int): String = js(context.getString(id))
++
++        val title = text(R.string.subtitle_font_web_title)
++        val subtitle = text(R.string.subtitle_font_web_subtitle)
++        val choose = text(R.string.subtitle_font_web_choose)
++        val upload = text(R.string.subtitle_font_web_upload)
++        val current = text(R.string.subtitle_font_web_current)
++        val chooseJs = jsText(R.string.subtitle_font_web_choose)
++        val uploading = jsText(R.string.subtitle_font_web_uploading)
++        val defaultFont = jsText(R.string.subtitle_font_default)
++        val imported = jsText(R.string.subtitle_font_web_imported)
++        val invalid = jsText(R.string.subtitle_font_invalid)
++        val tooLarge = jsText(R.string.subtitle_font_too_large)
++        val connection = jsText(R.string.subtitle_font_web_connection_error)
++        val api = js(fontPath)
++        val maxBytes = SubtitleFontStore.MAX_FONT_BYTES
++
++        return """
++<!DOCTYPE html>
++<html lang="en">
++<head>
++<meta charset="utf-8">
++<meta name="viewport" content="width=device-width,initial-scale=1">
++<title>$title</title>
++<style>
++*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
++body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#000;color:#fff;
++display:flex;justify-content:center;align-items:center;min-height:100vh;padding:16px}
++.card{max-width:560px;width:100%;padding:32px 0}
++h1{font-size:20px;font-weight:600;margin-bottom:4px}
++.subtitle{font-size:13px;color:rgba(255,255,255,0.5);margin-bottom:24px}
++input[type=file]{width:100%;padding:12px 1rem;border-radius:16px;border:1px solid rgba(255,255,255,0.14);
++color:#fff;font-size:0.875rem}
++button{width:100%;margin-top:16px;padding:0.875rem 1.3rem;border:1px solid rgba(255,255,255,0.2);border-radius:100px;
++background:transparent;color:#fff;font-size:0.875rem;font-weight:500;cursor:pointer}
++button:disabled{opacity:.4}
++.status{margin-top:12px;font-size:13px;text-align:center;min-height:20px}
++.status.ok{color:#4caf50}.status.err{color:#ef5350}
++.current{margin-top:20px;padding:12px;background:rgba(255,255,255,0.05);border-radius:12px;
++border:1px solid rgba(255,255,255,0.08);font-size:13px;color:rgba(255,255,255,0.6)}
++</style>
++</head>
++<body>
++<div class="card">
++  <h1>$title</h1>
++  <p class="subtitle">$subtitle</p>
++  <label for="file" style="display:none">$choose</label>
++  <input id="file" type="file" accept=".ttf,.otf,font/ttf,font/otf,application/x-font-ttf,application/x-font-otf,application/octet-stream">
++  <button id="send" onclick="send()">$upload</button>
++  <div id="status" class="status"></div>
++  <div class="current">$current <span id="current">…</span></div>
++</div>
++<script>
++const st=document.getElementById('status'),cur=document.getElementById('current'),btn=document.getElementById('send');
++function msg(t,ok){st.textContent=t;st.className='status '+(ok?'ok':'err')}
++async function load(){try{const r=await fetch('$api');const d=await r.json();cur.textContent=d.font||'$defaultFont'}catch(e){cur.textContent='?'}}
++async function send(){const f=document.getElementById('file').files[0];if(!f){msg('$chooseJs',false);return}
++if(f.size>$maxBytes){msg('$tooLarge',false);return}
++btn.disabled=true;msg('$uploading',true);
++try{const r=await fetch('$api',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:f});
++let d={};try{d=await r.json()}catch(e){}
++if(r.ok){msg('$imported',true);cur.textContent=d.font||'$defaultFont'}
++else{msg(d.error==='too_large'?'$tooLarge':'$invalid',false)}}
++catch(e){msg('$connection',false)}finally{btn.disabled=false}}
++load();
++</script>
++</body>
++</html>
++""".trimIndent()
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioMpvSurfaceView.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioMpvSurfaceView.kt
+index c1250278f..00a5c58bf 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioMpvSurfaceView.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioMpvSurfaceView.kt
+@@ -745,6 +745,8 @@ class NuvioMpvSurfaceView @JvmOverloads constructor(
+         mpv.setOptionString("sub-ass-override", "no")
+         mpv.setOptionString("sub-codepage", "auto:utf-8")
+         mpv.setOptionString("sub-font", "Roboto")
++        // Nuvio fork: custom subtitle font (replaces Roboto when one is imported)
++        com.nuvio.tv.reshaped.subtitlefont.SubtitleFontStore.mpvOptions(context).forEach { (name, value) -> mpv.setOptionString(name, value) }
+         mpv.setOptionString("sub-use-margins", "yes")
+         mpv.setOptionString("sub-ass-force-margins", "yes")
+         mpv.setOptionString(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+index 0a93ec909..efc9d637c 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+@@ -2034,6 +2034,8 @@ private fun ExoPlayerSurface(
+     LaunchedEffect(playerView, subtitleStyle) {
+         playerView.applySubtitleStyleIfNeeded(subtitleStyle)
+     }
++    // Nuvio fork: custom subtitle font, re-applied when it finishes loading or changes
++    LaunchedEffect(playerView) { com.nuvio.tv.reshaped.subtitlefont.SubtitleFontStore.font.collect { playerView.applySubtitleStyleIfNeeded(latestSubtitleStyle, force = true) } }
+ }
+ 
+ private fun PlayerView.enableComposeSurfaceSyncWorkaroundIfAvailable() {
+@@ -2121,7 +2123,9 @@ private fun PlayerView.applySubtitleStyleIfNeeded(
+         setFixedTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, scaledFontSize)
+         setApplyEmbeddedFontSizes(false)
+ 
+-        val typeface = if (subtitleStyle.bold) {
++        // Nuvio fork: custom subtitle font (null = default system font)
++        val typeface = com.nuvio.tv.reshaped.subtitlefont.SubtitleFontStore.exoTypeface(context, subtitleStyle.bold)
++            ?: if (subtitleStyle.bold) {
+             android.graphics.Typeface.DEFAULT_BOLD
+         } else {
+             android.graphics.Typeface.DEFAULT
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSubtitleSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSubtitleSettings.kt
+index 53bad0e6e..6f7206770 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSubtitleSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSubtitleSettings.kt
+@@ -78,6 +78,7 @@ internal fun PlaybackSubtitlesSection(
+         onClick = { onOpenDialog(PlaybackDialog.TERTIARY_SUBTITLE_LANGUAGE) }
+     )
+     autoSyncSettingsItems(enabled = enabled) // AutoSync hook
++    subtitleFontSettingsRow(enabled = enabled) // Nuvio fork: custom subtitle font
+ 
+     SettingsToggleRow(
+         title = stringResource(R.string.sub_use_forced_subtitles),
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SubtitleFontSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SubtitleFontSettingsItems.kt
+new file mode 100644
+index 000000000..f4d6d82cd
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SubtitleFontSettingsItems.kt
+@@ -0,0 +1,403 @@
++@file:OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
++
++package com.nuvio.tv.ui.screens.settings
++
++import android.content.ActivityNotFoundException
++import android.graphics.Bitmap
++import android.view.KeyEvent
++import android.widget.Toast
++import androidx.activity.compose.rememberLauncherForActivityResult
++import androidx.activity.result.contract.ActivityResultContracts
++import androidx.compose.foundation.BorderStroke
++import androidx.compose.foundation.Image
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.lazy.LazyListScope
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.foundation.text.BasicTextField
++import androidx.compose.foundation.text.KeyboardActions
++import androidx.compose.foundation.text.KeyboardOptions
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.FontDownload
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.focus.onFocusChanged
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.SolidColor
++import androidx.compose.ui.graphics.asImageBitmap
++import androidx.compose.ui.input.key.onKeyEvent
++import androidx.compose.ui.layout.ContentScale
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.platform.LocalSoftwareKeyboardController
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.text.input.ImeAction
++import androidx.compose.ui.text.input.KeyboardType
++import androidx.compose.ui.unit.dp
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.LifecycleEventObserver
++import androidx.lifecycle.compose.LocalLifecycleOwner
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import androidx.tv.material3.Border
++import androidx.tv.material3.Button
++import androidx.tv.material3.ButtonDefaults
++import androidx.tv.material3.Card
++import androidx.tv.material3.CardDefaults
++import androidx.tv.material3.MaterialTheme
++import androidx.tv.material3.Text
++import com.nuvio.tv.R
++import com.nuvio.tv.core.qr.QrCodeGenerator
++import com.nuvio.tv.reshaped.net.LanAddress
++import com.nuvio.tv.reshaped.subtitlefont.SubtitleFontImportResult
++import com.nuvio.tv.reshaped.subtitlefont.SubtitleFontStore
++import com.nuvio.tv.reshaped.subtitlefont.SubtitleFontUploadServer
++import com.nuvio.tv.ui.components.NuvioDialog
++import com.nuvio.tv.ui.theme.NuvioTheme
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++
++/**
++ * "Subtitle font" row: a user-imported .ttf/.otf used by ExoPlayer and libmpv, default system
++ * font otherwise. The font file in app storage is the setting (see SubtitleFontStore).
++ */
++@Composable
++internal fun subtitleFontSettingsRow(enabled: Boolean) {
++    val context = LocalContext.current
++    // The first read touches disk, so keep it off the main thread.
++    LaunchedEffect(Unit) { withContext(Dispatchers.IO) { SubtitleFontStore.current(context) } }
++    val font by SubtitleFontStore.font.collectAsStateWithLifecycle()
++    var showDialog by remember { mutableStateOf(false) }
++
++    SettingsActionRow(
++        title = stringResource(R.string.subtitle_font_title),
++        subtitle = null,
++        value = font?.familyName ?: stringResource(R.string.subtitle_font_default),
++        onClick = { showDialog = true },
++        enabled = enabled,
++    )
++
++    if (showDialog) {
++        SubtitleFontDialog(onDismiss = { showDialog = false })
++    }
++}
++
++private class SubtitleFontServerState(
++    val server: SubtitleFontUploadServer?,
++    val url: String?,
++    val qr: Bitmap?,
++    val error: String?,
++)
++
++private fun startSubtitleFontServer(
++    context: android.content.Context,
++    onImported: (SubtitleFontImportResult) -> Unit,
++): SubtitleFontServerState {
++    val ip = LanAddress.get(context)
++        ?: return SubtitleFontServerState(null, null, null, context.getString(R.string.error_network_required))
++    val server = SubtitleFontUploadServer.startOnAvailablePort(context, onImported)
++        ?: return SubtitleFontServerState(null, null, null, context.getString(R.string.error_server_ports_unavailable))
++    val url = "http://$ip:${server.listeningPort}/${server.token}/"
++    return SubtitleFontServerState(server, url, QrCodeGenerator.generate(url, 512), null)
++}
++
++@Composable
++private fun SubtitleFontDialog(onDismiss: () -> Unit) {
++    val context = LocalContext.current
++    val scope = rememberCoroutineScope()
++    val font by SubtitleFontStore.font.collectAsStateWithLifecycle()
++    // Written from the upload server's thread too, so a thread-safe flow rather than Compose state.
++    val status = remember { MutableStateFlow<String?>(null) }
++    val statusText by status.collectAsStateWithLifecycle()
++    var importing by remember { mutableStateOf(false) }
++    var showUrlDialog by remember { mutableStateOf(false) }
++    val firstFocus = remember { FocusRequester() }
++
++    val importingText = stringResource(R.string.subtitle_font_importing)
++    val invalidText = stringResource(R.string.subtitle_font_invalid)
++    val tooLargeText = stringResource(R.string.subtitle_font_too_large)
++    val downloadFailedText = stringResource(R.string.subtitle_font_download_failed)
++    val noPickerText = stringResource(R.string.subtitle_font_no_picker)
++
++    fun describe(result: SubtitleFontImportResult): String = when (result) {
++        SubtitleFontImportResult.IMPORTED -> context.getString(
++            R.string.subtitle_font_imported,
++            SubtitleFontStore.font.value?.familyName.orEmpty(),
++        )
++        SubtitleFontImportResult.TOO_LARGE -> tooLargeText
++        SubtitleFontImportResult.INVALID -> invalidText
++        SubtitleFontImportResult.DOWNLOAD_FAILED -> downloadFailedText
++    }
++
++    fun runImport(block: suspend () -> SubtitleFontImportResult) {
++        if (importing) return
++        importing = true
++        status.value = importingText
++        scope.launch {
++            val result = block()
++            importing = false
++            status.value = describe(result)
++        }
++    }
++
++    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
++        if (uri != null) runImport { SubtitleFontStore.importFromUri(context, uri) }
++    }
++
++    // The phone upload page runs only while this dialog is open and the app is in the foreground
++    // (a restart gets a new token, so a new QR code).
++    var serverState by remember { mutableStateOf<SubtitleFontServerState?>(null) }
++    val lifecycleOwner = LocalLifecycleOwner.current
++    DisposableEffect(lifecycleOwner) {
++        var running: SubtitleFontUploadServer? = null
++        fun startServer() {
++            if (running != null) return
++            val started = startSubtitleFontServer(context) { result -> status.value = describe(result) }
++            running = started.server
++            serverState = started
++        }
++        fun stopServer() {
++            running?.stop()
++            running = null
++        }
++        val observer = LifecycleEventObserver { _, event ->
++            when (event) {
++                Lifecycle.Event.ON_START -> startServer()
++                Lifecycle.Event.ON_STOP -> stopServer()
++                else -> Unit
++            }
++        }
++        // Replays ON_START right away when the screen is already started.
++        lifecycleOwner.lifecycle.addObserver(observer)
++        onDispose {
++            lifecycleOwner.lifecycle.removeObserver(observer)
++            stopServer()
++        }
++    }
++    LaunchedEffect(Unit) { runCatching { firstFocus.requestFocus() } }
++
++    NuvioDialog(
++        onDismiss = onDismiss,
++        title = stringResource(R.string.subtitle_font_title),
++        subtitle = stringResource(R.string.subtitle_font_dialog_description),
++        width = 760.dp,
++    ) {
++        Row(
++            modifier = Modifier.fillMaxWidth(),
++            horizontalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.lg),
++            verticalAlignment = Alignment.CenterVertically,
++        ) {
++            serverState?.qr?.let { qr ->
++                Image(
++                    bitmap = qr.asImageBitmap(),
++                    contentDescription = stringResource(R.string.cd_qr_code),
++                    modifier = Modifier.size(168.dp),
++                    contentScale = ContentScale.Fit,
++                )
++            }
++            Column(
++                modifier = Modifier.weight(1f),
++                verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.sm),
++            ) {
++                Text(
++                    text = stringResource(
++                        R.string.subtitle_font_current,
++                        font?.familyName ?: stringResource(R.string.subtitle_font_default),
++                    ),
++                    style = MaterialTheme.typography.titleMedium,
++                    color = NuvioTheme.colors.TextPrimary,
++                )
++                Text(
++                    text = serverState?.error ?: stringResource(R.string.subtitle_font_phone_instruction),
++                    style = MaterialTheme.typography.bodyMedium,
++                    color = NuvioTheme.colors.TextSecondary,
++                )
++                serverState?.url?.let { url ->
++                    Text(
++                        text = url,
++                        style = MaterialTheme.typography.bodyMedium,
++                        color = NuvioTheme.colors.TextTertiary,
++                    )
++                }
++                statusText?.let { text ->
++                    Text(
++                        text = text,
++                        style = MaterialTheme.typography.bodyMedium,
++                        color = NuvioTheme.colors.TextPrimary,
++                    )
++                }
++            }
++        }
++
++        Row(
++            modifier = Modifier.fillMaxWidth(),
++            horizontalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.sm, Alignment.End),
++        ) {
++            SubtitleFontDialogButton(
++                text = stringResource(R.string.subtitle_font_choose_file),
++                modifier = Modifier.focusRequester(firstFocus),
++                onClick = {
++                    if (!importing) {
++                        try {
++                            // Font MIME types vary by file manager; the import validates the file.
++                            picker.launch(arrayOf("*/*"))
++                        } catch (_: ActivityNotFoundException) {
++                            status.value = noPickerText
++                            Toast.makeText(context, noPickerText, Toast.LENGTH_LONG).show()
++                        }
++                    }
++                },
++            )
++            SubtitleFontDialogButton(
++                text = stringResource(R.string.subtitle_font_from_url),
++                onClick = { if (!importing) showUrlDialog = true },
++            )
++            if (font != null) {
++                SubtitleFontDialogButton(
++                    text = stringResource(R.string.subtitle_font_reset),
++                    onClick = {
++                        if (!importing) {
++                            SubtitleFontStore.clear(context)
++                            status.value = null
++                        }
++                    },
++                )
++            }
++            SubtitleFontDialogButton(
++                text = stringResource(R.string.subtitle_font_done),
++                onClick = onDismiss,
++            )
++        }
++    }
++
++    if (showUrlDialog) {
++        SubtitleFontUrlDialog(
++            onDismiss = { showUrlDialog = false },
++            onImport = { url ->
++                showUrlDialog = false
++                runImport { SubtitleFontStore.importFromUrl(context, url) }
++            },
++        )
++    }
++}
++
++@Composable
++private fun SubtitleFontDialogButton(
++    text: String,
++    onClick: () -> Unit,
++    modifier: Modifier = Modifier,
++) {
++    Button(
++        onClick = onClick,
++        modifier = modifier,
++        colors = ButtonDefaults.colors(
++            containerColor = NuvioTheme.colors.BackgroundElevated,
++            contentColor = NuvioTheme.colors.TextPrimary,
++        ),
++    ) {
++        Text(text)
++    }
++}
++
++@Composable
++private fun SubtitleFontUrlDialog(onDismiss: () -> Unit, onImport: (String) -> Unit) {
++    var value by remember { mutableStateOf("") }
++    var isInputFocused by remember { mutableStateOf(false) }
++    val inputFocusRequester = remember { FocusRequester() }
++    val cardFocusRequester = remember { FocusRequester() }
++    val keyboardController = LocalSoftwareKeyboardController.current
++    LaunchedEffect(Unit) { runCatching { cardFocusRequester.requestFocus() } }
++
++    NuvioDialog(
++        onDismiss = onDismiss,
++        title = stringResource(R.string.subtitle_font_url_title),
++        subtitle = stringResource(R.string.subtitle_font_url_description),
++        width = 700.dp,
++    ) {
++        Card(
++            onClick = { inputFocusRequester.requestFocus() },
++            modifier = Modifier
++                .fillMaxWidth()
++                .focusRequester(cardFocusRequester)
++                .onFocusChanged { isInputFocused = it.isFocused || it.hasFocus },
++            colors = CardDefaults.colors(
++                containerColor = NuvioTheme.colors.BackgroundElevated,
++                focusedContainerColor = NuvioTheme.colors.BackgroundElevated,
++            ),
++            border = CardDefaults.border(
++                border = Border(
++                    border = BorderStroke(NuvioTheme.spacing.hairline, NuvioTheme.colors.Border),
++                    shape = RoundedCornerShape(10.dp),
++                ),
++                focusedBorder = Border(
++                    border = NuvioTheme.focusRing.border(NuvioTheme.spacing.xxs),
++                    shape = RoundedCornerShape(10.dp),
++                ),
++            ),
++            shape = CardDefaults.shape(RoundedCornerShape(10.dp)),
++            scale = CardDefaults.scale(focusedScale = 1f),
++        ) {
++            Box(modifier = Modifier.padding(horizontal = 14.dp, vertical = NuvioTheme.spacing.md)) {
++                BasicTextField(
++                    value = value,
++                    onValueChange = { value = it },
++                    modifier = Modifier
++                        .fillMaxWidth()
++                        .focusRequester(inputFocusRequester)
++                        .onKeyEvent { event ->
++                            // Center on the field is consumed (so it doesn't fall through to the
++                            // card) and reopens the keyboard after it was dismissed.
++                            val isCenterDown = event.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_DPAD_CENTER &&
++                                event.nativeKeyEvent.action == KeyEvent.ACTION_DOWN
++                            if (isCenterDown) keyboardController?.show()
++                            isCenterDown
++                        },
++                    singleLine = true,
++                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Done),
++                    keyboardActions = KeyboardActions(onDone = { keyboardController?.hide() }),
++                    textStyle = MaterialTheme.typography.bodyMedium.copy(color = NuvioTheme.colors.TextPrimary),
++                    cursorBrush = SolidColor(if (isInputFocused) NuvioTheme.colors.Primary else Color.Transparent),
++                    decorationBox = { innerTextField ->
++                        if (value.isBlank()) {
++                            Text(
++                                text = "https://",
++                                style = MaterialTheme.typography.bodyMedium,
++                                color = NuvioTheme.colors.TextTertiary,
++                            )
++                        }
++                        innerTextField()
++                    },
++                )
++            }
++        }
++
++        Row(
++            modifier = Modifier.fillMaxWidth(),
++            horizontalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.sm, Alignment.End),
++        ) {
++            SubtitleFontDialogButton(
++                text = stringResource(R.string.action_cancel),
++                onClick = onDismiss,
++            )
++            SubtitleFontDialogButton(
++                text = stringResource(R.string.subtitle_font_url_import),
++                onClick = { if (value.isNotBlank()) onImport(value.trim()) },
++            )
++        }
++    }
++}
+diff --git a/app/src/main/res/values/subtitle_font_strings.xml b/app/src/main/res/values/subtitle_font_strings.xml
+new file mode 100644
+index 000000000..c20742536
+--- /dev/null
++++ b/app/src/main/res/values/subtitle_font_strings.xml
+@@ -0,0 +1,29 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="subtitle_font_title">Subtitle font</string>
++    <string name="subtitle_font_default">Default (system font)</string>
++    <string name="subtitle_font_dialog_description">Use your own .ttf or .otf font for subtitles in both players (up to 20 MB). Styled ASS subtitles keep their own fonts.</string>
++    <string name="subtitle_font_current">Current font: %1$s</string>
++    <string name="subtitle_font_phone_instruction">Scan with your phone, or open this address on a computer on the same network, to send a font file to the TV.</string>
++    <string name="subtitle_font_choose_file">Choose file</string>
++    <string name="subtitle_font_from_url">From URL</string>
++    <string name="subtitle_font_reset">Reset to default</string>
++    <string name="subtitle_font_done">Done</string>
++    <string name="subtitle_font_importing">Importing font…</string>
++    <string name="subtitle_font_imported">Font imported: %1$s</string>
++    <string name="subtitle_font_invalid">That file isn\'t a usable TTF or OTF font.</string>
++    <string name="subtitle_font_too_large">That font is larger than 20 MB.</string>
++    <string name="subtitle_font_download_failed">Couldn\'t download the font.</string>
++    <string name="subtitle_font_no_picker">This TV has no file picker. Send the font from your phone instead.</string>
++    <string name="subtitle_font_url_title">Import font from URL</string>
++    <string name="subtitle_font_url_description">Direct link to a .ttf or .otf file, up to 20 MB.</string>
++    <string name="subtitle_font_url_import">Import</string>
++    <string name="subtitle_font_web_title">Send a subtitle font</string>
++    <string name="subtitle_font_web_subtitle">Choose a .ttf or .otf file (up to 20 MB). Your TV uses it for subtitles in both players.</string>
++    <string name="subtitle_font_web_choose">Choose a font file first</string>
++    <string name="subtitle_font_web_upload">Send to TV</string>
++    <string name="subtitle_font_web_uploading">Sending…</string>
++    <string name="subtitle_font_web_current">Current font:</string>
++    <string name="subtitle_font_web_imported">Font imported</string>
++    <string name="subtitle_font_web_connection_error">Connection error</string>
++</resources>
