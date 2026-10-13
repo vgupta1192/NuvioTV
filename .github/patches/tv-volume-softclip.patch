@@ -1,0 +1,48 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/GainAudioProcessor.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/GainAudioProcessor.kt
+index 4cc245a9..47a70a08 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/GainAudioProcessor.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/GainAudioProcessor.kt
+@@ -66,7 +66,7 @@ internal class GainAudioProcessor : BaseAudioProcessor() {
+ 
+         while (inputBuffer.remaining() >= 2) {
+             val sample = inputBuffer.short.toInt()
+-            val amplified = (sample * scale)
++            val amplified = (softClipBoosted(sample * scale / 32768f) * 32768f)
+                 .roundToInt()
+                 .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+             outputBuffer.putShort(amplified.toShort())
+@@ -83,7 +83,7 @@ internal class GainAudioProcessor : BaseAudioProcessor() {
+ 
+         while (inputBuffer.remaining() >= 4) {
+             val sample = inputBuffer.float
+-            val amplified = (sample * scale).coerceIn(-1f, 1f)
++            val amplified = softClipBoosted(sample * scale).coerceIn(-1f, 1f)
+             outputBuffer.putFloat(amplified)
+         }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/VolumeBoostSoftClip.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/VolumeBoostSoftClip.kt
+new file mode 100644
+index 00000000..2bf0a3f1
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/VolumeBoostSoftClip.kt
+@@ -0,0 +1,20 @@
++package com.nuvio.tv.ui.screens.player
++
++import kotlin.math.abs
++import kotlin.math.tanh
++
++// Ported from DavidVamaiotu's NuvioTV-Reshaped (volume boost soft clip).
++private const val KNEE = 0.8f
++private const val HEADROOM = 1f - KNEE
++
++/**
++ * Soft clip for boosted samples (full scale = 1). Anything under the knee passes untouched, so
++ * normal speech costs one compare; peaks above it bend smoothly toward full scale instead of
++ * hard clipping, which is what makes a boosted explosion sound crackly.
++ */
++internal fun softClipBoosted(sample: Float): Float {
++    val magnitude = abs(sample)
++    if (magnitude <= KNEE) return sample
++    val bent = KNEE + HEADROOM * tanh((magnitude - KNEE) / HEADROOM)
++    return if (sample < 0f) -bent else bent
++}

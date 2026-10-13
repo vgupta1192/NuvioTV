@@ -1,0 +1,138 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/LiveTvRobustness.kt b/app/src/main/java/com/nuvio/tv/core/player/LiveTvRobustness.kt
+new file mode 100644
+index 00000000..3339c356
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/player/LiveTvRobustness.kt
+@@ -0,0 +1,81 @@
++package com.nuvio.tv.core.player
++
++import android.os.SystemClock
++import androidx.annotation.OptIn
++import androidx.media3.common.C
++import androidx.media3.common.PlaybackException
++import androidx.media3.common.Player
++import androidx.media3.common.util.UnstableApi
++import androidx.media3.datasource.HttpDataSource
++import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
++import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
++
++/**
++ * Live TV robustness, ported from DavidVamaiotu's NuvioTV-Reshaped Live TV
++ * (LiveTvLoadErrors, LiveEdgeRecovery). Every source built by [TvLiveMediaSourceFactory]
++ * is a live channel, so no per-URL registry is needed.
++ */
++@OptIn(UnstableApi::class)
++object LiveTvRobustness {
++    private const val HTTP_RETRIES = 3
++    private const val HTTP_RETRY_STEP_MS = 700L
++
++    /**
++     * Media3 fails a stream at once on HTTP 400/401/403/404/410, which suits files. An IPTV
++     * server often refuses a channel only for a moment: the channel just left still counts
++     * against a one-connection account, or a load balancer is busy. So a channel gets a few
++     * quick retries (0.7 s, 1.4 s, 2.1 s) before its error shows. Other errors keep Media3's
++     * defaults.
++     */
++    val loadErrorHandlingPolicy: LoadErrorHandlingPolicy = object : DefaultLoadErrorHandlingPolicy(
++        DefaultLoadErrorHandlingPolicy.DEFAULT_MIN_LOADABLE_RETRY_COUNT_PROGRESSIVE_LIVE,
++    ) {
++        override fun getRetryDelayMsFor(loadErrorInfo: LoadErrorHandlingPolicy.LoadErrorInfo): Long {
++            if (loadErrorInfo.exception.httpResponseCode() != null) {
++                return if (loadErrorInfo.errorCount <= HTTP_RETRIES) {
++                    HTTP_RETRY_STEP_MS * loadErrorInfo.errorCount
++                } else {
++                    C.TIME_UNSET
++                }
++            }
++            return super.getRetryDelayMsFor(loadErrorInfo)
++        }
++    }
++
++    private fun Throwable.httpResponseCode(): Int? {
++        var current: Throwable? = this
++        while (current != null) {
++            if (current is HttpDataSource.InvalidResponseCodeException) return current.responseCode
++            current = current.cause
++        }
++        return null
++    }
++
++    private const val MAX_REJOINS = 3
++    private const val REJOIN_WINDOW_MS = 60_000L
++    private var rejoinWindowStartMs = 0L
++    private var rejoins = 0
++    private var rejoinStream: String? = null
++
++    /**
++     * A paused or stalled live stream falls out of its playlist window (BEHIND_LIVE_WINDOW);
++     * the player then only needs to jump back to the live edge. At most a few rejoins per
++     * minute per stream, so a stream that keeps failing still reaches the normal error path.
++     * Returns true when [error] was handled.
++     */
++    fun tryRejoinLiveEdge(error: PlaybackException, player: Player?): Boolean {
++        if (error.errorCode != PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW || player == null) return false
++        val now = SystemClock.elapsedRealtime()
++        val playing = player.currentMediaItem?.localConfiguration?.uri?.toString()
++        if (playing != rejoinStream || now - rejoinWindowStartMs > REJOIN_WINDOW_MS) {
++            rejoinStream = playing
++            rejoinWindowStartMs = now
++            rejoins = 0
++        }
++        if (rejoins >= MAX_REJOINS) return false
++        rejoins++
++        player.seekToDefaultPosition()
++        player.prepare()
++        return true
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/TvLiveMediaSourceFactory.kt b/app/src/main/java/com/nuvio/tv/core/player/TvLiveMediaSourceFactory.kt
+index a9442385..a10e265d 100644
+--- a/app/src/main/java/com/nuvio/tv/core/player/TvLiveMediaSourceFactory.kt
++++ b/app/src/main/java/com/nuvio/tv/core/player/TvLiveMediaSourceFactory.kt
+@@ -103,17 +103,24 @@ object TvLiveMediaSourceFactory {
+             isHls -> {
+                 HlsMediaSource.Factory(dataSourceFactory)
+                     .setAllowChunklessPreparation(true)
++                    .setLoadErrorHandlingPolicy(LiveTvRobustness.loadErrorHandlingPolicy)
+                     .createMediaSource(mediaItem)
+             }
+             isDash -> {
+                 DashMediaSource.Factory(dataSourceFactory)
++                    .setLoadErrorHandlingPolicy(LiveTvRobustness.loadErrorHandlingPolicy)
+                     .createMediaSource(mediaItem)
+             }
+             else -> {
+                 val extractorsFactory = DefaultExtractorsFactory()
+-                    .setTsExtractorFlags(DefaultTsPayloadReaderFactory.FLAG_ENABLE_HDMV_DTS_AUDIO_STREAMS)
++                    // Broadcast restreams often send IDR frames rarely or never: start on any I-frame.
++                    .setTsExtractorFlags(
++                        DefaultTsPayloadReaderFactory.FLAG_ENABLE_HDMV_DTS_AUDIO_STREAMS or
++                            DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES
++                    )
+                     .setTsExtractorTimestampSearchBytes(1500 * TsExtractor.TS_PACKET_SIZE)
+                 DefaultMediaSourceFactory(dataSourceFactory, extractorsFactory)
++                    .setLoadErrorHandlingPolicy(LiveTvRobustness.loadErrorHandlingPolicy)
+                     .createMediaSource(mediaItem)
+             }
+         }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
+index d9ae2824..55d4b9cb 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
+@@ -35,6 +35,7 @@ import androidx.media3.common.util.UnstableApi
+ import android.util.Log
+ import androidx.media3.ui.AspectRatioFrameLayout
+ import androidx.media3.ui.PlayerView
++import com.nuvio.tv.core.player.LiveTvRobustness
+ import com.nuvio.tv.core.player.TvChannelPreviewPlayerPool
+ import com.nuvio.tv.core.player.TvLiveMediaSourceFactory
+ import com.nuvio.tv.ui.components.LoadingIndicator
+@@ -108,6 +109,8 @@ fun TvChannelPreviewPlayer(
+             }
+ 
+             override fun onPlayerError(error: PlaybackException) {
++                // Fell behind the live window after a pause or stall: rejoin the live edge.
++                if (LiveTvRobustness.tryRejoinLiveEdge(error, activePlayer)) return
+                 Log.e("TvPreviewPlayer", "ExoPlayer playback error: ${error.errorCodeName} (${error.errorCode})", error)
+                 isBuffering = false
+                 currentOnError(error.localizedMessage ?: "Erro ao reproduzir stream ao vivo")
