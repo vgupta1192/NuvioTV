@@ -1,0 +1,3736 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index f529718bb..d63aa6892 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -567,3 +567,4 @@ dependencies {
+ }
+ 
+ apply(from = "autosync.gradle") // AutoSync: audio subtitle sync fallback (sherpa-onnx)
++apply(from = "seekpreview.gradle") // Nuvio fork: seek previews (Seekr client)
+diff --git a/app/seekpreview.gradle b/app/seekpreview.gradle
+new file mode 100644
+index 000000000..66175e8df
+--- /dev/null
++++ b/app/seekpreview.gradle
+@@ -0,0 +1,4 @@
++// Nuvio fork: seek-preview thumbnails (seekr.tv client), ported from NuvioTV-Reshaped.
++dependencies {
++    implementation "tv.seekr:seekr-compose:0.2.0"
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt
+index f7fb5f0b6..8dd73667d 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt
+@@ -71,7 +71,13 @@ internal fun PlayerRuntimeController.autoSyncExtractorsFactory(
+     headers: Map<String, String>,
+ ): ExtractorsFactory {
+     // Audio is copied too, for the audio sync fallback (idle unless it is listening).
+-    val tapped = AudioSyncTaps.wrapExtractors(delegate, url)
++    // Video keyframes are copied too, for on-device seek previews (idle once all are made).
++    val tapped = com.nuvio.tv.ui.screens.player.seekpreview.local.LocalPreviewSources.register(
++        owner = this,
++        context = context,
++        sourceKey = url,
++        factory = AudioSyncTaps.wrapExtractors(delegate, url),
++    )
+     AutoSyncPreferences.ensureLoaded(context)
+     if (!AutoSyncPreferences.isEnabled(context)) return tapped
+     val factory = AutoSyncExtractorsFactory(delegate = tapped, sourceKey = url)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerLifecycle.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerLifecycle.kt
+index 5ed04ff33..484b5e337 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerLifecycle.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerLifecycle.kt
+@@ -51,6 +51,7 @@ internal fun PlayerRuntimeController.releasePlayer(
+     hideSubtitleDelayOverlayJob?.cancel()
+     subtitleAutoSyncLoadJob?.cancel()
+     cancelAutomaticSubtitleSync() // AutoSync hook
++    com.nuvio.tv.ui.screens.player.seekpreview.local.LocalPreviewSources.unregister(this) // Nuvio fork: on-device seek previews
+     stopSidecarAddonSubtitle(clearView = true)
+     subtitleTimingRefreshJob?.cancel()
+     subtitleTimingRefreshJob = null
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
+index 96eac7878..980b96148 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
+@@ -1259,7 +1259,7 @@ fun PlayerRuntimeController.onEvent(event: PlayerEvent) {
+             if (_playbackTimeline.value.isLive) return
+             val target = pendingPreviewSeekPosition
+             if (target != null) {
+-                seekPlaybackTo(target, SeekParameters.CLOSEST_SYNC)
++                seekPlaybackTo(target, forkSeekPreviewCommitSeekParameters()) // Nuvio fork: seek previews
+                 updatePlaybackTimeline(currentPosition = target)
+                 pendingPreviewSeekPosition = null
+                 scheduleProgressSyncAfterSeek()
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+index 0e2aa68d2..0a93ec909 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+@@ -307,6 +307,7 @@ fun PlayerScreen(
+ 
+     val handleBackPress = handleBackPress@{
+         if (externalHandoffInProgress) return@handleBackPress
++        if (viewModel.forkSeekPreviewHandleBack(uiState)) return@handleBackPress // Nuvio fork: seek previews
+         if (postPlayRecommendationState.canReturnToPlayer && !uiState.playbackEnded) {
+             returnToPlayerFromPostPlay()
+             viewModel.hideControls()
+@@ -515,6 +516,7 @@ fun PlayerScreen(
+     ) {
+         if (shouldConfirmNextEpisodeOnEnd || postPlayRecommendationState.isVisible) return@LaunchedEffect
+         if (uiState.error != null) return@LaunchedEffect
++        if (viewModel.seekPreview.isSyncOverlayOpen) return@LaunchedEffect // Nuvio fork: seek previews
+         if (uiState.showControls && !uiState.showEpisodesPanel && !uiState.showSourcesPanel &&
+             !uiState.showAudioOverlay && !uiState.showSubtitleOverlay &&
+             !uiState.showSubtitleStylePanel && !uiState.showSubtitleDelayOverlay &&
+@@ -1510,6 +1512,8 @@ fun PlayerScreen(
+             )
+         }
+ 
++        ForkSeekPreviewSyncLayer(viewModel, uiState, onDismissed = { runCatching { containerFocusRequester.requestFocus() } }) // Nuvio fork: seek previews
++
+         AnimatedVisibility(
+             visible = uiState.showSeekOverlay && !uiState.showControls && uiState.error == null &&
+                 !uiState.showLoadingOverlay && !uiState.showPauseOverlay &&
+@@ -2397,6 +2401,7 @@ private fun PlayerControlsOverlay(
+             if (!isLivePlayback) {
+                 // Progress bar — always LTR regardless of locale
+                 CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
++                    com.nuvio.tv.ui.screens.player.seekpreview.SeekPreviewAboveProgressBar(viewModel) // Nuvio fork: seek previews
+                     PlayerControlsProgressBarHost(
+                         viewModel = viewModel,
+                         focusRequester = progressBarFocusRequester,
+@@ -2566,6 +2571,16 @@ private fun PlayerControlsOverlay(
+                                 onDownKey = onHideControls,
+                                 onFocused = onResetHideTimer
+                             )
++                            com.nuvio.tv.ui.screens.player.seekpreview.seekPreviewSyncAction(viewModel)?.let { openSync -> // Nuvio fork: seek previews
++                                ControlButton(
++                                    icon = forkSeekPreviewSyncIcon,
++                                    contentDescription = stringResource(R.string.cd_seek_preview_sync),
++                                    onClick = openSync,
++                                    upFocusRequester = progressUpTarget,
++                                    onDownKey = onHideControls,
++                                    onFocused = onResetHideTimer
++                                )
++                            }
+                             if (uiState.playbackIssueReportsEnabled) {
+                                 ReportControlButton(
+                                     reportId = uiState.playbackIssueReportId,
+@@ -2927,7 +2942,8 @@ private fun ProgressBar(
+ private fun SeekOverlay(
+     currentPosition: Long,
+     duration: Long,
+-    bufferedPosition: Long = 0L
++    bufferedPosition: Long = 0L,
++    preview: @Composable () -> Unit = {} // Nuvio fork: seek previews
+ ) {
+     Column(
+         modifier = Modifier
+@@ -2935,6 +2951,7 @@ private fun SeekOverlay(
+             .padding(horizontal = NuvioTheme.spacing.xxl, vertical = NuvioTheme.spacing.xl)
+     ) {
+         CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
++            preview() // Nuvio fork: seek previews
+             ProgressBar(
+                 currentPosition = currentPosition,
+                 duration = duration,
+@@ -2967,7 +2984,8 @@ private fun SeekOverlayHost(viewModel: PlayerViewModel) {
+     SeekOverlay(
+         currentPosition = playbackTimeline.currentPosition,
+         duration = playbackTimeline.duration,
+-        bufferedPosition = playbackTimeline.bufferedPosition
++        bufferedPosition = playbackTimeline.bufferedPosition,
++        preview = { com.nuvio.tv.ui.screens.player.seekpreview.SeekPreviewThumbnailHost(viewModel = viewModel) } // Nuvio fork: seek previews
+     )
+ }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerViewModel.kt
+index ef1cf7584..9dd4178eb 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerViewModel.kt
+@@ -176,6 +176,9 @@ class PlayerViewModel @Inject constructor(
+         scope = viewModelScope
+     )
+ 
++    /** Seek-preview thumbnails (Nuvio fork, from NuvioTV-Reshaped); see the seekpreview package. */
++    val seekPreview = com.nuvio.tv.ui.screens.player.seekpreview.SeekPreviewState(viewModelScope, controller)
++
+     val uiState: StateFlow<PlayerUiState>
+         get() = controller.uiState
+ 
+@@ -262,7 +265,7 @@ class PlayerViewModel @Inject constructor(
+     }
+ 
+     fun onEvent(event: PlayerEvent) {
+-        controller.onEvent(event)
++        controller.onEvent(seekPreview.intercept(event)) // Nuvio fork: seek previews
+     }
+ 
+     fun bindExoSubtitleView(subtitleView: androidx.media3.ui.SubtitleView?) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/SeekPreviewForkHooks.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/SeekPreviewForkHooks.kt
+new file mode 100644
+index 000000000..b1d8f4acb
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/SeekPreviewForkHooks.kt
+@@ -0,0 +1,31 @@
++package com.nuvio.tv.ui.screens.player
++
++import androidx.compose.foundation.layout.BoxScope
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.Tune
++import androidx.compose.runtime.Composable
++import androidx.media3.exoplayer.SeekParameters
++import com.nuvio.tv.ui.screens.player.seekpreview.SeekPreviewSyncLayer
++import com.nuvio.tv.ui.screens.player.seekpreview.handleBack
++import com.nuvio.tv.ui.screens.player.seekpreview.seekPreviewCommitSeekParameters
++
++/*
++ * Nuvio fork: seek-preview entry points in the player package, so upstream player files call
++ * them without new import lines (upstream rewrites its imports often, which breaks patch hunks).
++ */
++
++internal fun PlayerRuntimeController.forkSeekPreviewCommitSeekParameters(): SeekParameters =
++    seekPreviewCommitSeekParameters()
++
++internal fun PlayerViewModel.forkSeekPreviewHandleBack(uiState: PlayerUiState): Boolean =
++    seekPreview.handleBack(uiState)
++
++@Composable
++internal fun BoxScope.ForkSeekPreviewSyncLayer(
++    viewModel: PlayerViewModel,
++    uiState: PlayerUiState,
++    onDismissed: () -> Unit,
++) = SeekPreviewSyncLayer(viewModel, uiState, onDismissed)
++
++internal val forkSeekPreviewSyncIcon: androidx.compose.ui.graphics.vector.ImageVector
++    get() = Icons.Default.Tune
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/BoundedSeekrTrack.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/BoundedSeekrTrack.kt
+new file mode 100644
+index 000000000..1f383932a
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/BoundedSeekrTrack.kt
+@@ -0,0 +1,178 @@
++package com.nuvio.tv.ui.screens.player.seekpreview
++
++import android.graphics.Bitmap
++import android.graphics.BitmapFactory
++import java.util.concurrent.ConcurrentHashMap
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.async
++import kotlinx.coroutines.awaitAll
++import kotlinx.coroutines.coroutineScope
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
++import kotlinx.coroutines.withContext
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import tv.seekr.previews.android.SeekrThumbnail
++import tv.seekr.previews.core.PreviewTrack
++import tv.seekr.previews.core.SeekrContent
++import tv.seekr.previews.core.SeekrPreviews
++import tv.seekr.previews.core.SeekrTile
++
++/**
++ * Stands in for the Seekr library's `Seekr`/`SeekrTrack` pair with the same API, but with memory
++ * bounded for 2 GB TVs.
++ *
++ * The library decodes every sprite sheet of a title at playback start and keeps all of them as
++ * full-size bitmaps for the whole session (its `maxCachedSheets` argument is ignored), which is
++ * over 100 MB on a long film. Here every sheet is still downloaded at the same moment, but kept
++ * as its compressed bytes; only the sheet in use and its neighbours stay decoded, and the
++ * neighbours are decoded ahead so stepping across a sheet boundary finds them ready. Tiles are
++ * cropped from the same ARGB_8888 sheets as before, so thumbnails look the same.
++ */
++internal object BoundedSeekr {
++    /** One client for every title, so connections are pooled rather than rebuilt per film. */
++    private val http: OkHttpClient by lazy { OkHttpClient() }
++
++    suspend fun loadTrack(apiKey: String, content: SeekrContent, durationMs: Long): BoundedSeekrTrack? {
++        val track = SeekrPreviews.create(apiKey, httpClient = http).loadTrack(content, durationMs) ?: return null
++        return BoundedSeekrTrack(track, BoundedSheetCache(http, track.sheetUrls.toList()))
++    }
++}
++
++class BoundedSeekrTrack internal constructor(
++    private val track: PreviewTrack,
++    private val sheets: BoundedSheetCache,
++) {
++    val isEmpty: Boolean get() = track.isEmpty
++    val sourceDurationMs: Long get() = track.sourceDurationMs
++    val scale: Double get() = track.scale
++
++    var offsetMs: Long
++        get() = track.offsetMs
++        set(value) {
++            track.offsetMs = value
++        }
++
++    /** Downloads every sheet in parallel, as the library does, keeping them compressed. */
++    suspend fun prefetchSheets() = sheets.downloadAll()
++
++    /** Decodes the sheet around [positionMs] and its neighbours ahead of the first scrub. */
++    fun warm(positionMs: Long) {
++        track.tileAt(positionMs)?.let { sheets.warm(it.sheetUrl) }
++    }
++
++    suspend fun thumbnailAt(positionMs: Long): Bitmap? {
++        val tile = track.tileAt(positionMs) ?: return null
++        return cropTile(tile)
++    }
++
++    suspend fun thumbnailFor(positionMs: Long): SeekrThumbnail? {
++        val cue = track.cueAt(positionMs) ?: return null
++        val bitmap = cropTile(cue.tile) ?: return null
++        return SeekrThumbnail(bitmap = bitmap, cueStartMs = cue.startMs, cueEndMs = cue.endMs)
++    }
++
++    // Same crop as the library's SeekrTrack.
++    private suspend fun cropTile(tile: SeekrTile): Bitmap? {
++        val sheet = sheets.get(tile.sheetUrl) ?: return null
++        val tileW = tile.w.takeIf { it > 0 } ?: 320
++        val tileH = tile.h.takeIf { it > 0 } ?: 180
++        val x = tile.x.coerceIn(0, (sheet.width - 1).coerceAtLeast(0))
++        val y = tile.y.coerceIn(0, (sheet.height - 1).coerceAtLeast(0))
++        val w = tileW.coerceAtMost((sheet.width - x).coerceAtLeast(1))
++        val h = tileH.coerceAtMost((sheet.height - y).coerceAtLeast(1))
++        return runCatching { Bitmap.createBitmap(sheet, x, y, w, h) }.getOrNull()
++    }
++}
++
++/**
++ * Compressed bytes for every sheet, decoded bitmaps for at most [MAX_DECODED] of them. A cropped
++ * tile is its own copy, so evicting a sheet never affects a thumbnail on screen; evicted sheets
++ * are left to the garbage collector rather than recycled.
++ */
++internal class BoundedSheetCache(
++    private val http: OkHttpClient,
++    /** Sheets in timeline order, so the ones either side of a sheet are its neighbours. */
++    private val urls: List<String>,
++) {
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++    private val encoded = ConcurrentHashMap<String, ByteArray>()
++    private val mutexes = ConcurrentHashMap<String, Mutex>()
++    private val decoded = object : LinkedHashMap<String, Bitmap>(8, 0.75f, true) {
++        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Bitmap>?) = size > MAX_DECODED
++    }
++
++    private fun mutexFor(url: String): Mutex = mutexes.computeIfAbsent(url) { Mutex() }
++
++    private fun cached(url: String): Bitmap? = synchronized(decoded) { decoded[url] }
++
++    suspend fun downloadAll() {
++        coroutineScope {
++            urls.map { url -> async { bytes(url) } }.awaitAll()
++        }
++    }
++
++    /** The decoded sheet; its neighbours are decoded in the background for the next step. */
++    suspend fun get(url: String): Bitmap? {
++        val sheet = decode(url)
++        if (sheet != null) warmNeighbours(url)
++        return sheet
++    }
++
++    fun warm(url: String) {
++        scope.launch { decode(url) }
++        warmNeighbours(url)
++    }
++
++    private fun warmNeighbours(url: String) {
++        val index = urls.indexOf(url)
++        if (index < 0) return
++        for (neighbour in listOf(index + 1, index - 1)) {
++            val next = urls.getOrNull(neighbour) ?: continue
++            if (cached(next) == null) scope.launch { decode(next) }
++        }
++    }
++
++    private suspend fun decode(url: String): Bitmap? {
++        cached(url)?.let { return it }
++        return mutexFor(url).withLock {
++            cached(url)?.let { return@withLock it }
++            val data = bytes(url) ?: return@withLock null
++            val bitmap = withContext(Dispatchers.Default) {
++                runCatching { BitmapFactory.decodeByteArray(data, 0, data.size) }.getOrNull()
++            } ?: return@withLock null
++            synchronized(decoded) { decoded[url] = bitmap }
++            bitmap
++        }
++    }
++
++    private suspend fun bytes(url: String): ByteArray? {
++        encoded[url]?.let { return it }
++        return downloadMutexFor(url).withLock {
++            encoded[url]?.let { return@withLock it }
++            download(url)?.also { encoded[url] = it }
++        }
++    }
++
++    private val downloadMutexes = ConcurrentHashMap<String, Mutex>()
++
++    private fun downloadMutexFor(url: String): Mutex = downloadMutexes.computeIfAbsent(url) { Mutex() }
++
++    private suspend fun download(url: String): ByteArray? = withContext(Dispatchers.IO) {
++        runCatching {
++            val request = Request.Builder().url(url).get().build()
++            http.newCall(request).execute().use { response ->
++                if (!response.isSuccessful) return@use null
++                response.body?.bytes()
++            }
++        }.getOrNull()
++    }
++
++    private companion object {
++        /** The sheet in use, the ones either side, and the one just left. */
++        const val MAX_DECODED = 4
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewCueGrid.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewCueGrid.kt
+new file mode 100644
+index 000000000..b5c42fb3f
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewCueGrid.kt
+@@ -0,0 +1,169 @@
++package com.nuvio.tv.ui.screens.player.seekpreview
++
++import kotlin.math.abs
++import kotlin.math.roundToLong
++
++/**
++ * The time window of a single seek-preview cue, expressed in the **playback** timebase.
++ *
++ * Seekr sprite sheets hold one frame per cue (a ~10 second grid today), so a preview
++ * thumbnail never represents an exact millisecond — it represents the whole window
++ * [startMs]..[endMs]. Resolving that window and keeping it in player state is what lets the
++ * scrubber move in whole cues instead of promising a precision the sprite sheet cannot back
++ * up.
++ *
++ * The cue times reported by the SDK are on the *preview* timeline; callers must subtract the
++ * active sync offset before constructing this so both ends are directly comparable with
++ * playback positions.
++ */
++data class SeekPreviewCue(
++    val startMs: Long,
++    val endMs: Long
++) {
++    /** Length of the cue window; the effective scrub granularity. */
++    val durationMs: Long get() = endMs - startMs
++
++    val isValid: Boolean get() = durationMs > 0L
++
++    /** True when [positionMs] falls inside this window (start-inclusive, end-exclusive). */
++    fun contains(positionMs: Long): Boolean = positionMs >= startMs && positionMs < endMs
++
++    /**
++     * True when this is the cue whose frame best represents [positionMs] — the one the
++     * preview centres on.
++     *
++     * A cue's frame is captured at its *start*, so the containing cue is not the closest one
++     * for positions in the back half of the window: at 18:29 the cue covering 18:20..18:30
++     * holds an 18:20 frame, nine seconds stale, while the next cue's 18:30 frame is one second
++     * away. Preferring the nearer frame roughly halves the worst-case error and, since the
++     * playhead sits between the two, keeps the filmstrip reading symmetrically around it.
++     *
++     * The window is therefore shifted back by half a cue, but its trailing edge is left at
++     * [endMs] rather than pulled in: the last cue of a track has no successor to hand over to,
++     * so it has to keep representing the run-out to the end of the media.
++     *
++     * This approximates the hand-over using *this* cue's length, where [prefersSuccessorFor]
++     * decides it exactly using the preceding cue's midpoint. The two agree whenever
++     * neighbouring cues are the same length, which is every cue on today's uniform 10s grid.
++     * Once the generator writes real keyframe times as cue starts, cue lengths will vary and
++     * the two will disagree near a length change — harmlessly, since a cue that fails this
++     * check merely falls back to free stepping, but this is the place to revisit if grid
++     * locking is to stay exact on a non-uniform grid.
++     */
++    fun represents(positionMs: Long): Boolean =
++        positionMs >= startMs - durationMs / 2 && positionMs < endMs
++
++    /**
++     * True when the *next* cue's frame is closer to [positionMs] than this cue's own — i.e.
++     * when [positionMs] is past this window's midpoint.
++     *
++     * Together with the window itself this is the complete input to the preview's re-centring
++     * decision, so replaying it is how the host knows a cached frame is still the right one.
++     */
++    fun prefersSuccessorFor(positionMs: Long): Boolean =
++        positionMs - startMs > endMs - positionMs
++}
++
++/**
++ * Grid-locked scrubbing: turns a free-form seek delta into a move of whole preview cues.
++ *
++ * ### Why
++ * The scrubber can address every millisecond, but previews exist only once per cue. Scrubbing
++ * freely therefore lands the user on positions that no thumbnail describes, and the frame they
++ * were shown can be several seconds away from where they end up — worst of all across a shot
++ * boundary, where "a few seconds out" reads as "the wrong scene". Rather than approximating
++ * the missing frames, this narrows the claim: every position the user can stop on is a
++ * position we hold a real frame for, so preview and playback always agree.
++ *
++ * ### How
++ * The cue window resolved for the frame currently on screen (see [SeekPreviewCue]) is the only
++ * input needed — no global cue table, which the SDK does not expose. Stepping forward one cue
++ * is "seek to this cue's end", which is exactly the next cue's start; larger steps extrapolate
++ * from the cue's own length. Extrapolation only ever picks the *candidate* position: once the
++ * thumbnail for it resolves, the true cue start comes back and [alignedTargetMs] snaps the
++ * pending position onto it, so a non-uniform cue grid self-corrects within one frame and can
++ * never drift or stall.
++ */
++object SeekPreviewCueStepper {
++
++    /**
++     * The position to scrub to when the user asks to move by [deltaMs] from [fromMs].
++     *
++     * Steps are measured from the cue the preview is *showing* (see [SeekPreviewCue.represents]),
++     * not the one containing [fromMs], so one press always advances the filmstrip by exactly one
++     * frame. From 18:29 — where the centre frame is 18:30 — forward lands on 18:40 and back on
++     * 18:20, rather than nudging a single second onto the frame already on screen.
++     *
++     * Falls back to plain [fromMs] + [deltaMs] whenever grid-locking cannot be justified —
++     * no cue resolved yet, a degenerate cue, or a cue that does not describe [fromMs]
++     * (which happens at the very ends of the track, where the SDK clamps its lookup). Keeping
++     * the free-form path for those cases preserves the user's ability to reach 0 and
++     * [durationMs] exactly.
++     */
++    fun targetMs(
++        cue: SeekPreviewCue?,
++        fromMs: Long,
++        deltaMs: Long,
++        durationMs: Long
++    ): Long {
++        val maxMs = if (durationMs > 0L) durationMs else Long.MAX_VALUE
++        val free = { (fromMs + deltaMs).coerceIn(0L, maxMs) }
++        if (cue == null || !cue.isValid || !cue.represents(fromMs) || deltaMs == 0L) return free()
++
++        val cueMs = cue.durationMs
++        val steps = (abs(deltaMs).toDouble() / cueMs).roundToLong().coerceAtLeast(1L)
++        val target = if (deltaMs > 0L) {
++            // The cue's end *is* the next cue's start, so a single step is exact.
++            cue.endMs + (steps - 1L) * cueMs
++        } else {
++            cue.startMs - steps * cueMs
++        }
++        return target.coerceIn(0L, maxMs)
++    }
++
++    /**
++     * The position [pendingMs] should be corrected to now that [cue] has resolved, or `null`
++     * to leave it untouched.
++     *
++     * Snapping the pending position onto the resolved cue's start is what makes the displayed
++     * time describe the frame on screen rather than an arbitrary point near it. It is a no-op
++     * once aligned, so it converges immediately and does not fight the user.
++     *
++     * It is deliberately skipped at the media boundaries. A cue window is expressed in the
++     * playback timebase, so a non-zero preview sync offset routinely pushes the first cue's
++     * start below `0` or the last cue's end past [durationMs]; snapping inside such a cue
++     * would drag the pending position out of the seekable range, or pull it a full cue back
++     * from an end the user had just reached — making 0 and [durationMs] unreachable and
++     * leaving the committed seek disagreeing with the time on screen.
++     *
++     * [snap] may move the cue's start onto a nearby keyframe of the playing file (see
++     * [SEEK_PREVIEW_KEYFRAME_SNAP_MS]); it must stay well inside half a cue, so the snapped
++     * position is still represented by the same cue and the alignment stays settled.
++     */
++    fun alignedTargetMs(
++        cue: SeekPreviewCue?,
++        pendingMs: Long?,
++        durationMs: Long,
++        snap: (Long) -> Long = { it },
++    ): Long? {
++        if (cue == null || !cue.isValid || pendingMs == null) return null
++        if (!cue.represents(pendingMs)) return null
++        // The ends of the media are destinations in their own right.
++        if (pendingMs <= 0L) return null
++        if (durationMs > 0L && pendingMs >= durationMs) return null
++
++        val target = snap(cue.startMs)
++        if (target < 0L) return null
++        if (durationMs > 0L && target > durationMs) return null
++        if (target == pendingMs) return null
++        return target
++    }
++}
++
++/**
++ * How far a scrub target may move to land on a keyframe of the playing file. A keyframe is the
++ * one position a player can seek to exactly without decoding forward, so this makes the seek
++ * both precise and as fast as it gets. Seekr frames are themselves only within about 3 s of
++ * their cue time, so moving by up to this much costs nothing visible.
++ */
++internal const val SEEK_PREVIEW_KEYFRAME_SNAP_MS = 1_500L
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewFilmstrip.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewFilmstrip.kt
+new file mode 100644
+index 000000000..2d1d3c230
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewFilmstrip.kt
+@@ -0,0 +1,174 @@
++package com.nuvio.tv.ui.screens.player.seekpreview
++
++import androidx.compose.animation.core.Animatable
++import androidx.compose.animation.core.AnimationVector1D
++import androidx.compose.foundation.Image
++import androidx.compose.foundation.background
++import androidx.compose.foundation.border
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.offset
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.key
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.asImageBitmap
++import androidx.compose.ui.graphics.graphicsLayer
++import androidx.compose.ui.layout.ContentScale
++import androidx.compose.ui.platform.LocalDensity
++import androidx.compose.ui.unit.Dp
++import androidx.compose.ui.unit.IntOffset
++import androidx.compose.ui.unit.dp
++import kotlin.math.roundToInt
++
++/** Frames either side of the centre: one in full and one cut off by the screen edge. */
++internal const val FilmstripSideFrames = 2
++internal const val FilmstripSize = FilmstripSideFrames * 2 + 1
++internal val FilmstripGap = 12.dp
++private const val CenterScale = 1.06f
++private val FrameShape = RoundedCornerShape(8.dp)
++private val CenterBorder = 2.dp
++
++/** A filmstrip position whose lookup finished: [thumbnail] is null past the title's start or end. */
++internal class FilmstripFrame(val thumbnail: SeekPreviewThumbnail?)
++
++/**
++ * The frames shown while scrubbing, oldest first, centre at [FilmstripSideFrames]. A null entry
++ * is still being looked up and is not drawn yet.
++ */
++internal class Filmstrip(
++    val frames: List<FilmstripFrame?>,
++    val revision: Int,
++    val offsetMs: Long,
++) {
++    val center: SeekPreviewThumbnail? get() = frames[FilmstripSideFrames]?.thumbnail
++
++    /** True when every neighbour came from the same frames ([revision]) and offset. */
++    fun matches(revision: Int, offsetMs: Long) = this.revision == revision && this.offsetMs == offsetMs
++
++    /** How many places [cueStartMs] sits from the centre, or null when it is not in the strip. */
++    fun stepsTo(cueStartMs: Long): Int? {
++        val index = frames.indexOfFirst { it?.thumbnail?.cueStartMs == cueStartMs }
++        return if (index < 0) null else index - FilmstripSideFrames
++    }
++
++    companion object {
++        /**
++         * The strip around a new [center], keeping the neighbours this strip already has when the
++         * centre only moved along it ([steps] places), so a step needs one new frame, not four.
++         */
++        fun around(
++            center: SeekPreviewThumbnail,
++            previous: Filmstrip?,
++            steps: Int?,
++            revision: Int,
++            offsetMs: Long,
++        ): Filmstrip {
++            val frames = List(FilmstripSize) { index ->
++                when {
++                    index == FilmstripSideFrames -> FilmstripFrame(center)
++                    previous == null || steps == null -> null
++                    else -> previous.frames.getOrNull(index + steps)
++                }
++            }
++            return Filmstrip(frames, revision, offsetMs)
++        }
++    }
++}
++
++/**
++ * Looks up the neighbours [strip] lacks — every neighbour when [refreshAll] — walking outwards
++ * from the centre one cue at a time. Side lookups use [SeekPreviewTrack.sideThumbnailFor], so
++ * they never pull on-device decoding away from the frame being scrubbed to.
++ */
++internal suspend fun SeekPreviewTrack.fillFilmstrip(strip: Filmstrip, refreshAll: Boolean): Filmstrip {
++    val frames = strip.frames.toMutableList()
++    val offset = strip.offsetMs
++    for (direction in intArrayOf(1, -1)) {
++        var from: SeekPreviewThumbnail? = strip.center ?: break
++        for (distance in 1..FilmstripSideFrames) {
++            val index = FilmstripSideFrames + direction * distance
++            val edge = from
++            if (edge == null) {
++                // Past the title's start or end there is nothing more on this side.
++                frames[index] = FilmstripFrame(null)
++                continue
++            }
++            val known = frames[index]
++            val frame = if (known != null && !refreshAll) {
++                known
++            } else {
++                val probe = if (direction > 0) edge.cueEndMs - offset else edge.cueStartMs - offset - 1
++                val found = sideThumbnailFor(probe)?.takeIf { candidate ->
++                    // No progress means the title ends (or starts) here.
++                    if (direction > 0) candidate.cueStartMs > edge.cueStartMs else candidate.cueStartMs < edge.cueStartMs
++                }
++                FilmstripFrame(found)
++            }
++            frames[index] = frame
++            from = frame.thumbnail
++        }
++    }
++    return Filmstrip(frames, strip.revision, strip.offsetMs)
++}
++
++/**
++ * Netflix-style scrub previews: the frame being scrubbed to in the middle with a white outline,
++ * the ones before and after it either side. When the centre moves along the strip, the strip
++ * slides by that many frames ([slide], in frames) instead of jumping. The slide only moves
++ * layers, so it costs no recomposition.
++ */
++@Composable
++internal fun SeekPreviewFilmstripRow(
++    strip: Filmstrip,
++    slide: Animatable<Float, AnimationVector1D>,
++    frameWidth: Dp,
++    modifier: Modifier = Modifier,
++) {
++    val frameHeight = frameWidth * 9f / 16f
++    val stepPx = with(LocalDensity.current) { (frameWidth + FilmstripGap).toPx() }
++    Box(modifier = modifier.fillMaxWidth().height(frameHeight * CenterScale)) {
++        strip.frames.forEachIndexed { index, frame ->
++            key(index) {
++                // Nothing is drawn past a title's start or end, nor while a side frame is
++                // still loading, so the strip never shows an empty black tile.
++                if (frame?.thumbnail != null) {
++                    val place = index - FilmstripSideFrames
++                    val isCenter = place == 0
++                    Box(
++                        modifier = Modifier
++                            .align(Alignment.Center)
++                            .offset { IntOffset(((place + slide.value) * stepPx).roundToInt(), 0) }
++                            .size(frameWidth, frameHeight)
++                            .then(
++                                if (isCenter) Modifier.graphicsLayer {
++                                    scaleX = CenterScale
++                                    scaleY = CenterScale
++                                } else Modifier
++                            )
++                            .clip(FrameShape)
++                            .background(Color.Black)
++                            .then(if (isCenter) Modifier.border(CenterBorder, Color.White, FrameShape) else Modifier)
++                    ) {
++                        frame?.thumbnail?.let { thumbnail ->
++                            val image = remember(thumbnail.bitmap) { thumbnail.bitmap.asImageBitmap() }
++                            Image(
++                                bitmap = image,
++                                contentDescription = null,
++                                contentScale = ContentScale.Crop,
++                                modifier = Modifier.fillMaxSize()
++                            )
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewPlayerHooks.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewPlayerHooks.kt
+new file mode 100644
+index 000000000..2fc030c56
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewPlayerHooks.kt
+@@ -0,0 +1,158 @@
++package com.nuvio.tv.ui.screens.player.seekpreview
++
++import androidx.compose.animation.AnimatedVisibility
++import androidx.compose.animation.core.tween
++import androidx.compose.animation.fadeIn
++import androidx.compose.animation.fadeOut
++import androidx.compose.foundation.Canvas
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.BoxScope
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.layout.layout
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.zIndex
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import androidx.media3.exoplayer.SeekParameters
++import com.nuvio.tv.ui.screens.player.PlayerEvent
++import com.nuvio.tv.ui.screens.player.PlayerRuntimeController
++import com.nuvio.tv.ui.screens.player.PlayerUiState
++import com.nuvio.tv.ui.screens.player.PlayerViewModel
++
++/*
++ * Seek-preview (Seekr) integration points for the TV player. Everything the player needs lives
++ * here and in this package, so upstream player files only carry short calls in.
++ */
++
++/** Ticks closer than this are noise rather than information, so the grid is hidden instead. */
++private val MinCueTickSpacing = 5.dp
++
++/** Upper bound on tick count, so a long title cannot turn the scrubber into a solid block. */
++private const val MaxCueTicks = 400L
++
++/**
++ * Seek-preview thumbnails above the controls' progress bar. Takes no height in the layout —
++ * it is drawn above whatever precedes the bar — so the controls never shift.
++ */
++@Composable
++fun SeekPreviewAboveProgressBar(viewModel: PlayerViewModel) {
++    Box(
++        modifier = Modifier
++            .fillMaxWidth()
++            .layout { measurable, constraints ->
++                val placeable = measurable.measure(constraints)
++                layout(placeable.width, 0) {
++                    placeable.placeRelative(0, -placeable.height)
++                }
++            }
++    ) {
++        SeekPreviewThumbnailHost(viewModel = viewModel)
++    }
++}
++
++/**
++ * Cue ticks across a progress bar, at the positions grid-locked scrubbing can stop on.
++ * Suppressed once they would be denser than the eye can separate — at that point the 10s grid
++ * is a rounding error on the bar, and the preview frame carries the granularity.
++ */
++@Composable
++fun SeekPreviewCueTicks(viewModel: PlayerViewModel, durationMs: Long, modifier: Modifier) {
++    val cueIntervalMs by viewModel.seekPreview.cueIntervalMs.collectAsStateWithLifecycle()
++    if (cueIntervalMs <= 0L || durationMs <= 0L) return
++    val tickCount = durationMs / cueIntervalMs
++    if (tickCount !in 2..MaxCueTicks) return
++    Canvas(modifier = modifier) {
++        val stepPx = size.width * (cueIntervalMs.toFloat() / durationMs.toFloat())
++        if (stepPx < MinCueTickSpacing.toPx()) return@Canvas
++        var x = stepPx
++        while (x < size.width) {
++            drawLine(
++                color = Color.White.copy(alpha = 0.28f),
++                start = Offset(x, 0f),
++                end = Offset(x, size.height),
++                strokeWidth = 1.dp.toPx()
++            )
++            x += stepPx
++        }
++    }
++}
++
++/**
++ * Seek parameters for committing a D-pad preview scrub: lands on the frame the preview showed
++ * while previews are on (see [SeekPreviewState.commitSeekParameters]), the player's closest
++ * keyframe otherwise.
++ */
++internal fun PlayerRuntimeController.seekPreviewCommitSeekParameters(): SeekParameters =
++    SeekPreviewState.forController(this)?.commitSeekParameters() ?: SeekParameters.CLOSEST_SYNC
++
++/** Opens Preview Sync, or null when no Seekr track loaded for this title. */
++@Composable
++fun seekPreviewSyncAction(viewModel: PlayerViewModel): (() -> Unit)? {
++    val track by viewModel.seekPreview.track.collectAsStateWithLifecycle()
++    if (track == null) return null
++    return { viewModel.seekPreview.showSyncOverlay() }
++}
++
++/**
++ * Whether the Preview Sync panel is actually on screen. Shared by the render site and the Back
++ * handler: if they diverged, Back could be consumed by a panel the user cannot see.
++ */
++fun SeekPreviewState.isSyncVisible(uiState: PlayerUiState): Boolean =
++    isSyncOverlayOpen && uiState.error == null && !uiState.showLoadingOverlay
++
++/** Closes Preview Sync on Back; returns true when it consumed the press. */
++fun SeekPreviewState.handleBack(uiState: PlayerUiState): Boolean {
++    if (!isSyncOverlayOpen) return false
++    val visible = isSyncVisible(uiState)
++    hideSyncOverlay()
++    return visible
++}
++
++/**
++ * The Preview Sync panel. While it is open it owns the screen: controls or the pause overlay
++ * raised underneath by an async path are dismissed again, and [onDismissed] hands focus back
++ * to the player when it closes.
++ */
++@Composable
++fun BoxScope.SeekPreviewSyncLayer(
++    viewModel: PlayerViewModel,
++    uiState: PlayerUiState,
++    onDismissed: () -> Unit,
++) {
++    val seekPreview = viewModel.seekPreview
++    val isOpen by seekPreview.showSyncOverlay.collectAsStateWithLifecycle()
++    val visible = isOpen && uiState.error == null && !uiState.showLoadingOverlay
++
++    LaunchedEffect(isOpen, uiState.showControls, uiState.showPauseOverlay) {
++        if (!isOpen) return@LaunchedEffect
++        if (uiState.showControls) viewModel.hideControls()
++        if (uiState.showPauseOverlay) viewModel.onEvent(PlayerEvent.OnDismissPauseOverlay)
++    }
++    var wasOpen by remember { mutableStateOf(false) }
++    LaunchedEffect(isOpen) {
++        if (wasOpen && !isOpen) onDismissed()
++        wasOpen = isOpen
++    }
++
++    AnimatedVisibility(
++        visible = visible,
++        enter = fadeIn(animationSpec = tween(120)),
++        exit = fadeOut(animationSpec = tween(120)),
++        modifier = Modifier
++            .align(Alignment.TopCenter)
++            .padding(top = 44.dp)
++            .zIndex(2.32f)
++    ) {
++        SeekPreviewSyncOverlayHost(viewModel = viewModel)
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewState.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewState.kt
+new file mode 100644
+index 000000000..164a0394a
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewState.kt
+@@ -0,0 +1,342 @@
++package com.nuvio.tv.ui.screens.player.seekpreview
++
++import com.nuvio.tv.ui.screens.player.PlayerEvent
++import com.nuvio.tv.ui.screens.player.PlayerRuntimeController
++import com.nuvio.tv.ui.screens.player.currentPlaybackDurationMs
++import com.nuvio.tv.ui.screens.player.currentPlaybackPositionMs
++import com.nuvio.tv.ui.screens.player.hideControls
++import com.nuvio.tv.ui.screens.player.setPlaybackPaused
++import com.nuvio.tv.ui.screens.player.seekpreview.local.LocalPreviewSource
++import com.nuvio.tv.ui.screens.player.seekpreview.local.LocalPreviewSources
++import com.nuvio.tv.ui.screens.player.seekpreview.local.LocalPreviewTrack
++import com.nuvio.tv.ui.screens.player.seekpreview.local.LocalSeekPreviewSettings
++import com.nuvio.tv.ui.screens.player.seekpreview.local.localSeekPreviewCacheKey
++import androidx.media3.exoplayer.SeekParameters
++import java.lang.ref.WeakReference
++import java.util.WeakHashMap
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.ExperimentalCoroutinesApi
++import kotlinx.coroutines.awaitCancellation
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.SharingStarted
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.flow.combine
++import kotlinx.coroutines.flow.distinctUntilChanged
++import kotlinx.coroutines.flow.map
++import kotlinx.coroutines.flow.mapLatest
++import kotlinx.coroutines.flow.stateIn
++import kotlinx.coroutines.flow.transformLatest
++import kotlinx.coroutines.launch
++import kotlin.math.abs
++
++/**
++ * Seek-preview (Seekr) state for one player session: the loaded track, the cue behind the
++ * frame on screen, and the manual Preview Sync correction.
++ *
++ * Holds what the seek-preview fork (AKhalil609/NuvioTV) keeps in PlayerUiState, PlayerViewModel
++ * and the runtime controller's events, so upstream player state stays untouched. The key is the
++ * user's own (SeekrKeyPreferences), else BuildConfig.SEEKR_API_KEY; without one, no Seekr track
++ * loads. On-device previews (see the `local` package) work with or without it.
++ */
++class SeekPreviewState internal constructor(
++    scope: CoroutineScope,
++    private val controller: PlayerRuntimeController,
++) {
++    private val _previewCue = MutableStateFlow<SeekPreviewCue?>(null)
++
++    /**
++     * Cue window (playback timebase) behind the preview frame currently on screen, or `null`
++     * while no preview has resolved. Drives grid-locked scrubbing and the scrubber's cue ticks.
++     */
++    val previewCue: StateFlow<SeekPreviewCue?> = _previewCue.asStateFlow()
++
++    private val _offsetMs = MutableStateFlow(0)
++
++    /**
++     * Manual sync correction applied to the position before the thumbnail lookup.
++     * Session-scoped: it describes the gap between the playing release and the one the
++     * sprites were generated from, so it is dropped whenever a new track loads.
++     */
++    val offsetMs: StateFlow<Int> = _offsetMs.asStateFlow()
++
++    private val _showSyncOverlay = MutableStateFlow(false)
++    val showSyncOverlay: StateFlow<Boolean> = _showSyncOverlay.asStateFlow()
++    val isSyncOverlayOpen: Boolean get() = _showSyncOverlay.value
++
++    /**
++     * The Seekr track alone. Preview Sync only exists for it: on-device frames always line up.
++     * The preview itself reads [previewTrack].
++     */
++    @OptIn(ExperimentalCoroutinesApi::class)
++    val track: StateFlow<BoundedSeekrTrack?> =
++        controller.playbackTimeline
++            .map { it.duration }
++            .distinctUntilChanged()
++            .mapLatest { durationMs ->
++                // A new track describes a different release, so any manual sync dialled in
++                // for the previous one is meaningless. Drop it.
++                setOffset(0)
++                _previewCue.value = null
++                _showSyncOverlay.value = false
++                val apiKey = SeekrKeyPreferences.effectiveKey(controller.context) // Seekr hook: user key, else built-in
++                if (apiKey.isBlank() || durationMs <= 0L) return@mapLatest null
++                val content = seekrContentFor(
++                    contentId = controller.contentId,
++                    contentType = controller.contentType,
++                    season = controller.currentSeason,
++                    episode = controller.currentEpisode
++                ) ?: return@mapLatest null
++                // Seekr hook: bounded sheet memory (see BoundedSeekrTrack), same thumbnails.
++                BoundedSeekr.loadTrack(apiKey, content, durationMs)
++                    ?.also { track ->
++                        track.prefetchSheets()
++                        track.warm(runCatching { controller.currentPlaybackPositionMs() }.getOrNull() ?: 0L)
++                    }
++            }
++            .stateIn(scope, SharingStarted.Eagerly, null)
++
++    init {
++        // The sheets around the current position are decoded as soon as the controls open, so
++        // the first thumbnail of a scrub is as ready as when every sheet was kept decoded.
++        scope.launch {
++            controller.uiState
++                .map { it.showControls || it.showSeekOverlay }
++                .distinctUntilChanged()
++                .collect { open ->
++                    if (open) track.value?.warm(runCatching { controller.currentPlaybackPositionMs() }.getOrNull() ?: 0L)
++                }
++        }
++    }
++
++    /**
++     * On-device thumbnails for the stream this player shows with ExoPlayer, while "Generate
++     * previews on device" is on. Opened when the stream registers and its duration is known,
++     * closed (and saved to the disk cache) when either changes or the player goes away. The
++     * duration of some streams is refined while they play: a change of a second or less keeps
++     * the open track rather than tearing it down mid-playback.
++     */
++    @OptIn(ExperimentalCoroutinesApi::class)
++    private val localTrack: StateFlow<SeekPreviewTrack?> =
++        combine(
++            // Live windows have no fixed timeline to hang thumbnails on.
++            controller.playbackTimeline.map { if (it.isLive) 0L else it.duration }
++                .distinctUntilChanged { old, new -> (old > 0L) == (new > 0L) && abs(old - new) <= 1_000L },
++            LocalSeekPreviewSettings.enabled(controller.context),
++            LocalPreviewSources.sourceFor(controller)
++        ) { durationMs, enabled, source ->
++            Triple(durationMs, enabled, source)
++        }
++            .distinctUntilChanged()
++            .transformLatest<Triple<Long, Boolean, LocalPreviewSource?>, SeekPreviewTrack?> { (durationMs, enabled, source) ->
++                if (!enabled || source == null || durationMs <= 0L) {
++                    emit(null)
++                    return@transformLatest
++                }
++                val cacheKey = localSeekPreviewCacheKey(
++                    contentId = controller.contentId,
++                    season = controller.currentSeason,
++                    episode = controller.currentEpisode,
++                    durationMs = durationMs
++                )
++                val opened = LocalPreviewSources.open(source, cacheKey, durationMs)
++                if (opened == null) {
++                    emit(null)
++                    return@transformLatest
++                }
++                try {
++                    emit(opened)
++                    // Keyframes are only decoded while paused or scrubbing: decoding during
++                    // playback made the video judder. Buffering counts as playing.
++                    controller.uiState
++                        .map { state ->
++                            val scrubbing = state.pendingPreviewSeekPosition != null || state.showSeekOverlay
++                            (state.isPlaying || state.isBuffering) && !scrubbing
++                        }
++                        .distinctUntilChanged()
++                        .collect { active -> opened.playbackActive = active }
++                    awaitCancellation()
++                } finally {
++                    LocalPreviewSources.close(source, opened)
++                }
++            }
++            .stateIn(scope, SharingStarted.Eagerly, null)
++
++    /**
++     * What the preview shows: on-device frames where playback has been, Seekr elsewhere (see
++     * [HybridSeekPreviewTrack]); either alone when the other is unavailable.
++     */
++    val previewTrack: StateFlow<SeekPreviewTrack?> =
++        combine(localTrack, track) { local, seekr ->
++            when {
++                local != null && seekr != null -> HybridSeekPreviewTrack(local, SeekrPreviewTrack(seekr))
++                local != null -> local
++                seekr != null -> SeekrPreviewTrack(seekr)
++                else -> null
++            }
++        }.stateIn(scope, SharingStarted.Eagerly, null)
++
++    init {
++        // Scrubbing pauses the video and playback resumes once the scrub ends (committed or
++        // abandoned), unless the viewer paused or played meanwhile. A paused player leaves the
++        // CPU to the preview frames and stops the picture moving under a frame that is elsewhere.
++        scope.launch {
++            var pausedForScrub = false
++            controller.uiState
++                .map { it.pendingPreviewSeekPosition != null }
++                .distinctUntilChanged()
++                .collect { scrubbing ->
++                    val state = controller.uiState.value
++                    if (scrubbing) {
++                        if (state.isPlaying && state.error == null) {
++                            pausedForScrub = true
++                            controller.setPlaybackPaused(true)
++                        }
++                    } else if (pausedForScrub) {
++                        pausedForScrub = false
++                        val latest = controller.uiState.value
++                        if (!latest.isPlaying && !controller.userPausedManually &&
++                            latest.error == null && !latest.playbackEnded
++                        ) {
++                            controller.setPlaybackPaused(false)
++                        }
++                    }
++                }
++        }
++        // Which way the viewer scrubs, so on-device frames ahead of the scrub decode first.
++        // Snapping onto a cue start moves the position a little; only whole steps count.
++        scope.launch {
++            var previous: Long? = null
++            controller.uiState
++                .map { it.pendingPreviewSeekPosition }
++                .distinctUntilChanged()
++                .collect { position ->
++                    val track = localTrack.value as? LocalPreviewTrack
++                    val last = previous
++                    previous = position
++                    if (position == null || last == null) {
++                        if (position == null) track?.scrubDirection = 0
++                        return@collect
++                    }
++                    if (abs(position - last) >= SCRUB_STEP_MIN_MS) {
++                        track?.scrubDirection = if (position > last) 1 else -1
++                    }
++                }
++        }
++    }
++
++    /**
++     * The duration gap between the playing release and the preview source, offered as a
++     * starting point for Preview Sync. Deliberately not applied automatically: the backend
++     * anchors cues at the start, and most gaps are a different credits length around an
++     * identical body, for which shifting by the gap would make every thumbnail wrong.
++     */
++    val suggestedOffsetMs: StateFlow<Long> =
++        combine(
++            track,
++            controller.playbackTimeline.map { it.duration }.distinctUntilChanged()
++        ) { track, durationMs ->
++            val sourceDurationMs = track?.sourceDurationMs ?: 0L
++            if (sourceDurationMs > 0L && durationMs > 0L) sourceDurationMs - durationMs else 0L
++        }.stateIn(scope, SharingStarted.Eagerly, 0L)
++
++    /** Spacing between preview cues, or 0 when no preview has resolved. */
++    val cueIntervalMs: StateFlow<Long> =
++        previewCue
++            .map { it?.durationMs ?: 0L }
++            .distinctUntilChanged()
++            .stateIn(scope, SharingStarted.Eagerly, 0L)
++
++    /**
++     * Grid-locked scrubbing: rewrites a D-pad preview step so it lands on a position an actual
++     * preview frame exists for, so the thumbnail and the eventual seek can never disagree.
++     * Every other event, and every step without a resolved cue, passes through unchanged.
++     */
++    internal fun intercept(event: PlayerEvent): PlayerEvent {
++        if (event !is PlayerEvent.OnPreviewSeekBy || previewTrack.value == null) return event
++        if (controller.playbackTimeline.value.isLive) return event
++        val maxDuration = controller.currentPlaybackDurationMs().takeIf { it >= 0 } ?: Long.MAX_VALUE
++        val basePosition = controller.pendingPreviewSeekPosition
++            ?: controller.currentPlaybackPositionMs()?.coerceAtLeast(0L)
++            ?: 0L
++        val target = SeekPreviewCueStepper.targetMs(
++            cue = _previewCue.value,
++            fromMs = basePosition,
++            deltaMs = event.deltaMs,
++            durationMs = maxDuration
++        )
++        return PlayerEvent.OnPreviewSeekBy(target - basePosition)
++    }
++
++    /**
++     * Reported by the thumbnail host once it knows which cue the frame on screen came from.
++     * Snapping the pending scrub position onto its start keeps the number under the thumbnail
++     * honest even when the cue grid is not perfectly uniform. The start moves onto the file's
++     * keyframe when one is within [SEEK_PREVIEW_KEYFRAME_SNAP_MS], so the committed seek is exact
++     * and needs no decoding forward (see [commitSeekParameters]).
++     */
++    fun onPreviewCueResolved(cue: SeekPreviewCue?) {
++        _previewCue.value = cue
++        if (controller.playbackTimeline.value.isLive) return
++        val maxDuration = controller.currentPlaybackDurationMs().takeIf { it >= 0 } ?: Long.MAX_VALUE
++        val activeTrack = previewTrack.value
++        val aligned = SeekPreviewCueStepper.alignedTargetMs(
++            cue = cue,
++            pendingMs = controller.pendingPreviewSeekPosition,
++            durationMs = maxDuration,
++            snap = { startMs -> activeTrack?.keyframeNear(startMs, SEEK_PREVIEW_KEYFRAME_SNAP_MS) ?: startMs }
++        ) ?: return
++        controller.pendingPreviewSeekPosition = aligned
++        controller.updatePlaybackTimeline(currentPosition = aligned)
++    }
++
++    fun showSyncOverlay() {
++        controller.hideControls()
++        _showSyncOverlay.value = true
++    }
++
++    fun hideSyncOverlay() {
++        _showSyncOverlay.value = false
++    }
++
++    /**
++     * Sets the manual correction. Only the thumbnail composables consume it, pushing it onto the
++     * track before every lookup, so this is safe at D-pad repeat rate.
++     */
++    fun setOffset(targetMs: Int) {
++        val clamped = targetMs.coerceIn(SEEK_PREVIEW_OFFSET_MIN_MS, SEEK_PREVIEW_OFFSET_MAX_MS)
++        if (_offsetMs.value == clamped) return
++        // The cached cue was converted to the playback timebase with the old offset.
++        _offsetMs.value = clamped
++        _previewCue.value = null
++    }
++
++    fun adjustOffset(deltaMs: Int) = setOffset(_offsetMs.value + deltaMs)
++
++    init {
++        synchronized(states) { states[controller] = WeakReference(this) }
++    }
++
++    /**
++     * How a committed D-pad scrub should land while previews are shown. The player's own choice,
++     * the closest keyframe at any distance, can land seconds away from the frame just shown (half
++     * the gap between keyframes). A preview target is already a keyframe whenever the file's
++     * index is known (see [onPreviewCueResolved]), and landing on it needs no decoding forward;
++     * otherwise a keyframe within Seekr's own precision is taken, and the seek is exact beyond it.
++     */
++    internal fun commitSeekParameters(): SeekParameters? =
++        if (previewTrack.value != null) PreviewCommitSeek else null
++
++    internal companion object {
++        private val PreviewCommitSeek = SeekParameters(3_000_000L, 3_000_000L)
++        // The value is weak too: the state references its controller, so a strong value would keep
++        // the key, and with it every finished player session, alive for the whole app session.
++        private val states = WeakHashMap<PlayerRuntimeController, WeakReference<SeekPreviewState>>()
++
++        fun forController(controller: PlayerRuntimeController): SeekPreviewState? =
++            synchronized(states) { states[controller]?.get() }
++    }
++}
++
++/** A change of the scrub position at least this large is a step, not a snap onto a cue start. */
++private const val SCRUB_STEP_MIN_MS = 6_000L
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewSyncConfig.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewSyncConfig.kt
+new file mode 100644
+index 000000000..9003de675
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewSyncConfig.kt
+@@ -0,0 +1,35 @@
++package com.nuvio.tv.ui.screens.player.seekpreview
++
++/**
++ * Bounds for the manual seek-preview sync correction.
++ *
++ * The backend only serves a sprite version whose duration is within `DURATION_TOLERANCE_SEC`
++ * (240s) of the playing release, so the true preview/playback gap can never exceed that.
++ * Anything beyond it would be the user fighting a different problem.
++ */
++internal const val SEEK_PREVIEW_OFFSET_MIN_MS = -240_000
++internal const val SEEK_PREVIEW_OFFSET_MAX_MS = 240_000
++
++/** Fine step for a single D-pad press. */
++internal const val SEEK_PREVIEW_OFFSET_STEP_MS = 250
++
++/** Coarse step once the D-pad key starts auto-repeating, so ±4min stays reachable. */
++internal const val SEEK_PREVIEW_OFFSET_COARSE_STEP_MS = 2_000
++
++/** Repeat count at which a held key switches from the fine step to the coarse one. */
++internal const val SEEK_PREVIEW_OFFSET_COARSE_AFTER_REPEATS = 3
++
++internal fun seekPreviewOffsetStepMs(repeatCount: Int, forward: Boolean): Int {
++    val magnitude = if (repeatCount >= SEEK_PREVIEW_OFFSET_COARSE_AFTER_REPEATS) {
++        SEEK_PREVIEW_OFFSET_COARSE_STEP_MS
++    } else {
++        SEEK_PREVIEW_OFFSET_STEP_MS
++    }
++    return if (forward) magnitude else -magnitude
++}
++
++internal fun formatSeekPreviewOffset(offsetMs: Int): String {
++    val sign = if (offsetMs >= 0) "+" else "-"
++    val absMs = kotlin.math.abs(offsetMs)
++    return "$sign${absMs / 1000}.${(absMs % 1000).toString().padStart(3, '0')}s"
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewSyncOverlay.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewSyncOverlay.kt
+new file mode 100644
+index 000000000..26b9a9bf1
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewSyncOverlay.kt
+@@ -0,0 +1,272 @@
++@file:OptIn(ExperimentalTvMaterial3Api::class)
++
++package com.nuvio.tv.ui.screens.player.seekpreview
++
++import android.view.KeyEvent
++import androidx.compose.foundation.Image
++import androidx.compose.foundation.background
++import androidx.compose.foundation.border
++import androidx.compose.foundation.focusable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.BoxWithConstraints
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.asImageBitmap
++import androidx.compose.ui.input.key.onKeyEvent
++import androidx.compose.ui.layout.ContentScale
++import androidx.compose.ui.platform.LocalLayoutDirection
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.LayoutDirection
++import androidx.compose.ui.unit.dp
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import androidx.tv.material3.ExperimentalTvMaterial3Api
++import androidx.tv.material3.MaterialTheme
++import androidx.tv.material3.Text
++import com.nuvio.tv.R
++import com.nuvio.tv.ui.screens.player.PlayerViewModel
++import com.nuvio.tv.ui.theme.NuvioTheme
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.collectLatest
++
++private val SyncThumbnailWidth = 208.dp
++private val SyncThumbnailHeight = 117.dp
++
++/**
++ * Manual seek-preview sync control.
++ *
++ * Sprite sheets are generated once per release, but the user may be playing a different
++ * release of the same title. The backend intentionally anchors cue times 1:1 at the start
++ * and never shifts them (a duration gap is usually a different credits length, not a
++ * different head), so when the gap *is* at the head the only thing that can resolve it is
++ * the user looking at the picture. This overlay is that control: nudge until the thumbnail
++ * matches the frame playing behind it.
++ */
++@Composable
++internal fun SeekPreviewSyncOverlayHost(viewModel: PlayerViewModel) {
++    val seekPreview = viewModel.seekPreview
++    val track by seekPreview.track.collectAsStateWithLifecycle()
++    val offsetMs by seekPreview.offsetMs.collectAsStateWithLifecycle()
++    val timeline by viewModel.playbackTimeline.collectAsStateWithLifecycle()
++    val suggestedOffsetMs by seekPreview.suggestedOffsetMs.collectAsStateWithLifecycle()
++
++    val focusRequester = remember { FocusRequester() }
++    // Opening this panel hides the player controls, which destroys the button that had
++    // focus. Without claiming focus here the whole player is left with no focused node, so
++    // key events stop being delivered to the player's Back handler and Back escapes to the
++    // navigation stack — closing the player instead of this panel.
++    LaunchedEffect(Unit) {
++        runCatching { focusRequester.requestFocus() }
++    }
++
++    SeekPreviewSyncOverlay(
++        track = track,
++        positionMs = timeline.currentPosition,
++        offsetMs = offsetMs,
++        suggestedOffsetMs = suggestedOffsetMs,
++        modifier = Modifier
++            .focusRequester(focusRequester)
++            .onKeyEvent { event ->
++                val keyCode = event.nativeKeyEvent.keyCode
++                val ownsKey = keyCode == KeyEvent.KEYCODE_DPAD_LEFT ||
++                    keyCode == KeyEvent.KEYCODE_DPAD_RIGHT ||
++                    keyCode == KeyEvent.KEYCODE_DPAD_UP ||
++                    keyCode == KeyEvent.KEYCODE_DPAD_DOWN ||
++                    keyCode == KeyEvent.KEYCODE_DPAD_CENTER ||
++                    keyCode == KeyEvent.KEYCODE_ENTER ||
++                    keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER ||
++                    keyCode == KeyEvent.KEYCODE_BACK ||
++                    keyCode == KeyEvent.KEYCODE_ESCAPE
++                if (!ownsKey) return@onKeyEvent false
++                if (event.nativeKeyEvent.action != KeyEvent.ACTION_DOWN) return@onKeyEvent true
++                when (keyCode) {
++                    KeyEvent.KEYCODE_BACK,
++                    KeyEvent.KEYCODE_ESCAPE,
++                    KeyEvent.KEYCODE_DPAD_UP ->
++                        seekPreview.hideSyncOverlay()
++                    KeyEvent.KEYCODE_DPAD_LEFT,
++                    KeyEvent.KEYCODE_DPAD_RIGHT -> seekPreview.adjustOffset(
++                        seekPreviewOffsetStepMs(
++                            repeatCount = event.nativeKeyEvent.repeatCount,
++                            forward = keyCode == KeyEvent.KEYCODE_DPAD_RIGHT
++                        )
++                    )
++                    KeyEvent.KEYCODE_DPAD_CENTER,
++                    KeyEvent.KEYCODE_ENTER,
++                    KeyEvent.KEYCODE_NUMPAD_ENTER ->
++                        seekPreview.setOffset(0)
++                    KeyEvent.KEYCODE_DPAD_DOWN -> seekPreview.setOffset(
++                        suggestedOffsetMs.coerceIn(
++                            SEEK_PREVIEW_OFFSET_MIN_MS.toLong(),
++                            SEEK_PREVIEW_OFFSET_MAX_MS.toLong()
++                        ).toInt()
++                    )
++                }
++                true
++            }
++            .focusable()
++    )
++}
++
++@Composable
++private fun SeekPreviewSyncOverlay(
++    track: BoundedSeekrTrack?,
++    positionMs: Long,
++    offsetMs: Int,
++    suggestedOffsetMs: Long,
++    modifier: Modifier = Modifier
++) {
++    val fraction = ((offsetMs - SEEK_PREVIEW_OFFSET_MIN_MS).toFloat() /
++        (SEEK_PREVIEW_OFFSET_MAX_MS - SEEK_PREVIEW_OFFSET_MIN_MS).toFloat()).coerceIn(0f, 1f)
++
++    Column(
++        modifier = modifier
++            .fillMaxWidth(0.62f)
++            .clip(RoundedCornerShape(26.dp))
++            .background(Color(0xCC0F0F0F))
++            .padding(horizontal = 26.dp, vertical = 20.dp),
++        verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.md)
++    ) {
++        Row(
++            modifier = Modifier.fillMaxWidth(),
++            horizontalArrangement = Arrangement.SpaceBetween,
++            verticalAlignment = Alignment.CenterVertically
++        ) {
++            Text(
++                text = stringResource(R.string.player_seek_preview_sync),
++                style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.SemiBold),
++                color = Color.White
++            )
++            CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
++                Text(
++                    text = formatSeekPreviewOffset(offsetMs),
++                    style = MaterialTheme.typography.titleLarge,
++                    color = Color.White.copy(alpha = 0.95f)
++                )
++            }
++        }
++
++        Row(
++            modifier = Modifier.fillMaxWidth(),
++            horizontalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.lg),
++            verticalAlignment = Alignment.CenterVertically
++        ) {
++            SyncPreviewImage(track = track, positionMs = positionMs, offsetMs = offsetMs)
++
++            Column(
++                modifier = Modifier.fillMaxWidth(),
++                verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.sm)
++            ) {
++                Text(
++                    text = stringResource(R.string.player_seek_preview_sync_hint),
++                    style = MaterialTheme.typography.bodySmall,
++                    color = Color.White.copy(alpha = 0.72f)
++                )
++                Text(
++                    text = stringResource(R.string.player_seek_preview_sync_keys),
++                    style = MaterialTheme.typography.bodySmall,
++                    color = Color.White.copy(alpha = 0.55f)
++                )
++                if (suggestedOffsetMs != 0L) {
++                    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
++                        Text(
++                            text = stringResource(
++                                R.string.player_seek_preview_sync_suggested,
++                                formatSeekPreviewOffset(
++                                    suggestedOffsetMs.coerceIn(
++                                        SEEK_PREVIEW_OFFSET_MIN_MS.toLong(),
++                                        SEEK_PREVIEW_OFFSET_MAX_MS.toLong()
++                                    ).toInt()
++                                )
++                            ),
++                            style = MaterialTheme.typography.bodySmall,
++                            color = Color(0xFF9BE2AF)
++                        )
++                    }
++                }
++            }
++        }
++
++        BoxWithConstraints(
++            modifier = Modifier
++                .fillMaxWidth()
++                .height(NuvioTheme.spacing.lg)
++        ) {
++            val thumbWidth = 22.dp
++            val thumbOffset = (maxWidth - thumbWidth) * fraction
++
++            Box(
++                modifier = Modifier
++                    .fillMaxWidth()
++                    .height(NuvioTheme.spacing.xs)
++                    .clip(RoundedCornerShape(NuvioTheme.radii.xxs))
++                    .align(Alignment.CenterStart)
++                    .background(Color.White.copy(alpha = 0.15f))
++            )
++            Box(
++                modifier = Modifier
++                    .padding(start = thumbOffset)
++                    .size(width = thumbWidth, height = NuvioTheme.spacing.md)
++                    .clip(RoundedCornerShape(NuvioTheme.radii.xxs))
++                    .align(Alignment.CenterStart)
++                    .background(Color(0xFF4AA3FF))
++            )
++        }
++    }
++}
++
++@Composable
++private fun SyncPreviewImage(
++    track: BoundedSeekrTrack?,
++    positionMs: Long,
++    offsetMs: Int
++) {
++    var bitmap by remember(track) { mutableStateOf<android.graphics.Bitmap?>(null) }
++    val requestFlow = remember(track) { MutableStateFlow(positionMs to offsetMs) }
++    LaunchedEffect(track, positionMs, offsetMs) {
++        requestFlow.value = positionMs to offsetMs
++    }
++    LaunchedEffect(track) {
++        requestFlow.collectLatest { (position, offset) ->
++            val active = track ?: return@collectLatest
++            active.offsetMs = offset.toLong()
++            active.thumbnailAt(position)?.let { bitmap = it }
++        }
++    }
++
++    Box(
++        modifier = Modifier
++            .size(SyncThumbnailWidth, SyncThumbnailHeight)
++            .clip(RoundedCornerShape(8.dp))
++            .background(Color.Black)
++            .border(1.dp, Color.White.copy(alpha = 0.55f), RoundedCornerShape(8.dp))
++    ) {
++        bitmap?.let { bmp ->
++            Image(
++                bitmap = bmp.asImageBitmap(),
++                contentDescription = null,
++                contentScale = ContentScale.Crop,
++                modifier = Modifier.size(SyncThumbnailWidth, SyncThumbnailHeight)
++            )
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewThumbnailHost.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewThumbnailHost.kt
+new file mode 100644
+index 000000000..2e74a5960
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewThumbnailHost.kt
+@@ -0,0 +1,219 @@
++package com.nuvio.tv.ui.screens.player.seekpreview
++
++import androidx.compose.animation.AnimatedVisibility
++import androidx.compose.animation.core.Animatable
++import androidx.compose.animation.core.FastOutSlowInEasing
++import androidx.compose.animation.core.tween
++import androidx.compose.animation.fadeIn
++import androidx.compose.animation.fadeOut
++import androidx.compose.foundation.layout.BoxWithConstraints
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.unit.dp
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import com.nuvio.tv.ui.screens.player.PlayerViewModel
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.launch
++
++/**
++ * Frame width as a share of the width available (the progress bar's), clamped for a 10-foot
++ * screen: about 260 dp on a typical 960 dp wide TV, never smaller than 240 dp nor wider than
++ * 400 dp on large layouts.
++ */
++private const val FrameWidthFraction = 0.30f
++private val MinFrameWidth = 240.dp
++private val MaxFrameWidth = 400.dp
++private val FrameGapAboveBar = 10.dp
++private const val LingerAfterScrubMs = 1500L
++private const val SlideMs = 220
++
++/**
++ * The scrub-time preview, Netflix style, above the progress bar: the frame of the cue the scrub
++ * lands on in the middle, outlined, with the frames before and after it either side (see
++ * [SeekPreviewFilmstripRow]).
++ *
++ * Grid-locked scrubbing (see [SeekPreviewCueStepper]) parks the playhead on the centre frame's
++ * own timestamp, so the frame outlined is the frame playback resumes on, and the controls' own
++ * time readout stays the single, honest position label.
++ */
++@Composable
++fun SeekPreviewThumbnailHost(
++    viewModel: PlayerViewModel,
++    modifier: Modifier = Modifier
++) {
++    val seekPreview = viewModel.seekPreview
++    val track by seekPreview.previewTrack.collectAsStateWithLifecycle()
++    val offsetState by seekPreview.offsetMs.collectAsStateWithLifecycle()
++    val uiState by viewModel.uiState.collectAsStateWithLifecycle()
++    val timeline by viewModel.playbackTimeline.collectAsStateWithLifecycle()
++    val activeTrack = track
++
++    val previewTs = uiState.pendingPreviewSeekPosition
++    val scrubActive = previewTs != null || uiState.showSeekOverlay
++
++    // Prevent flicker between repeated seek inputs.
++    var lingerVisible by remember { mutableStateOf(false) }
++    LaunchedEffect(scrubActive) {
++        if (scrubActive) {
++            lingerVisible = true
++        } else {
++            delay(LingerAfterScrubMs)
++            lingerVisible = false
++        }
++    }
++
++    val displayTs = previewTs ?: timeline.currentPosition
++    val offsetMs = offsetState.toLong()
++    // On-device tracks fill in while playing; a new revision means the frame may have sharpened.
++    val revision by (activeTrack?.revision ?: NoRevision).collectAsStateWithLifecycle()
++    var strip by remember(activeTrack) { mutableStateOf<Filmstrip?>(null) }
++    // In frames: how far the strip still has to slide to settle on its centre.
++    val slide = remember { Animatable(0f) }
++    val scope = rememberCoroutineScope()
++    // Conflate rapid scrub/nudge changes: a lookup that finishes takes the latest request next.
++    val requestFlow = remember(activeTrack) {
++        MutableStateFlow(PreviewRequest(displayTs, offsetMs, revision, lingerVisible))
++    }
++    LaunchedEffect(activeTrack, displayTs, offsetMs, revision, lingerVisible) {
++        requestFlow.value = PreviewRequest(displayTs, offsetMs, revision, lingerVisible)
++    }
++    LaunchedEffect(activeTrack) {
++        if (activeTrack == null) {
++            seekPreview.onPreviewCueResolved(null)
++            return@LaunchedEffect
++        }
++        // The host stays composed while the controls are up, so the playhead alone would
++        // re-read the frame every progress tick for a frame that cannot have changed.
++        // Caching the *inputs* to the re-centring decision below — the covering cue and which
++        // side of its midpoint the position falls — replays that decision exactly, so the
++        // cache expires precisely when the frame is due to hand over to its successor. New
++        // on-device frames only matter while the preview is on screen.
++        var cachedCovering: SeekPreviewCue? = null
++        var cachedPrefersSuccessor = false
++        var cachedOffsetMs: Long? = null
++        var cachedRevision: Int? = null
++        // Neighbours load on their own, so the next scrub step never waits for them.
++        var fillJob: Job? = null
++        // Each lookup runs to the end, then the latest request is taken (the StateFlow conflates
++        // the ones in between). Cancelling on every new request starved a held D-pad scrub: each
++        // repeat cancelled the lookup in flight, so the frame stayed on an old one until release.
++        requestFlow.collect { (positionMs, offset, rev, visible) ->
++            val covering = cachedCovering
++            if (offset == cachedOffsetMs &&
++                (rev == cachedRevision || !visible) &&
++                covering != null &&
++                covering.contains(positionMs) &&
++                covering.prefersSuccessorFor(positionMs) == cachedPrefersSuccessor
++            ) {
++                // Shown again on the same frame: load the neighbours skipped while hidden.
++                val current = strip
++                if (visible && current != null && fillJob?.isActive != true && current.frames.any { it == null }) {
++                    fillJob = scope.launch {
++                        val filled = activeTrack.fillFilmstrip(current, refreshAll = false)
++                        if (strip === current) strip = filled
++                    }
++                }
++                return@collect
++            }
++            // Single writer for the track's offset: the manual sync correction is pushed in
++            // right before the lookup so a nudge is reflected on the very next frame.
++            activeTrack.offsetMs = offset
++            // Only overwrite on success — keeps the last good frame visible during a fetch.
++            val coveringThumbnail = activeTrack.thumbnailFor(positionMs) ?: return@collect
++            // Cue times arrive on the preview timeline; undo the sync offset so they can be
++            // compared with, and assigned to, playback positions.
++            val coveringCue = SeekPreviewCue(
++                startMs = coveringThumbnail.cueStartMs - offset,
++                endMs = coveringThumbnail.cueEndMs - offset
++            )
++
++            // A cue's frame is captured at its start, so past the halfway mark the next cue's
++            // frame is the closer one.
++            val prefersSuccessor = coveringCue.prefersSuccessorFor(positionMs)
++            val successor = if (prefersSuccessor) {
++                activeTrack.thumbnailFor(coveringCue.endMs)
++                    ?.takeIf { it.cueStartMs != coveringThumbnail.cueStartMs }
++            } else {
++                null
++            }
++            cachedCovering = coveringCue
++            cachedPrefersSuccessor = prefersSuccessor
++            cachedOffsetMs = offset
++            cachedRevision = rev
++
++            val center = successor ?: coveringThumbnail
++            val previous = strip
++            val steps = previous?.stepsTo(center.cueStartMs)
++            val reusable = previous != null && previous.matches(rev, offset)
++            val seeded = Filmstrip.around(center, previous, steps, rev, offset)
++            strip = seeded
++            seekPreview.onPreviewCueResolved(
++                SeekPreviewCue(center.cueStartMs - offset, center.cueEndMs - offset)
++            )
++            if (!visible) {
++                scope.launch { slide.snapTo(0f) }
++            } else if (steps != null && steps != 0) {
++                scope.launch {
++                    val start = (slide.value + steps)
++                        .coerceIn(-FilmstripSideFrames.toFloat(), FilmstripSideFrames.toFloat())
++                    slide.snapTo(start)
++                    slide.animateTo(0f, tween(SlideMs, easing = FastOutSlowInEasing))
++                }
++            } else if (steps == null) {
++                scope.launch { slide.snapTo(0f) }
++            }
++            // Neighbours only matter while the strip is on screen; hidden, only the centre's
++            // cue is kept current for grid-locked seeking.
++            fillJob?.cancel()
++            fillJob = if (visible) {
++                scope.launch {
++                    val filled = activeTrack.fillFilmstrip(seeded, refreshAll = !reusable)
++                    if (strip === seeded) strip = filled
++                }
++            } else {
++                null
++            }
++        }
++    }
++
++    AnimatedVisibility(
++        visible = lingerVisible && activeTrack != null,
++        enter = fadeIn(animationSpec = tween(120)),
++        exit = fadeOut(animationSpec = tween(200)),
++        modifier = modifier
++    ) {
++        BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
++            val frameWidth = (maxWidth * FrameWidthFraction)
++                .coerceIn(MinFrameWidth, MaxFrameWidth)
++                .coerceAtMost(maxWidth)
++            strip?.let { current ->
++                SeekPreviewFilmstripRow(
++                    strip = current,
++                    slide = slide,
++                    frameWidth = frameWidth,
++                    modifier = Modifier.padding(bottom = FrameGapAboveBar)
++                )
++            }
++        }
++    }
++}
++
++private data class PreviewRequest(
++    val positionMs: Long,
++    val offsetMs: Long,
++    val revision: Int,
++    val visible: Boolean
++)
++
++private val NoRevision: StateFlow<Int> = MutableStateFlow(0)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewTrack.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewTrack.kt
+new file mode 100644
+index 000000000..01157574f
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewTrack.kt
+@@ -0,0 +1,119 @@
++package com.nuvio.tv.ui.screens.player.seekpreview
++
++import android.graphics.Bitmap
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++
++/**
++ * A preview frame with the cue window it stands for.
++ *
++ * Cue times are on the preview timeline: the position asked for plus the track's [SeekPreviewTrack.offsetMs].
++ * [approximate] marks a stand-in from a nearby moment (an on-device frame for a slot that has
++ * none yet); its [bitmap] is already a low-resolution copy, so drawing it scaled up reads as
++ * blurred on every API level without a blur shader.
++ */
++data class SeekPreviewThumbnail(
++    val bitmap: Bitmap,
++    val cueStartMs: Long,
++    val cueEndMs: Long,
++    val approximate: Boolean = false,
++)
++
++/**
++ * Seek-preview thumbnails queried by playback position: Seekr sprite sheets, frames generated on
++ * the device from the playing stream, or both (see [HybridSeekPreviewTrack]).
++ */
++interface SeekPreviewTrack {
++    /** Signed milliseconds added to a requested position before the lookup (Preview Sync). */
++    var offsetMs: Long
++
++    /** Built from the playing stream itself, so it never needs Preview Sync. */
++    val isLocal: Boolean get() = false
++
++    /** Bumped whenever thumbnails are added, so a visible preview re-reads its frame. */
++    val revision: StateFlow<Int> get() = StaticRevision
++
++    /** The thumbnail covering [positionMs] (after [offsetMs]) with its cue window, or null. */
++    suspend fun thumbnailFor(positionMs: Long): SeekPreviewThumbnail?
++
++    /**
++     * Like [thumbnailFor], for a frame shown beside the one being scrubbed to: it does not steer
++     * background work (the on-device track decodes nearest the last [thumbnailFor] first).
++     */
++    suspend fun sideThumbnailFor(positionMs: Long): SeekPreviewThumbnail? = thumbnailFor(positionMs)
++
++    /**
++     * The playing file's keyframe nearest [positionMs] (playback timeline) when one is within
++     * [toleranceMs], read from the file's own index; null when unknown. Seeking onto a keyframe
++     * is both exact and the fastest seek a player can make.
++     */
++    fun keyframeNear(positionMs: Long, toleranceMs: Long): Long? = null
++
++    /** Stops background work; the track is not fed again. */
++    fun close() = Unit
++}
++
++private val StaticRevision: StateFlow<Int> = MutableStateFlow(0)
++
++/** Adapts the Seekr library's track. Its sheets are prefetched by [SeekPreviewState]. */
++internal class SeekrPreviewTrack(private val seekr: BoundedSeekrTrack) : SeekPreviewTrack {
++    override var offsetMs: Long
++        get() = seekr.offsetMs
++        set(value) {
++            seekr.offsetMs = value
++        }
++
++    override suspend fun thumbnailFor(positionMs: Long): SeekPreviewThumbnail? =
++        seekr.thumbnailFor(positionMs)?.let { thumbnail ->
++            SeekPreviewThumbnail(
++                bitmap = thumbnail.bitmap,
++                cueStartMs = thumbnail.cueStartMs,
++                cueEndMs = thumbnail.cueEndMs,
++            )
++        }
++}
++
++/**
++ * On-device thumbnails where playback has already been, Seekr everywhere else.
++ *
++ * The on-device track only has frames for parts of the title that were buffered, now or on an
++ * earlier watch. Where it has an exact frame that frame wins, since it always lines up; where it
++ * would only offer a nearby stand-in, the Seekr frame is shown instead. The Preview Sync offset
++ * only moves Seekr frames: on-device ones are already on playback's timeline, so their cue times
++ * are shifted onto the preview timeline here to keep the caller's `cue - offset` conversion right.
++ *
++ * Owns neither track: [SeekPreviewState] opens and closes both.
++ */
++internal class HybridSeekPreviewTrack(
++    private val local: SeekPreviewTrack,
++    private val seekr: SeekPreviewTrack,
++) : SeekPreviewTrack {
++    override var offsetMs: Long
++        get() = seekr.offsetMs
++        set(value) {
++            seekr.offsetMs = value
++        }
++
++    override val revision: StateFlow<Int> get() = local.revision
++
++    override suspend fun thumbnailFor(positionMs: Long): SeekPreviewThumbnail? =
++        pick(positionMs, local.thumbnailFor(positionMs))
++
++    override suspend fun sideThumbnailFor(positionMs: Long): SeekPreviewThumbnail? =
++        pick(positionMs, local.sideThumbnailFor(positionMs))
++
++    private suspend fun pick(positionMs: Long, localThumbnail: SeekPreviewThumbnail?): SeekPreviewThumbnail? {
++        val shift = seekr.offsetMs
++        val own = localThumbnail?.let { thumbnail ->
++            if (shift == 0L) thumbnail else thumbnail.copy(
++                cueStartMs = thumbnail.cueStartMs + shift,
++                cueEndMs = thumbnail.cueEndMs + shift,
++            )
++        }
++        if (own != null && !own.approximate) return own
++        return seekr.thumbnailFor(positionMs) ?: own
++    }
++
++    override fun keyframeNear(positionMs: Long, toleranceMs: Long): Long? =
++        local.keyframeNear(positionMs, toleranceMs)
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekrContentMapping.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekrContentMapping.kt
+new file mode 100644
+index 000000000..280bd642b
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekrContentMapping.kt
+@@ -0,0 +1,37 @@
++package com.nuvio.tv.ui.screens.player.seekpreview
++
++import tv.seekr.previews.core.SeekrContent
++
++/** Maps supported IMDb and TMDB IDs to Seekr content. */
++internal fun seekrContentFor(
++    contentId: String?,
++    contentType: String?,
++    season: Int?,
++    episode: Int?
++): SeekrContent? {
++    val baseId = contentId
++        ?.removePrefix("tmdb:")
++        ?.removePrefix("movie:")
++        ?.removePrefix("series:")
++        ?.substringBefore(':')
++        ?.substringBefore('/')
++        ?.trim()
++        ?.takeIf { it.isNotEmpty() }
++        ?: return null
++
++    val imdbId = baseId.takeIf { it.startsWith("tt") }
++    val tmdbId = baseId.toIntOrNull()
++    if (imdbId == null && tmdbId == null) return null
++
++    val isSeries = contentType?.lowercase() in setOf("series", "tv", "show")
++    return if (isSeries && season != null && episode != null) {
++        SeekrContent.Episode(
++            showTmdbId = tmdbId,
++            showImdbId = imdbId,
++            season = season,
++            episode = episode
++        )
++    } else {
++        SeekrContent.Movie(tmdbId = tmdbId, imdbId = imdbId)
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekrKeyPreferences.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekrKeyPreferences.kt
+new file mode 100644
+index 000000000..9dcaac47e
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekrKeyPreferences.kt
+@@ -0,0 +1,72 @@
++package com.nuvio.tv.ui.screens.player.seekpreview
++
++import android.content.Context
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.withContext
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import java.util.concurrent.TimeUnit
++
++/**
++ * The user's own Seekr API key. The built-in key is shared by everyone and Seekr's free tier
++ * caps it at 40 distinct titles a day, so people can paste their own; empty means built-in.
++ */
++internal object SeekrKeyPreferences {
++    private const val PREFS = "nuvio_seekr_settings"
++    private const val KEY_USER_API_KEY = "user_api_key"
++
++    private val _userKey = MutableStateFlow("")
++    val userKey: StateFlow<String> = _userKey.asStateFlow()
++
++    @Volatile
++    private var loaded = false
++
++    fun ensureLoaded(context: Context) {
++        if (loaded) return
++        synchronized(this) {
++            if (loaded) return
++            _userKey.value = prefs(context).getString(KEY_USER_API_KEY, null).orEmpty()
++            loaded = true
++        }
++    }
++
++    fun setUserKey(context: Context, key: String) {
++        val trimmed = key.trim()
++        _userKey.value = trimmed
++        loaded = true
++        prefs(context).edit().putString(KEY_USER_API_KEY, trimmed).apply()
++    }
++
++    /** The user's key; this fork has no built-in key. */
++    fun effectiveKey(context: Context): String {
++        ensureLoaded(context)
++        return _userKey.value
++    }
++
++    /** True when Seekr accepts [key]; false when it rejects it or can't be reached. */
++    suspend fun validate(key: String): Boolean = withContext(Dispatchers.IO) {
++        runCatching {
++            val request = Request.Builder()
++                .url("https://api.seekr.tv/v1/keys/validate")
++                .header("X-API-Key", key)
++                .build()
++            httpClient.newCall(request).execute().use { response ->
++                response.isSuccessful &&
++                    response.body?.string().orEmpty().replace(" ", "").contains("\"valid\":true")
++            }
++        }.getOrDefault(false)
++    }
++
++    private val httpClient by lazy {
++        OkHttpClient.Builder()
++            .connectTimeout(10, TimeUnit.SECONDS)
++            .readTimeout(10, TimeUnit.SECONDS)
++            .build()
++    }
++
++    private fun prefs(context: Context) =
++        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/KeyframeThumbnailDecoder.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/KeyframeThumbnailDecoder.kt
+new file mode 100644
+index 000000000..6f7c34f80
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/KeyframeThumbnailDecoder.kt
+@@ -0,0 +1,256 @@
++package com.nuvio.tv.ui.screens.player.seekpreview.local
++
++import android.graphics.Bitmap
++import android.media.Image
++import android.media.MediaCodec
++import android.media.MediaCodecInfo
++import android.media.MediaCodecList
++import android.media.MediaFormat
++import android.os.Build
++import android.util.Log
++import java.io.ByteArrayOutputStream
++import kotlin.math.roundToInt
++
++/**
++ * Decodes single keyframes into small JPEG thumbnails.
++ *
++ * One codec is kept and reused with `flush()` between frames: creating a video decoder costs
++ * far more than decoding one keyframe. It runs in ByteBuffer mode (no Surface, no GL) and the
++ * frame is downscaled straight from its YUV planes, so the full-size picture is never converted
++ * to RGB. Only software decoders are used: TV SoCs often have a single hardware instance per
++ * codec, and holding it would stop playback from recreating its own decoder (track, resolution
++ * or engine changes). A format no software decoder handles gets no on-device previews (Seekr
++ * still covers it). All calls are serialised.
++ */
++internal class KeyframeThumbnailDecoder(
++    private val targetWidth: Int = THUMB_WIDTH,
++) {
++    class Frame(val jpeg: ByteArray, val width: Int, val height: Int, val dark: Boolean)
++
++    private var codec: MediaCodec? = null
++    private var codecKey: String? = null
++    private var codecInputCapacity = 0
++    private var needsFlush = false
++    private var released = false
++
++    private val rejectedDecoders = mutableSetOf<String>()
++    private val unsupportedFormats = mutableSetOf<String>()
++
++    /** True once a format turned out to have no usable decoder; the caller can stop feeding it. */
++    @Volatile
++    var gaveUp = false
++        private set
++
++    @Synchronized
++    fun decode(format: MediaFormat, data: ByteArray, offset: Int, size: Int, timeUs: Long): Frame? {
++        if (released) return null
++        for (attempt in 0 until 2) {
++            val active = ensureCodec(format, size) ?: return null
++            try {
++                return decodeOnce(active, data, offset, size, timeUs)
++            } catch (error: Exception) {
++                Log.w(TAG, "decode failed (attempt $attempt): ${error.message}")
++                releaseCodec()
++            }
++        }
++        return null
++    }
++
++    @Synchronized
++    fun release() {
++        released = true
++        releaseCodec()
++    }
++
++    private fun ensureCodec(format: MediaFormat, sampleSize: Int): MediaCodec? {
++        val key = formatKey(format)
++        val existing = codec
++        if (existing != null && key == codecKey && sampleSize <= codecInputCapacity) return existing
++        if (key in unsupportedFormats) return null
++        releaseCodec()
++        val capacity = maxOf(format.intOrZero(MediaFormat.KEY_MAX_INPUT_SIZE), sampleSize * 2, MIN_INPUT_SIZE)
++        for (mime in candidateMimes(format)) {
++            for (name in decoderNames(mime)) {
++                if (name in rejectedDecoders) continue
++                val created = runCatching { MediaCodec.createByCodecName(name) }.getOrNull() ?: continue
++                try {
++                    created.configure(configFormat(format, mime, capacity), null, null, 0)
++                    created.start()
++                    codec = created
++                    codecKey = key
++                    codecInputCapacity = capacity
++                    needsFlush = false
++                    Log.i(TAG, "using $name for $mime")
++                    return created
++                } catch (error: Exception) {
++                    // E.g. the picture is larger than this software decoder supports; try the next one.
++                    Log.w(TAG, "decoder $name unavailable: ${error.message}")
++                    rejectedDecoders += name
++                    runCatching { created.release() }
++                }
++            }
++        }
++        unsupportedFormats += key
++        gaveUp = true
++        Log.i(TAG, "no software decoder for ${format.getString(MediaFormat.KEY_MIME)}")
++        return null
++    }
++
++    private fun decodeOnce(codec: MediaCodec, data: ByteArray, offset: Int, size: Int, timeUs: Long): Frame? {
++        if (needsFlush) codec.flush()
++        needsFlush = true
++        val inputIndex = codec.dequeueInputBuffer(TIMEOUT_US)
++        check(inputIndex >= 0) { "no input buffer" }
++        val input = codec.getInputBuffer(inputIndex) ?: error("null input buffer")
++        input.clear()
++        check(input.capacity() >= size) { "input buffer too small" }
++        input.put(data, offset, size)
++        codec.queueInputBuffer(inputIndex, 0, size, timeUs, MediaCodec.BUFFER_FLAG_KEY_FRAME)
++        // End of stream makes decoders that hold frames for reordering release this one now.
++        val eosIndex = codec.dequeueInputBuffer(TIMEOUT_US)
++        if (eosIndex >= 0) {
++            codec.queueInputBuffer(eosIndex, 0, 0, timeUs + 1, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
++        }
++        val info = MediaCodec.BufferInfo()
++        val deadline = System.nanoTime() + OUTPUT_DEADLINE_NS
++        while (System.nanoTime() < deadline) {
++            val outputIndex = codec.dequeueOutputBuffer(info, 20_000L)
++            when {
++                outputIndex >= 0 -> {
++                    val frame = if (info.size > 0) {
++                        codec.getOutputImage(outputIndex)?.use { image -> toThumbnail(image) }
++                    } else {
++                        null
++                    }
++                    codec.releaseOutputBuffer(outputIndex, false)
++                    if (frame != null) return frame
++                    if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) return null
++                }
++                else -> Unit // format change or try again
++            }
++        }
++        return null
++    }
++
++    /** Nearest-neighbour downscale straight from the YUV planes (8-bit or P010) to JPEG. */
++    private fun toThumbnail(image: Image): Frame? {
++        val crop = image.cropRect
++        val srcW = crop.width()
++        val srcH = crop.height()
++        if (srcW <= 0 || srcH <= 0 || image.planes.size < 3) return null
++        val outW = targetWidth
++        val outH = ((targetWidth.toFloat() * srcH / srcW).roundToInt() and 1.inv()).coerceIn(64, targetWidth)
++        // P010 stores each sample in 16 bits, value in the high bits: read the high byte.
++        val high = if (image.format == IMAGE_FORMAT_P010) 1 else 0
++        val (yPlane, uPlane, vPlane) = image.planes
++        val yBuf = yPlane.buffer
++        val uBuf = uPlane.buffer
++        val vBuf = vPlane.buffer
++        val pixels = IntArray(outW * outH)
++        var lumaSum = 0L
++        var lumaMax = 0
++        for (y in 0 until outH) {
++            val sy = crop.top + y * srcH / outH
++            val yRow = sy * yPlane.rowStride
++            val cRowU = (sy / 2) * uPlane.rowStride
++            val cRowV = (sy / 2) * vPlane.rowStride
++            for (x in 0 until outW) {
++                val sx = crop.left + x * srcW / outW
++                val luma = yBuf.get(yRow + sx * yPlane.pixelStride + high).toInt() and 0xFF
++                val u = (uBuf.get(cRowU + (sx / 2) * uPlane.pixelStride + high).toInt() and 0xFF) - 128
++                val v = (vBuf.get(cRowV + (sx / 2) * vPlane.pixelStride + high).toInt() and 0xFF) - 128
++                lumaSum += luma
++                if (luma > lumaMax) lumaMax = luma
++                // BT.709, limited range.
++                val c = 1.164f * (luma - 16)
++                val r = (c + 1.793f * v).toInt().coerceIn(0, 255)
++                val g = (c - 0.213f * u - 0.533f * v).toInt().coerceIn(0, 255)
++                val b = (c + 2.112f * u).toInt().coerceIn(0, 255)
++                pixels[y * outW + x] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
++            }
++        }
++        val meanLuma = (lumaSum / pixels.size).toInt()
++        val bitmap = Bitmap.createBitmap(pixels, outW, outH, Bitmap.Config.ARGB_8888)
++        val out = ByteArrayOutputStream(16 * 1024)
++        bitmap.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, out)
++        bitmap.recycle()
++        return Frame(out.toByteArray(), outW, outH, dark = meanLuma < DARK_MEAN && lumaMax < DARK_MAX)
++    }
++
++    private fun releaseCodec() {
++        codec?.let { active ->
++            runCatching { active.stop() }
++            runCatching { active.release() }
++        }
++        codec = null
++        codecKey = null
++        codecInputCapacity = 0
++        needsFlush = false
++    }
++
++    private fun configFormat(source: MediaFormat, mime: String, capacity: Int): MediaFormat {
++        val format = MediaFormat.createVideoFormat(
++            mime,
++            source.getInteger(MediaFormat.KEY_WIDTH),
++            source.getInteger(MediaFormat.KEY_HEIGHT),
++        )
++        for (key in listOf("csd-0", "csd-1", "csd-2")) {
++            if (source.containsKey(key)) format.setByteBuffer(key, source.getByteBuffer(key)?.duplicate())
++        }
++        format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, capacity)
++        format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
++        // Best effort: never compete with the playback decoder for real-time resources.
++        format.setInteger(MediaFormat.KEY_PRIORITY, 1)
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
++        return format
++    }
++
++    private fun candidateMimes(format: MediaFormat): List<String> {
++        val mime = format.getString(MediaFormat.KEY_MIME).orEmpty()
++        // Dolby Vision profiles 8.x carry an HEVC base layer that a plain HEVC decoder can show.
++        return if (mime == MediaFormat.MIMETYPE_VIDEO_DOLBY_VISION) {
++            listOf(mime, MediaFormat.MIMETYPE_VIDEO_HEVC, MediaFormat.MIMETYPE_VIDEO_AVC)
++        } else {
++            listOf(mime)
++        }
++    }
++
++    private fun decoderNames(mime: String): List<String> {
++        val infos = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
++            .filter { info -> !info.isEncoder && info.supportedTypes.any { it.equals(mime, ignoreCase = true) } }
++        return infos.filter { it.isSoftwareOnlyCompat() }.map { it.name }
++    }
++
++    private fun MediaCodecInfo.isSoftwareOnlyCompat(): Boolean =
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
++            isSoftwareOnly
++        } else {
++            name.startsWith("OMX.google.") || name.startsWith("c2.android.")
++        }
++
++    private fun formatKey(format: MediaFormat): String = buildString {
++        append(format.getString(MediaFormat.KEY_MIME)).append('|')
++        append(format.intOrZero(MediaFormat.KEY_WIDTH)).append('x').append(format.intOrZero(MediaFormat.KEY_HEIGHT))
++        append('|').append(format.getByteBuffer("csd-0")?.duplicate()?.let { buffer ->
++            var hash = 1
++            while (buffer.hasRemaining()) hash = hash * 31 + buffer.get()
++            hash
++        })
++    }
++
++    private fun MediaFormat.intOrZero(key: String): Int =
++        if (containsKey(key)) runCatching { getInteger(key) }.getOrDefault(0) else 0
++
++    companion object {
++        private const val TAG = "NuvioLocalPreviews"
++        const val THUMB_WIDTH = 256
++        private const val TIMEOUT_US = 200_000L
++        private const val OUTPUT_DEADLINE_NS = 2_000_000_000L
++        private const val MIN_INPUT_SIZE = 2 * 1024 * 1024
++        private const val JPEG_QUALITY = 72
++        private const val DARK_MEAN = 22
++        private const val DARK_MAX = 48
++        /** ImageFormat.YCBCR_P010 (API 33 constant, valid on earlier releases too). */
++        private const val IMAGE_FORMAT_P010 = 0x36
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/LocalPreviewSources.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/LocalPreviewSources.kt
+new file mode 100644
+index 000000000..5ea2b41d1
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/LocalPreviewSources.kt
+@@ -0,0 +1,133 @@
++@file:OptIn(androidx.media3.common.util.UnstableApi::class)
++
++package com.nuvio.tv.ui.screens.player.seekpreview.local
++
++import android.content.Context
++import androidx.media3.common.Format
++import androidx.media3.extractor.ChunkIndex
++import androidx.media3.extractor.ExtractorsFactory
++import androidx.media3.extractor.SeekMap
++import androidx.media3.extractor.mp4.Mp4Extractor
++import kotlin.math.abs
++import kotlinx.coroutines.flow.Flow
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.distinctUntilChanged
++import kotlinx.coroutines.flow.map
++
++/** The ExoPlayer stream a player is showing, as far as on-device previews need it. */
++internal class LocalPreviewSource(
++    val owner: Any,
++    val sourceKey: String,
++    val context: Context,
++) {
++    @Volatile var released = false
++    @Volatile var track: LocalPreviewTrack? = null
++
++    /**
++     * The stream's index when it lists real keyframes: an MP4's sync-sample table, or the cue
++     * points of an MKV (or a fragmented MP4's segment index). Estimated maps (constant bitrate,
++     * binary search) would point between keyframes, so they are not kept.
++     */
++    @Volatile var keyframeIndex: SeekMap? = null
++
++    /**
++     * The keyframe nearest [positionMs] when one is within [toleranceMs], from the stream's own
++     * index; null without a usable index.
++     */
++    fun keyframeNear(positionMs: Long, toleranceMs: Long): Long? {
++        val seekMap = keyframeIndex ?: return null
++        if (released || positionMs < 0L) return null
++        return runCatching {
++            val points = seekMap.getSeekPoints(positionMs * 1_000L)
++            listOf(points.first.timeUs, points.second.timeUs)
++                .map { it / 1_000L }
++                .filter { it >= 0L && abs(it - positionMs) <= toleranceMs }
++                .minByOrNull { abs(it - positionMs) }
++        }.getOrNull()
++    }
++}
++
++/**
++ * Connects the player to on-device seek previews. The player makes two calls: [register] when
++ * it builds an ExoPlayer for a stream (the returned factory copies playback's own keyframes to
++ * the preview track) and [unregister] when it releases it. [SeekPreviewState] watches
++ * [sourceFor] and [open]s a track for the registered stream. The MPV engine never registers, so
++ * it gets no on-device track.
++ */
++internal object LocalPreviewSources {
++    private val current = MutableStateFlow<LocalPreviewSource?>(null)
++
++    /**
++     * Registers [sourceKey] as [owner]'s playing stream and returns [factory] wrapped so its
++     * video keyframes reach that stream's preview track while playback demuxes them.
++     */
++    fun register(owner: Any, context: Context, sourceKey: String, factory: ExtractorsFactory): ExtractorsFactory {
++        val source = LocalPreviewSource(owner, sourceKey, context.applicationContext)
++        current.value?.let { stale ->
++            stale.released = true
++            stale.track = null
++        }
++        current.value = source
++        return VideoKeyframeExtractorsFactory(factory, object : KeyframeSink {
++            private fun track() = source.takeIf { !it.released }?.track
++
++            override fun wantsKeyframes(): Boolean = track()?.wantsKeyframes() == true
++
++            override fun wantsKeyframe(timeUs: Long): Boolean = track()?.wantsKeyframe(timeUs) == true
++
++            // No track yet: say yes, so the tap only stops copying once a track says nothing is due.
++            override fun mayWantKeyframesNear(timeUs: Long): Boolean = track()?.mayWantKeyframesNear(timeUs) ?: true
++
++            override fun onKeyframe(format: Format, timeUs: Long, data: ByteArray, offset: Int, size: Int) {
++                track()?.onKeyframe(format, timeUs, data, offset, size)
++            }
++
++            override fun onSeekMap(seekMap: SeekMap) {
++                if (seekMap is Mp4Extractor || seekMap is ChunkIndex) source.keyframeIndex = seekMap
++            }
++        })
++    }
++
++    /** [owner] released its player; its stream stops feeding previews. */
++    fun unregister(owner: Any) {
++        val source = current.value?.takeIf { it.owner === owner } ?: return
++        source.released = true
++        source.track = null
++        current.compareAndSet(source, null)
++    }
++
++    /** The stream [owner] is playing with ExoPlayer, or null. */
++    fun sourceFor(owner: Any): Flow<LocalPreviewSource?> =
++        current.map { source -> source?.takeIf { it.owner === owner } }.distinctUntilChanged()
++
++    /**
++     * A started track fed by [source]'s keyframes, or null when [source] is no longer playing.
++     * The caller closes it.
++     */
++    fun open(source: LocalPreviewSource, cacheKey: String, durationMs: Long): LocalPreviewTrack? {
++        if (source.released || durationMs <= 0L) return null
++        val track = LocalPreviewTrack(source.context, cacheKey, durationMs, source::keyframeNear)
++        source.track = track
++        track.start()
++        return track
++    }
++
++    /** Detaches [track] from [source] (if still attached) and closes it. */
++    fun close(source: LocalPreviewSource, track: LocalPreviewTrack) {
++        if (source.track === track) source.track = null
++        track.close()
++    }
++}
++
++/** Names a title and release for the thumbnail cache; the duration tells releases apart. */
++internal fun localSeekPreviewCacheKey(
++    contentId: String?,
++    season: Int?,
++    episode: Int?,
++    durationMs: Long,
++): String = listOf(
++    contentId.orEmpty(),
++    season?.toString().orEmpty(),
++    episode?.toString().orEmpty(),
++    (durationMs / 1000L).toString(),
++).joinToString("|")
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/LocalPreviewTrack.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/LocalPreviewTrack.kt
+new file mode 100644
+index 000000000..3a3f7da76
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/LocalPreviewTrack.kt
+@@ -0,0 +1,655 @@
++@file:OptIn(androidx.media3.common.util.UnstableApi::class)
++
++package com.nuvio.tv.ui.screens.player.seekpreview.local
++
++import android.app.ActivityManager
++import android.content.Context
++import android.graphics.Bitmap
++import android.graphics.BitmapFactory
++import android.os.SystemClock
++import android.util.Log
++import androidx.media3.common.Format
++import androidx.media3.common.util.MediaFormatUtil
++import com.nuvio.tv.ui.screens.player.seekpreview.SeekPreviewCue
++import com.nuvio.tv.ui.screens.player.seekpreview.SeekPreviewThumbnail
++import com.nuvio.tv.ui.screens.player.seekpreview.SeekPreviewTrack
++import java.io.DataInputStream
++import java.io.DataOutputStream
++import java.io.File
++import java.io.RandomAccessFile
++import java.security.MessageDigest
++import java.util.concurrent.ArrayBlockingQueue
++import java.util.concurrent.ThreadPoolExecutor
++import java.util.concurrent.TimeUnit
++import java.util.concurrent.atomic.AtomicBoolean
++import java.util.concurrent.atomic.AtomicInteger
++import kotlin.math.abs
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.cancel
++import kotlinx.coroutines.channels.Channel
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++
++/**
++ * Seek-preview thumbnails generated on the device from the stream that is playing, one per
++ * [SLOT_MS] slot, filled only from the buffer tap ([onKeyframe]): keyframes playback downloads
++ * anyway, so it costs no extra requests. Reading keyframes over separate connections was tried
++ * and dropped: debrid CDNs rate limit the burst of range requests it makes.
++ *
++ * Lookups return the nearest filled slot marked approximate (a low-resolution copy that reads as
++ * blurred, or replaced by a Seekr frame when one is loaded). Thumbnails are small JPEGs kept in
++ * memory and in a disk cache per title/release, so a rewatch starts with every part watched
++ * before. Decoding runs on one background thread behind a short queue that drops keyframes when
++ * it falls behind, so a slow box never stalls playback's loader.
++ *
++ * Keyframes are not decoded while the video plays: a software decode of a large keyframe takes
++ * every core for a moment and playback drops frames (a judder every 10-20 s). They are kept
++ * compressed in a spool file instead and decoded while paused or scrubbing, the ones nearest
++ * the scrub position first.
++ */
++internal class LocalPreviewTrack(
++    context: Context,
++    private val cacheKey: String,
++    private val durationMs: Long,
++    /** The playing file's keyframe near a time, from its index (see [LocalPreviewSource.keyframeNear]). */
++    private val keyframeIndex: (positionMs: Long, toleranceMs: Long) -> Long? = { _, _ -> null },
++) : SeekPreviewTrack {
++    /**
++     * Largest picture decoded for previews. Boxes with under 3 GB of RAM skip streams above
++     * 1080p: a software decoder's 4K buffers next to 4K playback risk the low-memory killer.
++     */
++    private val maxPixels: Long = run {
++        val memory = ActivityManager.MemoryInfo()
++        val manager = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
++        manager?.getMemoryInfo(memory)
++        val lowMemory = manager == null || manager.isLowRamDevice || memory.totalMem < LOW_MEMORY_BYTES
++        if (lowMemory) FULL_HD_PIXELS else Long.MAX_VALUE
++    }
++
++    /** Set when the stream cannot be previewed on this device; stops copying its keyframes. */
++    @Volatile private var unsupported = false
++
++    override val isLocal: Boolean get() = true
++
++    @Volatile
++    override var offsetMs: Long = 0L
++
++    private val slotCount = ((durationMs + SLOT_MS - 1) / SLOT_MS).toInt().coerceAtLeast(1)
++    private val lock = Any()
++    private val jpegs = arrayOfNulls<ByteArray>(slotCount)
++    private val frameMs = LongArray(slotCount) { -1L }
++    private val slotState = ByteArray(slotCount)
++    private var filledCount = 0
++    /**
++     * Slots holding a nearly black frame (a fade or a cut to black). Such a frame stays on show
++     * but its slot stays open, so a brighter keyframe of the same slot replaces it. Guarded by [lock].
++     */
++    private val darkSlots = BooleanArray(slotCount)
++    private var darkCount = 0
++    /** Keyframe time (ms) → slot holding its thumbnail, so a keyframe is never fetched twice. */
++    private val keyframeSlots = HashMap<Long, Int>()
++    private val decoded = object : LinkedHashMap<Int, Bitmap>(64, 0.75f, true) {
++        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Int, Bitmap>?) = size > MAX_DECODED
++    }
++    private val blurred = object : LinkedHashMap<Int, Bitmap>(64, 0.75f, true) {
++        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Int, Bitmap>?) = size > MAX_DECODED
++    }
++    @Volatile private var closed = false
++
++    private val sinceSave = AtomicInteger()
++
++    private val decoder = KeyframeThumbnailDecoder()
++    private val tapExecutor = ThreadPoolExecutor(
++        1, 1, 30, TimeUnit.SECONDS, ArrayBlockingQueue<Runnable>(TAP_QUEUE),
++        { runnable -> Thread(runnable, "NuvioPreviewTap").apply { isDaemon = true } },
++        ThreadPoolExecutor.AbortPolicy(),
++    )
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
++    private val changes = Channel<Unit>(Channel.CONFLATED)
++
++    private val _revision = MutableStateFlow(0)
++    override val revision: StateFlow<Int> = _revision.asStateFlow()
++
++    private val cacheFile: File = File(File(context.applicationContext.cacheDir, CACHE_DIR), sha1(cacheKey) + ".bin")
++
++    /**
++     * False while the viewer has paused or is scrubbing (set by the owner from the player's
++     * state); keyframes are only decoded then.
++     */
++    @Volatile var playbackActive = true
++        set(value) {
++            field = value
++            if (!value) scheduleDrain()
++        }
++
++    /**
++     * The spool had no room for the last keyframe. While playing, copying the stream's video
++     * for keyframes that would only be dropped is skipped until a pause drains the spool.
++     */
++    @Volatile private var spoolFull = false
++
++    /** A keyframe copied while playing, waiting in the spool to be decoded. */
++    private class SpooledKeyframe(val format: Format, val timeUs: Long, val position: Long, val size: Int)
++
++    /** A keyframe waiting to see whether the next one is nearer its slot's time. */
++    private class Candidate(val slot: Int, val format: Format, val timeUs: Long, val bytes: ByteArray) {
++        val keyMs: Long get() = timeUs / 1_000L
++        val slotMs: Long get() = slot * SLOT_MS
++    }
++
++    /** The keyframe before its slot's time that is still in the running. Guarded by [lock]. */
++    private var candidate: Candidate? = null
++
++    /** Slot → its spooled keyframe; the slot stays CLAIMED meanwhile. Guarded by [lock]. */
++    private val spooled = HashMap<Int, SpooledKeyframe>()
++    private val spoolFile = File(
++        File(context.applicationContext.cacheDir, CACHE_DIR),
++        sha1(cacheKey) + "-" + SystemClock.elapsedRealtimeNanos() + SPOOL_SUFFIX,
++    )
++    // Spool file state: only touched on the tap thread.
++    private var spool: RandomAccessFile? = null
++    private var spoolEnd = 0L
++    private var spoolLimit = SPOOL_LIMIT_BYTES
++    private val drainScheduled = AtomicBoolean(false)
++    /** Slot the viewer last looked at, so its keyframes are decoded first. */
++    @Volatile private var focusSlot = -1
++
++    /**
++     * +1 while the viewer scrubs forward, -1 backward, 0 otherwise (set by the owner from the
++     * scrub position): spooled frames in that direction are decoded first.
++     */
++    @Volatile var scrubDirection = 0
++
++    fun start() {
++        // Coalesce UI updates: at most a few revisions per second however fast frames land.
++        scope.launch {
++            for (unit in changes) {
++                _revision.value = _revision.value + 1
++                delay(UI_UPDATE_INTERVAL_MS)
++            }
++        }
++        scope.launch(Dispatchers.IO) {
++            deleteStaleSpools()
++            loadCache()
++            notifyChanged()
++        }
++    }
++
++    override fun close() {
++        if (closed) return
++        closed = true
++        synchronized(lock) { candidate = null }
++        tapExecutor.shutdownNow()
++        Thread({
++            runCatching { tapExecutor.awaitTermination(3, TimeUnit.SECONDS) }
++            decoder.release()
++            runCatching { spool?.close() }
++            spool = null
++            spoolFile.delete()
++            saveCache()
++            scope.cancel()
++        }, "NuvioPreviewClose").apply { isDaemon = true }.start()
++    }
++
++    // ---- Lookups -------------------------------------------------------------------------
++
++    override suspend fun thumbnailFor(positionMs: Long): SeekPreviewThumbnail? = lookup(positionMs, focus = true)
++
++    override suspend fun sideThumbnailFor(positionMs: Long): SeekPreviewThumbnail? = lookup(positionMs, focus = false)
++
++    private suspend fun lookup(positionMs: Long, focus: Boolean): SeekPreviewThumbnail? {
++        val corrected = (positionMs + offsetMs).coerceIn(0L, (durationMs - 1).coerceAtLeast(0L))
++        val slot = (corrected / SLOT_MS).toInt().coerceIn(0, slotCount - 1)
++        if (focus) {
++            focusSlot = slot
++            if (synchronized(lock) { spooled.isNotEmpty() }) scheduleDrain()
++        }
++        val exact = synchronized(lock) { exactFrameFor(corrected) }
++        val found = exact ?: synchronized(lock) { nearestFilled(slot) } ?: return null
++        val approximate = exact == null
++        val bitmap = bitmapFor(found, small = approximate) ?: return null
++        val cue = if (exact != null) synchronized(lock) { frameCue(exact) } else gridCue(slot)
++        return SeekPreviewThumbnail(
++            bitmap = bitmap,
++            cueStartMs = cue.startMs,
++            cueEndMs = cue.endMs,
++            approximate = approximate,
++        )
++    }
++
++    override fun keyframeNear(positionMs: Long, toleranceMs: Long): Long? = keyframeIndex(positionMs, toleranceMs)
++
++    /**
++     * The filled slot whose frame is the latest at or before [positionMs], or null when that
++     * frame does not reach [positionMs] (see [frameCue]). Guarded by [lock].
++     *
++     * A frame is filed under the slot its keyframe is nearest to, so it lies within half a slot
++     * of the slot's time and frame times rise with the slot index: the latest one at or before
++     * [positionMs] is in the slot after [positionMs]'s own, that slot, or the one before.
++     */
++    private fun exactFrameFor(positionMs: Long): Int? {
++        val base = (positionMs / SLOT_MS).toInt()
++        for (slot in minOf(base + 1, slotCount - 1) downTo maxOf(base - 1, 0)) {
++            if (jpegs[slot] == null || frameMs[slot] > positionMs) continue
++            return slot.takeIf { positionMs < frameCue(it).endMs }
++        }
++        return null
++    }
++
++    /**
++     * The window a filled slot's frame stands for: from the keyframe's own time to the next
++     * slot's frame, or one slot long when the next slot has none. Cue starts are real frame
++     * times, so grid-locked scrubbing parks the seek on the very frame shown. Guarded by [lock].
++     */
++    private fun frameCue(slot: Int): SeekPreviewCue {
++        val startMs = frameMs[slot]
++        val next = slot + 1
++        val endMs = if (next < slotCount && jpegs[next] != null) frameMs[next] else startMs + SLOT_MS
++        return SeekPreviewCue(startMs, endMs.coerceAtLeast(startMs + 1))
++    }
++
++    /** A stand-in's window: its slot on the fixed grid, since its frame is from elsewhere. */
++    private fun gridCue(slot: Int): SeekPreviewCue {
++        val startMs = slot * SLOT_MS
++        return SeekPreviewCue(startMs, minOf(startMs + SLOT_MS, durationMs).coerceAtLeast(startMs + 1))
++    }
++
++    private fun nearestFilled(slot: Int): Int? {
++        if (jpegs[slot] != null) return slot
++        for (distance in 1 until slotCount) {
++            val before = slot - distance
++            val after = slot + distance
++            if (before < 0 && after >= slotCount) break
++            if (before >= 0 && jpegs[before] != null) return before
++            if (after < slotCount && jpegs[after] != null) return after
++        }
++        return null
++    }
++
++    /**
++     * The slot's thumbnail, decoded off the main thread as RGB_565 (half the memory). [small]
++     * decodes it at a quarter of its width instead: drawn at preview size it looks blurred,
++     * which marks a stand-in without a blur shader (API 31+ only, and costly on TV boxes).
++     */
++    private suspend fun bitmapFor(slot: Int, small: Boolean): Bitmap? {
++        val cache = if (small) blurred else decoded
++        synchronized(lock) { cache[slot] }?.let { return it }
++        val bytes = synchronized(lock) { jpegs[slot] } ?: return null
++        val bitmap = withContext(Dispatchers.Default) {
++            runCatching {
++                val options = BitmapFactory.Options().apply {
++                    inPreferredConfig = Bitmap.Config.RGB_565
++                    inSampleSize = if (small) STAND_IN_SAMPLE_SIZE else 1
++                }
++                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
++            }.getOrNull()
++        } ?: return null
++        synchronized(lock) { cache[slot] = bitmap }
++        return bitmap
++    }
++
++    // ---- Buffer tap ----------------------------------------------------------------------
++
++    fun wantsKeyframes(): Boolean =
++        !closed && !unsupported && !decoder.gaveUp && !(spoolFull && playbackActive) &&
++            synchronized(lock) { filledCount < slotCount || darkCount > 0 }
++
++    fun wantsKeyframe(timeUs: Long): Boolean {
++        if (closed) return false
++        val keyMs = timeUs / 1_000L
++        val slot = slotFor(keyMs) ?: return false
++        return synchronized(lock) {
++            // Any keyframe settles a waiting candidate, so it is wanted while one waits.
++            candidate != null || (isOpen(slot) && keyMs !in keyframeSlots)
++        }
++    }
++
++    /**
++     * Whether a keyframe from just before to [KEYFRAME_LOOKAHEAD_MS] after [timeUs] could still be
++     * wanted ([wantsKeyframe]). False lets the tap skip copying the video until the next slot that
++     * still needs a frame comes within reach. Only ever false where [wantsKeyframe] would be too.
++     */
++    fun mayWantKeyframesNear(timeUs: Long): Boolean {
++        if (closed) return false
++        val fromMs = timeUs / 1_000L - KEYFRAME_LOOKBEHIND_MS
++        val toMs = timeUs / 1_000L + KEYFRAME_LOOKAHEAD_MS
++        if (toMs < 0L || fromMs > durationMs + SLOT_MS) return false
++        val first = ((fromMs.coerceAtLeast(0L) + SLOT_MS / 2) / SLOT_MS).toInt().coerceIn(0, slotCount - 1)
++        val last = ((toMs.coerceAtLeast(0L) + SLOT_MS / 2) / SLOT_MS).toInt().coerceIn(0, slotCount - 1)
++        return synchronized(lock) {
++            candidate != null || (first..last).any { isOpen(it) }
++        }
++    }
++
++    /**
++     * A keyframe playback downloaded. Each slot keeps the keyframe nearest its time rather than
++     * the first one that arrives: keyframes come in playback order, so one before the slot's
++     * time waits as the candidate until the next keyframe shows whether it is closer. One at or
++     * after the slot's time is final, since later ones only get farther. A candidate is never
++     * decoded before it is chosen, so this costs one copy of compressed bytes, not a decode.
++     */
++    fun onKeyframe(format: Format, timeUs: Long, data: ByteArray, offset: Int, size: Int) {
++        if (format.width.toLong() * format.height.toLong() > maxPixels) {
++            unsupported = true
++            return
++        }
++        val keyMs = timeUs / 1_000L
++        val slot = slotFor(keyMs) ?: return
++        val wanted = synchronized(lock) { isOpen(slot) && keyMs !in keyframeSlots }
++        val incoming = if (wanted) Candidate(slot, format, timeUs, data.copyOfRange(offset, offset + size)) else null
++        val settled = ArrayList<Candidate>(2)
++        synchronized(lock) {
++            val waiting = candidate
++            candidate = null
++            var next = incoming
++            if (waiting != null) {
++                if (next == null || next.slot != waiting.slot) {
++                    settled += waiting
++                } else if (abs(waiting.keyMs - waiting.slotMs) < abs(next.keyMs - next.slotMs)) {
++                    // The new keyframe is past the slot's time and farther than the waiting one.
++                    settled += waiting
++                    next = null
++                }
++            }
++            if (next != null) {
++                if (next.keyMs >= next.slotMs) settled += next else candidate = next
++            }
++        }
++        for (chosen in settled) submit(chosen)
++    }
++
++    /** Decodes (or spools) a chosen keyframe into its slot. */
++    private fun submit(chosen: Candidate) {
++        // Decoding runs behind playback's loader thread; when it falls behind, skip frames.
++        if (tapExecutor.queue.remainingCapacity() == 0) return
++        val slot = chosen.slot
++        if (!claim(slot)) return
++        val submitted = runCatching {
++            tapExecutor.execute {
++                if (mayDecodeNow()) {
++                    decodeInto(slot, chosen.format, chosen.bytes, chosen.timeUs)
++                } else if (!spoolKeyframe(slot, chosen.format, chosen.timeUs, chosen.bytes)) {
++                    release(slot)
++                }
++                if (mayDecodeNow()) scheduleDrain()
++            }
++        }.isSuccess
++        if (!submitted) release(slot)
++    }
++
++    /** Tap thread. */
++    private fun decodeInto(slot: Int, format: Format, bytes: ByteArray, timeUs: Long) {
++        val frame = runCatching {
++            decoder.decode(MediaFormatUtil.createMediaFormatFromFormat(format), bytes, 0, bytes.size, timeUs)
++        }.getOrNull()
++        if (frame != null) {
++            store(slot, frame.jpeg, timeUs / 1_000L, frame.dark)
++        } else {
++            release(slot)
++        }
++    }
++
++    /** Paused, or scrubbing: the viewer is not watching frames go by. */
++    private fun mayDecodeNow(): Boolean = !playbackActive
++
++    // ---- Spool (tap thread only) -------------------------------------------------------
++
++    /** Keeps [bytes] compressed until it may be decoded; false when the spool is full or unwritable. */
++    private fun spoolKeyframe(slot: Int, format: Format, timeUs: Long, bytes: ByteArray): Boolean {
++        if (spoolEnd + bytes.size > spoolLimit) {
++            spoolFull = true
++            return false
++        }
++        return runCatching {
++            val file = spool ?: run {
++                val dir = spoolFile.parentFile
++                dir?.mkdirs()
++                // TV boxes have little storage: never take more than a quarter of what is free.
++                val free = runCatching { dir?.usableSpace ?: 0L }.getOrDefault(0L)
++                spoolLimit = minOf(SPOOL_LIMIT_BYTES, free / 4)
++                if (spoolEnd + bytes.size > spoolLimit) {
++                    spoolFull = true
++                    return false
++                }
++                RandomAccessFile(spoolFile, "rw").also { it.setLength(0L); spool = it }
++            }
++            file.seek(spoolEnd)
++            file.write(bytes)
++            synchronized(lock) { spooled[slot] = SpooledKeyframe(format, timeUs, spoolEnd, bytes.size) }
++            spoolEnd += bytes.size
++        }.onFailure { Log.w(TAG, "spool not written: ${it.message}") }.isSuccess
++    }
++
++    private fun scheduleDrain() {
++        if (closed || !drainScheduled.compareAndSet(false, true)) return
++        val submitted = runCatching { tapExecutor.execute(::drainOne) }.isSuccess
++        if (!submitted) drainScheduled.set(false)
++    }
++
++    /** Decodes one spooled keyframe, nearest the scrub position first, then schedules the next. */
++    private fun drainOne() {
++        drainScheduled.set(false)
++        if (closed || !mayDecodeNow()) return
++        val next = synchronized(lock) {
++            val focus = focusSlot
++            val slot = if (focus >= 0) spooled.keys.minByOrNull { drainCost(it, focus) } else spooled.keys.minOrNull()
++            slot?.let { it to spooled.remove(it)!! }
++        }
++        if (next == null) {
++            // Everything decoded: start the spool over so it never grows past one pause's worth.
++            if (spoolEnd > 0L) {
++                spoolEnd = 0L
++                runCatching { spool?.setLength(0L) }
++            }
++            spoolFull = false
++            return
++        }
++        val (slot, entry) = next
++        val bytes = runCatching {
++            ByteArray(entry.size).also { buffer ->
++                val file = spool ?: error("no spool")
++                file.seek(entry.position)
++                file.readFully(buffer)
++            }
++        }.getOrNull()
++        if (bytes != null) decodeInto(slot, entry.format, bytes, entry.timeUs) else release(slot)
++        scheduleDrain()
++    }
++
++    /**
++     * Order of decoding around the scrub position: the slot itself, then the ones in the direction
++     * of the scrub before those behind it, so the next steps already have their frames.
++     */
++    private fun drainCost(slot: Int, focus: Int): Int {
++        val distance = abs(slot - focus)
++        val direction = scrubDirection
++        val behind = direction != 0 && (slot - focus) * direction < 0
++        return if (behind) distance * 2 else distance * 2 - 1
++    }
++
++    private fun deleteStaleSpools() {
++        val now = System.currentTimeMillis()
++        spoolFile.parentFile?.listFiles { file ->
++            file.name.endsWith(SPOOL_SUFFIX) && file != spoolFile && now - file.lastModified() > STALE_SPOOL_MS
++        }?.forEach { it.delete() }
++    }
++
++    /** Nearest slot to a keyframe, or null when the keyframe is closer to no slot start. */
++    private fun slotFor(keyMs: Long): Int? {
++        if (keyMs < 0 || keyMs > durationMs + SLOT_MS) return null
++        return ((keyMs + SLOT_MS / 2) / SLOT_MS).toInt().coerceIn(0, slotCount - 1)
++    }
++
++    // ---- Slot bookkeeping ----------------------------------------------------------------
++
++    /** No frame yet, or only a dark one that a brighter keyframe may replace. Guarded by [lock]. */
++    private fun isOpen(slot: Int): Boolean =
++        slotState[slot] == EMPTY || (slotState[slot] == FILLED && darkSlots[slot])
++
++    private fun claim(slot: Int): Boolean = synchronized(lock) {
++        if (!isOpen(slot)) return@synchronized false
++        if (slotState[slot] == FILLED) {
++            // Replacing a dark frame: it stays on show until the new one is stored.
++            filledCount--
++            setDark(slot, false)
++        }
++        slotState[slot] = CLAIMED
++        true
++    }
++
++    /** Guarded by [lock]. */
++    private fun setDark(slot: Int, dark: Boolean) {
++        if (darkSlots[slot] == dark) return
++        darkSlots[slot] = dark
++        darkCount += if (dark) 1 else -1
++    }
++
++    private fun release(slot: Int) {
++        synchronized(lock) {
++            if (slotState[slot] != CLAIMED) return
++            if (jpegs[slot] != null) {
++                // The dark frame a replacement was tried for stays, still replaceable.
++                filledCount++
++                slotState[slot] = FILLED
++                setDark(slot, true)
++            } else {
++                slotState[slot] = EMPTY
++            }
++        }
++    }
++
++    private fun store(slot: Int, jpeg: ByteArray, keyMs: Long, dark: Boolean) {
++        synchronized(lock) {
++            if (slotState[slot] != FILLED) filledCount++
++            slotState[slot] = FILLED
++            setDark(slot, dark)
++            jpegs[slot] = jpeg
++            frameMs[slot] = keyMs
++            keyframeSlots.putIfAbsent(keyMs, slot)
++            decoded.remove(slot)
++            blurred.remove(slot)
++        }
++        if (sinceSave.incrementAndGet() >= SAVE_EVERY) {
++            sinceSave.set(0)
++            scope.launch(Dispatchers.IO) { saveCache() }
++        }
++        notifyChanged()
++    }
++
++    private fun notifyChanged() {
++        changes.trySend(Unit)
++    }
++
++    // ---- Disk cache ----------------------------------------------------------------------
++
++    private fun loadCache() {
++        if (!cacheFile.exists()) return
++        runCatching {
++            DataInputStream(cacheFile.inputStream().buffered()).use { input ->
++                val magic = input.readInt()
++                if ((magic != CACHE_MAGIC && magic != CACHE_MAGIC_V1) || input.readInt().toLong() != SLOT_MS) return
++                val count = input.readInt()
++                repeat(count) {
++                    val slot = input.readInt()
++                    val keyMs = input.readLong()
++                    val bytes = ByteArray(input.readInt())
++                    input.readFully(bytes)
++                    // Caches from before dark frames were marked count every frame as bright.
++                    val dark = magic == CACHE_MAGIC && input.readBoolean()
++                    if (slot in 0 until slotCount && claim(slot)) {
++                        synchronized(lock) {
++                            filledCount++
++                            slotState[slot] = FILLED
++                            setDark(slot, dark)
++                            jpegs[slot] = bytes
++                            frameMs[slot] = keyMs
++                            keyframeSlots.putIfAbsent(keyMs, slot)
++                        }
++                    }
++                }
++            }
++            cacheFile.setLastModified(System.currentTimeMillis())
++        }.onFailure { Log.w(TAG, "cache unreadable: ${it.message}") }
++    }
++
++    @Synchronized
++    private fun saveCache() {
++        val entries = synchronized(lock) {
++            (0 until slotCount).mapNotNull { slot ->
++                val bytes = jpegs[slot]
++                if (slotState[slot] == FILLED && bytes != null) CachedFrame(slot, frameMs[slot], bytes, darkSlots[slot]) else null
++            }
++        }
++        if (entries.isEmpty()) return
++        runCatching {
++            cacheFile.parentFile?.mkdirs()
++            val temp = File(cacheFile.path + ".tmp")
++            DataOutputStream(temp.outputStream().buffered()).use { output ->
++                output.writeInt(CACHE_MAGIC)
++                output.writeInt(SLOT_MS.toInt())
++                output.writeInt(entries.size)
++                for ((slot, keyMs, bytes, dark) in entries) {
++                    output.writeInt(slot)
++                    output.writeLong(keyMs)
++                    output.writeInt(bytes.size)
++                    output.write(bytes)
++                    output.writeBoolean(dark)
++                }
++            }
++            temp.renameTo(cacheFile)
++            pruneCache(cacheFile.parentFile)
++        }.onFailure { Log.w(TAG, "cache not saved: ${it.message}") }
++    }
++
++    private fun pruneCache(dir: File?) {
++        val files = dir?.listFiles { file -> file.name.endsWith(".bin") }?.sortedByDescending { it.lastModified() } ?: return
++        var total = 0L
++        for (file in files) {
++            total += file.length()
++            if (total > CACHE_LIMIT_BYTES && file != cacheFile) file.delete()
++        }
++    }
++
++    companion object {
++        private const val TAG = "NuvioLocalPreviews"
++        const val SLOT_MS = 10_000L
++        /**
++         * How far past the latest sample time the next keyframe is looked for. In decode order a
++         * keyframe's time is later than every sample before it, by at most the B-frame reorder span
++         * (well under a second); the margins leave room for that and for timestamps' jitter.
++         */
++        private const val KEYFRAME_LOOKAHEAD_MS = 3_000L
++        private const val KEYFRAME_LOOKBEHIND_MS = 1_000L
++        private const val MAX_DECODED = 48
++        private const val STAND_IN_SAMPLE_SIZE = 4
++        private const val LOW_MEMORY_BYTES = 3L * 1024L * 1024L * 1024L
++        private const val FULL_HD_PIXELS = 1920L * 1088L
++        private const val TAP_QUEUE = 3
++        private const val UI_UPDATE_INTERVAL_MS = 250L
++        private const val SAVE_EVERY = 60
++        private const val CACHE_DIR = "seek_previews"
++        private const val CACHE_MAGIC = 0x4E535032 // "NSP2": each frame ends with its dark flag
++        private const val CACHE_MAGIC_V1 = 0x4E535031 // "NSP1"
++        private const val CACHE_LIMIT_BYTES = 200L * 1_000_000L
++        private const val SPOOL_SUFFIX = ".spool"
++        /** About an hour of 1080p keyframes. */
++        private const val SPOOL_LIMIT_BYTES = 96L * 1024 * 1024
++        /** A spool left by a crash; a live one is never this old without being written. */
++        private const val STALE_SPOOL_MS = 12L * 60 * 60 * 1000
++
++        private const val EMPTY: Byte = 0
++        private const val CLAIMED: Byte = 1
++        private const val FILLED: Byte = 2
++
++        private fun sha1(value: String): String =
++            MessageDigest.getInstance("SHA-1").digest(value.toByteArray()).joinToString("") { "%02x".format(it) }
++    }
++}
++
++private data class CachedFrame(val slot: Int, val keyMs: Long, val bytes: ByteArray, val dark: Boolean)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/LocalSeekPreviewSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/LocalSeekPreviewSettings.kt
+new file mode 100644
+index 000000000..39cf4578a
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/LocalSeekPreviewSettings.kt
+@@ -0,0 +1,43 @@
++package com.nuvio.tv.ui.screens.player.seekpreview.local
++
++import android.content.Context
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++
++/**
++ * "Generate previews on device" (default on). Stored next to the user's Seekr key, under the
++ * same preference names the phone app uses.
++ */
++internal object LocalSeekPreviewSettings {
++    private const val PREFS = "nuvio_seekr_settings"
++    private const val KEY_LOCAL_ENABLED = "local_previews_enabled"
++
++    private val _enabled = MutableStateFlow(true)
++
++    @Volatile
++    private var loaded = false
++
++    fun ensureLoaded(context: Context) {
++        if (loaded) return
++        synchronized(this) {
++            if (loaded) return
++            _enabled.value = prefs(context).getBoolean(KEY_LOCAL_ENABLED, true)
++            loaded = true
++        }
++    }
++
++    fun enabled(context: Context): StateFlow<Boolean> {
++        ensureLoaded(context)
++        return _enabled.asStateFlow()
++    }
++
++    fun setEnabled(context: Context, value: Boolean) {
++        _enabled.value = value
++        loaded = true
++        prefs(context).edit().putBoolean(KEY_LOCAL_ENABLED, value).apply()
++    }
++
++    private fun prefs(context: Context) =
++        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/VideoKeyframeTap.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/VideoKeyframeTap.kt
+new file mode 100644
+index 000000000..cbb8b964b
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/VideoKeyframeTap.kt
+@@ -0,0 +1,250 @@
++@file:OptIn(androidx.media3.common.util.UnstableApi::class)
++
++package com.nuvio.tv.ui.screens.player.seekpreview.local
++
++import android.net.Uri
++import androidx.media3.common.C
++import androidx.media3.common.DataReader
++import androidx.media3.common.Format
++import androidx.media3.common.util.ParsableByteArray
++import androidx.media3.extractor.Extractor
++import androidx.media3.extractor.ExtractorInput
++import androidx.media3.extractor.ExtractorOutput
++import androidx.media3.extractor.ExtractorsFactory
++import androidx.media3.extractor.PositionHolder
++import androidx.media3.extractor.SeekMap
++import androidx.media3.extractor.SniffFailure
++import androidx.media3.extractor.TrackOutput
++import com.nuvio.tv.ui.screens.player.RewrappableExtractor
++import java.io.EOFException
++
++/** Receives the video keyframes playback downloads, to turn them into free thumbnails. */
++internal interface KeyframeSink {
++    /** Cheap check made for every chunk of video data; false leaves the track untouched. */
++    fun wantsKeyframes(): Boolean
++
++    /** Only for keyframes the sink may want ([wantsKeyframe]); [data] is valid during the call only. */
++    fun onKeyframe(format: Format, timeUs: Long, data: ByteArray, offset: Int, size: Int)
++
++    /** Whether a keyframe at [timeUs] would fill a missing thumbnail. */
++    fun wantsKeyframe(timeUs: Long): Boolean
++
++    /**
++     * Whether the next keyframe after a sample at [timeUs] could still be wanted. False lets the
++     * tap stop copying video until one could be; it must never be false where [wantsKeyframe] is true.
++     */
++    fun mayWantKeyframesNear(timeUs: Long): Boolean = true
++
++    /** The stream's seek map, once its index has been read. */
++    fun onSeekMap(seekMap: SeekMap) = Unit
++}
++
++/**
++ * Wraps every extractor so the video keyframes ExoPlayer downloads are copied to [sink] while
++ * being forwarded unchanged to the player. Nothing is downloaded twice; the copy happens at
++ * load time, so keyframes are collected as far ahead as playback buffers.
++ */
++internal class VideoKeyframeExtractorsFactory(
++    private val delegate: ExtractorsFactory,
++    private val sink: KeyframeSink,
++) : ExtractorsFactory {
++    override fun createExtractors(): Array<Extractor> = wrap(delegate.createExtractors())
++
++    override fun createExtractors(uri: Uri, responseHeaders: Map<String, List<String>>): Array<Extractor> =
++        wrap(delegate.createExtractors(uri, responseHeaders))
++
++    private fun wrap(extractors: Array<Extractor>): Array<Extractor> =
++        Array(extractors.size) { index -> VideoTapExtractor(extractors[index], sink) }
++}
++
++private class VideoTapExtractor(
++    private val delegate: Extractor,
++    private val sink: KeyframeSink,
++) : RewrappableExtractor {
++    override val wrappedExtractor: Extractor get() = delegate
++    override fun rewrap(inner: Extractor): Extractor = VideoTapExtractor(inner, sink)
++
++    override fun sniff(input: ExtractorInput): Boolean = delegate.sniff(input)
++
++    override fun getSniffFailureDetails(): List<SniffFailure> = delegate.sniffFailureDetails
++
++    private var output: VideoTapExtractorOutput? = null
++
++    override fun init(output: ExtractorOutput) {
++        val tapped = VideoTapExtractorOutput(output, sink)
++        this.output = tapped
++        delegate.init(tapped)
++    }
++
++    override fun read(input: ExtractorInput, seekPosition: PositionHolder): Int = delegate.read(input, seekPosition)
++
++    override fun seek(position: Long, timeUs: Long) {
++        output?.onSeek()
++        delegate.seek(position, timeUs)
++    }
++
++    override fun release() = delegate.release()
++
++    override fun getUnderlyingImplementation(): Extractor = delegate.underlyingImplementation
++}
++
++private class VideoTapExtractorOutput(
++    private val delegate: ExtractorOutput,
++    private val sink: KeyframeSink,
++) : ExtractorOutput {
++    private val videoOutputs = HashMap<Int, TrackOutput>()
++
++    override fun track(id: Int, type: Int): TrackOutput {
++        val output = delegate.track(id, type)
++        if (type != C.TRACK_TYPE_VIDEO) return output
++        return videoOutputs.getOrPut(id) { VideoTapTrackOutput(output, sink) }
++    }
++
++    override fun endTracks() = delegate.endTracks()
++
++    /** Sample times start over somewhere else: watch for keyframes again until the first sample. */
++    fun onSeek() {
++        videoOutputs.values.forEach { (it as? VideoTapTrackOutput)?.onSeek() }
++    }
++
++    override fun seekMap(seekMap: SeekMap) {
++        runCatching { sink.onSeekMap(seekMap) }
++        delegate.seekMap(seekMap)
++    }
++}
++
++/**
++ * Keeps the bytes of the samples being written until [sampleMetadata] says whether they form a
++ * keyframe (extractors may write a sample in parts and report it later, with [offset] bytes of
++ * following samples already written). Same bookkeeping as the AutoSync audio tap.
++ *
++ * Bytes read from the stream go straight into [pending] and are handed to playback from there,
++ * so each one is copied once. Between keyframes no slot could use (see
++ * [KeyframeSink.mayWantKeyframesNear]) nothing is copied at all.
++ */
++private class VideoTapTrackOutput(
++    private val delegate: TrackOutput,
++    private val sink: KeyframeSink,
++) : TrackOutput {
++    private var format: Format? = null
++    private var capturing = false
++    private var pending = ByteArray(0)
++    private var start = 0
++    private var end = 0
++    private val pendingReader = ParsableByteArray()
++
++    /** Latest sample time since the stream started or seeked, or [C.TIME_UNSET]. */
++    private var latestTimeUs = C.TIME_UNSET
++
++    /** Whether the next keyframe could be wanted, judged from [latestTimeUs]. */
++    private var keyframeInReach = true
++
++    override fun format(format: Format) {
++        this.format = format
++        delegate.format(format)
++    }
++
++    override fun durationUs(durationUs: Long) = delegate.durationUs(durationUs)
++
++    override fun sampleData(input: DataReader, length: Int, allowEndOfInput: Boolean, sampleDataPart: Int): Int {
++        if (!updateCapturing() || !reserve(length)) {
++            return delegate.sampleData(input, length, allowEndOfInput, sampleDataPart)
++        }
++        val read = input.read(pending, end, length)
++        if (read == C.RESULT_END_OF_INPUT) {
++            if (allowEndOfInput) return C.RESULT_END_OF_INPUT
++            throw EOFException()
++        }
++        pendingReader.reset(pending, end + read)
++        pendingReader.setPosition(end)
++        end += read
++        delegate.sampleData(pendingReader, read, sampleDataPart)
++        return read
++    }
++
++    override fun sampleData(data: ParsableByteArray, length: Int, sampleDataPart: Int) {
++        if (updateCapturing()) append(data.data, data.position, length)
++        delegate.sampleData(data, length, sampleDataPart)
++    }
++
++    override fun sampleMetadata(
++        timeUs: Long,
++        flags: Int,
++        size: Int,
++        offset: Int,
++        cryptoData: TrackOutput.CryptoData?,
++    ) {
++        if (capturing) {
++            val sampleStart = end - offset - size
++            val currentFormat = format
++            val usable = currentFormat != null && size > 0 && sampleStart >= start &&
++                timeUs != C.TIME_UNSET && cryptoData == null &&
++                flags and C.BUFFER_FLAG_KEY_FRAME != 0 && flags and C.BUFFER_FLAG_ENCRYPTED == 0
++            if (usable) {
++                try {
++                    if (sink.wantsKeyframe(timeUs)) sink.onKeyframe(currentFormat!!, timeUs, pending, sampleStart, size)
++                } catch (_: Throwable) {
++                    // Never let thumbnails disturb playback.
++                }
++            }
++            start = maxOf(start, end - offset)
++            if (start == end) {
++                start = 0
++                end = 0
++            }
++        }
++        if (timeUs != C.TIME_UNSET && (latestTimeUs == C.TIME_UNSET || timeUs > latestTimeUs)) {
++            latestTimeUs = timeUs
++            keyframeInReach = runCatching { sink.mayWantKeyframesNear(timeUs) }.getOrDefault(true)
++        }
++        delegate.sampleMetadata(timeUs, flags, size, offset, cryptoData)
++    }
++
++    fun onSeek() {
++        latestTimeUs = C.TIME_UNSET
++        keyframeInReach = true
++    }
++
++    private fun updateCapturing(): Boolean {
++        val wanted = format != null && keyframeInReach && runCatching { sink.wantsKeyframes() }.getOrDefault(false)
++        if (wanted != capturing) {
++            capturing = wanted
++            start = 0
++            end = 0
++        }
++        return wanted
++    }
++
++    private fun append(data: ByteArray, offset: Int, length: Int) {
++        if (length <= 0 || !reserve(length)) return
++        data.copyInto(pending, end, offset, offset + length)
++        end += length
++    }
++
++    /**
++     * Makes room for [length] more bytes at [end]. False (and nothing kept) when that would pass
++     * [MAX_PENDING_BYTES]; the bytes then reach playback without being kept.
++     */
++    private fun reserve(length: Int): Boolean {
++        if (pending.size - end >= length) return true
++        val retained = end - start
++        if (start > 0) {
++            pending.copyInto(pending, 0, start, end)
++            start = 0
++            end = retained
++        }
++        if (pending.size - end >= length) return true
++        val required = end.toLong() + length
++        if (required > MAX_PENDING_BYTES) {
++            start = 0
++            end = 0
++            return false
++        }
++        pending = pending.copyOf(maxOf(required.toInt(), pending.size * 2, 65_536))
++        return true
++    }
++
++    companion object {
++        private const val MAX_PENDING_BYTES = 24 * 1024 * 1024
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPlayerSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPlayerSettings.kt
+index c444cab17..4be188be2 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPlayerSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPlayerSettings.kt
+@@ -168,7 +168,7 @@ internal fun PlaybackPlayerInterfaceSection(
+         checked = settings.parentalGuideEnabled,
+         onToggle = { onUpdate { setParentalGuideEnabled(!settings.parentalGuideEnabled) } },
+         enabled = internalPlayer
+-    )
++    )    seekPreviewSettingsRows(enabled = internalPlayer) // Nuvio fork: seek previews
+ }
+ 
+ @Composable
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SeekPreviewSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SeekPreviewSettingsItems.kt
+new file mode 100644
+index 000000000..e80f13523
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SeekPreviewSettingsItems.kt
+@@ -0,0 +1,30 @@
++@file:OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
++
++package com.nuvio.tv.ui.screens.settings
++
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.res.stringResource
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import com.nuvio.tv.R
++import com.nuvio.tv.ui.screens.player.seekpreview.local.LocalSeekPreviewSettings
++
++/**
++ * Seek-preview rows (ported from NuvioTV-Reshaped): "Generate previews on device" and the
++ * user's own Seekr key. Drawn with Nuvio's settings rows under Playback › Player interface.
++ */
++@Composable
++internal fun seekPreviewSettingsRows(enabled: Boolean) {
++    val context = LocalContext.current
++    val checked by LocalSeekPreviewSettings.enabled(context).collectAsStateWithLifecycle()
++
++    SettingsToggleRow(
++        title = stringResource(R.string.settings_seek_preview_local),
++        subtitle = stringResource(R.string.settings_seek_preview_local_description),
++        checked = checked,
++        onToggle = { LocalSeekPreviewSettings.setEnabled(context, !checked) },
++        enabled = enabled,
++    )
++    seekrKeySettingsRow(enabled = enabled)
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SeekrKeySettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SeekrKeySettingsItems.kt
+new file mode 100644
+index 000000000..155f2e79f
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SeekrKeySettingsItems.kt
+@@ -0,0 +1,230 @@
++@file:OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
++
++package com.nuvio.tv.ui.screens.settings
++
++import android.view.KeyEvent
++import android.widget.Toast
++import androidx.compose.foundation.BorderStroke
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.lazy.LazyListScope
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.foundation.text.BasicTextField
++import androidx.compose.foundation.text.KeyboardActions
++import androidx.compose.foundation.text.KeyboardOptions
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.Key
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.focus.onFocusChanged
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.SolidColor
++import androidx.compose.ui.input.key.onKeyEvent
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.platform.LocalSoftwareKeyboardController
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.text.input.ImeAction
++import androidx.compose.ui.text.input.PasswordVisualTransformation
++import androidx.compose.ui.unit.dp
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import androidx.tv.material3.Border
++import androidx.tv.material3.Button
++import androidx.tv.material3.ButtonDefaults
++import androidx.tv.material3.Card
++import androidx.tv.material3.CardDefaults
++import androidx.tv.material3.MaterialTheme
++import androidx.tv.material3.Text
++import com.nuvio.tv.R
++import com.nuvio.tv.reshaped.phoneentry.PhoneEntryPage
++import com.nuvio.tv.ui.components.NuvioDialog
++import com.nuvio.tv.ui.reshaped.phoneentry.PhoneEntryQr
++import com.nuvio.tv.ui.screens.player.seekpreview.SeekrKeyPreferences
++import com.nuvio.tv.ui.theme.NuvioTheme
++import kotlinx.coroutines.launch
++
++/** Seekr-owned settings row: the user's own seek-preview API key. */
++@Composable
++internal fun seekrKeySettingsRow(enabled: Boolean) {
++    val context = LocalContext.current
++    SeekrKeyPreferences.ensureLoaded(context)
++    val userKey by SeekrKeyPreferences.userKey.collectAsStateWithLifecycle()
++    var showDialog by remember { mutableStateOf(false) }
++
++    SettingsActionRow(
++        title = stringResource(R.string.settings_seekr_api_key),
++        subtitle = stringResource(
++            if (userKey.isBlank()) R.string.settings_seekr_api_key_builtin
++            else R.string.settings_seekr_api_key_custom
++        ),
++        onClick = { showDialog = true },
++        enabled = enabled,
++    )
++
++    if (showDialog) {
++        SeekrApiKeyDialog(currentValue = userKey, onDismiss = { showDialog = false })
++    }
++}
++
++@Composable
++private fun SeekrApiKeyDialog(currentValue: String, onDismiss: () -> Unit) {
++    val context = LocalContext.current
++    val scope = rememberCoroutineScope()
++    var value by remember(currentValue) { mutableStateOf(currentValue) }
++    var validating by remember { mutableStateOf(false) }
++    var isInputFocused by remember { mutableStateOf(false) }
++    val inputFocusRequester = remember { FocusRequester() }
++    val keyboardController = LocalSoftwareKeyboardController.current
++    val invalidMessage = stringResource(R.string.settings_seekr_api_key_invalid)
++
++    fun save(key: String) {
++        val trimmed = key.trim()
++        if (trimmed.isEmpty() || trimmed == currentValue) {
++            SeekrKeyPreferences.setUserKey(context, trimmed)
++            onDismiss()
++            return
++        }
++        validating = true
++        scope.launch {
++            val valid = SeekrKeyPreferences.validate(trimmed)
++            validating = false
++            if (valid) {
++                SeekrKeyPreferences.setUserKey(context, trimmed)
++                onDismiss()
++            } else {
++                Toast.makeText(context, invalidMessage, Toast.LENGTH_SHORT).show()
++            }
++        }
++    }
++
++    NuvioDialog(
++        onDismiss = onDismiss,
++        title = stringResource(R.string.settings_seekr_api_key),
++        subtitle = stringResource(R.string.settings_seekr_api_key_description),
++        width = 860.dp,
++        usePlatformDefaultWidth = false,
++    ) {
++        val phonePage = PhoneEntryPage(
++            title = stringResource(R.string.settings_seekr_api_key),
++            subtitle = stringResource(R.string.settings_seekr_phone_subtitle),
++            fieldLabel = stringResource(R.string.settings_seekr_api_key),
++            send = stringResource(R.string.settings_seekr_phone_send),
++            sending = stringResource(R.string.settings_seekr_phone_sending),
++            sent = stringResource(R.string.settings_seekr_phone_sent),
++            failed = stringResource(R.string.settings_seekr_phone_failed),
++            secret = true,
++        )
++        Row(horizontalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.xl)) {
++            // Typing a long key with the remote is slow: scan to paste it on a phone.
++            PhoneEntryQr(
++                page = phonePage,
++                instruction = stringResource(R.string.settings_seekr_phone_instruction),
++                onValue = { sent ->
++                    value = sent
++                    if (!validating) save(sent)
++                },
++            )
++            Column(
++                modifier = Modifier.weight(1f),
++                verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.lg),
++            ) {
++                Card(
++                    onClick = { inputFocusRequester.requestFocus() },
++                    modifier = Modifier
++                        .fillMaxWidth()
++                        .onFocusChanged { isInputFocused = it.isFocused || it.hasFocus },
++                    colors = CardDefaults.colors(
++                        containerColor = NuvioTheme.colors.BackgroundElevated,
++                        focusedContainerColor = NuvioTheme.colors.BackgroundElevated
++                    ),
++                    border = CardDefaults.border(
++                        border = Border(
++                            border = BorderStroke(NuvioTheme.spacing.hairline, NuvioTheme.colors.Border),
++                            shape = RoundedCornerShape(10.dp)
++                        ),
++                        focusedBorder = Border(
++                            border = NuvioTheme.focusRing.border(NuvioTheme.spacing.xxs),
++                            shape = RoundedCornerShape(10.dp)
++                        )
++                    ),
++                    shape = CardDefaults.shape(RoundedCornerShape(10.dp)),
++                    scale = CardDefaults.scale(focusedScale = 1f)
++                ) {
++                    Box(modifier = Modifier.padding(horizontal = 14.dp, vertical = NuvioTheme.spacing.md)) {
++                        BasicTextField(
++                            value = value,
++                            onValueChange = { value = it },
++                            modifier = Modifier
++                                .fillMaxWidth()
++                                .focusRequester(inputFocusRequester)
++                                .onKeyEvent { event ->
++                                    event.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_DPAD_CENTER &&
++                                        event.nativeKeyEvent.action == KeyEvent.ACTION_DOWN
++                                },
++                            singleLine = true,
++                            visualTransformation = PasswordVisualTransformation(),
++                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
++                            keyboardActions = KeyboardActions(onDone = { keyboardController?.hide() }),
++                            textStyle = MaterialTheme.typography.bodyMedium.copy(color = NuvioTheme.colors.TextPrimary),
++                            cursorBrush = SolidColor(if (isInputFocused) NuvioTheme.colors.Primary else Color.Transparent),
++                            decorationBox = { innerTextField ->
++                                if (value.isBlank()) {
++                                    Text(
++                                        text = stringResource(R.string.settings_seekr_api_key_builtin),
++                                        style = MaterialTheme.typography.bodyMedium,
++                                        color = NuvioTheme.colors.TextTertiary
++                                    )
++                                }
++                                innerTextField()
++                            }
++                        )
++                    }
++                }
++
++                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
++                    Button(
++                        onClick = onDismiss,
++                        colors = ButtonDefaults.colors(
++                            containerColor = NuvioTheme.colors.BackgroundElevated,
++                            contentColor = NuvioTheme.colors.TextPrimary
++                        )
++                    ) {
++                        Text(stringResource(R.string.action_cancel))
++                    }
++                    Spacer(modifier = Modifier.width(NuvioTheme.spacing.sm))
++                    Button(
++                        onClick = { if (!validating) save("") },
++                        colors = ButtonDefaults.colors(
++                            containerColor = NuvioTheme.colors.BackgroundElevated,
++                            contentColor = NuvioTheme.colors.TextPrimary
++                        )
++                    ) {
++                        Text(stringResource(R.string.action_clear))
++                    }
++                    Spacer(modifier = Modifier.width(NuvioTheme.spacing.sm))
++                    Button(
++                        onClick = { if (!validating) save(value) },
++                        colors = ButtonDefaults.colors(
++                            containerColor = NuvioTheme.colors.BackgroundCard,
++                            contentColor = NuvioTheme.colors.TextPrimary
++                        )
++                    ) {
++                        Text(stringResource(if (validating) R.string.action_saving else R.string.action_save))
++                    }
++                }
++            }
++        }
++    }
++}
+diff --git a/app/src/main/res/values/seek_preview_strings.xml b/app/src/main/res/values/seek_preview_strings.xml
+new file mode 100644
+index 000000000..1aa0732a5
+--- /dev/null
++++ b/app/src/main/res/values/seek_preview_strings.xml
+@@ -0,0 +1,11 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- Seek-preview (Seekr) strings, kept apart from strings.xml so upstream merges stay clean. -->
++<resources>
++    <string name="player_seek_preview_sync">Preview Sync</string>
++    <string name="player_seek_preview_sync_hint">Nudge until the thumbnail matches the frame playing behind this panel.</string>
++    <string name="player_seek_preview_sync_keys">Left/Right adjust · OK resets · Down uses the suggested value · Up or Back closes</string>
++    <string name="player_seek_preview_sync_suggested">Suggested: %1$s (duration gap vs. the preview source)</string>
++    <string name="cd_seek_preview_sync">Preview sync</string>
++    <string name="settings_seek_preview_local">Generate previews on device</string>
++    <string name="settings_seek_preview_local_description">Makes seek thumbnails from what playback already downloaded, so they always line up and cost no extra data. Seekr fills in the parts you have not watched yet.</string>
++</resources>
+diff --git a/app/src/main/res/values/seekr_key_strings.xml b/app/src/main/res/values/seekr_key_strings.xml
+new file mode 100644
+index 000000000..a7d9226a2
+--- /dev/null
++++ b/app/src/main/res/values/seekr_key_strings.xml
+@@ -0,0 +1,15 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="settings_seek_preview_section">Seek previews</string>
++    <string name="settings_seekr_api_key">Seekr API key</string>
++    <string name="settings_seekr_api_key_builtin">No key: previews are made on this TV only</string>
++    <string name="settings_seekr_api_key_custom">Your own key</string>
++    <string name="settings_seekr_api_key_description">Seek preview thumbnails come from seekr.tv. Without a key, thumbnails are made on this TV from what playback downloads. Get a free key at seekr.tv and paste it here to fill in the parts you have not watched yet.</string>
++    <string name="settings_seekr_api_key_invalid">Seekr didn\'t accept this key.</string>
++    <string name="settings_seekr_phone_instruction">Scan with your phone to paste your key there.</string>
++    <string name="settings_seekr_phone_subtitle">Paste your key from seekr.tv. The TV checks it and saves it.</string>
++    <string name="settings_seekr_phone_send">Send to TV</string>
++    <string name="settings_seekr_phone_sending">Sending…</string>
++    <string name="settings_seekr_phone_sent">Sent. Check the TV to see if the key was accepted.</string>
++    <string name="settings_seekr_phone_failed">Could not reach the TV. Is the Seekr key screen still open?</string>
++</resources>
