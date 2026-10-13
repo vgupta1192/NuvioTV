@@ -1,5 +1,5 @@
 diff --git a/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt
-index 8b5df22f..8d25c731 100644
+index 8b5df22f..f8cd077a 100644
 --- a/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt
 @@ -7,6 +7,7 @@ import com.nuvio.tv.domain.model.JellyfinItemPage
@@ -23,7 +23,7 @@ index 8b5df22f..8d25c731 100644
  import kotlinx.serialization.json.buildJsonObject
  import kotlinx.serialization.json.contentOrNull
  import kotlinx.serialization.json.doubleOrNull
-@@ -713,6 +717,59 @@ object JellyfinRepository {
+@@ -713,6 +717,71 @@ object JellyfinRepository {
              "${session.serverUrl}/Videos/${item.id}/stream?Static=true&api_key=${encodeQueryValue(session.accessToken)}"
          }
  
@@ -42,10 +42,22 @@ index 8b5df22f..8d25c731 100644
 +    suspend fun externalSubtitlesFor(item: JellyfinItem): List<Subtitle> {
 +        val session = _uiState.value.session ?: return emptyList()
 +        return try {
-+            withTimeoutOrNull(5_000L) {
++            withTimeoutOrNull(15_000L) {
 +                withContext(Dispatchers.IO) {
-+                    val root = call(session, "/Users/${session.userId}/Items/${item.id}")
-+                    val source = root.array("MediaSources")?.firstOrNull() as? JsonObject ?: return@withContext emptyList<Subtitle>()
++                    // Only the media streams: the full item (cast, images) can take seconds on a cold server.
++                    val root = call(
++                        session,
++                        "/Items",
++                        mapOf(
++                            "userId" to session.userId,
++                            "ids" to item.id,
++                            "fields" to "MediaSources",
++                            "enableImages" to "false",
++                            "enableUserData" to "false",
++                        ),
++                    )
++                    val found = root.array("Items")?.firstOrNull() as? JsonObject
++                    val source = found?.array("MediaSources")?.firstOrNull() as? JsonObject ?: return@withContext emptyList<Subtitle>()
 +                    val sourceId = source.string("Id") ?: item.id
 +                    source.array("MediaStreams").orEmpty().mapNotNull { element ->
 +                        val stream = element as? JsonObject ?: return@mapNotNull null
