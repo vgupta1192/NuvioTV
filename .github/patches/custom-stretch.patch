@@ -1,5 +1,5 @@
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioMpvSurfaceView.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioMpvSurfaceView.kt
-index 04b7ec4a..3bac4408 100644
+index 04b7ec4a..ae3df7ec 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioMpvSurfaceView.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioMpvSurfaceView.kt
 @@ -193,6 +193,7 @@ class NuvioMpvSurfaceView @JvmOverloads constructor(
@@ -10,53 +10,64 @@ index 04b7ec4a..3bac4408 100644
          val path = if (initialized) mpv.getPropertyString("path") else null
          pathAtMediaRequest = mpvPathBaselineForRequest(url, requestedMediaUrl, pathAtMediaRequest, path)
          requestedMediaUrl = url
-@@ -378,7 +379,61 @@ class NuvioMpvSurfaceView @JvmOverloads constructor(
+@@ -378,7 +379,72 @@ class NuvioMpvSurfaceView @JvmOverloads constructor(
          }
      }
  
 +    /** Changes with every media request, so Custom Stretch can start over for a new stream. */
 +    var mediaGeneration = 0L
 +        private set
-+    private var customStretchTransform = MpvStretchTransform.Identity
++    private var customStretchRect: VideoContentRect? = null
++    /** Picture area mpv currently crops to (null = whole frame), as last applied. */
++    private var appliedCustomStretchRect: VideoContentRect? = null
++    private var appliedVideoCrop = ""
 +    private var customStretchPropsApplied = false
 +
 +    /** Picture area for Custom Stretch (null = stretch the whole frame). */
-+    fun setCustomStretchContent(rect: VideoContentRect?) {
-+        customStretchTransform = rect?.toMpvStretchTransform() ?: MpvStretchTransform.Identity
++    internal fun setCustomStretchContent(rect: VideoContentRect?) {
++        customStretchRect = rect
 +        if (currentAspectMode == AspectMode.CUSTOM_STRETCH) applyCustomStretchProps(active = true)
 +    }
 +
 +    /**
 +     * Picture area of the current frame, from a capture of the rendered surface. The capture
-+     * shows the current stretch and mpv's subtitles, so it is mapped back to frame fractions and
++     * shows the current crop and mpv's subtitles, so it is mapped back to frame fractions and
 +     * made symmetric (a subtitle drawn inside the bottom bar must not count as picture).
 +     * The surface is captured instead of mpv's decoded frame because direct hardware decoding
 +     * cannot hand frames out.
 +     */
-+    fun sampleCustomStretchContent(onResult: (VideoContentRect?) -> Unit) {
++    internal fun sampleCustomStretchContent(onResult: (VideoContentRect?) -> Unit) {
 +        if (!initialized) {
 +            onResult(null)
 +            return
 +        }
-+        val transform = customStretchTransform
++        // The crop needs the source size, so it is retried on every sample until mpv knows it.
++        if (currentAspectMode == AspectMode.CUSTOM_STRETCH) applyCustomStretchProps(active = true)
++        val crop = appliedCustomStretchRect
 +        captureVideoLuma { frame ->
-+            onResult(frame?.detectContent()?.symmetric()?.mapFromScreen(transform))
++            onResult(frame?.detectContent()?.symmetric()?.mapFromCrop(crop))
 +        }
 +    }
 +
 +    /**
-+     * Custom Stretch runs inside mpv (keepaspect=no plus video-scale/pan) instead of scaling the
-+     * view, so mpv keeps subtitles inside the visible picture.
++     * Custom Stretch runs inside mpv instead of scaling the view, so mpv keeps subtitles inside
++     * the visible picture: keepaspect=no stretches the frame over the view and video-crop drops
++     * the bars first (mpv ignores video-zoom/scale/pan when keepaspect is off).
 +     */
 +    private fun applyCustomStretchProps(active: Boolean) {
 +        if (!initialized || (!active && !customStretchPropsApplied)) return
-+        val transform = if (active) customStretchTransform else MpvStretchTransform.Identity
++        val rect = if (active) customStretchRect else null
 +        runCatching {
++            val crop = rect.toMpvVideoCrop(
++                mpv.getPropertyInt("video-params/w") ?: 0,
++                mpv.getPropertyInt("video-params/h") ?: 0,
++            )
 +            mpv.setPropertyString("keepaspect", if (active) "no" else "yes")
-+            mpv.setPropertyDouble("video-scale-x", transform.scaleX)
-+            mpv.setPropertyDouble("video-scale-y", transform.scaleY)
-+            mpv.setPropertyDouble("video-pan-x", transform.panX)
-+            mpv.setPropertyDouble("video-pan-y", transform.panY)
++            if (crop != appliedVideoCrop) {
++                mpv.setPropertyString("video-crop", crop)
++                appliedVideoCrop = crop
++            }
++            appliedCustomStretchRect = if (crop.isEmpty()) null else rect
 +        }.onFailure { Log.w(TAG, "Failed to apply custom stretch: ${it.message}") }
 +        customStretchPropsApplied = active
 +    }
@@ -72,11 +83,13 @@ index 04b7ec4a..3bac4408 100644
          val viewAspect = readViewAspectRatio(width, height)
          val videoAspect = readVideoAspectRatio()
          val scale = resolveAspectScale(
-@@ -641,6 +696,7 @@ class NuvioMpvSurfaceView @JvmOverloads constructor(
+@@ -641,6 +707,9 @@ class NuvioMpvSurfaceView @JvmOverloads constructor(
          runCatching { destroy() }
              .onFailure { Log.w(TAG, "Failed to destroy libmpv view cleanly: ${it.message}") }
          initialized = false
 +        customStretchPropsApplied = false
++        appliedVideoCrop = ""
++        appliedCustomStretchRect = null
          hasQueuedInitialMedia = false
          lastMediaRequestKey = null
          pendingInitialMediaUrl = null
@@ -147,10 +160,10 @@ index cf86d7cc..9eefea35 100644
      val viewAspect = readViewAspectRatio(playerView.width, playerView.height)
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerCustomStretch.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerCustomStretch.kt
 new file mode 100644
-index 00000000..54327090
+index 00000000..993eac7f
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerCustomStretch.kt
-@@ -0,0 +1,295 @@
+@@ -0,0 +1,319 @@
 +package com.nuvio.tv.ui.screens.player
 +
 +import android.graphics.Bitmap
@@ -163,6 +176,8 @@ index 00000000..54327090
 +import kotlinx.coroutines.suspendCancellableCoroutine
 +import kotlin.coroutines.resume
 +import kotlin.math.abs
++import kotlin.math.ceil
++import kotlin.math.floor
 +import kotlin.math.max
 +import kotlin.math.min
 +import kotlin.math.roundToInt
@@ -207,29 +222,35 @@ index 00000000..54327090
 +}
 +
 +/**
-+ * mpv geometry for a picture area, used with `keepaspect=no`: `video-scale-x/y` enlarge the
-+ * frame so the picture area covers the window and `video-pan-x/y` move the picture area to the
-+ * window center. mpv clips the result to the window, so subtitles stay on screen.
++ * mpv `video-crop` value for a picture area, in source pixels ([sourceWidth] x [sourceHeight]
++ * from `video-params/w` and `video-params/h`). Used with `keepaspect=no`: mpv drops the bars
++ * and stretches the rest over the window. mpv ignores video-zoom, video-scale and video-pan
++ * when keepaspect is off, so cropping is the only way to do this inside mpv. The edges are
++ * rounded outward, so no picture row or column is lost. Returns "" (no crop) for the whole
++ * frame or unknown sizes.
 + */
-+internal data class MpvStretchTransform(
-+    val scaleX: Double,
-+    val scaleY: Double,
-+    val panX: Double,
-+    val panY: Double,
-+) {
-+    companion object {
-+        val Identity = MpvStretchTransform(1.0, 1.0, 0.0, 0.0)
-+    }
++internal fun VideoContentRect?.toMpvVideoCrop(sourceWidth: Int, sourceHeight: Int): String {
++    if (this == null || sourceWidth <= 0 || sourceHeight <= 0) return ""
++    val x0 = floor(left * sourceWidth).toInt().coerceIn(0, sourceWidth - 1)
++    val y0 = floor(top * sourceHeight).toInt().coerceIn(0, sourceHeight - 1)
++    val x1 = ceil(right * sourceWidth).toInt().coerceIn(x0 + 1, sourceWidth)
++    val y1 = ceil(bottom * sourceHeight).toInt().coerceIn(y0 + 1, sourceHeight)
++    if (x0 == 0 && y0 == 0 && x1 == sourceWidth && y1 == sourceHeight) return ""
++    return "${x1 - x0}x${y1 - y0}+$x0+$y0"
 +}
 +
 +/**
-+ * Map a picture area measured on the rendered output (what is on screen while [transform] is
-+ * active with `keepaspect=no`) back to frame fractions, clipped to the frame.
++ * Map a picture area measured on a cropped image (only [crop] of the frame, stretched to the
++ * whole image) back to frame fractions.
 + */
-+internal fun VideoContentRect.mapFromScreen(transform: MpvStretchTransform): VideoContentRect {
-+    fun frameX(x: Float) = ((x - 0.5) / transform.scaleX + 0.5 - transform.panX).toFloat().coerceIn(0f, 1f)
-+    fun frameY(y: Float) = ((y - 0.5) / transform.scaleY + 0.5 - transform.panY).toFloat().coerceIn(0f, 1f)
-+    return VideoContentRect(frameX(left), frameY(top), frameX(right), frameY(bottom))
++internal fun VideoContentRect.mapFromCrop(crop: VideoContentRect?): VideoContentRect {
++    if (crop == null) return this
++    return VideoContentRect(
++        left = (crop.left + left * crop.width).coerceIn(0f, 1f),
++        top = (crop.top + top * crop.height).coerceIn(0f, 1f),
++        right = (crop.left + right * crop.width).coerceIn(0f, 1f),
++        bottom = (crop.top + bottom * crop.height).coerceIn(0f, 1f),
++    )
 +}
 +
 +/** Bars of letterboxed and pillarboxed video are centered. Use the thicker bar on both sides. */
@@ -240,18 +261,35 @@ index 00000000..54327090
 +}
 +
 +/** A downscaled luma (0..255) picture of one video frame. */
-+internal class LumaFrame(val luma: ByteArray, val width: Int, val height: Int) {
++internal class LumaFrame(
++    val luma: ByteArray,
++    val width: Int,
++    val height: Int,
++    /** True when the image is only the current mpv video-crop region, not the whole frame. */
++    val cropped: Boolean = false,
++) {
 +    fun detectContent(): VideoContentRect? = BlackBarDetector.detect(luma, width, height)
-+}
 +
-+internal fun VideoContentRect.toMpvStretchTransform(): MpvStretchTransform {
-+    if (width <= 0f || height <= 0f) return MpvStretchTransform.Identity
-+    return MpvStretchTransform(
-+        scaleX = 1.0 / width,
-+        scaleY = 1.0 / height,
-+        panX = 0.5 - (left + right) / 2.0,
-+        panY = 0.5 - (top + bottom) / 2.0,
-+    )
++    companion object {
++        /**
++         * Parse a native sample: width and height as little-endian UInt16, a cropped flag byte,
++         * then width * height luma bytes.
++         */
++        fun fromNative(raw: ByteArray): LumaFrame? {
++            if (raw.size <= HEADER_BYTES) return null
++            val width = (raw[0].toInt() and 0xFF) or ((raw[1].toInt() and 0xFF) shl 8)
++            val height = (raw[2].toInt() and 0xFF) or ((raw[3].toInt() and 0xFF) shl 8)
++            if (width <= 0 || height <= 0 || raw.size < HEADER_BYTES + width * height) return null
++            return LumaFrame(
++                luma = raw.copyOfRange(HEADER_BYTES, HEADER_BYTES + width * height),
++                width = width,
++                height = height,
++                cropped = raw[4].toInt() != 0,
++            )
++        }
++
++        const val HEADER_BYTES = 5
++    }
 +}
 +
 +internal object BlackBarDetector {
@@ -381,7 +419,6 @@ index 00000000..54327090
 +        const val SAMPLE_MAX_DIMENSION = 320
 +    }
 +}
-+
 +
 +internal fun Bitmap.toLumaFrame(): LumaFrame {
 +    val pixels = IntArray(width * height)
