@@ -1,0 +1,113 @@
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt
+index 8b5df22f..8d25c731 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt
+@@ -7,6 +7,7 @@ import com.nuvio.tv.domain.model.JellyfinItemPage
+ import com.nuvio.tv.domain.model.JellyfinLibrary
+ import com.nuvio.tv.domain.model.JellyfinSession
+ import com.nuvio.tv.domain.model.JellyfinUiState
++import com.nuvio.tv.domain.model.Subtitle
+ import kotlinx.coroutines.CancellationException
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
+@@ -21,9 +22,12 @@ import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.flow.asStateFlow
+ import kotlinx.coroutines.flow.update
+ import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import kotlinx.coroutines.withTimeoutOrNull
+ import kotlinx.serialization.json.Json
+ import kotlinx.serialization.json.JsonArray
+ import kotlinx.serialization.json.JsonObject
++import kotlinx.serialization.json.booleanOrNull
+ import kotlinx.serialization.json.buildJsonObject
+ import kotlinx.serialization.json.contentOrNull
+ import kotlinx.serialization.json.doubleOrNull
+@@ -713,6 +717,59 @@ object JellyfinRepository {
+             "${session.serverUrl}/Videos/${item.id}/stream?Static=true&api_key=${encodeQueryValue(session.accessToken)}"
+         }
+ 
++    /**
++     * External text subtitles Jellyfin found next to the file (e.g. `Movie.en.srt`). The static
++     * stream carries only the subtitles embedded in the container, so these go to the player as
++     * sidecar tracks. Image subtitles (PGS, VobSub) are skipped. Failures give an empty list.
++     */
++    fun withExternalSubtitles(item: JellyfinItem, onReady: (List<Subtitle>) -> Unit) {
++        scope.launch {
++            val subtitles = externalSubtitlesFor(item)
++            withContext(Dispatchers.Main) { onReady(subtitles) }
++        }
++    }
++
++    suspend fun externalSubtitlesFor(item: JellyfinItem): List<Subtitle> {
++        val session = _uiState.value.session ?: return emptyList()
++        return try {
++            withTimeoutOrNull(5_000L) {
++                withContext(Dispatchers.IO) {
++                    val root = call(session, "/Users/${session.userId}/Items/${item.id}")
++                    val source = root.array("MediaSources")?.firstOrNull() as? JsonObject ?: return@withContext emptyList<Subtitle>()
++                    val sourceId = source.string("Id") ?: item.id
++                    source.array("MediaStreams").orEmpty().mapNotNull { element ->
++                        val stream = element as? JsonObject ?: return@mapNotNull null
++                        if (stream.string("Type") != "Subtitle") return@mapNotNull null
++                        if (stream["IsExternal"]?.jsonPrimitive?.booleanOrNull != true) return@mapNotNull null
++                        val index = stream.int("Index") ?: return@mapNotNull null
++                        val format = when (stream.string("Codec")?.lowercase()) {
++                            "srt", "subrip" -> "srt"
++                            "ass", "ssa" -> "ass"
++                            "vtt", "webvtt" -> "vtt"
++                            "ttml", "dfxp" -> "ttml"
++                            "pgs", "pgssub", "dvdsub", "dvbsub", "vobsub", "sub", "idx" -> return@mapNotNull null
++                            else -> "srt"
++                        }
++                        val label = stream.string("DisplayTitle") ?: stream.string("Title")
++                        Subtitle(
++                            id = "jellyfin-${item.id}-$index",
++                            url = "${session.serverUrl}/Videos/${item.id}/$sourceId/Subtitles/$index/0/Stream.$format" +
++                                "?api_key=${encodeQueryValue(session.accessToken)}",
++                            lang = stream.string("Language")?.takeIf { it.isNotBlank() } ?: "und",
++                            addonName = label?.let { "Jellyfin · $it" } ?: "Jellyfin",
++                            addonLogo = null,
++                            isStreamProvided = true,
++                        )
++                    }
++                }
++            }.orEmpty()
++        } catch (error: CancellationException) {
++            throw error
++        } catch (error: Throwable) {
++            emptyList()
++        }
++    }
++
+     fun posterUrlFor(item: JellyfinItem, maxWidth: Int = 480): String? {
+         if (item.imageTag.isNullOrBlank()) return null
+         return _uiState.value.session?.let { session ->
+diff --git a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
+index 1388e449..279c4d30 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
+@@ -1132,7 +1132,9 @@ private fun PlaybackNavHost(
+             JellyfinScreen(
+                 onPlayFullscreen = { item ->
+                     val streamUrl = JellyfinRepository.streamUrlFor(item)
+-                    if (!streamUrl.isNullOrBlank()) {
++                    // External .srt/.ass files next to the video are not in the static stream.
++                    if (!streamUrl.isNullOrBlank()) JellyfinRepository.withExternalSubtitles(item) { subtitles ->
++                        com.nuvio.tv.ui.screens.player.StreamSidecarSubtitles.set(streamUrl, subtitles)
+                         navController.navigate(
+                             Screen.Player.createRoute(
+                                 streamUrl = streamUrl,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerObservers.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerObservers.kt
+index 1ff64808..de2fa82f 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerObservers.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerObservers.kt
+@@ -264,6 +264,8 @@ internal fun PlayerRuntimeController.filterToVisibleAddonSubtitles(
+     }
+ 
+     return subtitles.filter { subtitle ->
++        // Jellyfin sidecar files without a language tag (Movie.srt) cannot match a language; keep them.
++        (subtitle.id.startsWith("jellyfin-") && subtitle.lang == "und") ||
+         preferredTargets.any { target ->
+             PlayerSubtitleUtils.matchesLanguageCode(subtitle.lang, target)
+         }
