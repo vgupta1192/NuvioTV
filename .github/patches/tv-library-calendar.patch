@@ -1,0 +1,235 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryCalendarTv.kt b/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryCalendarTv.kt
+new file mode 100644
+index 000000000..522edc3a0
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryCalendarTv.kt
+@@ -0,0 +1,212 @@
++@file:OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
++
++package com.nuvio.tv.ui.screens.library
++
++import android.content.Context
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.items
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.unit.dp
++import androidx.tv.material3.Button
++import androidx.tv.material3.ButtonDefaults
++import androidx.tv.material3.Card
++import androidx.tv.material3.CardDefaults
++import androidx.tv.material3.MaterialTheme
++import androidx.tv.material3.Text
++import com.nuvio.tv.core.network.NetworkResult
++import com.nuvio.tv.domain.model.LibraryEntry
++import com.nuvio.tv.domain.repository.MetaRepository
++import com.nuvio.tv.ui.components.NuvioDialog
++import com.nuvio.tv.ui.theme.NuvioTheme
++import dagger.hilt.EntryPoint
++import dagger.hilt.InstallIn
++import dagger.hilt.android.EntryPointAccessors
++import dagger.hilt.components.SingletonComponent
++import java.time.LocalDate
++import java.time.OffsetDateTime
++import java.time.format.DateTimeFormatter
++import java.util.Locale
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.async
++import kotlinx.coroutines.awaitAll
++import kotlinx.coroutines.coroutineScope
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.sync.Semaphore
++import kotlinx.coroutines.sync.withPermit
++import kotlinx.coroutines.withContext
++import kotlinx.coroutines.withTimeoutOrNull
++
++/*
++ * Nuvio fork: release calendar for the saved library (the TV counterpart of Nuvio Mobile's
++ * library calendar). Lists episode and movie release dates of saved titles from two weeks ago to
++ * three months ahead, grouped by day; picking one opens the title.
++ */
++
++@EntryPoint
++@InstallIn(SingletonComponent::class)
++internal interface LibraryCalendarEntryPoint {
++    fun metaRepository(): MetaRepository
++}
++
++internal data class LibraryCalendarEvent(
++    val entry: LibraryEntry,
++    val date: LocalDate,
++    val label: String,
++)
++
++private object LibraryCalendarCache {
++    var key: Set<String> = emptySet()
++    var events: List<LibraryCalendarEvent>? = null
++}
++
++private const val PAST_DAYS = 14L
++private const val FUTURE_DAYS = 90L
++
++private fun parseReleaseDate(value: String?): LocalDate? {
++    val text = value?.trim()?.takeIf { it.isNotEmpty() } ?: return null
++    return runCatching { OffsetDateTime.parse(text).toLocalDate() }.getOrNull()
++        ?: runCatching { LocalDate.parse(text.take(10)) }.getOrNull()
++}
++
++private suspend fun loadLibraryCalendar(context: Context, items: List<LibraryEntry>): List<LibraryCalendarEvent> {
++    val key = items.map { "${it.type}:${it.id}" }.toSet()
++    LibraryCalendarCache.events?.takeIf { LibraryCalendarCache.key == key }?.let { return it }
++    val repository = EntryPointAccessors.fromApplication(context.applicationContext, LibraryCalendarEntryPoint::class.java)
++        .metaRepository()
++    val today = LocalDate.now()
++    val from = today.minusDays(PAST_DAYS)
++    val to = today.plusDays(FUTURE_DAYS)
++    val gate = Semaphore(4)
++    val events = withContext(Dispatchers.IO) {
++        coroutineScope {
++            items.distinctBy { "${it.type}:${it.id}" }.map { entry ->
++                async {
++                    gate.withPermit {
++                        val meta = withTimeoutOrNull(10_000L) {
++                            repository.getMetaFromAllAddons(entry.type, entry.id, entry.addonBaseUrl)
++                                .first { it !is NetworkResult.Loading }
++                        }.let { (it as? NetworkResult.Success)?.data } ?: return@withPermit emptyList()
++                        val episodes = meta.videos.mapNotNull { video ->
++                            val date = parseReleaseDate(video.released) ?: return@mapNotNull null
++                            if (date < from || date > to) return@mapNotNull null
++                            val number = if (video.season != null && video.episode != null) {
++                                "S%02dE%02d".format(video.season, video.episode)
++                            } else null
++                            val title = video.title.takeIf { it.isNotBlank() }
++                            LibraryCalendarEvent(entry, date, listOfNotNull(number, title).joinToString(" · ").ifBlank { entry.name })
++                        }
++                        val movie = if (meta.videos.isEmpty()) {
++                            parseReleaseDate(meta.released)?.takeIf { it in from..to }
++                                ?.let { LibraryCalendarEvent(entry, it, "Release") }
++                        } else null
++                        episodes + listOfNotNull(movie)
++                    }
++                }
++            }.awaitAll().flatten()
++        }
++    }.sortedWith(compareBy({ it.date }, { it.entry.name }))
++    LibraryCalendarCache.key = key
++    LibraryCalendarCache.events = events
++    return events
++}
++
++/** "Calendar" button for the saved library; opens the release agenda. */
++@Composable
++internal fun LibraryCalendarButton(items: List<LibraryEntry>, onOpen: (LibraryEntry) -> Unit) {
++    var open by remember { mutableStateOf(false) }
++    Button(
++        onClick = { open = true },
++        colors = ButtonDefaults.colors(
++            containerColor = NuvioTheme.colors.BackgroundCard,
++            contentColor = NuvioTheme.colors.TextPrimary
++        )
++    ) {
++        Text("Calendar")
++    }
++    if (open) {
++        LibraryCalendarDialog(items = items, onDismiss = { open = false }, onOpen = { entry ->
++            open = false
++            onOpen(entry)
++        })
++    }
++}
++
++@Composable
++private fun LibraryCalendarDialog(items: List<LibraryEntry>, onDismiss: () -> Unit, onOpen: (LibraryEntry) -> Unit) {
++    val context = LocalContext.current
++    var events by remember { mutableStateOf<List<LibraryCalendarEvent>?>(null) }
++    LaunchedEffect(items) { events = runCatching { loadLibraryCalendar(context, items) }.getOrDefault(emptyList()) }
++    val today = LocalDate.now()
++    val dayFormat = remember { DateTimeFormatter.ofPattern("EEE d MMM", Locale.getDefault()) }
++    val firstFocus = remember { FocusRequester() }
++
++    NuvioDialog(
++        onDismiss = onDismiss,
++        title = "Release calendar",
++        subtitle = "Episodes and movies of your saved titles, two weeks back to three months ahead.",
++        width = 900.dp,
++        usePlatformDefaultWidth = false,
++    ) {
++        val list = events
++        when {
++            list == null -> Text("Loading saved releases…", color = NuvioTheme.colors.TextSecondary)
++            list.isEmpty() -> Text("No release dates found for your saved titles.", color = NuvioTheme.colors.TextSecondary)
++            else -> {
++                val firstUpcoming = list.indexOfFirst { it.date >= today }.coerceAtLeast(0)
++                LaunchedEffect(list) { runCatching { firstFocus.requestFocus() } }
++                LazyColumn(
++                    modifier = Modifier.fillMaxWidth().heightIn(max = 520.dp),
++                    verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.sm),
++                ) {
++                    items(list.size) { index ->
++                        val event = list[index]
++                        val day = when (event.date) {
++                            today -> "Today"
++                            today.plusDays(1) -> "Tomorrow"
++                            today.minusDays(1) -> "Yesterday"
++                            else -> event.date.format(dayFormat)
++                        }
++                        Card(
++                            onClick = { onOpen(event.entry) },
++                            modifier = Modifier
++                                .fillMaxWidth()
++                                .then(if (index == firstUpcoming) Modifier.focusRequester(firstFocus) else Modifier),
++                            colors = CardDefaults.colors(
++                                containerColor = NuvioTheme.colors.BackgroundElevated,
++                                focusedContainerColor = NuvioTheme.colors.BackgroundCard
++                            ),
++                            scale = CardDefaults.scale(focusedScale = 1.02f)
++                        ) {
++                            Column(modifier = Modifier.padding(horizontal = NuvioTheme.spacing.lg, vertical = NuvioTheme.spacing.md)) {
++                                Text(
++                                    text = "$day · ${event.entry.name}",
++                                    style = MaterialTheme.typography.titleSmall,
++                                    color = if (event.date >= today) NuvioTheme.colors.TextPrimary else NuvioTheme.colors.TextSecondary,
++                                )
++                                Text(
++                                    text = (if (event.date > today) "Coming soon · " else "Available · ") + event.label,
++                                    style = MaterialTheme.typography.bodySmall,
++                                    color = NuvioTheme.colors.TextSecondary,
++                                )
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryScreen.kt
+index 2f30e9a34..581bb05c6 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryScreen.kt
+@@ -405,6 +405,12 @@ fun LibraryScreen(
+                             )
+                         }
+                     }
++                } else if (viewMode == LibraryViewMode.Saved && uiState.allItems.isNotEmpty()) {
++                    { // Nuvio fork: library release calendar
++                        LibraryCalendarButton(uiState.allItems) { entry ->
++                            onNavigateToDetail(entry.id, entry.type, entry.addonBaseUrl)
++                        }
++                    }
+                 } else {
+                     null
+                 }
