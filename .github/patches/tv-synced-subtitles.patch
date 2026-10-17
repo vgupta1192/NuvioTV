@@ -37,10 +37,10 @@ index 9bd3115d8..35b5cadb1 100644
      val uiState: StateFlow<PlayerUiState>
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt
 new file mode 100644
-index 000000000..05a99f4e8
+index 000000000..911ad1369
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt
-@@ -0,0 +1,315 @@
+@@ -0,0 +1,337 @@
 +package com.nuvio.tv.ui.screens.player
 +
 +import android.content.Context
@@ -156,6 +156,22 @@ index 000000000..05a99f4e8
 +    }
 +
 +    /**
++     * Coarse fallback key that survives what the exact key cannot: an addon changing its manifest
++     * URL (config tokens), stream lists rotating between fetches, description churn. It is only
++     * the first line of the stream name (usually the addon's own name) with numbers blanked, so
++     * every row of the same addon shares one key. Saved next to the exact key; matching tries both.
++     */
++    fun canonicalStreamKey(name: String?): String? {
++        val label = name.orEmpty().trim().substringBefore('\n').trim()
++        if (label.isEmpty()) return null
++        return "c:" + fnv64(label.replace(VOLATILE_NUMBER, "#"))
++    }
++
++    /** The canonical key of the playing stream, kept next to [playback]; see [canonicalStreamKey]. */
++    var playbackCanonicalKey: String? = null
++        private set
++
++    /**
 +     * Mobile's addon id for a stream's addon ("addon:<manifest id>:<manifest URL>"), found by the
 +     * addon name the TV stream carries; null when no installed addon has that name.
 +     */
@@ -170,7 +186,7 @@ index 000000000..05a99f4e8
 +        return "addon:${addon.id}:$manifestPath$query"
 +    }
 +
-+    /** Both keys a listed stream may have been saved under (as a torrent, or by its name). */
++    /** Every key a listed stream may have been saved under: torrent, by name, and the canonical. */
 +    fun streamKeys(stream: Stream, addons: List<Addon>): List<String> {
 +        val addonId = addonInstanceId(stream.addonName, addons)
 +        val label = stream.name?.takeIf { it.isNotBlank() } ?: "Stream"
@@ -178,6 +194,7 @@ index 000000000..05a99f4e8
 +        return listOfNotNull(
 +            hash?.let { streamKey(addonId, label, stream.description, it, stream.fileIdx) },
 +            streamKey(addonId, label, stream.description, null, null),
++            canonicalStreamKey(label),
 +        )
 +    }
 +
@@ -206,9 +223,10 @@ index 000000000..05a99f4e8
 +    }
 +
 +    /** The player moved to [videoId] + stream: look up the synced subtitles saved for it. */
-+    fun setPlayback(videoId: String?, streamKey: String?) {
++    fun setPlayback(videoId: String?, streamKey: String?, canonicalKey: String? = playbackCanonicalKey) {
 +        val next = if (videoId.isNullOrBlank() || streamKey == null) null else Playback(videoId, streamKey)
 +        if (next == _playback.value) return
++        playbackCanonicalKey = if (next == null) null else canonicalKey?.trim()?.takeIf { it.isNotEmpty() }
 +        _playback.value = next
 +        _saved.value = null
 +        restoredUrls.clear()
@@ -219,17 +237,20 @@ index 000000000..05a99f4e8
 +        scope.launch {
 +            val local = localLoad?.invoke(fileName(next))?.let(::decodeList).orEmpty()
 +            if (local.isNotEmpty() && _playback.value == next) merge(next, local, store = false)
-+            val remote = runCatching {
-+                val result = GeneratedSubtitleSync.postgrest()!!.rpc(
-+                    "synced_subtitles_pull_all",
-+                    buildJsonObject {
-+                        put("p_video_id", next.videoId)
-+                        put("p_stream_key", next.streamKey)
-+                    },
-+                )
-+                decodeList(result.data)
-+            }.getOrNull().orEmpty()
-+            if (remote.isNotEmpty() && _playback.value == next) merge(next, remote, store = true)
++            val keys = listOfNotNull(next.streamKey, playbackCanonicalKey?.takeIf { it != next.streamKey })
++            for (key in keys) {
++                val remote = runCatching {
++                    val result = GeneratedSubtitleSync.postgrest()!!.rpc(
++                        "synced_subtitles_pull_all",
++                        buildJsonObject {
++                            put("p_video_id", next.videoId)
++                            put("p_stream_key", key)
++                        },
++                    )
++                    decodeList(result.data)
++                }.getOrNull().orEmpty()
++                if (remote.isNotEmpty() && _playback.value == next) merge(next, remote, store = true)
++            }
 +        }
 +    }
 +
@@ -308,13 +329,14 @@ index 000000000..05a99f4e8
 +        )
 +        merge(playback, listOf(saved), store = true)
 +        val encoded = json.encodeToString(Saved.serializer(), saved)
++        val keys = listOfNotNull(playback.streamKey, playbackCanonicalKey?.takeIf { it != playback.streamKey })
 +        scope.launch {
-+            runCatching {
++            for (key in keys) runCatching {
 +                GeneratedSubtitleSync.postgrest()!!.rpc(
 +                    "synced_subtitles_push_one",
 +                    buildJsonObject {
 +                        put("p_video_id", playback.videoId)
-+                        put("p_stream_key", playback.streamKey)
++                        put("p_stream_key", key)
 +                        put("p_subtitle_key", fnv64(url))
 +                        put("p_payload", Json.parseToJsonElement(encoded))
 +                    },
@@ -358,10 +380,10 @@ index 000000000..05a99f4e8
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitlesPlayerHooks.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitlesPlayerHooks.kt
 new file mode 100644
-index 000000000..fe9876e8e
+index 000000000..e4ea4d185
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitlesPlayerHooks.kt
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,323 @@
 +@file:OptIn(androidx.media3.common.util.UnstableApi::class)
 +
 +package com.nuvio.tv.ui.screens.player
@@ -437,6 +459,14 @@ index 000000000..fe9876e8e
 +    )
 +}
 +
++/** The coarse canonical key of the playing stream (first line of the stream name). */
++private fun PlayerRuntimeController.syncedCanonicalKey(): String? =
++    SyncedSubtitles.canonicalStreamKey(
++        _uiState.value.currentStreamName?.takeIf { it.isNotBlank() }
++            ?: streamName?.takeIf { it.isNotBlank() }
++            ?: "Stream",
++    )
++
 +private fun PlayerRuntimeController.syncedVideoId(): String? =
 +    currentVideoId?.takeIf { it.isNotBlank() } ?: contentId?.let { id ->
 +        val season = currentSeason
@@ -449,13 +479,27 @@ index 000000000..fe9876e8e
 + * AutoSync does not run again. False when nothing is saved or the sidecar can't show it.
 + */
 +internal fun PlayerRuntimeController.restoreSyncedSubtitle(subtitle: Subtitle): Boolean {
-+    if (isUsingMpvEngine() || GeneratedSubtitles.isGenerated(subtitle.url)) return false
-+    val saved = SyncedSubtitles.savedFor(subtitle.url) ?: return false
-+    val player = _exoPlayer ?: return false
++    if (isUsingMpvEngine()) {
++        Log.i(TAG, "synced restore: stream plays on mpv, skipping")
++        return false
++    }
++    if (GeneratedSubtitles.isGenerated(subtitle.url)) return false
++    val saved = SyncedSubtitles.savedFor(subtitle.url)
++    if (saved == null) {
++        Log.i(TAG, "synced restore: nothing saved for this subtitle url")
++        return false
++    }
++    val player = _exoPlayer
++    if (player == null) {
++        Log.i(TAG, "synced restore: exoPlayer not ready")
++        return false
++    }
 +    cancelAutomaticSubtitleSync()
 +    SyncedSubtitles.restoredUrls += subtitle.url
-+    if (!startSidecarAddonSubtitle(subtitle, rawBodyLoader = { saved.srt })) {
++    val started = startSidecarAddonSubtitle(subtitle, rawBodyLoader = { saved.srt })
++    if (!started) {
 +        SyncedSubtitles.restoredUrls -= subtitle.url
++        Log.i(TAG, "synced restore: sidecar refused the saved subtitle")
 +        return false
 +    }
 +    player.trackSelectionParameters = player.trackSelectionParameters
@@ -497,7 +541,7 @@ index 000000000..fe9876e8e
 +                    addons = SyncedSubtitlesAddons.get(context)
 +                    addonsReadAt = System.currentTimeMillis()
 +                }
-+                SyncedSubtitles.setPlayback(syncedVideoId(), syncedStreamKey(addons))
++                SyncedSubtitles.setPlayback(syncedVideoId(), syncedStreamKey(addons), syncedCanonicalKey())
 +                pickSavedSyncedSubtitle()
 +
 +                // Save the synced timing once it has settled (the audio sync keeps refining it).
@@ -527,18 +571,42 @@ index 000000000..fe9876e8e
 + * picked by hand is kept.
 + */
 +private fun PlayerRuntimeController.pickSavedSyncedSubtitle() {
-+    val (playback, subtitles) = SyncedSubtitles.saved.value ?: return
-+    if (playback != SyncedSubtitles.playback.value || subtitles.isEmpty()) return
++    val (playback, subtitles) = SyncedSubtitles.saved.value
++    if (playback == null) {
++        logPickState("nothing saved/pulled for this title + stream yet")
++        return
++    }
++    if (playback != SyncedSubtitles.playback.value || subtitles.isEmpty()) {
++        logPickState("pull came back for another playback or is empty")
++        return
++    }
 +    val state = _uiState.value
-+    if (state.isLoadingAddonSubtitles || isUsingMpvEngine() || _exoPlayer == null) return
++    if (state.isLoadingAddonSubtitles) {
++        logPickState("addon subtitles still loading")
++        return
++    }
++    if (isUsingMpvEngine()) {
++        logPickState("stream plays on mpv")
++        return
++    }
++    if (_exoPlayer == null) {
++        logPickState("exoPlayer not ready")
++        return
++    }
 +    val list = SyncedSubtitles.withEntry(state.addonSubtitles, loading = false)
 +    val selected = state.selectedAddonSubtitle
 +    val target = selected?.takeIf { it.url in subtitles }
 +        ?: subtitles.values.sortedByDescending { it.savedAtMs }
 +            .firstNotNullOfOrNull { saved -> list.firstOrNull { it.url == saved.subtitleUrl } }
 +        ?: return
-+    if (!SyncedSubtitles.claimAutoSelect(playback)) return
-+    if (selected != null && selected.url != target.url && isUserExplicitSubtitleSelection) return
++    if (!SyncedSubtitles.claimAutoSelect(playback)) {
++        logPickMiss("auto-select already claimed for this playback")
++        return
++    }
++    if (selected != null && selected.url != target.url && isUserExplicitSubtitleSelection) {
++        logPickMiss("user picked a subtitle by hand (${selected.url})")
++        return
++    }
 +    if (selected?.url == target.url && target.url in SyncedSubtitles.restoredUrls) return
 +    Log.i(TAG, "picking saved synced subtitle (${target.url})")
 +    autoSubtitleSelected = true
@@ -547,6 +615,25 @@ index 000000000..fe9876e8e
 +        selectAddonSubtitle(target)
 +    }
 +    restoreSyncedSubtitle(target)
++}
++
++private var lastPickMissLogAtMs = 0L
++private var lastPickStateLogAtMs = 0L
++
++/** Logs why no saved subtitle is being picked yet, at most every 60 s (the loop retries). */
++private fun PlayerRuntimeController.logPickState(reason: String) {
++    val now = System.currentTimeMillis()
++    if (now - lastPickStateLogAtMs < 60_000L) return
++    lastPickStateLogAtMs = now
++    Log.i(TAG, "synced pick state: $reason")
++}
++
++/** Logs why the saved subtitle was not auto-picked, at most every 15 s (the loop retries). */
++private fun PlayerRuntimeController.logPickMiss(reason: String) {
++    val now = System.currentTimeMillis()
++    if (now - lastPickMissLogAtMs < 15_000L) return
++    lastPickMissLogAtMs = now
++    Log.i(TAG, "synced pick: $reason")
 +}
 +
 +/** Adds saved synced subtitles that this TV's addons don't list to the player's subtitle list. */
