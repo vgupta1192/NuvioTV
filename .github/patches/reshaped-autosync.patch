@@ -42,10 +42,10 @@ index 000000000..1fe620323
 +    implementation files(sherpaOnnxAar)
 +}
 diff --git a/app/build.gradle.kts b/app/build.gradle.kts
-index 13e0195db..94262d895 100644
+index c5b1acb4a..1b9d1f261 100644
 --- a/app/build.gradle.kts
 +++ b/app/build.gradle.kts
-@@ -565,3 +565,5 @@ dependencies {
+@@ -564,3 +564,5 @@ dependencies {
      debugImplementation("androidx.compose.ui:ui-tooling")
      debugImplementation(libs.androidx.compose.ui.test.manifest)
  }
@@ -123,14 +123,14 @@ index 000000000..e9bba6088
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerLibassCompat.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerLibassCompat.kt
-index ada71ce26..79cb2ec60 100644
+index ada71ce26..de76dfcef 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerLibassCompat.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerLibassCompat.kt
 @@ -103,18 +103,19 @@ private fun ExtractorsFactory.withAssMkvSupportCompat(
          extractors.forEachIndexed { index, extractor ->
              val underlying = extractor.getUnderlyingImplementation()
              // Stock MatroskaExtractor: replace with ASS-aware variant for libass support.
-+            // AutoSync: keep the extractor taps (AutoSync, audio sync) around Matroska when swapping it.
++            // Nuvio RS: keep the fork's extractor taps around Matroska when swapping it.
              if (underlying is StockMatroskaExtractor) {
 -                extractors[index] = NuvioAssMatroskaExtractor(subtitleParserFactory, assHandler)
 +                extractors[index] = extractor.replaceInnermostExtractor(NuvioAssMatroskaExtractor(subtitleParserFactory, assHandler))
@@ -150,7 +150,7 @@ index ada71ce26..79cb2ec60 100644
          }
          extractors
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt
-index bd2b33078..f7fb5f0b6 100644
+index e2ac43f71..148106e67 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt
 @@ -1,8 +1,6 @@
@@ -162,14 +162,15 @@ index bd2b33078..f7fb5f0b6 100644
  import android.util.Log
  import android.widget.Toast
  import androidx.media3.common.C
-@@ -11,31 +9,58 @@ import com.nuvio.tv.R
+@@ -11,6 +9,7 @@ import com.nuvio.tv.R
  import com.nuvio.tv.domain.model.Subtitle
  import com.nuvio.tv.ui.screens.player.autosync.AutoSyncAnalysisOutcome
  import com.nuvio.tv.ui.screens.player.autosync.AutoSyncCandidateScope
 +import com.nuvio.tv.ui.screens.player.autosync.AutoSyncDebugLog
  import com.nuvio.tv.ui.screens.player.autosync.AutoSyncExtractorsFactory
  import com.nuvio.tv.ui.screens.player.autosync.AutoSyncPreferences
- import com.nuvio.tv.ui.screens.player.autosync.AutoSyncSubtitleCandidate
+ import com.nuvio.tv.ui.screens.player.autosync.AutoSyncResolvedTimeline
+@@ -19,28 +18,52 @@ import com.nuvio.tv.ui.screens.player.autosync.AutoSyncSubtitleTextRetimer
  import com.nuvio.tv.ui.screens.player.autosync.AutoSyncSyncedSubtitle
  import com.nuvio.tv.ui.screens.player.autosync.AutomaticSubtitleSync
  import com.nuvio.tv.ui.screens.player.autosync.EmbeddedSubtitleTimelineLoader
@@ -183,12 +184,14 @@ index bd2b33078..f7fb5f0b6 100644
 +import com.nuvio.tv.ui.screens.player.audiosync.AudioSyncFallback
 +import com.nuvio.tv.ui.screens.player.audiosync.AudioSyncSettings
 +import com.nuvio.tv.ui.screens.player.audiosync.AudioSyncTaps
+ import java.io.File
  import kotlinx.coroutines.CancellationException
  import kotlinx.coroutines.CompletableDeferred
-+import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.Dispatchers
  import kotlinx.coroutines.launch
-+import kotlinx.coroutines.withContext
- import kotlinx.coroutines.flow.update
+-import kotlinx.coroutines.flow.update
+ import kotlinx.coroutines.withContext
++import kotlinx.coroutines.flow.update
  
  /** Thin TV adapter around the feature-owned Mobile AutoSync V2 pipeline. */
 -private val autoSyncToastHandler = Handler(Looper.getMainLooper())
@@ -225,7 +228,7 @@ index bd2b33078..f7fb5f0b6 100644
  /**
   * Wraps Nuvio's extractors so AutoSync can observe embedded subtitle timing (output is forwarded
   * unchanged), and starts AutoSync's embedded subtitle index download while the stream opens.
-@@ -45,9 +70,11 @@ internal fun PlayerRuntimeController.autoSyncExtractorsFactory(
+@@ -50,9 +73,11 @@ internal fun PlayerRuntimeController.autoSyncExtractorsFactory(
      url: String,
      headers: Map<String, String>,
  ): ExtractorsFactory {
@@ -239,7 +242,7 @@ index bd2b33078..f7fb5f0b6 100644
      prefetchAutoSyncIndex(url, headers)
      return factory
  }
-@@ -72,6 +99,14 @@ internal fun PlayerRuntimeController.runSelectedAutomaticSubtitleSync(subtitle:
+@@ -77,6 +102,14 @@ internal fun PlayerRuntimeController.runSelectedAutomaticSubtitleSync(subtitle:
  internal fun PlayerRuntimeController.cancelAutomaticSubtitleSync() {
      automaticSubtitleSyncJob?.cancel()
      automaticSubtitleSyncJob = null
@@ -254,7 +257,7 @@ index bd2b33078..f7fb5f0b6 100644
  }
  
  internal fun PlayerRuntimeController.maybeRunAutomaticSubtitleSync(
-@@ -96,14 +131,19 @@ internal fun PlayerRuntimeController.maybeRunAutomaticSubtitleSync(
+@@ -105,14 +138,19 @@ internal fun PlayerRuntimeController.maybeRunAutomaticSubtitleSync(
      val player = _exoPlayer ?: return
      val useLibass = requestedUseLibassByUser || activePlayerUsesLibass
  
@@ -275,7 +278,7 @@ index bd2b33078..f7fb5f0b6 100644
      val sourceHeadersAtStart = currentHeaders.toMap()
      val selectedUrl = selectedSubtitle.url
      val candidatesAtStart = (_uiState.value.addonSubtitles + selectedSubtitle)
-@@ -121,7 +161,7 @@ internal fun PlayerRuntimeController.maybeRunAutomaticSubtitleSync(
+@@ -130,7 +168,7 @@ internal fun PlayerRuntimeController.maybeRunAutomaticSubtitleSync(
          },
      )
      if (!started) {
@@ -284,7 +287,7 @@ index bd2b33078..f7fb5f0b6 100644
          return
      }
  
-@@ -129,6 +169,11 @@ internal fun PlayerRuntimeController.maybeRunAutomaticSubtitleSync(
+@@ -138,6 +176,11 @@ internal fun PlayerRuntimeController.maybeRunAutomaticSubtitleSync(
          .buildUpon()
          .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
          .build()
@@ -296,7 +299,7 @@ index bd2b33078..f7fb5f0b6 100644
  
      automaticSubtitleSyncJob = scope.launch {
          launch {
-@@ -159,7 +204,7 @@ internal fun PlayerRuntimeController.maybeRunAutomaticSubtitleSync(
+@@ -168,7 +211,7 @@ internal fun PlayerRuntimeController.maybeRunAutomaticSubtitleSync(
                      "lang=${selectedSubtitle.lang} candidates=${candidatesAtStart.size}",
              )
              var analysisOutcome: AutoSyncAnalysisOutcome? = null
@@ -305,7 +308,7 @@ index bd2b33078..f7fb5f0b6 100644
                  sourceKey = sourceUrlAtStart,
                  sourceHeaders = sourceHeadersAtStart,
                  selectedSubtitleUrl = selectedUrl,
-@@ -194,17 +239,92 @@ internal fun PlayerRuntimeController.maybeRunAutomaticSubtitleSync(
+@@ -189,17 +232,92 @@ internal fun PlayerRuntimeController.maybeRunAutomaticSubtitleSync(
                  },
                  onReferenceReady = {},
                  onAnalysisOutcome = { outcome -> analysisOutcome = outcome },
@@ -400,7 +403,7 @@ index bd2b33078..f7fb5f0b6 100644
              if (currentStreamUrl != sourceUrlAtStart) return@launch
              val activeSubtitleUrl = _uiState.value.selectedAddonSubtitle?.url
              if (activeSubtitleUrl != selectedUrl && activeSubtitleUrl != resolved.subtitleUrl) {
-@@ -260,11 +380,18 @@ internal fun PlayerRuntimeController.maybeRunAutomaticSubtitleSync(
+@@ -255,11 +373,18 @@ internal fun PlayerRuntimeController.maybeRunAutomaticSubtitleSync(
              }
  
              if (!applied) {
@@ -421,7 +424,7 @@ index bd2b33078..f7fb5f0b6 100644
                  return@launch
              }
  
-@@ -275,34 +402,96 @@ internal fun PlayerRuntimeController.maybeRunAutomaticSubtitleSync(
+@@ -270,25 +395,80 @@ internal fun PlayerRuntimeController.maybeRunAutomaticSubtitleSync(
                          selectedSubtitleTrackIndex = -1,
                      )
                  }
@@ -502,16 +505,67 @@ index bd2b33078..f7fb5f0b6 100644
 +        tracks.groups.any { it.type == C.TRACK_TYPE_TEXT }
 +    }
 +
-+private fun Subtitle.toAutoSyncCandidate(): AutoSyncSubtitleCandidate =
-+    AutoSyncSubtitleCandidate(
-+        url = url,
-+        language = lang,
-+        name = addonName.ifBlank { id },
-+    )
-+
- /** Why AutoSync kept the original timing, in the fewest words that still help the viewer. */
- private fun Context.buildAutoSyncFailureToast(analysisOutcome: AutoSyncAnalysisOutcome?): String =
-     getString(
+ /**
+  * mpv path. mpv exposes no embedded subtitle timing while it plays, so only the container's own
+  * subtitle index can serve as the reference. The result is applied by loading a copy of the
+@@ -298,7 +478,8 @@ private fun PlayerRuntimeController.runMpvAutomaticSubtitleSync(
+     selectedSubtitle: Subtitle,
+     candidateScope: AutoSyncCandidateScope,
+ ) {
+-    automaticSubtitleSyncJob?.cancel()
++    stopAutomaticSubtitleSync()
++    showAutoSyncToast(AutoSyncBubbleKind.Working, context.getString(R.string.autosync_toast_analyzing))
+ 
+     val sourceUrlAtStart = currentStreamUrl
+     val sourceHeadersAtStart = currentHeaders.toMap()
+@@ -348,7 +529,7 @@ private fun PlayerRuntimeController.runMpvAutomaticSubtitleSync(
+             if (resolved == null) {
+                 Log.d(PlayerRuntimeController.TAG, "AUTO_SYNC_V2 mpv no match outcome=$analysisOutcome")
+                 if (activeSubtitleUrl == selectedUrl) {
+-                    showAutoSyncToast(context.buildAutoSyncFailureToast(analysisOutcome))
++                    showAutoSyncToast(AutoSyncBubbleKind.Failure, context.buildAutoSyncFailureToast(analysisOutcome))
+                 }
+                 return@launch
+             }
+@@ -378,7 +559,7 @@ private fun PlayerRuntimeController.runMpvAutomaticSubtitleSync(
+                     language = PlayerSubtitleUtils.normalizeLanguageCode(chosenSubtitle.lang),
+                 ) == true
+                 if (!added) {
+-                    showAutoSyncToast(context.getString(R.string.autosync_toast_failed))
++                    showAutoSyncToast(AutoSyncBubbleKind.Failure, context.getString(R.string.reshaped_autosync_toast_failed))
+                     return@launch
+                 }
+                 keepMpvPlayingIfNeeded(wasPlaying)
+@@ -394,8 +575,18 @@ private fun PlayerRuntimeController.runMpvAutomaticSubtitleSync(
+                 rememberAddonSubtitleSelection(chosenSubtitle)
+             }
+             if (!withinTolerance) updateMpvAvailableTracks()
+-            setSubtitleDelayMs(targetMs = 0, showOverlay = false)
++            resetSubtitleDelayForAutoSync()
+             AutoSyncSyncedSubtitle.mark(chosenSubtitle.url)
++            showAutoSyncToast(
++                AutoSyncBubbleKind.Success,
++                context.getString(
++                    when {
++                        chosenSubtitle.url != selectedUrl -> R.string.autosync_toast_synced_replaced
++                        withinTolerance -> R.string.autosync_toast_in_sync
++                        else -> R.string.autosync_toast_synced
++                    },
++                ),
++            )
+             Log.d(
+                 PlayerRuntimeController.TAG,
+                 "AUTO_SYNC_V2 mpv applied id=${chosenSubtitle.id} " +
+@@ -409,7 +600,7 @@ private fun PlayerRuntimeController.runMpvAutomaticSubtitleSync(
+         } catch (error: Throwable) {
+             Log.w(PlayerRuntimeController.TAG, "AUTO_SYNC_V2 mpv failed", error)
+             if (streamUnchanged() && _uiState.value.selectedAddonSubtitle?.url == selectedUrl) {
+-                showAutoSyncToast(context.getString(R.string.autosync_toast_failed))
++                showAutoSyncToast(AutoSyncBubbleKind.Failure, context.getString(R.string.reshaped_autosync_toast_failed))
+             }
+         }
+     }
+@@ -460,9 +651,9 @@ private fun Context.buildAutoSyncFailureToast(analysisOutcome: AutoSyncAnalysisO
          when (analysisOutcome) {
              AutoSyncAnalysisOutcome.NO_SUBTITLE_TRACKS,
              AutoSyncAnalysisOutcome.NO_USABLE_REFERENCE,
@@ -524,7 +578,7 @@ index bd2b33078..f7fb5f0b6 100644
          },
      )
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
-index e3885c309..ddd9f6107 100644
+index a0d94375c..b97bcb39f 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
 @@ -2208,7 +2208,7 @@ private class SubtitleOffsetRenderersFactory(
@@ -553,10 +607,10 @@ index 2dca0214a..123b4bfe2 100644
              Log.d(PlayerRuntimeController.TAG, "fetchAddonSubtitles done: ${subtitles.size} subs, visible=${visibleSubtitles.size}, persistedPref=${persistedTrackPreference?.subtitle?.javaClass?.simpleName}")
              _uiState.update {
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
-index ca6c37fce..decf0b370 100644
+index a00208b55..b64248597 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
-@@ -1344,7 +1344,7 @@ fun PlayerRuntimeController.onEvent(event: PlayerEvent) {
+@@ -1365,7 +1365,7 @@ fun PlayerRuntimeController.onEvent(event: PlayerEvent) {
              pendingAddonSubtitleTrackId = null
              pendingAudioSelectionAfterSubtitleRefresh = null
              resetSubtitleAutoSyncState()
@@ -565,7 +619,7 @@ index ca6c37fce..decf0b370 100644
              if (_uiState.value.serverSubtitleTracks.isNotEmpty()) {
                  selectServerSubtitle(event.index)
              } else {
-@@ -1372,7 +1372,7 @@ fun PlayerRuntimeController.onEvent(event: PlayerEvent) {
+@@ -1393,7 +1393,7 @@ fun PlayerRuntimeController.onEvent(event: PlayerEvent) {
              pendingAddonSubtitleTrackId = null
              pendingAudioSelectionAfterSubtitleRefresh = null
              resetSubtitleAutoSyncState()
@@ -575,25 +629,24 @@ index ca6c37fce..decf0b370 100644
              disableSubtitles()
              if (hasBurnedInServerSubtitle) clearServerSubtitle()
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
-index 0ed1711fa..cb037c197 100644
+index ae2bee919..5e33806fb 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
-@@ -5,6 +5,9 @@
+@@ -5,6 +5,8 @@
  
  package com.nuvio.tv.ui.screens.player
  
 +import com.nuvio.tv.ui.screens.player.audiosync.SubtitleSyncStatusPanel
 +import com.nuvio.tv.ui.screens.player.autosync.bubble.AutoSyncBubbleToastHost
-+
+ import com.nuvio.tv.ui.screens.detail.formatPlaybackTime
  import com.nuvio.tv.ui.theme.NuvioMotion
  
- import com.nuvio.tv.ui.theme.NuvioTheme
-@@ -1143,6 +1146,9 @@ fun PlayerScreen(
+@@ -1233,6 +1235,9 @@ fun PlayerScreen(
              )
          }
  
 +        SubtitleSyncStatusPanel(NuvioTheme.spacing.xl) // AutoSync hook: audio sync fallback status
-+        AutoSyncBubbleToastHost(controlsVisible = uiState.showControls) // AutoSync hook: AutoSync bubble
++        AutoSyncBubbleToastHost(controlsVisible = uiState.showControls) // Nuvio RS hook: AutoSync bubble
 +
          // Torrent stats overlay (top-right corner)
          TorrentOverlay(
@@ -8065,7 +8118,7 @@ index 0f5715882..2fdead4d0 100644
          }
  
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncSidecarBridge.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncSidecarBridge.kt
-index 2bbf8fb6a..a0f55b28c 100644
+index 72104d8fb..549f93a98 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncSidecarBridge.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncSidecarBridge.kt
 @@ -1,5 +1,6 @@
@@ -8075,7 +8128,7 @@ index 2bbf8fb6a..a0f55b28c 100644
  import android.util.Log
  import androidx.media3.common.C
  import androidx.media3.extractor.text.CuesWithTiming
-@@ -30,6 +31,8 @@ internal suspend fun applyAutoSyncSidecarTimeline(
+@@ -28,6 +29,8 @@ internal suspend fun applyAutoSyncSidecarTimeline(
      if (!timeline.confident || sidecar.activeSidecarSubtitleKey != url) return false
      val expectedGeneration = sidecar.currentSidecarGenerationFor(url) ?: return false
  
@@ -8084,7 +8137,7 @@ index 2bbf8fb6a..a0f55b28c 100644
      val current = sidecar.sidecarTimedCues.takeIf { it.isNotEmpty() } ?: withTimeoutOrNull(
          SIDECAR_WAIT_MS,
      ) {
-@@ -46,17 +49,28 @@ internal suspend fun applyAutoSyncSidecarTimeline(
+@@ -44,17 +47,28 @@ internal suspend fun applyAutoSyncSidecarTimeline(
                  it.isNotEmpty()
          }
      } ?: return false
@@ -8114,7 +8167,7 @@ index 2bbf8fb6a..a0f55b28c 100644
  }
  
  internal suspend fun replaceAutoSyncSidecarSubtitle(
-@@ -74,25 +88,37 @@ internal suspend fun replaceAutoSyncSidecarSubtitle(
+@@ -72,25 +86,37 @@ internal suspend fun replaceAutoSyncSidecarSubtitle(
      val expectedGeneration =
          sidecar.currentSidecarGenerationFor(expectedCurrentUrl) ?: return false
  
@@ -8152,7 +8205,7 @@ index 2bbf8fb6a..a0f55b28c 100644
          prepared
      } catch (cancel: CancellationException) {
          throw cancel
-@@ -112,14 +138,24 @@ internal suspend fun replaceAutoSyncSidecarSubtitle(
+@@ -110,14 +136,24 @@ internal suspend fun replaceAutoSyncSidecarSubtitle(
          return false
      }
  
@@ -8726,7 +8779,7 @@ index 000000000..4b489637e
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutomaticSubtitleSync.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutomaticSubtitleSync.kt
-index 8f0c3b776..1662094f5 100644
+index 17aafaca8..27031a5ee 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutomaticSubtitleSync.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutomaticSubtitleSync.kt
 @@ -33,6 +33,7 @@ internal object AutomaticSubtitleSync {
@@ -8808,7 +8861,7 @@ index 8f0c3b776..1662094f5 100644
      suspend fun findTimelineRetime(
          sourceKey: String,
          selectedSubtitleUrl: String,
-@@ -107,10 +172,44 @@ internal object AutomaticSubtitleSync {
+@@ -107,12 +172,46 @@ internal object AutomaticSubtitleSync {
          onNoSubtitleTracks: () -> Unit = {},
          onAnalysisOutcome: ((AutoSyncAnalysisOutcome) -> Unit)? = null,
          sourceHeaders: Map<String, String> = emptyMap(),
@@ -8826,6 +8879,8 @@ index 8f0c3b776..1662094f5 100644
 +         * sync takes over at once.
 +         */
 +        sparseLiveReferenceAllowed: Boolean = true,
+         /** False when the player does not feed [EmbeddedSubtitleCueStore] (mpv): indexed references only. */
+         allowLiveReference: Boolean = true,
      ): AutoSyncResolvedTimeline? {
          Unit
          val aggressiveMode = AutoSyncPreferences.aggressiveMode.value
@@ -8853,7 +8908,7 @@ index 8f0c3b776..1662094f5 100644
          val result = supervisorScope {
              val indexedTimelineDeferred = async {
                  EmbeddedSubtitleTimelineLoader.load(
-@@ -237,6 +336,13 @@ internal object AutomaticSubtitleSync {
+@@ -239,6 +338,13 @@ internal object AutomaticSubtitleSync {
                  }
              }
  
@@ -8867,7 +8922,7 @@ index 8f0c3b776..1662094f5 100644
              val indexedTimeline = indexedTimelineDeferred.await()
              var selectedResolved = selectedSubtitleDeferred.isCompleted
              var selected =
-@@ -245,17 +351,47 @@ internal object AutomaticSubtitleSync {
+@@ -247,17 +353,47 @@ internal object AutomaticSubtitleSync {
                  } else {
                      null
                  }
@@ -8915,7 +8970,7 @@ index 8f0c3b776..1662094f5 100644
              fun currentExternalCandidates(): List<AutoSyncSubtitleCandidate> =
                  (alternativeSubtitlesProvider?.invoke() ?: alternativeSubtitles)
                      .distinctBy { it.url }
-@@ -324,6 +460,12 @@ internal object AutomaticSubtitleSync {
+@@ -326,6 +462,12 @@ internal object AutomaticSubtitleSync {
                      }
                  }
  
@@ -8928,7 +8983,7 @@ index 8f0c3b776..1662094f5 100644
              }
  
              if (selected == null) {
-@@ -376,6 +518,7 @@ internal object AutomaticSubtitleSync {
+@@ -378,6 +520,7 @@ internal object AutomaticSubtitleSync {
                      if (completed.first == selectedSubtitleUrl) {
                          selectedResolved = true
                          selected = completed.second
@@ -8936,7 +8991,7 @@ index 8f0c3b776..1662094f5 100644
                      }
  
                      completed.second?.let { loaded ->
-@@ -389,21 +532,52 @@ internal object AutomaticSubtitleSync {
+@@ -391,21 +534,52 @@ internal object AutomaticSubtitleSync {
              if (seedTarget.isNullOrEmpty() && !selectedResolved) {
                  selected = selectedSubtitleDeferred.await()
                  selectedResolved = true
@@ -8990,7 +9045,7 @@ index 8f0c3b776..1662094f5 100644
                  val eligibleProfiles = profiles.filter { profile ->
                      profile.fullDialogueCandidate &&
                          profile.cueCount >= MIN_FULL_DIALOGUE_CUES &&
-@@ -421,11 +595,20 @@ internal object AutomaticSubtitleSync {
+@@ -423,11 +597,20 @@ internal object AutomaticSubtitleSync {
                  } else {
                      referenceTracks = orderReferenceProfiles(forcedProfiles)
                          .map { it.track.copy(cues = it.track.cues.toList()) }
@@ -9006,13 +9061,13 @@ index 8f0c3b776..1662094f5 100644
                  }
              }
  
-             if (referenceTracks.isEmpty()) {
+             if (referenceTracks.isEmpty() && allowLiveReference) {
 -                val useSparseLiveReference =
 +                val useSparseLiveReference = sparseLiveReferenceAllowed &&
                      indexedTimeline?.source == "matroska-cues-no-subtitle-entries"
                  val liveSelection = awaitNearCompleteLiveReferences(
                      sourceKey = sourceKey,
-@@ -437,6 +620,7 @@ internal object AutomaticSubtitleSync {
+@@ -439,6 +622,7 @@ internal object AutomaticSubtitleSync {
                          else -> LIVE_REFERENCE_WAIT_MS
                      },
                      allowSparseLiveReference = useSparseLiveReference,
@@ -9020,7 +9075,7 @@ index 8f0c3b776..1662094f5 100644
                  )
                  referenceTracks = liveSelection.primary
                  forcedFallbackTracks = liveSelection.forcedFallback
-@@ -450,8 +634,24 @@ internal object AutomaticSubtitleSync {
+@@ -452,8 +636,24 @@ internal object AutomaticSubtitleSync {
                  } else {
                      onAnalysisOutcome?.invoke(AutoSyncAnalysisOutcome.NO_USABLE_REFERENCE)
                  }
@@ -9046,7 +9101,7 @@ index 8f0c3b776..1662094f5 100644
                  return@supervisorScope null
              }
  
-@@ -461,6 +661,7 @@ internal object AutomaticSubtitleSync {
+@@ -463,6 +663,7 @@ internal object AutomaticSubtitleSync {
                  mutableMapOf<String, AutoSyncTimelineRetimer.PreparedActivity?>()
  
              if (referenceTracks.size >= 3) {
@@ -9054,7 +9109,7 @@ index 8f0c3b776..1662094f5 100644
                  val consistencyContext = currentCoroutineContext()
                  val outliers = withContext(autoSyncDispatcher) {
                      AutoSyncReferenceConsistency.findOutliers(
-@@ -476,6 +677,11 @@ internal object AutomaticSubtitleSync {
+@@ -478,6 +679,11 @@ internal object AutomaticSubtitleSync {
                          cancellationCheck = { consistencyContext.ensureActive() },
                      )
                  }
@@ -9066,7 +9121,7 @@ index 8f0c3b776..1662094f5 100644
                  if (outliers.isNotEmpty()) {
                      referenceTracks = referenceTracks.filterNot { it.key in outliers }
                  }
-@@ -540,6 +746,7 @@ internal object AutomaticSubtitleSync {
+@@ -542,6 +748,7 @@ internal object AutomaticSubtitleSync {
                      activeLoads[url] = job
                      scheduledUrls += url
                  } else {
@@ -9074,7 +9129,7 @@ index 8f0c3b776..1662094f5 100644
                      job.cancel()
                  }
              }
-@@ -612,6 +819,7 @@ internal object AutomaticSubtitleSync {
+@@ -614,6 +821,7 @@ internal object AutomaticSubtitleSync {
              ) {
                  loadedByUrl[candidate.url] = loaded
                  val index = candidateOrder[candidate.url] ?: return
@@ -9082,7 +9137,7 @@ index 8f0c3b776..1662094f5 100644
                  val alternative = LoadedAlternative(
                      index = index,
                      candidate = candidate,
-@@ -626,13 +834,20 @@ internal object AutomaticSubtitleSync {
+@@ -628,13 +836,20 @@ internal object AutomaticSubtitleSync {
                  }
                  if (equivalent != null) {
                      equivalent.members += alternative
@@ -9103,7 +9158,7 @@ index 8f0c3b776..1662094f5 100644
                  val preflightResult = if (targetActivity != null) {
                      withContext(autoSyncDispatcher) {
                          AutoSyncDelayPreflight.evaluate(
-@@ -650,7 +865,9 @@ internal object AutomaticSubtitleSync {
+@@ -652,7 +867,9 @@ internal object AutomaticSubtitleSync {
                      )
                  }
                  val preflight = preflightResult.best
@@ -9113,7 +9168,7 @@ index 8f0c3b776..1662094f5 100644
                  val rankedReferences = withContext(autoSyncDispatcher) {
                      rankReferenceCandidates(
                          target = loaded.cues,
-@@ -658,6 +875,14 @@ internal object AutomaticSubtitleSync {
+@@ -660,6 +877,14 @@ internal object AutomaticSubtitleSync {
                          preferredReferenceKey = preflight?.referenceKey,
                      )
                  }
@@ -9128,7 +9183,7 @@ index 8f0c3b776..1662094f5 100644
  
                  val family = CandidateTimingFamilyState(
                      representative = alternative,
-@@ -695,6 +920,11 @@ internal object AutomaticSubtitleSync {
+@@ -697,6 +922,11 @@ internal object AutomaticSubtitleSync {
                      )
                  }
  
@@ -9140,7 +9195,7 @@ index 8f0c3b776..1662094f5 100644
              }
  
              fun startPairJobs() {
-@@ -745,6 +975,13 @@ internal object AutomaticSubtitleSync {
+@@ -747,6 +977,13 @@ internal object AutomaticSubtitleSync {
                  if (sameTarget) {
                      preferTighterFitOnDisagreement(candidate.timeline, current.timeline)
                          ?.let { preferCandidate ->
@@ -9154,7 +9209,7 @@ index 8f0c3b776..1662094f5 100644
                              return preferCandidate
                          }
                  }
-@@ -760,6 +997,12 @@ internal object AutomaticSubtitleSync {
+@@ -762,6 +999,12 @@ internal object AutomaticSubtitleSync {
                  Pair<CandidateTimingFamilyState, TimelineRetimeMatch>? {
                  if (forcedFallbackTracks.isEmpty() || timingFamilies.isEmpty()) return null
  
@@ -9167,7 +9222,7 @@ index 8f0c3b776..1662094f5 100644
                  var fallbackBestFamily: CandidateTimingFamilyState? = null
                  var fallbackBestMatch: TimelineRetimeMatch? = null
                  var fallbackPairs = 0
-@@ -833,6 +1076,12 @@ internal object AutomaticSubtitleSync {
+@@ -835,6 +1078,12 @@ internal object AutomaticSubtitleSync {
                      }
                  }
  
@@ -9180,7 +9235,7 @@ index 8f0c3b776..1662094f5 100644
                  val family = fallbackBestFamily ?: return null
                  val match = fallbackBestMatch ?: return null
                  return family to match
-@@ -904,7 +1153,12 @@ internal object AutomaticSubtitleSync {
+@@ -906,7 +1155,12 @@ internal object AutomaticSubtitleSync {
                      )
                      if (referenceActivity != null && family.noFit.recordNoFit(referenceActivity)) {
                          family.abandoned = true
@@ -9193,7 +9248,7 @@ index 8f0c3b776..1662094f5 100644
                      }
                  }
              }
-@@ -942,16 +1196,37 @@ internal object AutomaticSubtitleSync {
+@@ -944,16 +1198,37 @@ internal object AutomaticSubtitleSync {
              scheduleMoreLoads()
              startPairJobs()
  
@@ -9232,7 +9287,7 @@ index 8f0c3b776..1662094f5 100644
                      if (strongStop) break
  
                      startPairJobs()
-@@ -959,7 +1234,10 @@ internal object AutomaticSubtitleSync {
+@@ -961,7 +1236,10 @@ internal object AutomaticSubtitleSync {
  
                      // Starting/refilling is cheap, but a worker may already have completed.
                      drainCompletedPairs()
@@ -9244,7 +9299,7 @@ index 8f0c3b776..1662094f5 100644
                      if (strongStop) break
  
                      if (
-@@ -994,11 +1272,18 @@ internal object AutomaticSubtitleSync {
+@@ -996,11 +1274,18 @@ internal object AutomaticSubtitleSync {
                              // Do not let synchronous activity/preflight/ranking preparation hide
                              // a matcher result that already completed.
                              drainCompletedPairs()
@@ -9264,7 +9319,7 @@ index 8f0c3b776..1662094f5 100644
                              }
  
                              drainCompletedPairs()
-@@ -1012,7 +1297,10 @@ internal object AutomaticSubtitleSync {
+@@ -1014,7 +1299,10 @@ internal object AutomaticSubtitleSync {
                          }
                      }
  
@@ -9276,7 +9331,7 @@ index 8f0c3b776..1662094f5 100644
                  }
              } finally {
                  val pendingLoads =
-@@ -1020,10 +1308,31 @@ internal object AutomaticSubtitleSync {
+@@ -1022,10 +1310,31 @@ internal object AutomaticSubtitleSync {
                  val pendingPairs =
                      activePairJobs.values.filterNot { it.isCompleted }
  
@@ -9309,7 +9364,7 @@ index 8f0c3b776..1662094f5 100644
              var winningFamily = bestFamily
              var winningMatch = bestMatch
              if (
-@@ -1037,8 +1346,13 @@ internal object AutomaticSubtitleSync {
+@@ -1039,8 +1348,13 @@ internal object AutomaticSubtitleSync {
              }
              if (winningFamily == null || winningMatch == null || !winningMatch.timeline.confident) {
                  if (!selectedResolved) {
@@ -9323,7 +9378,7 @@ index 8f0c3b776..1662094f5 100644
                  return@supervisorScope null
              }
  
-@@ -1060,9 +1374,20 @@ internal object AutomaticSubtitleSync {
+@@ -1062,9 +1376,20 @@ internal object AutomaticSubtitleSync {
                  }
  
              if (!selectedResolved) {
@@ -9344,7 +9399,7 @@ index 8f0c3b776..1662094f5 100644
              return@supervisorScope AutoSyncResolvedTimeline(
                  subtitleUrl = winningMember.candidate.url,
                  subtitleHeaders = headersForCandidate(winningMember.candidate.url),
-@@ -1070,6 +1395,15 @@ internal object AutomaticSubtitleSync {
+@@ -1072,6 +1397,15 @@ internal object AutomaticSubtitleSync {
                  timeline = memberMatch.timeline,
              )
          }
@@ -9360,7 +9415,7 @@ index 8f0c3b776..1662094f5 100644
          return result
      }
  
-@@ -1088,8 +1422,28 @@ internal object AutomaticSubtitleSync {
+@@ -1090,8 +1424,28 @@ internal object AutomaticSubtitleSync {
          val targetActivity =
              preparedTargetActivity ?: AutoSyncTimelineRetimer.prepareUnitActivity(target)
          val track = rankedReference.track
@@ -9389,7 +9444,7 @@ index 8f0c3b776..1662094f5 100644
          }
  
          val preparedReference = if (track.sampled) {
-@@ -1098,6 +1452,7 @@ internal object AutomaticSubtitleSync {
+@@ -1100,6 +1454,7 @@ internal object AutomaticSubtitleSync {
              preparedReferenceActivity(track, referenceActivityCache)
          }
  
@@ -9397,7 +9452,7 @@ index 8f0c3b776..1662094f5 100644
          val timeline = buildTimelineRetimeResult(
              track = track,
              target = target,
-@@ -1110,12 +1465,63 @@ internal object AutomaticSubtitleSync {
+@@ -1112,12 +1467,63 @@ internal object AutomaticSubtitleSync {
              delayOnlyEvidence = preflightEvidence,
              allowPrecomputedDelayFastPath = allowPrecomputedDelayFastPath,
              cancellationCheck = { evaluationContext.ensureActive() },
@@ -9461,7 +9516,7 @@ index 8f0c3b776..1662094f5 100644
  
          PairEvaluation(match = match)
      }
-@@ -1132,6 +1538,29 @@ internal object AutomaticSubtitleSync {
+@@ -1134,6 +1540,29 @@ internal object AutomaticSubtitleSync {
          }
      }
  
@@ -9491,7 +9546,7 @@ index 8f0c3b776..1662094f5 100644
      private fun constantTimelineShiftMs(
          representative: List<SubtitleSyncCue>,
          candidate: List<SubtitleSyncCue>,
-@@ -1354,80 +1783,122 @@ internal object AutomaticSubtitleSync {
+@@ -1356,80 +1785,122 @@ internal object AutomaticSubtitleSync {
          downloadSemaphore: Semaphore? = null,
          parseSemaphore: Semaphore? = null,
      ): LoadedSubtitle? {
@@ -9670,7 +9725,7 @@ index 8f0c3b776..1662094f5 100644
      }
  
      internal suspend fun downloadSubtitleBody(
-@@ -1448,6 +1919,9 @@ internal object AutomaticSubtitleSync {
+@@ -1450,6 +1921,9 @@ internal object AutomaticSubtitleSync {
      ): String {
          val first = requestSubtitle(url, headers, languageHint)
          if (first.status == 429) {
@@ -9680,7 +9735,7 @@ index 8f0c3b776..1662094f5 100644
              delay(HTTP_429_RETRY_DELAY_MS)
              return validatedSubtitleBody(requestSubtitle(url, headers, languageHint))
          }
-@@ -1485,6 +1959,7 @@ internal object AutomaticSubtitleSync {
+@@ -1487,6 +1961,7 @@ internal object AutomaticSubtitleSync {
          target: List<SubtitleSyncCue>,
          waitMs: Long = LIVE_REFERENCE_WAIT_MS,
          allowSparseLiveReference: Boolean = false,
@@ -9688,7 +9743,7 @@ index 8f0c3b776..1662094f5 100644
      ): ReferenceSelection {
          val targetSpan = referenceSpanMs(target).coerceAtLeast(1L)
          val started = SystemClock.elapsedRealtime()
-@@ -1530,6 +2005,12 @@ internal object AutomaticSubtitleSync {
+@@ -1532,6 +2007,12 @@ internal object AutomaticSubtitleSync {
              }
              if (signature != lastSignature) {
                  lastSignature = signature
@@ -9701,7 +9756,7 @@ index 8f0c3b776..1662094f5 100644
              }
  
              if (ready.isNotEmpty()) {
-@@ -1542,6 +2023,11 @@ internal object AutomaticSubtitleSync {
+@@ -1544,6 +2025,11 @@ internal object AutomaticSubtitleSync {
              }
  
              if (sparseReady.isNotEmpty()) {
@@ -9713,7 +9768,7 @@ index 8f0c3b776..1662094f5 100644
                  return ReferenceSelection(
                      primary = sparseReady.map { it.track.copy(cues = it.track.cues.toList()) },
                  )
-@@ -1549,15 +2035,39 @@ internal object AutomaticSubtitleSync {
+@@ -1551,15 +2037,39 @@ internal object AutomaticSubtitleSync {
  
              val elapsedMs = SystemClock.elapsedRealtime() - started
              if (elapsedMs >= waitMs) break
@@ -9753,7 +9808,7 @@ index 8f0c3b776..1662094f5 100644
          return ReferenceSelection()
      }
  
-@@ -1809,12 +2319,19 @@ internal object AutomaticSubtitleSync {
+@@ -1811,12 +2321,19 @@ internal object AutomaticSubtitleSync {
          delayOnlyEvidence: AutoSyncTimelineRetimer.DelayOnlySearchEvidence? = null,
          allowPrecomputedDelayFastPath: Boolean = true,
          cancellationCheck: (() -> Unit)? = null,
@@ -9773,7 +9828,7 @@ index 8f0c3b776..1662094f5 100644
              return AutoSyncTimelineRetimer.buildDelayOnlyTimeline(target, alignment).copy(
                  alignmentSource = "sampled-delay",
                  referenceCoverage = alignment.score,
-@@ -1827,6 +2344,14 @@ internal object AutomaticSubtitleSync {
+@@ -1829,6 +2346,14 @@ internal object AutomaticSubtitleSync {
              targetSize = target.size,
          )
  
@@ -9788,7 +9843,7 @@ index 8f0c3b776..1662094f5 100644
          return AutoSyncTimelineRetimer.retime(
              reference = track.cues,
              target = target,
-@@ -1841,6 +2366,7 @@ internal object AutomaticSubtitleSync {
+@@ -1843,6 +2368,7 @@ internal object AutomaticSubtitleSync {
              precomputedDelayOnlyEvidence = delayOnlyEvidence,
              allowPrecomputedDelayFastPath = allowPrecomputedDelayFastPath,
              cancellationCheck = cancellationCheck,
@@ -9796,7 +9851,7 @@ index 8f0c3b776..1662094f5 100644
          )
      }
  
-@@ -1857,9 +2383,18 @@ internal object AutomaticSubtitleSync {
+@@ -1859,9 +2385,18 @@ internal object AutomaticSubtitleSync {
          val url: String,
          val headers: List<Pair<String, String>>,
      )
@@ -9815,7 +9870,7 @@ index 8f0c3b776..1662094f5 100644
      )
      private data class ReferenceTimingFingerprint(
          val cueCount: Int,
-@@ -1999,6 +2534,13 @@ internal object EmbeddedSubtitleCueStore {
+@@ -2001,6 +2536,13 @@ internal object EmbeddedSubtitleCueStore {
          var generation = 0L
          synchronized(lock) {
              generation = (generations[sourceKey] ?: 0L) + 1L
@@ -9829,7 +9884,7 @@ index 8f0c3b776..1662094f5 100644
              sources[sourceKey] = linkedMapOf()
              retainedGenerations.remove(sourceKey)
              generations[sourceKey] = generation
-@@ -2006,6 +2548,7 @@ internal object EmbeddedSubtitleCueStore {
+@@ -2008,6 +2550,7 @@ internal object EmbeddedSubtitleCueStore {
              lastSeekWallMs.remove(sourceKey)
          }
  
@@ -9837,7 +9892,7 @@ index 8f0c3b776..1662094f5 100644
      }
  
      fun beginNewGeneration(sourceKey: String, targetTimeMs: Long?) {
-@@ -2044,6 +2587,10 @@ internal object EmbeddedSubtitleCueStore {
+@@ -2046,6 +2589,10 @@ internal object EmbeddedSubtitleCueStore {
              lastSeekTargetMs[sourceKey] = targetTimeMs
              lastSeekWallMs[sourceKey] = now
          }
@@ -9848,7 +9903,7 @@ index 8f0c3b776..1662094f5 100644
      }
  
      fun record(
-@@ -2057,6 +2604,9 @@ internal object EmbeddedSubtitleCueStore {
+@@ -2059,6 +2606,9 @@ internal object EmbeddedSubtitleCueStore {
      ) {
          if (sourceKey.isBlank() || trackKey.isBlank()) return
  
@@ -9858,7 +9913,7 @@ index 8f0c3b776..1662094f5 100644
          synchronized(lock) {
              val track = sources
                  .getOrPut(sourceKey) { linkedMapOf() }
-@@ -2075,9 +2625,16 @@ internal object EmbeddedSubtitleCueStore {
+@@ -2077,9 +2627,16 @@ internal object EmbeddedSubtitleCueStore {
              track.roleFlags = track.roleFlags or roleFlags
  
              val cueKey = "${cue.startTimeMs}:${cue.endTimeMs}:${cue.text}"
@@ -11113,10 +11168,10 @@ index 000000000..656e21e74
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/AudioSyncSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/AudioSyncSettingsItems.kt
 new file mode 100644
-index 000000000..24d923f84
+index 000000000..98c9874a9
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/AudioSyncSettingsItems.kt
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,230 @@
 +@file:OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
 +
 +package com.nuvio.tv.ui.screens.settings
@@ -11131,7 +11186,14 @@ index 000000000..24d923f84
 +import androidx.compose.foundation.layout.height
 +import androidx.compose.foundation.layout.padding
 +import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.lazy.LazyListScope
 +import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.CloudDownload
++import androidx.compose.material.icons.filled.GraphicEq
++import androidx.compose.material.icons.filled.Info
++import androidx.compose.material.icons.filled.NetworkCell
++import androidx.compose.material.icons.filled.Share
 +import androidx.compose.runtime.Composable
 +import androidx.compose.runtime.LaunchedEffect
 +import androidx.compose.runtime.getValue
@@ -11164,24 +11226,27 @@ index 000000000..24d923f84
 + * Settings of the audio sync fallback, shown under AutoSync's own: it runs only after AutoSync,
 + * so the rows are available only while AutoSync is on ([enabled]).
 + */
-+@Composable
-+internal fun audioSyncFallbackSettingsItems(enabled: Boolean) {
-+    val rowsEnabled = rowsEnabled(enabled)
-+    val fallbackEnabled by AudioSyncSettings.fallbackEnabled.collectAsStateWithLifecycle()
-+    val model by SubtitleSyncStatus.speechModel.collectAsStateWithLifecycle()
-+    val meteredSampling by AudioSyncSettings.samplingOnMobileData.collectAsStateWithLifecycle()
-+    val showStatistics by AudioSyncSettings.showStatistics.collectAsStateWithLifecycle()
++internal fun LazyListScope.audioSyncFallbackSettingsItems(enabled: Boolean) {
++    item(key = "audio_sync_fallback") {
++        val rowsEnabled = rowsEnabled(enabled)
++        val checked by AudioSyncSettings.fallbackEnabled.collectAsStateWithLifecycle()
++        ToggleSettingsItem(
++            icon = Icons.Default.GraphicEq,
++            title = "Sync to audio when AutoSync can't",
++            subtitle = "When there are no embedded subtitles or the match is too weak, aligns the subtitle with the dialogue by listening to the audio.",
++            isChecked = checked,
++            onCheckedChange = AudioSyncSettings::setFallbackEnabled,
++            enabled = rowsEnabled,
++        )
++    }
 +
-+    SettingsToggleRow(
-+        title = "Sync to audio when AutoSync can't",
-+        subtitle = "When there are no embedded subtitles or the match is too weak, aligns the subtitle with the dialogue by listening to the audio.",
-+        checked = fallbackEnabled,
-+        onToggle = { AudioSyncSettings.setFallbackEnabled(!fallbackEnabled) },
-+        enabled = rowsEnabled,
-+    )
-+
-+    if (model.supported) {
-+        SettingsActionRow(
++    item(key = "audio_sync_speech_model") {
++        val rowsEnabled = rowsEnabled(enabled)
++        val fallbackEnabled by AudioSyncSettings.fallbackEnabled.collectAsStateWithLifecycle()
++        val model by SubtitleSyncStatus.speechModel.collectAsStateWithLifecycle()
++        if (!model.supported) return@item
++        NavigationSettingsItem(
++            icon = Icons.Default.CloudDownload,
 +            title = "Speech recognition model (${model.sizeMb} MB)",
 +            subtitle = when {
 +                model.downloading -> "Downloading… ${(model.progress * 100).toInt()}%"
@@ -11197,24 +11262,39 @@ index 000000000..24d923f84
 +        )
 +    }
 +
-+    SettingsToggleRow(
-+        title = "Sample across the film on metered networks",
-+        subtitle = "Syncs much faster by reading a few short parts of the film ahead of playback, also on metered connections. Uses up to 150 MB per film.",
-+        checked = meteredSampling,
-+        onToggle = { AudioSyncSettings.setSamplingOnMobileData(!meteredSampling) },
-+        enabled = rowsEnabled && fallbackEnabled,
-+    )
++    item(key = "audio_sync_mobile_data") {
++        val rowsEnabled = rowsEnabled(enabled)
++        val fallbackEnabled by AudioSyncSettings.fallbackEnabled.collectAsStateWithLifecycle()
++        val checked by AudioSyncSettings.samplingOnMobileData.collectAsStateWithLifecycle()
++        ToggleSettingsItem(
++            icon = Icons.Default.NetworkCell,
++            title = "Sample across the film on metered networks",
++            subtitle = "Syncs much faster by reading a few short parts of the film ahead of playback, also on metered connections. Uses up to 150 MB per film.",
++            isChecked = checked,
++            onCheckedChange = AudioSyncSettings::setSamplingOnMobileData,
++            enabled = rowsEnabled && fallbackEnabled,
++        )
++    }
 +
-+    SettingsToggleRow(
-+        title = stringResource(R.string.audio_sync_show_statistics_title),
-+        subtitle = stringResource(R.string.audio_sync_show_statistics_subtitle),
-+        checked = showStatistics,
-+        onToggle = { AudioSyncSettings.setShowStatistics(!showStatistics) },
-+        enabled = rowsEnabled && fallbackEnabled,
-+    )
++    item(key = "audio_sync_show_statistics") {
++        val rowsEnabled = rowsEnabled(enabled)
++        val fallbackEnabled by AudioSyncSettings.fallbackEnabled.collectAsStateWithLifecycle()
++        val checked by AudioSyncSettings.showStatistics.collectAsStateWithLifecycle()
++        ToggleSettingsItem(
++            icon = Icons.Default.Info,
++            title = stringResource(R.string.audio_sync_show_statistics_title),
++            subtitle = stringResource(R.string.audio_sync_show_statistics_subtitle),
++            isChecked = checked,
++            onCheckedChange = AudioSyncSettings::setShowStatistics,
++            enabled = rowsEnabled && fallbackEnabled,
++        )
++    }
 +
-+    SubtitleSyncStatus.logActions?.let { actions ->
-+        SettingsActionRow(
++    item(key = "audio_sync_share_log") {
++        AudioSyncFallback.initialize(LocalContext.current)
++        val actions = SubtitleSyncStatus.logActions ?: return@item
++        NavigationSettingsItem(
++            icon = Icons.Default.Share,
 +            title = "Share audio sync log",
 +            subtitle = "Timings and decisions of recent syncs, for reporting a problem. Links are shortened and no audio or subtitle text is included.",
 +            onClick = { actions.share() },
@@ -11324,13 +11404,17 @@ index 000000000..24d923f84
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/AutoSyncBubbleSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/AutoSyncBubbleSettingsItems.kt
 new file mode 100644
-index 000000000..334b5bf86
+index 000000000..3f6f238eb
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/AutoSyncBubbleSettingsItems.kt
-@@ -0,0 +1,24 @@
+@@ -0,0 +1,30 @@
++@file:OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
++
 +package com.nuvio.tv.ui.screens.settings
 +
-+import androidx.compose.runtime.Composable
++import androidx.compose.foundation.lazy.LazyListScope
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.ChatBubble
 +import androidx.compose.runtime.getValue
 +import androidx.compose.ui.platform.LocalContext
 +import androidx.compose.ui.res.stringResource
@@ -11339,134 +11423,151 @@ index 000000000..334b5bf86
 +import com.nuvio.tv.ui.screens.player.autosync.bubble.AutoSyncBubbleToasts
 +
 +/** "Bubble notifications": AutoSync's messages in the frosted bubble instead of plain toasts. On by default. */
-+@Composable
-+internal fun autoSyncBubbleSettingsItems(enabled: Boolean) {
-+    val context = LocalContext.current
-+    AutoSyncBubbleToasts.ensureLoaded(context)
-+    val checked by AutoSyncBubbleToasts.enabled.collectAsStateWithLifecycle()
-+    SettingsToggleRow(
-+        title = stringResource(R.string.settings_autosync_bubble_toast),
-+        subtitle = stringResource(R.string.settings_autosync_bubble_toast_description),
-+        checked = checked,
-+        onToggle = { AutoSyncBubbleToasts.setEnabled(context, !checked) },
-+        enabled = enabled,
-+    )
++internal fun LazyListScope.autoSyncBubbleSettingsItems(enabled: Boolean) {
++    item(key = "autosync_bubble_toast") {
++        val context = LocalContext.current
++        AutoSyncBubbleToasts.ensureLoaded(context)
++        val checked by AutoSyncBubbleToasts.enabled.collectAsStateWithLifecycle()
++        ToggleSettingsItem(
++            icon = Icons.Default.ChatBubble,
++            title = stringResource(R.string.settings_autosync_bubble_toast),
++            subtitle = stringResource(R.string.settings_autosync_bubble_toast_description),
++            isChecked = checked,
++            onCheckedChange = { AutoSyncBubbleToasts.setEnabled(context, it) },
++            enabled = enabled,
++        )
++    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/AutoSyncSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/AutoSyncSettingsItems.kt
-index af099114f..926d9d0b0 100644
+index af099114f..b499066d2 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/AutoSyncSettingsItems.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/AutoSyncSettingsItems.kt
-@@ -2,52 +2,83 @@ package com.nuvio.tv.ui.screens.settings
+@@ -1,34 +1,67 @@
++@file:OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
++
+ package com.nuvio.tv.ui.screens.settings
  
- import androidx.compose.runtime.Composable
+-import androidx.compose.runtime.Composable
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.Sync
++import androidx.compose.material.icons.filled.BugReport
++import androidx.compose.material.icons.filled.QrCode2
++import androidx.compose.material.icons.filled.Timer
  import androidx.compose.runtime.getValue
 +import androidx.compose.runtime.mutableStateOf
 +import androidx.compose.runtime.remember
 +import androidx.compose.runtime.setValue
  import androidx.compose.ui.platform.LocalContext
  import androidx.compose.ui.res.stringResource
- import androidx.lifecycle.compose.collectAsStateWithLifecycle
+-import androidx.lifecycle.compose.collectAsStateWithLifecycle
  import com.nuvio.tv.R
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.lazy.LazyListScope
++import androidx.compose.ui.Modifier
+ import com.nuvio.tv.ui.screens.player.autosync.AutoSyncPreferences
 +import com.nuvio.tv.ui.screens.player.audiosync.AudioSyncFallback
 +import com.nuvio.tv.ui.screens.player.audiosync.AudioSyncSettings
 +import com.nuvio.tv.ui.screens.player.audiosync.SubtitleSyncStatus
- import com.nuvio.tv.ui.screens.player.autosync.AutoSyncPreferences
  
--/** AutoSync-owned settings rows; keeps AutoSync state out of NuvioTV PlayerSettingsDataStore. */
-+/**
-+ * AutoSync-owned settings rows; keeps AutoSync state out of NuvioTV PlayerSettingsDataStore.
-+ * Ported from NuvioTV-Reshaped (subtitle-autosync), drawn with Nuvio's own settings rows.
-+ */
- @Composable
- internal fun autoSyncSettingsItems(enabled: Boolean) {
-     val context = LocalContext.current
-     AutoSyncPreferences.ensureLoaded(context)
-     val checked by AutoSyncPreferences.enabled.collectAsStateWithLifecycle()
-+    var offerSpeechModel by remember { mutableStateOf(false) }
- 
-     SettingsToggleRow(
-         title = stringResource(R.string.autosync_setting_title),
-         subtitle = stringResource(R.string.autosync_setting_description),
-         checked = checked,
+ /** AutoSync-owned settings rows; keeps AutoSync state out of NuvioTV PlayerSettingsDataStore. */
+-@Composable
+-internal fun autoSyncSettingsItems(enabled: Boolean) {
+-    val context = LocalContext.current
+-    AutoSyncPreferences.ensureLoaded(context)
+-    val checked by AutoSyncPreferences.enabled.collectAsStateWithLifecycle()
+-
+-    SettingsToggleRow(
+-        title = stringResource(R.string.autosync_setting_title),
+-        subtitle = stringResource(R.string.autosync_setting_description),
+-        checked = checked,
 -        onToggle = { AutoSyncPreferences.setEnabled(context, !checked) },
-+        onToggle = {
-+            val on = !checked
-+            AutoSyncPreferences.setEnabled(context, on)
-+            // The audio fallback that comes with it works best with the speech model: offer it.
-+            AudioSyncFallback.initialize(context)
-+            val model = SubtitleSyncStatus.speechModel.value
-+            offerSpeechModel = on && AudioSyncSettings.fallbackEnabled.value && model.supported &&
-+                !model.downloaded && !model.downloading
-+        },
-         enabled = enabled,
-     )
-+    if (offerSpeechModel) SpeechModelOfferDialog(onDismiss = { offerSpeechModel = false })
- 
+-        enabled = enabled,
+-    )
+-
 -    // Tolerance and search depth only matter while AutoSync is on.
 -    if (checked) {
--        val toleranceMs by AutoSyncPreferences.syncToleranceMs.collectAsStateWithLifecycle()
++internal fun LazyListScope.autoSyncSettingsItems(
++    enabled: Boolean,
++    firstItemModifier: Modifier = Modifier,
++) {
++    item(key = "subtitle_auto_sync") {
++        val context = LocalContext.current
++        AutoSyncPreferences.ensureLoaded(context)
++        val checked by AutoSyncPreferences.enabled.collectAsStateWithLifecycle()
++
++        var offerSpeechModel by remember { mutableStateOf(false) }
++
++        Box(modifier = firstItemModifier) {
++        ToggleSettingsItem(
++            icon = Icons.Default.Sync,
++            title = stringResource(R.string.autosync_setting_title),
++            subtitle = stringResource(R.string.autosync_setting_description),
++            isChecked = checked,
++            onCheckedChange = { on ->
++                AutoSyncPreferences.setEnabled(context, on)
++                // The audio fallback that comes with it works best with the speech model: offer it.
++                AudioSyncFallback.initialize(context)
++                val model = SubtitleSyncStatus.speechModel.value
++                offerSpeechModel = on && AudioSyncSettings.fallbackEnabled.value && model.supported &&
++                    !model.downloaded && !model.downloading
++            },
++            enabled = enabled,
++        )
++        }
++        if (offerSpeechModel) SpeechModelOfferDialog(onDismiss = { offerSpeechModel = false })
++    }
++
++    item(key = "subtitle_auto_sync_tolerance") {
++        val context = LocalContext.current
++        AutoSyncPreferences.ensureLoaded(context)
+         val toleranceMs by AutoSyncPreferences.syncToleranceMs.collectAsStateWithLifecycle()
 -        val thorough by AutoSyncPreferences.aggressiveMode.collectAsStateWithLifecycle()
--
--        SliderSettingsItem(
--            title = stringResource(R.string.autosync_tolerance_title),
--            subtitle = stringResource(R.string.autosync_tolerance_description),
--            values = AutoSyncPreferences.syncToleranceOptionsMs,
--            selected = toleranceMs,
--            valueText = if (toleranceMs > 0) {
--                stringResource(R.string.autosync_tolerance_value, toleranceMs)
--            } else {
--                stringResource(R.string.autosync_tolerance_off)
--            },
--            onValueChange = { AutoSyncPreferences.setSyncToleranceMs(context, it) },
--            enabled = enabled,
--        )
--
+ 
+         SliderSettingsItem(
++            icon = Icons.Default.Timer,
+             title = stringResource(R.string.autosync_tolerance_title),
+             subtitle = stringResource(R.string.autosync_tolerance_description),
+             values = AutoSyncPreferences.syncToleranceOptionsMs,
+@@ -41,13 +74,37 @@ internal fun autoSyncSettingsItems(enabled: Boolean) {
+             onValueChange = { AutoSyncPreferences.setSyncToleranceMs(context, it) },
+             enabled = enabled,
+         )
++    }
++
++    item(key = "subtitle_auto_sync_debug_logs") {
++        val context = LocalContext.current
++        AutoSyncPreferences.ensureLoaded(context)
++        val checked by AutoSyncPreferences.debugLogsEnabled.collectAsStateWithLifecycle()
+ 
 -        SettingsToggleRow(
--            title = stringResource(R.string.autosync_thorough_title),
--            subtitle = stringResource(R.string.autosync_thorough_description),
++        ToggleSettingsItem(
++            icon = Icons.Default.BugReport,
++            title = stringResource(R.string.autosync_debug_logs_title),
++            subtitle = stringResource(R.string.autosync_debug_logs_description),
++            isChecked = checked,
++            onCheckedChange = { AutoSyncPreferences.setDebugLogsEnabled(context, it) },
++            enabled = enabled,
++        )
++    }
++
++    item(key = "subtitle_auto_sync_aggressive_mode") {
++        val context = LocalContext.current
++        AutoSyncPreferences.ensureLoaded(context)
++        val checked by AutoSyncPreferences.aggressiveMode.collectAsStateWithLifecycle()
++
++        ToggleSettingsItem(
++            icon = Icons.Default.Sync,
+             title = stringResource(R.string.autosync_thorough_title),
+             subtitle = stringResource(R.string.autosync_thorough_description),
 -            checked = thorough,
 -            onToggle = { AutoSyncPreferences.setAggressiveMode(context, !thorough) },
--            enabled = enabled,
--        )
--    }
-+    // The other rows only matter while AutoSync is on.
-+    if (!checked) return
++            isChecked = checked,
++            onCheckedChange = { AutoSyncPreferences.setAggressiveMode(context, it) },
+             enabled = enabled,
+         )
+     }
 +
-+    val toleranceMs by AutoSyncPreferences.syncToleranceMs.collectAsStateWithLifecycle()
-+    val thorough by AutoSyncPreferences.aggressiveMode.collectAsStateWithLifecycle()
-+    val debugLogs by AutoSyncPreferences.debugLogsEnabled.collectAsStateWithLifecycle()
-+
-+    SliderSettingsItem(
-+        title = stringResource(R.string.autosync_tolerance_title),
-+        subtitle = stringResource(R.string.autosync_tolerance_description),
-+        values = AutoSyncPreferences.syncToleranceOptionsMs,
-+        selected = toleranceMs,
-+        valueText = if (toleranceMs > 0) {
-+            stringResource(R.string.autosync_tolerance_value, toleranceMs)
-+        } else {
-+            stringResource(R.string.autosync_tolerance_off)
-+        },
-+        onValueChange = { AutoSyncPreferences.setSyncToleranceMs(context, it) },
-+        enabled = enabled,
-+    )
-+
-+    SettingsToggleRow(
-+        title = stringResource(R.string.autosync_thorough_title),
-+        subtitle = stringResource(R.string.autosync_thorough_description),
-+        checked = thorough,
-+        onToggle = { AutoSyncPreferences.setAggressiveMode(context, !thorough) },
-+        enabled = enabled,
-+    )
-+
-+    SettingsToggleRow(
-+        title = stringResource(R.string.autosync_debug_logs_title),
-+        subtitle = stringResource(R.string.autosync_debug_logs_description),
-+        checked = debugLogs,
-+        onToggle = { AutoSyncPreferences.setDebugLogsEnabled(context, !debugLogs) },
-+        enabled = enabled,
-+    )
-+
-+    autoSyncBubbleSettingsItems(enabled)
 +    audioSyncFallbackSettingsItems(enabled)
  }
 diff --git a/app/src/main/res/raw/silero_vad_v5_16k.bin b/app/src/main/res/raw/silero_vad_v5_16k.bin
@@ -20590,13 +20691,20 @@ index 000000000..fd9db9199
 +</resources>
 diff --git a/app/src/main/res/values-hu/autosync_strings.xml b/app/src/main/res/values-hu/autosync_strings.xml
 new file mode 100644
-index 000000000..740590208
+index 000000000..9b860a07f
 --- /dev/null
 +++ b/app/src/main/res/values-hu/autosync_strings.xml
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,22 @@
 +<?xml version="1.0" encoding="utf-8"?>
 +<!-- Subtitle AutoSync. Keep keys in sync with values/autosync_strings.xml; Nuvio's own AutoSync strings live in strings.xml. -->
 +<resources>
++    <string name="autosync_setting_title">Feliratok automatikus szinkronizálása</string>
++    <string name="autosync_setting_description">A kiválasztott bővítményfeliratot a videóba ágyazott feliratok időzítéséhez igazítja.</string>
++    <string name="autosync_tolerance_title">Auto Sync tűréshatár</string>
++    <string name="autosync_tolerance_description">Az eredeti időzítés megtartása, ha a szükséges javítás ekkora vagy kisebb.</string>
++    <string name="autosync_tolerance_off">Ki</string>
++    <string name="autosync_thorough_title">Alapos Auto Sync keresés</string>
++    <string name="autosync_thorough_description">Szinkronizálás előtt további feliratokat és beágyazott sávokat hasonlít össze a pontosabb egyezésért. Kikapcsolva az első erős egyezést hamarabb használja. Csak megbízható egyezések kerülnek alkalmazásra.</string>
 +    <string name="autosync_debug_logs_title">Auto Sync hibakeresési naplók</string>
 +    <string name="autosync_debug_logs_description">Részletes Auto Sync időzítési jelentést ment és a vágólapra másol a nehéz feliratesetek bejelentéséhez.</string>
 +    <string name="autosync_toast_analyzing">Auto Sync • Elemzés…</string>
@@ -20607,6 +20715,7 @@ index 000000000..740590208
 +    <string name="reshaped_autosync_toast_failed_no_reference">Auto Sync • Nincs beágyazott felirat az összehasonlításhoz • a felirat időzítése nem változott</string>
 +    <string name="reshaped_autosync_toast_failed_unsupported">Auto Sync • A feliratformátum nem támogatott • a felirat időzítése nem változott</string>
 +    <string name="autosync_toast_failed_audio_fallback">Auto Sync • Nincs egyezés • szinkronizálás a hanghoz…</string>
++    <string name="autosync_label_synced">Automatikusan szinkronizálva</string>
 +</resources>
 diff --git a/app/src/main/res/values-in/autosync_strings.xml b/app/src/main/res/values-in/autosync_strings.xml
 new file mode 100644
@@ -20638,13 +20747,20 @@ index 000000000..b25d21b71
 +</resources>
 diff --git a/app/src/main/res/values-it/autosync_strings.xml b/app/src/main/res/values-it/autosync_strings.xml
 new file mode 100644
-index 000000000..431629b98
+index 000000000..2454ca29c
 --- /dev/null
 +++ b/app/src/main/res/values-it/autosync_strings.xml
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,22 @@
 +<?xml version="1.0" encoding="utf-8"?>
 +<!-- Subtitle AutoSync. Keep keys in sync with values/autosync_strings.xml; Nuvio's own AutoSync strings live in strings.xml. -->
 +<resources>
++    <string name="autosync_setting_title">Sincronizza sottotitoli automaticamente</string>
++    <string name="autosync_setting_description">Allinea il sottotitolo del componente aggiuntivo selezionato ai tempi dei sottotitoli incorporati nel video.</string>
++    <string name="autosync_tolerance_title">Tolleranza Auto Sync</string>
++    <string name="autosync_tolerance_description">Mantieni i tempi originali quando la correzione necessaria è pari o inferiore a questo valore.</string>
++    <string name="autosync_tolerance_off">Disattivato</string>
++    <string name="autosync_thorough_title">Ricerca Auto Sync approfondita</string>
++    <string name="autosync_thorough_description">Continua a confrontare altri sottotitoli e tracce incorporate per una corrispondenza più precisa prima di sincronizzare. Se disattivata, la prima corrispondenza solida viene usata prima. Vengono applicate solo corrispondenze affidabili.</string>
 +    <string name="autosync_debug_logs_title">Log di debug di Auto Sync</string>
 +    <string name="autosync_debug_logs_description">Salva un rapporto dettagliato sui tempi di Auto Sync e lo copia negli appunti, per segnalare casi di sottotitoli difficili.</string>
 +    <string name="autosync_toast_analyzing">Auto Sync • Analisi in corso…</string>
@@ -20655,6 +20771,7 @@ index 000000000..431629b98
 +    <string name="reshaped_autosync_toast_failed_no_reference">Auto Sync • Nessun sottotitolo incorporato da confrontare • tempi del sottotitolo invariati</string>
 +    <string name="reshaped_autosync_toast_failed_unsupported">Auto Sync • Formato del sottotitolo non supportato • tempi del sottotitolo invariati</string>
 +    <string name="autosync_toast_failed_audio_fallback">Auto Sync • Nessuna corrispondenza • sincronizzazione con l\'audio…</string>
++    <string name="autosync_label_synced">Sincronizzato automaticamente</string>
 +</resources>
 diff --git a/app/src/main/res/values-iw/autosync_strings.xml b/app/src/main/res/values-iw/autosync_strings.xml
 new file mode 100644
@@ -21230,3 +21347,126 @@ index 000000000..af116c2d8
 +    <string name="reshaped_autosync_toast_failed_unsupported">Auto Sync • Subtitle format not supported • subtitle timing not changed</string>
 +    <string name="autosync_toast_failed_audio_fallback">Auto Sync • No match found • syncing to the audio instead…</string>
 +</resources>
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ReshapedSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ReshapedSettingsItems.kt
+new file mode 100644
+index 000000000..5811663a6
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ReshapedSettingsItems.kt
+@@ -0,0 +1,117 @@
++package com.nuvio.tv.ui.screens.settings
++
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.focus.focusProperties
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.vector.ImageVector
++import com.nuvio.tv.ui.theme.NuvioTheme
++
++// Keep Reshaped's settings contracts while using upstream's current row design.
++// Upstream's toggle and slider rows intentionally omit leading icons.
++// Disabled Reshaped rows remain focusable, including the category's initial focus target.
++@Suppress("UNUSED_PARAMETER")
++@Composable
++internal fun ToggleSettingsItem(
++    icon: ImageVector,
++    title: String,
++    subtitle: String,
++    isChecked: Boolean,
++    onCheckedChange: (Boolean) -> Unit,
++    onFocused: () -> Unit = {},
++    enabled: Boolean = true,
++    titleTrailingIcon: ImageVector? = null,
++    titleTrailingIconTint: Color = NuvioTheme.colors.TextPrimary,
++    expandSubtitleOnFocus: Boolean = false
++) {
++    SettingsToggleRow(
++        title = title,
++        subtitle = subtitle,
++        checked = isChecked,
++        onToggle = { onCheckedChange(!isChecked) },
++        onFocused = onFocused,
++        modifier = Modifier.focusProperties { canFocus = true },
++        enabled = enabled,
++        titleTrailingIcon = titleTrailingIcon,
++        titleTrailingIconTint = titleTrailingIconTint,
++        expandSubtitleOnFocus = expandSubtitleOnFocus
++    )
++}
++
++@Composable
++internal fun NavigationSettingsItem(
++    icon: ImageVector,
++    title: String,
++    subtitle: String,
++    onClick: () -> Unit,
++    onFocused: () -> Unit = {},
++    enabled: Boolean = true
++) {
++    SettingsActionRow(
++        title = title,
++        subtitle = subtitle,
++        onClick = onClick,
++        onFocused = onFocused,
++        modifier = Modifier.focusProperties { canFocus = true },
++        enabled = enabled,
++        leadingIcon = icon
++    )
++}
++
++@Suppress("UNUSED_PARAMETER")
++@Composable
++internal fun SliderSettingsItem(
++    icon: ImageVector?,
++    title: String,
++    value: Int,
++    valueText: String,
++    minValue: Int,
++    maxValue: Int,
++    step: Int,
++    onValueChange: (Int) -> Unit,
++    subtitle: String? = null,
++    onFocused: () -> Unit = {},
++    enabled: Boolean = true,
++    modifier: Modifier = Modifier
++) {
++    SliderSettingsItem(
++        title = title,
++        value = value,
++        valueText = valueText,
++        minValue = minValue,
++        maxValue = maxValue,
++        step = step,
++        onValueChange = onValueChange,
++        subtitle = subtitle,
++        onFocused = onFocused,
++        enabled = enabled,
++        modifier = modifier
++    )
++}
++
++@Suppress("UNUSED_PARAMETER")
++@Composable
++internal fun SliderSettingsItem(
++    icon: ImageVector?,
++    title: String,
++    values: List<Int>,
++    selected: Int,
++    valueText: String,
++    onValueChange: (Int) -> Unit,
++    subtitle: String? = null,
++    onFocused: () -> Unit = {},
++    enabled: Boolean = true,
++    modifier: Modifier = Modifier
++) {
++    SliderSettingsItem(
++        title = title,
++        values = values,
++        selected = selected,
++        valueText = valueText,
++        onValueChange = onValueChange,
++        subtitle = subtitle,
++        onFocused = onFocused,
++        enabled = enabled,
++        modifier = modifier
++    )
++}

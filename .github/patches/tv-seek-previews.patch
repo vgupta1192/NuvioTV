@@ -1,8 +1,8 @@
 diff --git a/app/build.gradle.kts b/app/build.gradle.kts
-index f529718bb..d63aa6892 100644
+index 3f4e103cb..f3be37139 100644
 --- a/app/build.gradle.kts
 +++ b/app/build.gradle.kts
-@@ -567,3 +567,4 @@ dependencies {
+@@ -566,3 +566,4 @@ dependencies {
  }
  
  apply(from = "autosync.gradle") // AutoSync: audio subtitle sync fallback (sherpa-onnx)
@@ -18,10 +18,10 @@ index 000000000..66175e8df
 +    implementation "tv.seekr:seekr-compose:0.2.0"
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt
-index f7fb5f0b6..8dd73667d 100644
+index 148106e67..659687e90 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt
-@@ -71,7 +71,13 @@ internal fun PlayerRuntimeController.autoSyncExtractorsFactory(
+@@ -74,7 +74,13 @@ internal fun PlayerRuntimeController.autoSyncExtractorsFactory(
      headers: Map<String, String>,
  ): ExtractorsFactory {
      // Audio is copied too, for the audio sync fallback (idle unless it is listening).
@@ -49,23 +49,23 @@ index 5ed04ff33..484b5e337 100644
      subtitleTimingRefreshJob?.cancel()
      subtitleTimingRefreshJob = null
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
-index 96eac7878..980b96148 100644
+index b64248597..ccf47e865 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
-@@ -1259,7 +1259,7 @@ fun PlayerRuntimeController.onEvent(event: PlayerEvent) {
-             if (_playbackTimeline.value.isLive) return
-             val target = pendingPreviewSeekPosition
-             if (target != null) {
+@@ -1277,7 +1277,7 @@ fun PlayerRuntimeController.onEvent(event: PlayerEvent) {
+                     updatePlaybackTimeline(currentPosition = currentPlaybackPositionMs() ?: 0L)
+                     return
+                 }
 -                seekPlaybackTo(target, SeekParameters.CLOSEST_SYNC)
 +                seekPlaybackTo(target, forkSeekPreviewCommitSeekParameters()) // Nuvio fork: seek previews
                  updatePlaybackTimeline(currentPosition = target)
                  pendingPreviewSeekPosition = null
                  scheduleProgressSyncAfterSeek()
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
-index 0e2aa68d2..0a93ec909 100644
+index fefedcb87..8f9eebd9b 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
-@@ -307,6 +307,7 @@ fun PlayerScreen(
+@@ -334,6 +334,7 @@ fun PlayerScreen(
  
      val handleBackPress = handleBackPress@{
          if (externalHandoffInProgress) return@handleBackPress
@@ -73,24 +73,24 @@ index 0e2aa68d2..0a93ec909 100644
          if (postPlayRecommendationState.canReturnToPlayer && !uiState.playbackEnded) {
              returnToPlayerFromPostPlay()
              viewModel.hideControls()
-@@ -515,6 +516,7 @@ fun PlayerScreen(
-     ) {
+@@ -546,6 +547,7 @@ fun PlayerScreen(
          if (shouldConfirmNextEpisodeOnEnd || postPlayRecommendationState.isVisible) return@LaunchedEffect
          if (uiState.error != null) return@LaunchedEffect
+         if (uiState.showPartyPanel) return@LaunchedEffect
 +        if (viewModel.seekPreview.isSyncOverlayOpen) return@LaunchedEffect // Nuvio fork: seek previews
          if (uiState.showControls && !uiState.showEpisodesPanel && !uiState.showSourcesPanel &&
              !uiState.showAudioOverlay && !uiState.showSubtitleOverlay &&
              !uiState.showSubtitleStylePanel && !uiState.showSubtitleDelayOverlay &&
-@@ -1510,6 +1512,8 @@ fun PlayerScreen(
+@@ -1611,6 +1613,8 @@ fun PlayerScreen(
              )
          }
  
 +        ForkSeekPreviewSyncLayer(viewModel, uiState, onDismissed = { runCatching { containerFocusRequester.requestFocus() } }) // Nuvio fork: seek previews
 +
          AnimatedVisibility(
-             visible = uiState.showSeekOverlay && !uiState.showControls && uiState.error == null &&
-                 !uiState.showLoadingOverlay && !uiState.showPauseOverlay &&
-@@ -2397,6 +2401,7 @@ private fun PlayerControlsOverlay(
+             visible = seekOverlayVisible,
+             enter = fadeIn(animationSpec = tween(150)),
+@@ -2600,6 +2604,7 @@ private fun PlayerControlsOverlay(
              if (!isLivePlayback) {
                  // Progress bar — always LTR regardless of locale
                  CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
@@ -98,7 +98,7 @@ index 0e2aa68d2..0a93ec909 100644
                      PlayerControlsProgressBarHost(
                          viewModel = viewModel,
                          focusRequester = progressBarFocusRequester,
-@@ -2566,6 +2571,16 @@ private fun PlayerControlsOverlay(
+@@ -2781,6 +2786,16 @@ private fun PlayerControlsOverlay(
                                  onDownKey = onHideControls,
                                  onFocused = onResetHideTimer
                              )
@@ -115,7 +115,7 @@ index 0e2aa68d2..0a93ec909 100644
                              if (uiState.playbackIssueReportsEnabled) {
                                  ReportControlButton(
                                      reportId = uiState.playbackIssueReportId,
-@@ -2927,7 +2942,8 @@ private fun ProgressBar(
+@@ -3150,7 +3165,8 @@ private fun ProgressBar(
  private fun SeekOverlay(
      currentPosition: Long,
      duration: Long,
@@ -125,7 +125,7 @@ index 0e2aa68d2..0a93ec909 100644
  ) {
      Column(
          modifier = Modifier
-@@ -2935,6 +2951,7 @@ private fun SeekOverlay(
+@@ -3158,6 +3174,7 @@ private fun SeekOverlay(
              .padding(horizontal = NuvioTheme.spacing.xxl, vertical = NuvioTheme.spacing.xl)
      ) {
          CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
@@ -133,7 +133,7 @@ index 0e2aa68d2..0a93ec909 100644
              ProgressBar(
                  currentPosition = currentPosition,
                  duration = duration,
-@@ -2967,7 +2984,8 @@ private fun SeekOverlayHost(viewModel: PlayerViewModel) {
+@@ -3190,7 +3207,8 @@ private fun SeekOverlayHost(viewModel: PlayerViewModel) {
      SeekOverlay(
          currentPosition = playbackTimeline.currentPosition,
          duration = playbackTimeline.duration,
@@ -144,10 +144,10 @@ index 0e2aa68d2..0a93ec909 100644
  }
  
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerViewModel.kt
-index ef1cf7584..9dd4178eb 100644
+index dc0990f28..aea1998e4 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerViewModel.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerViewModel.kt
-@@ -176,6 +176,9 @@ class PlayerViewModel @Inject constructor(
+@@ -203,6 +203,9 @@ class PlayerViewModel @Inject constructor(
          scope = viewModelScope
      )
  
@@ -157,7 +157,7 @@ index ef1cf7584..9dd4178eb 100644
      val uiState: StateFlow<PlayerUiState>
          get() = controller.uiState
  
-@@ -262,7 +265,7 @@ class PlayerViewModel @Inject constructor(
+@@ -289,7 +292,7 @@ class PlayerViewModel @Inject constructor(
      }
  
      fun onEvent(event: PlayerEvent) {
