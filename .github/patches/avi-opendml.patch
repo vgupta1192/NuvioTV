@@ -1,0 +1,2051 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/AviAudioClock.kt b/app/src/main/java/com/nuvio/tv/core/player/AviAudioClock.kt
+index 757a454..ad710a0 100644
+--- a/app/src/main/java/com/nuvio/tv/core/player/AviAudioClock.kt
++++ b/app/src/main/java/com/nuvio/tv/core/player/AviAudioClock.kt
+@@ -133,40 +133,30 @@ internal class AviAudioClock private constructor(
+     }
+ }
+ 
+-/** Reads the entries of an AVI idx1 chunk the way the stock reader does. */
++/** The chunk index the AVI reader uses, from idx1 or from the OpenDML indexes. */
+ internal object AviIndex {
+ 
+     /** Where the data of each chunk of a stream starts in the file, and its size, in index order. */
+     class Entries(val dataPositions: LongArray, val sizes: IntArray)
+ 
+-    private const val ENTRY_BYTES = 16
++    /** The reader's index entries in its order: chunk id, AVIIF flags, chunk header position and data size. */
++    class Chunks(val chunkIds: IntArray, val flags: IntArray, val positions: LongArray, val sizes: IntArray, val count: Int)
++
+     private const val CHUNK_HEADER_BYTES = 8
+-    private const val KEY_FRAME_FLAG = 0x10L
++    private const val KEY_FRAME_FLAG = 0x10
+ 
+-    /**
+-     * The audio ('##wb') entries of [streams] in the idx1 body [body] ([length] bytes from [offset]).
+-     * [moviListPosition] is where the movi LIST header starts: the offsets count from its list type unless the
+-     * first offset lies beyond it, in which case they are file positions.
+-     */
+-    fun audioEntries(
+-        body: ByteArray,
+-        offset: Int,
+-        length: Int,
+-        moviListPosition: Long,
+-        streams: Collection<Int>,
+-    ): Map<Int, Entries> {
+-        val end = offset + minOf(length, body.size - offset) / ENTRY_BYTES * ENTRY_BYTES
+-        if (end <= offset || moviListPosition < 0 || streams.isEmpty()) return emptyMap()
+-        val base = base(body, offset, moviListPosition)
++    /** The audio ('##wb') entries of [streams]. */
++    fun audioEntries(chunks: Chunks, streams: Collection<Int>): Map<Int, Entries> {
++        if (streams.isEmpty()) return emptyMap()
+         val counts = HashMap<Int, Int>()
+-        forEachEntry(body, offset, end, 'w', 'b', streams) { stream, _ -> counts[stream] = (counts[stream] ?: 0) + 1 }
++        forEachChunk(chunks, 'w', 'b', streams) { stream, _ -> counts[stream] = (counts[stream] ?: 0) + 1 }
+         val positions = counts.mapValues { LongArray(it.value) }
+         val sizes = counts.mapValues { IntArray(it.value) }
+         val filled = HashMap<Int, Int>()
+-        forEachEntry(body, offset, end, 'w', 'b', streams) { stream, at ->
++        forEachChunk(chunks, 'w', 'b', streams) { stream, at ->
+             val i = filled[stream] ?: 0
+-            positions.getValue(stream)[i] = base + u32(body, at + 8) + CHUNK_HEADER_BYTES
+-            sizes.getValue(stream)[i] = u32(body, at + 12).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
++            positions.getValue(stream)[i] = chunks.positions[at] + CHUNK_HEADER_BYTES
++            sizes.getValue(stream)[i] = chunks.sizes[at]
+             filled[stream] = i + 1
+         }
+         return counts.keys.associateWith { Entries(positions.getValue(it), sizes.getValue(it)) }
+@@ -175,64 +165,47 @@ internal object AviIndex {
+     /** The key frames of a video stream: their number among the stream's chunks, and where their chunk starts. */
+     class KeyFrames(val chunkIndices: IntArray, val positions: LongArray)
+ 
+-    /** The key frame entries ('##dc' or '##db') of video [stream], as the stock reader keeps them. */
+-    fun videoKeyFrames(body: ByteArray, offset: Int, length: Int, moviListPosition: Long, stream: Int): KeyFrames? {
+-        val end = offset + minOf(length, body.size - offset) / ENTRY_BYTES * ENTRY_BYTES
+-        if (end <= offset || moviListPosition < 0) return null
+-        val base = base(body, offset, moviListPosition)
++    /** The key frame entries ('##dc' or '##db') of video [stream], as the reader keeps them. */
++    fun videoKeyFrames(chunks: Chunks, stream: Int): KeyFrames? {
+         val indices = ArrayList<Int>()
+         val positions = ArrayList<Long>()
+-        var chunks = 0
+-        var at = offset
+-        while (at < end) {
+-            val type1 = body[at + 3].toInt()
+-            if (body[at + 2].toInt() == 'd'.code && (type1 == 'c'.code || type1 == 'b'.code) &&
+-                streamNumber(body, at) == stream
++        var count = 0
++        for (at in 0 until chunks.count) {
++            val id = chunks.chunkIds[at]
++            val type1 = (id ushr 24) and 0xFF
++            if ((id ushr 16) and 0xFF == 'd'.code && (type1 == 'c'.code || type1 == 'b'.code) &&
++                streamNumber(id) == stream
+             ) {
+-                if (u32(body, at + 4) and KEY_FRAME_FLAG != 0L) {
+-                    indices += chunks
+-                    positions += base + u32(body, at + 8)
++                if (chunks.flags[at] and KEY_FRAME_FLAG != 0) {
++                    indices += count
++                    positions += chunks.positions[at]
+                 }
+-                chunks++
++                count++
+             }
+-            at += ENTRY_BYTES
+         }
+         if (indices.isEmpty()) return null
+         return KeyFrames(indices.toIntArray(), positions.toLongArray())
+     }
+ 
+-    // As the stock reader: the first entry's offset, read as a signed int, decides between the two bases.
+-    private fun base(body: ByteArray, offset: Int, moviListPosition: Long): Long {
+-        val firstOffset = u32(body, offset + 8).toInt().toLong()
+-        return if (firstOffset > moviListPosition) 0L else moviListPosition + CHUNK_HEADER_BYTES
+-    }
+-
+-    private inline fun forEachEntry(
+-        body: ByteArray,
+-        offset: Int,
+-        end: Int,
++    private inline fun forEachChunk(
++        chunks: Chunks,
+         type0: Char,
+         type1: Char,
+         streams: Collection<Int>,
+         action: (stream: Int, at: Int) -> Unit,
+     ) {
+-        var at = offset
+-        while (at < end) {
+-            if (body[at + 2].toInt() == type0.code && body[at + 3].toInt() == type1.code) {
+-                val stream = streamNumber(body, at)
++        for (at in 0 until chunks.count) {
++            val id = chunks.chunkIds[at]
++            if ((id ushr 16) and 0xFF == type0.code && (id ushr 24) and 0xFF == type1.code) {
++                val stream = streamNumber(id)
+                 if (stream >= 0 && stream in streams) action(stream, at)
+             }
+-            at += ENTRY_BYTES
+         }
+     }
+ 
+-    private fun streamNumber(body: ByteArray, at: Int): Int {
+-        val tens = body[at].toInt() - '0'.code
+-        val units = body[at + 1].toInt() - '0'.code
++    private fun streamNumber(chunkId: Int): Int {
++        val tens = (chunkId and 0xFF) - '0'.code
++        val units = ((chunkId ushr 8) and 0xFF) - '0'.code
+         return if (tens in 0..9 && units in 0..9) tens * 10 + units else -1
+     }
+-
+-    private fun u32(b: ByteArray, at: Int): Long =
+-        (b[at].toLong() and 0xFF) or ((b[at + 1].toLong() and 0xFF) shl 8) or
+-            ((b[at + 2].toLong() and 0xFF) shl 16) or ((b[at + 3].toLong() and 0xFF) shl 24)
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/AviTrackFormatExtractorsFactory.kt b/app/src/main/java/com/nuvio/tv/core/player/AviTrackFormatExtractorsFactory.kt
+index def6d01..3c697f5 100644
+--- a/app/src/main/java/com/nuvio/tv/core/player/AviTrackFormatExtractorsFactory.kt
++++ b/app/src/main/java/com/nuvio/tv/core/player/AviTrackFormatExtractorsFactory.kt
+@@ -12,13 +12,14 @@ import androidx.media3.extractor.Extractor
+ import androidx.media3.extractor.ExtractorInput
+ import androidx.media3.extractor.ExtractorOutput
+ import androidx.media3.extractor.ExtractorsFactory
+-import androidx.media3.extractor.ForwardingExtractorInput
+ import androidx.media3.extractor.ForwardingSeekMap
+ import androidx.media3.extractor.ForwardingTrackOutput
+ import androidx.media3.extractor.PositionHolder
+ import androidx.media3.extractor.SeekMap
+ import androidx.media3.extractor.TrackOutput
+ import androidx.media3.extractor.avi.AviExtractor
++import androidx.media3.extractor.text.SubtitleParser
++import com.nuvio.tv.core.player.avi.AviExtractor as OpenDmlAviExtractor
+ import java.io.EOFException
+ import java.io.IOException
+ 
+@@ -28,6 +29,9 @@ import java.io.IOException
+  * extractor drops because it does not know the codec (DivX 3 and other old FourCCs) is reported as an unknown
+  * video track, so the player can tell there is a picture it cannot decode instead of playing sound only.
+  * AC-3 and DTS audio chunks are split into single syncframes, see [AviAudioFramer].
++ *
++ * The stock reader is swapped for [com.nuvio.tv.core.player.avi.AviExtractor], which also reads OpenDML files
++ * (AVI 2.0, the usual layout above 1 GB) and hands over the index it uses.
+  */
+ @UnstableApi
+ internal class AviTrackFormatExtractorsFactory(private val delegate: ExtractorsFactory) : ExtractorsFactory {
+@@ -39,24 +43,29 @@ internal class AviTrackFormatExtractorsFactory(private val delegate: ExtractorsF
+         delegate.createExtractors(uri, responseHeaders).map(::wrap).toTypedArray()
+ 
+     private fun wrap(extractor: Extractor): Extractor =
+-        if (extractor is AviExtractor) AviTrackFormatExtractor(extractor) else extractor
++        if (extractor is AviExtractor) {
++            AviTrackFormatExtractor(
++                OpenDmlAviExtractor(OpenDmlAviExtractor.FLAG_EMIT_RAW_SUBTITLE_DATA, SubtitleParser.Factory.UNSUPPORTED)
++            )
++        } else {
++            extractor
++        }
+ }
+ 
+ @UnstableApi
+-private class AviTrackFormatExtractor(private val delegate: AviExtractor) : Extractor {
++private class AviTrackFormatExtractor(private val delegate: OpenDmlAviExtractor) : Extractor {
+ 
+     private var headerRead = false
+     private var video: AviHeader.Video? = null
+     private var streams: List<AviHeader.Stream> = emptyList()
+     private val audioTracks = ArrayList<AudioFrameTrackOutput>()
+-    private var watchingIndex = true
+-    private var moviListPosition = C.INDEX_UNSET.toLong()
+-    private var indexBodyPosition = C.INDEX_UNSET.toLong()
+-    private var indexBodySize = 0L
+     private var videoStreamId = C.INDEX_UNSET
+     @Volatile private var videoSeekTable: AviVideoSeekTable? = null
+ 
+     override fun init(output: ExtractorOutput) {
++        delegate.setIndexListener { chunkIds, flags, positions, sizes, count ->
++            onIndexRead(AviIndex.Chunks(chunkIds, flags, positions, sizes, count))
++        }
+         delegate.init(object : ExtractorOutput {
+             private var videoTrackSeen = false
+ 
+@@ -87,7 +96,6 @@ private class AviTrackFormatExtractor(private val delegate: AviExtractor) : Extr
+             }
+ 
+             override fun seekMap(seekMap: SeekMap) {
+-                watchingIndex = false
+                 output.seekMap(VideoSeekMap(seekMap))
+             }
+         })
+@@ -102,7 +110,7 @@ private class AviTrackFormatExtractor(private val delegate: AviExtractor) : Extr
+             peekHeader(input)
+             headerRead = true
+         }
+-        return delegate.read(if (watchingIndex) IndexWatchingInput(input) else input, seekPosition)
++        return delegate.read(input, seekPosition)
+     }
+ 
+     // The header list can be longer than a few KB when an audio stream with an index block comes first.
+@@ -121,11 +129,11 @@ private class AviTrackFormatExtractor(private val delegate: AviExtractor) : Extr
+         }
+     }
+ 
+-    private fun onIndexRead(body: ByteArray, offset: Int, length: Int) {
+-        val entries = AviIndex.audioEntries(body, offset, length, moviListPosition, audioTracks.map { it.id })
++    private fun onIndexRead(chunks: AviIndex.Chunks) {
++        val entries = AviIndex.audioEntries(chunks, audioTracks.map { it.id })
+         audioTracks.forEach { track -> entries[track.id]?.let(track::useIndex) }
+         val videoStream = streams.getOrNull(videoStreamId) ?: return
+-        videoSeekTable = AviIndex.videoKeyFrames(body, offset, length, moviListPosition, videoStreamId)
++        videoSeekTable = AviIndex.videoKeyFrames(chunks, videoStreamId)
+             ?.let { AviVideoSeekTable.create(videoStream, it) }
+     }
+ 
+@@ -138,52 +146,6 @@ private class AviTrackFormatExtractor(private val delegate: AviExtractor) : Extr
+         }
+     }
+ 
+-    /** Sees the reader find the movi list and read the idx1 body, which it does before the first sample. */
+-    private inner class IndexWatchingInput(private val input: ExtractorInput) : ForwardingExtractorInput(input) {
+-        override fun peekFully(target: ByteArray, offset: Int, length: Int, allowEndOfInput: Boolean): Boolean {
+-            val at = input.peekPosition
+-            val peeked = input.peekFully(target, offset, length, allowEndOfInput)
+-            if (peeked) onPeeked(at, target, offset, length)
+-            return peeked
+-        }
+-
+-        override fun peekFully(target: ByteArray, offset: Int, length: Int) {
+-            val at = input.peekPosition
+-            input.peekFully(target, offset, length)
+-            onPeeked(at, target, offset, length)
+-        }
+-
+-        override fun readFully(target: ByteArray, offset: Int, length: Int, allowEndOfInput: Boolean): Boolean {
+-            val at = input.position
+-            val read = input.readFully(target, offset, length, allowEndOfInput)
+-            if (read) onRead(at, target, offset, length)
+-            return read
+-        }
+-
+-        override fun readFully(target: ByteArray, offset: Int, length: Int) {
+-            val at = input.position
+-            input.readFully(target, offset, length)
+-            onRead(at, target, offset, length)
+-        }
+-
+-        private fun onPeeked(at: Long, data: ByteArray, offset: Int, length: Int) {
+-            if (length >= 12 && tag(data, offset) == "LIST" && tag(data, offset + 8) == "movi") moviListPosition = at
+-        }
+-
+-        private fun onRead(at: Long, data: ByteArray, offset: Int, length: Int) {
+-            if (length == 8 && tag(data, offset) == "idx1") {
+-                indexBodyPosition = at + 8
+-                indexBodySize = (data[offset + 4].toLong() and 0xFF) or ((data[offset + 5].toLong() and 0xFF) shl 8) or
+-                    ((data[offset + 6].toLong() and 0xFF) shl 16) or ((data[offset + 7].toLong() and 0xFF) shl 24)
+-            } else if (at == indexBodyPosition && length.toLong() == indexBodySize) {
+-                indexBodyPosition = C.INDEX_UNSET.toLong()
+-                onIndexRead(data, offset, length)
+-            }
+-        }
+-
+-        private fun tag(data: ByteArray, at: Int) = String(data, at, 4, Charsets.ISO_8859_1)
+-    }
+-
+     @Throws(IOException::class)
+     private fun peekUpTo(input: ExtractorInput, target: ByteArray): Int {
+         var length = 0
+@@ -358,19 +320,27 @@ private class AviTrackFormatExtractor(private val delegate: AviExtractor) : Extr
+ 
+ /** Reads the first video stream's frame rate and FourCC from the first bytes of an AVI file (hdrl list). */
+ internal object AviHeader {
+-    const val LIST_START_BYTES = 24
++    const val LIST_START_BYTES = 256
+     private const val MIN_PROBE_BYTES = 4096
+     private const val MAX_PROBE_BYTES = 256 * 1024
+ 
+-    /** How much of the file to look at: the whole hdrl list when its size is known, within sane bounds. */
++    /**
++     * How much of the file to look at: the whole hdrl list when its size is known, within sane bounds. Some muxers
++     * put a JUNK chunk before the hdrl list.
++     */
+     fun probeBytes(start: ByteArray, length: Int): Int {
+-        if (length < LIST_START_BYTES || fourCc(start, 0) != "RIFF" || fourCc(start, 8) != "AVI " ||
+-            fourCc(start, 12) != "LIST" || fourCc(start, 20) != "hdrl"
+-        ) {
+-            return MIN_PROBE_BYTES
++        val end = minOf(length, start.size)
++        if (end < 12 || fourCc(start, 0) != "RIFF" || fourCc(start, 8) != "AVI ") return MIN_PROBE_BYTES
++        var at = 12L
++        while (at + 12 <= end) {
++            val i = at.toInt()
++            val size = u32(start, i + 4)
++            if (fourCc(start, i) == "LIST" && fourCc(start, i + 8) == "hdrl") {
++                return (at + 8 + size).coerceIn(MIN_PROBE_BYTES.toLong(), MAX_PROBE_BYTES.toLong()).toInt()
++            }
++            at += 8 + size + (size and 1L)
+         }
+-        val headerListEnd = 20L + u32(start, 16)
+-        return headerListEnd.coerceIn(MIN_PROBE_BYTES.toLong(), MAX_PROBE_BYTES.toLong()).toInt()
++        return MIN_PROBE_BYTES
+     }
+     private const val MIN_FPS = 5f
+     private const val MAX_FPS = 121f
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/avi/AviChunk.java b/app/src/main/java/com/nuvio/tv/core/player/avi/AviChunk.java
+new file mode 100644
+index 0000000..582a008
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/player/avi/AviChunk.java
+@@ -0,0 +1,27 @@
++/*
++ * Copyright 2022 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.nuvio.tv.core.player.avi;
++
++/**
++ * A chunk, as defined in the AVI spec.
++ *
++ * <p>See https://docs.microsoft.com/en-us/windows/win32/directshow/avi-riff-file-reference.
++ */
++/* package */ interface AviChunk {
++
++  /** Returns the chunk type fourcc. */
++  int getType();
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/avi/AviExtractor.java b/app/src/main/java/com/nuvio/tv/core/player/avi/AviExtractor.java
+new file mode 100644
+index 0000000..12764f1
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/player/avi/AviExtractor.java
+@@ -0,0 +1,855 @@
++/*
++ * Copyright 2022 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.nuvio.tv.core.player.avi;
++
++import static java.lang.Math.max;
++import static java.lang.annotation.ElementType.TYPE_USE;
++
++import androidx.annotation.IntDef;
++import androidx.annotation.Nullable;
++import androidx.media3.common.C;
++import androidx.media3.common.Format;
++import androidx.media3.common.MimeTypes;
++import androidx.media3.common.ParserException;
++import androidx.media3.common.util.Assertions;
++import androidx.media3.common.util.Log;
++import androidx.media3.common.util.ParsableByteArray;
++import androidx.media3.common.util.UnstableApi;
++import androidx.media3.extractor.Extractor;
++import androidx.media3.extractor.ExtractorInput;
++import androidx.media3.extractor.ExtractorOutput;
++import androidx.media3.extractor.NoOpExtractorOutput;
++import androidx.media3.extractor.PositionHolder;
++import androidx.media3.extractor.SeekMap;
++import androidx.media3.extractor.TrackOutput;
++import androidx.media3.extractor.text.SubtitleParser;
++import androidx.media3.extractor.text.SubtitleTranscodingExtractorOutput;
++import java.io.IOException;
++import java.lang.annotation.Documented;
++import java.lang.annotation.Retention;
++import java.lang.annotation.RetentionPolicy;
++import java.lang.annotation.Target;
++import java.util.ArrayList;
++import java.util.Arrays;
++import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
++
++/**
++ * Extracts data from the AVI container format.
++ *
++ * <p>Spec: https://docs.microsoft.com/en-us/windows/win32/directshow/avi-riff-file-reference.
++ */
++@UnstableApi
++public final class AviExtractor implements Extractor {
++
++  private static final String TAG = "AviExtractor";
++
++  public static final int FOURCC_RIFF = 0x46464952;
++  public static final int FOURCC_AVI_ = 0x20495641; // AVI<space>
++  public static final int FOURCC_LIST = 0x5453494c;
++
++  @SuppressWarnings("ConstantCaseForConstants")
++  public static final int FOURCC_avih = 0x68697661;
++
++  @SuppressWarnings("ConstantCaseForConstants")
++  public static final int FOURCC_hdrl = 0x6c726468;
++
++  @SuppressWarnings("ConstantCaseForConstants")
++  public static final int FOURCC_strl = 0x6c727473;
++
++  @SuppressWarnings("ConstantCaseForConstants")
++  public static final int FOURCC_movi = 0x69766f6d;
++
++  @SuppressWarnings("ConstantCaseForConstants")
++  public static final int FOURCC_idx1 = 0x31786469;
++
++  public static final int FOURCC_JUNK = 0x4b4e554a;
++
++  @SuppressWarnings("ConstantCaseForConstants")
++  public static final int FOURCC_indx = 0x78646e69;
++
++  @SuppressWarnings("ConstantCaseForConstants")
++  public static final int FOURCC_odml = 0x6c6d646f;
++
++  @SuppressWarnings("ConstantCaseForConstants")
++  public static final int FOURCC_dmlh = 0x686c6d64;
++
++  @SuppressWarnings("ConstantCaseForConstants")
++  public static final int FOURCC_strf = 0x66727473;
++
++  @SuppressWarnings("ConstantCaseForConstants")
++  public static final int FOURCC_strn = 0x6e727473;
++
++  @SuppressWarnings("ConstantCaseForConstants")
++  public static final int FOURCC_strh = 0x68727473;
++
++  @SuppressWarnings("ConstantCaseForConstants")
++  public static final int FOURCC_auds = 0x73647561;
++
++  @SuppressWarnings("ConstantCaseForConstants")
++  public static final int FOURCC_txts = 0x73747874;
++
++  @SuppressWarnings("ConstantCaseForConstants")
++  public static final int FOURCC_vids = 0x73646976;
++
++  /** Parser states. */
++  @Documented
++  @Retention(RetentionPolicy.SOURCE)
++  @Target(TYPE_USE)
++  @IntDef({
++    STATE_SKIPPING_TO_HDRL,
++    STATE_READING_HDRL_HEADER,
++    STATE_READING_HDRL_BODY,
++    STATE_FINDING_MOVI_HEADER,
++    STATE_FINDING_IDX1_HEADER,
++    STATE_READING_IDX1_BODY,
++    STATE_READING_SAMPLES,
++    STATE_READING_STANDARD_INDEX_HEADER,
++    STATE_READING_STANDARD_INDEX_BODY,
++  })
++  private @interface State {}
++
++  private static final int STATE_SKIPPING_TO_HDRL = 0;
++  private static final int STATE_READING_HDRL_HEADER = 1;
++  private static final int STATE_READING_HDRL_BODY = 2;
++  private static final int STATE_FINDING_MOVI_HEADER = 3;
++  private static final int STATE_FINDING_IDX1_HEADER = 4;
++  private static final int STATE_READING_IDX1_BODY = 5;
++  private static final int STATE_READING_SAMPLES = 6;
++  private static final int STATE_READING_STANDARD_INDEX_HEADER = 7;
++  private static final int STATE_READING_STANDARD_INDEX_BODY = 8;
++
++  private static final int AVIIF_KEYFRAME = 16;
++  private static final int AVI_INDEX_OF_CHUNKS = 1;
++  private static final int STANDARD_INDEX_HEADER_BYTES = 24;
++  private static final int MAX_STANDARD_INDEX_BYTES = 16 * 1024 * 1024;
++  private static final long MAX_HEADER_LIST_SEARCH_BYTES = 1024 * 1024;
++  private static final long NON_KEY_FRAME_SIZE_BIT = 0x80000000L;
++
++  /** Receives the chunk index the reader uses, from idx1 or from the OpenDML indexes. */
++  public interface IndexListener {
++
++    /**
++     * Called once with the first {@code count} entries of each array: the chunk id, the AVIIF
++     * flags, the file position of the chunk header and the size of the chunk data.
++     */
++    void onIndex(int[] chunkIds, int[] flags, long[] chunkPositions, int[] sizes, int count);
++  }
++
++  /**
++   * Flags controlling the behavior of the extractor. Possible flag value is {@link
++   * #FLAG_EMIT_RAW_SUBTITLE_DATA}.
++   */
++  @Documented
++  @Retention(RetentionPolicy.SOURCE)
++  @Target(TYPE_USE)
++  @IntDef(
++      flag = true,
++      value = {FLAG_EMIT_RAW_SUBTITLE_DATA})
++  public @interface Flags {}
++
++  /**
++   * Flag to use the source subtitle formats without modification. If unset, subtitles will be
++   * transcoded to {@link MimeTypes#APPLICATION_MEDIA3_CUES} during extraction.
++   */
++  public static final int FLAG_EMIT_RAW_SUBTITLE_DATA = 1;
++
++  /**
++   * Maximum size to skip using {@link ExtractorInput#skip}. Boxes larger than this size are skipped
++   * using {@link #RESULT_SEEK}.
++   */
++  private static final long RELOAD_MINIMUM_SEEK_DISTANCE = 256 * 1024;
++
++  private final ParsableByteArray scratch;
++  private final ChunkHeaderHolder chunkHeaderHolder;
++  private final boolean parseSubtitlesDuringExtraction;
++  private final SubtitleParser.Factory subtitleParserFactory;
++
++  private @State int state;
++  private ExtractorOutput extractorOutput;
++  private @MonotonicNonNull AviMainHeaderChunk aviHeader;
++  private long durationUs;
++  private ChunkReader[] chunkReaders;
++
++  private long pendingReposition;
++  @Nullable private ChunkReader currentChunkReader;
++  private int hdrlSize;
++  private long moviStart;
++  private long moviEnd;
++  private int idx1BodySize;
++  private boolean seekMapHasBeenOutput;
++  private boolean followsRiffSegments;
++  private long[] standardIndexPositions;
++  private int nextStandardIndex;
++  private int standardIndexBodySize;
++  private final IndexEntries indexEntries;
++  @Nullable private IndexListener indexListener;
++
++  /**
++   * @deprecated Use {@link #AviExtractor(int, SubtitleParser.Factory)} instead.
++   */
++  @Deprecated
++  public AviExtractor() {
++    this(FLAG_EMIT_RAW_SUBTITLE_DATA, SubtitleParser.Factory.UNSUPPORTED);
++  }
++
++  /**
++   * Constructs an instance.
++   *
++   * @param extractorFlags Flags that control the extractor's behavior.
++   * @param subtitleParserFactory The {@link SubtitleParser.Factory} for parsing subtitles during
++   *     extraction.
++   */
++  public AviExtractor(@Flags int extractorFlags, SubtitleParser.Factory subtitleParserFactory) {
++    this.subtitleParserFactory = subtitleParserFactory;
++    parseSubtitlesDuringExtraction = (extractorFlags & FLAG_EMIT_RAW_SUBTITLE_DATA) == 0;
++    scratch = new ParsableByteArray(/* limit= */ 12);
++    chunkHeaderHolder = new ChunkHeaderHolder();
++    extractorOutput = new NoOpExtractorOutput();
++    chunkReaders = new ChunkReader[0];
++    standardIndexPositions = new long[0];
++    indexEntries = new IndexEntries();
++    moviStart = C.INDEX_UNSET;
++    moviEnd = C.INDEX_UNSET;
++    hdrlSize = C.LENGTH_UNSET;
++    durationUs = C.TIME_UNSET;
++  }
++
++  public void setIndexListener(@Nullable IndexListener indexListener) {
++    this.indexListener = indexListener;
++  }
++
++  // Extractor implementation.
++
++  @Override
++  public void init(ExtractorOutput output) {
++    this.state = STATE_SKIPPING_TO_HDRL;
++    this.extractorOutput =
++        parseSubtitlesDuringExtraction
++            ? new SubtitleTranscodingExtractorOutput(output, subtitleParserFactory)
++            : output;
++    pendingReposition = C.INDEX_UNSET;
++  }
++
++  @Override
++  public boolean sniff(ExtractorInput input) throws IOException {
++    input.peekFully(scratch.getData(), /* offset= */ 0, /* length= */ 12);
++    scratch.setPosition(0);
++    if (scratch.readLittleEndianInt() != FOURCC_RIFF) {
++      return false;
++    }
++    scratch.skipBytes(4); // Skip the RIFF chunk length.
++    return scratch.readLittleEndianInt() == FOURCC_AVI_;
++  }
++
++  @Override
++  public int read(ExtractorInput input, PositionHolder seekPosition) throws IOException {
++    if (resolvePendingReposition(input, seekPosition)) {
++      return RESULT_SEEK;
++    }
++    switch (state) {
++      case STATE_SKIPPING_TO_HDRL:
++        // Check for RIFF and AVI fourcc's just in case the caller did not sniff, in order to
++        // provide a meaningful error if the input is not an AVI file.
++        if (sniff(input)) {
++          input.skipFully(/* length= */ 12);
++        } else {
++          throw ParserException.createForMalformedContainer(
++              /* message= */ "AVI Header List not found", /* cause= */ null);
++        }
++        state = STATE_READING_HDRL_HEADER;
++        return RESULT_CONTINUE;
++      case STATE_READING_HDRL_HEADER:
++        input.peekFully(scratch.getData(), /* offset= */ 0, /* length= */ 12);
++        input.resetPeekPosition();
++        scratch.setPosition(0);
++        chunkHeaderHolder.populateFrom(scratch);
++        chunkHeaderHolder.listType = scratch.readLittleEndianInt();
++        if (chunkHeaderHolder.chunkType != FOURCC_LIST
++            || chunkHeaderHolder.listType != FOURCC_hdrl) {
++          // Some muxers write a JUNK chunk between the RIFF header and the header list.
++          long size = chunkHeaderHolder.size & 0xFFFFFFFFL;
++          long next = input.getPosition() + 8 + size + (size & 1);
++          if (next > MAX_HEADER_LIST_SEARCH_BYTES) {
++            throw ParserException.createForMalformedContainer(
++                /* message= */ "hdrl expected, found: " + chunkHeaderHolder.listType,
++                /* cause= */ null);
++          }
++          pendingReposition = next;
++          return RESULT_CONTINUE;
++        }
++        input.skipFully(12);
++        hdrlSize = chunkHeaderHolder.size;
++        state = STATE_READING_HDRL_BODY;
++        return RESULT_CONTINUE;
++      case STATE_READING_HDRL_BODY:
++        // hdrlSize includes the LIST type (hdrl), so we subtract 4 to the size.
++        int bytesToRead = hdrlSize - 4;
++        ParsableByteArray hdrlBody = new ParsableByteArray(bytesToRead);
++        input.readFully(hdrlBody.getData(), /* offset= */ 0, bytesToRead);
++        parseHdrlBody(hdrlBody);
++        state = STATE_FINDING_MOVI_HEADER;
++        return RESULT_CONTINUE;
++      case STATE_FINDING_MOVI_HEADER:
++        if (moviStart != C.INDEX_UNSET && input.getPosition() != moviStart) {
++          pendingReposition = moviStart;
++          return RESULT_CONTINUE;
++        }
++        input.peekFully(scratch.getData(), /* offset= */ 0, /* length= */ 12);
++        input.resetPeekPosition();
++        scratch.setPosition(0);
++        chunkHeaderHolder.populateFrom(scratch);
++        int listType = scratch.readLittleEndianInt();
++        if (chunkHeaderHolder.chunkType == FOURCC_RIFF) {
++          // We are at the start of the file. The movi chunk is in the RIFF chunk, so we skip the
++          // header, so as to read the RIFF chunk's body.
++          input.skipFully(12);
++          return RESULT_CONTINUE;
++        }
++        if (chunkHeaderHolder.chunkType != FOURCC_LIST || listType != FOURCC_movi) {
++          // The chunk header (8 bytes) plus the whole body.
++          pendingReposition = input.getPosition() + chunkHeaderHolder.size + 8;
++          return RESULT_CONTINUE;
++        }
++        moviStart = input.getPosition();
++        // Size includes the list type, but not the LIST or size fields, so we add 8.
++        moviEnd = moviStart + chunkHeaderHolder.size + 8;
++        if (!seekMapHasBeenOutput) {
++          if (standardIndexPositions.length > 0) {
++            nextStandardIndex = 0;
++            state = STATE_READING_STANDARD_INDEX_HEADER;
++            pendingReposition = standardIndexPositions[0];
++            return RESULT_CONTINUE;
++          }
++          if (Assertions.checkNotNull(aviHeader).hasIndex()) {
++            state = STATE_FINDING_IDX1_HEADER;
++            pendingReposition = moviEnd;
++            return RESULT_CONTINUE;
++          } else {
++            extractorOutput.seekMap(new SeekMap.Unseekable(durationUs));
++            seekMapHasBeenOutput = true;
++          }
++        }
++        // No need to parse the idx1, so we start reading the samples from the movi chunk straight
++        // away. We skip 12 bytes to move to the start of the movi's body.
++        pendingReposition = input.getPosition() + 12;
++        state = STATE_READING_SAMPLES;
++        return RESULT_CONTINUE;
++      case STATE_FINDING_IDX1_HEADER:
++        input.readFully(scratch.getData(), /* offset= */ 0, /* length= */ 8);
++        scratch.setPosition(0);
++        int idx1Fourcc = scratch.readLittleEndianInt();
++        int boxSize = scratch.readLittleEndianInt();
++        if (idx1Fourcc == FOURCC_idx1) {
++          state = STATE_READING_IDX1_BODY;
++          idx1BodySize = boxSize;
++        } else {
++          // This one is not idx1, skip to the next box.
++          pendingReposition = input.getPosition() + boxSize;
++        }
++        return RESULT_CONTINUE;
++      case STATE_READING_IDX1_BODY:
++        ParsableByteArray idx1Body = new ParsableByteArray(idx1BodySize);
++        input.readFully(idx1Body.getData(), /* offset= */ 0, /* length= */ idx1BodySize);
++        parseIdx1Body(idx1Body);
++        state = STATE_READING_SAMPLES;
++        pendingReposition = moviStart;
++        return RESULT_CONTINUE;
++      case STATE_READING_STANDARD_INDEX_HEADER:
++        input.readFully(scratch.getData(), /* offset= */ 0, /* length= */ 8);
++        scratch.setPosition(4);
++        long standardIndexSize = scratch.readLittleEndianUnsignedInt();
++        if (standardIndexSize < STANDARD_INDEX_HEADER_BYTES
++            || standardIndexSize > MAX_STANDARD_INDEX_BYTES) {
++          useLegacyIndex();
++          return RESULT_CONTINUE;
++        }
++        standardIndexBodySize = (int) standardIndexSize;
++        state = STATE_READING_STANDARD_INDEX_BODY;
++        return RESULT_CONTINUE;
++      case STATE_READING_STANDARD_INDEX_BODY:
++        ParsableByteArray standardIndexBody = new ParsableByteArray(standardIndexBodySize);
++        input.readFully(
++            standardIndexBody.getData(), /* offset= */ 0, /* length= */ standardIndexBodySize);
++        if (!parseStandardIndex(standardIndexBody)) {
++          useLegacyIndex();
++          return RESULT_CONTINUE;
++        }
++        nextStandardIndex++;
++        if (nextStandardIndex < standardIndexPositions.length) {
++          state = STATE_READING_STANDARD_INDEX_HEADER;
++          pendingReposition = standardIndexPositions[nextStandardIndex];
++        } else {
++          commitIndex(/* sortByPosition= */ true);
++          state = STATE_READING_SAMPLES;
++          pendingReposition = moviStart;
++        }
++        return RESULT_CONTINUE;
++      case STATE_READING_SAMPLES:
++        return readMoviChunks(input);
++      default:
++        throw new AssertionError(); // Should never happen.
++    }
++  }
++
++  @Override
++  public void seek(long position, long timeUs) {
++    pendingReposition = C.INDEX_UNSET;
++    currentChunkReader = null;
++    for (ChunkReader chunkReader : chunkReaders) {
++      chunkReader.seekToPosition(position);
++    }
++    if (position == 0) {
++      if (chunkReaders.length == 0) {
++        // Still unprepared.
++        state = STATE_SKIPPING_TO_HDRL;
++      } else {
++        state = STATE_FINDING_MOVI_HEADER;
++      }
++      return;
++    }
++    state = STATE_READING_SAMPLES;
++  }
++
++  @Override
++  public void release() {
++    // Nothing to release.
++  }
++
++  // Internal methods.
++
++  /**
++   * Returns whether a {@link #RESULT_SEEK} is required for the pending reposition. A seek may not
++   * be necessary when the desired position (as held by {@link #pendingReposition}) is after the
++   * {@link ExtractorInput#getPosition() current position}, but not further than {@link
++   * #RELOAD_MINIMUM_SEEK_DISTANCE}.
++   */
++  private boolean resolvePendingReposition(ExtractorInput input, PositionHolder seekPosition)
++      throws IOException {
++    boolean needSeek = false;
++    if (pendingReposition != C.INDEX_UNSET) {
++      long currentPosition = input.getPosition();
++      if (pendingReposition < currentPosition
++          || pendingReposition > currentPosition + RELOAD_MINIMUM_SEEK_DISTANCE) {
++        seekPosition.position = pendingReposition;
++        needSeek = true;
++      } else {
++        // The distance to the target position is short enough that it makes sense to just skip the
++        // bytes, instead of doing a seek which might re-create an HTTP connection.
++        input.skipFully((int) (pendingReposition - currentPosition));
++      }
++    }
++    pendingReposition = C.INDEX_UNSET;
++    return needSeek;
++  }
++
++  private void parseHdrlBody(ParsableByteArray hrdlBody) throws IOException {
++    ListChunk headerList = ListChunk.parseFrom(FOURCC_hdrl, hrdlBody);
++    if (headerList.getType() != FOURCC_hdrl) {
++      throw ParserException.createForMalformedContainer(
++          /* message= */ "Unexpected header list type " + headerList.getType(), /* cause= */ null);
++    }
++    @Nullable AviMainHeaderChunk aviHeader = headerList.getChild(AviMainHeaderChunk.class);
++    if (aviHeader == null) {
++      throw ParserException.createForMalformedContainer(
++          /* message= */ "AviHeader not found", /* cause= */ null);
++    }
++    this.aviHeader = aviHeader;
++    long totalFrames = aviHeader.totalFrames & 0xFFFFFFFFL;
++    for (AviChunk aviChunk : headerList.children) {
++      if (aviChunk.getType() == FOURCC_odml) {
++        // OpenDML: the movie goes on in further RIFF AVIX segments after the first one.
++        followsRiffSegments = true;
++        @Nullable
++        OpenDmlHeaderChunk openDmlHeader =
++            ((ListChunk) aviChunk).getChild(OpenDmlHeaderChunk.class);
++        if (openDmlHeader != null) {
++          totalFrames = max(totalFrames, openDmlHeader.totalFrames);
++        }
++      }
++    }
++    // This is usually wrong, so it will be overwritten by video if present
++    durationUs = totalFrames * aviHeader.frameDurationUs;
++    ArrayList<ChunkReader> chunkReaderList = new ArrayList<>();
++    ArrayList<SuperIndexChunk> superIndexes = new ArrayList<>();
++    boolean everyStreamHasSuperIndex = true;
++    int streamId = 0;
++    for (AviChunk aviChunk : headerList.children) {
++      if (aviChunk.getType() == FOURCC_strl) {
++        ListChunk streamList = (ListChunk) aviChunk;
++        // Note the streamId needs to increment even if the corresponding `strl` is discarded.
++        // See
++        // https://docs.microsoft.com/en-us/windows/win32/directshow/avi-riff-file-reference#avi-stream-headers.
++        @Nullable ChunkReader chunkReader = processStreamList(streamList, streamId++);
++        if (chunkReader != null) {
++          chunkReaderList.add(chunkReader);
++          @Nullable SuperIndexChunk superIndex = streamList.getChild(SuperIndexChunk.class);
++          if (superIndex == null) {
++            everyStreamHasSuperIndex = false;
++          } else {
++            superIndexes.add(superIndex);
++          }
++        }
++      }
++    }
++    chunkReaders = chunkReaderList.toArray(new ChunkReader[0]);
++    if (everyStreamHasSuperIndex && !superIndexes.isEmpty()) {
++      followsRiffSegments = true;
++      int count = 0;
++      for (SuperIndexChunk superIndex : superIndexes) {
++        count += superIndex.indexOffsets.length;
++      }
++      standardIndexPositions = new long[count];
++      int at = 0;
++      for (SuperIndexChunk superIndex : superIndexes) {
++        for (long offset : superIndex.indexOffsets) {
++          standardIndexPositions[at++] = offset;
++        }
++      }
++      Arrays.sort(standardIndexPositions);
++    }
++    extractorOutput.endTracks();
++  }
++
++  /** Builds and outputs the {@link SeekMap} from the idx1 chunk. */
++  private void parseIdx1Body(ParsableByteArray body) {
++    long seekOffset = peekSeekOffset(body);
++    indexEntries.clear();
++    while (body.bytesLeft() >= 16) {
++      int chunkId = body.readLittleEndianInt();
++      int flags = body.readLittleEndianInt();
++      long offset = body.readLittleEndianUnsignedInt() + seekOffset;
++      int size = body.readLittleEndianInt();
++      indexEntries.add(chunkId, flags, offset, size);
++    }
++    commitIndex(/* sortByPosition= */ false);
++  }
++
++  /** Adds the entries of an OpenDML standard index ('ix##'); false when it cannot be read. */
++  private boolean parseStandardIndex(ParsableByteArray body) {
++    int longsPerEntry = body.readLittleEndianUnsignedShort();
++    body.skipBytes(1); // bIndexSubType.
++    int indexType = body.readUnsignedByte();
++    long entriesInUse = body.readLittleEndianUnsignedInt();
++    int chunkId = body.readLittleEndianInt();
++    long baseOffset = body.readLittleEndianLong();
++    body.skipBytes(4); // dwReserved.
++    if (indexType != AVI_INDEX_OF_CHUNKS || longsPerEntry != 2 || baseOffset < 0) {
++      return false;
++    }
++    long count = Math.min(entriesInUse, body.bytesLeft() / 8);
++    for (long i = 0; i < count; i++) {
++      // The offset points at the chunk data, after the 8 byte chunk header.
++      long dataOffset = body.readLittleEndianUnsignedInt();
++      long size = body.readLittleEndianUnsignedInt();
++      int flags = (size & NON_KEY_FRAME_SIZE_BIT) == 0 ? AVIIF_KEYFRAME : 0;
++      indexEntries.add(
++          chunkId, flags, baseOffset + dataOffset - 8, (int) (size & ~NON_KEY_FRAME_SIZE_BIT));
++    }
++    return true;
++  }
++
++  /** Falls back to idx1 when the OpenDML indexes cannot be read. */
++  private void useLegacyIndex() {
++    Log.w(TAG, "OpenDML index unreadable, using idx1");
++    standardIndexPositions = new long[0];
++    indexEntries.clear();
++    if (Assertions.checkNotNull(aviHeader).hasIndex()) {
++      state = STATE_FINDING_IDX1_HEADER;
++      pendingReposition = moviEnd;
++    } else {
++      extractorOutput.seekMap(new SeekMap.Unseekable(durationUs));
++      seekMapHasBeenOutput = true;
++      state = STATE_READING_SAMPLES;
++      pendingReposition = moviStart;
++    }
++  }
++
++  /** Hands the collected index to the chunk readers and outputs the {@link SeekMap}. */
++  private void commitIndex(boolean sortByPosition) {
++    if (sortByPosition) {
++      indexEntries.sortByPosition();
++    }
++    for (int i = 0; i < indexEntries.count; i++) {
++      ChunkReader chunkReader = getChunkReader(indexEntries.chunkIds[i]);
++      if (chunkReader == null) {
++        // We ignore unknown chunk IDs.
++        continue;
++      }
++      chunkReader.appendIndexChunk(
++          indexEntries.positions[i],
++          /* isKeyFrame= */ (indexEntries.flags[i] & AVIIF_KEYFRAME) == AVIIF_KEYFRAME);
++    }
++    for (ChunkReader chunkReader : chunkReaders) {
++      chunkReader.commitIndex();
++    }
++    if (indexListener != null) {
++      indexListener.onIndex(
++          indexEntries.chunkIds,
++          indexEntries.flags,
++          indexEntries.positions,
++          indexEntries.sizes,
++          indexEntries.count);
++    }
++    indexEntries.release();
++    seekMapHasBeenOutput = true;
++    if (chunkReaders.length == 0) {
++      extractorOutput.seekMap(new SeekMap.Unseekable(durationUs));
++    } else {
++      extractorOutput.seekMap(new AviSeekMap(durationUs));
++    }
++  }
++
++  private long peekSeekOffset(ParsableByteArray idx1Body) {
++    // The spec states the offset is based on the start of the movi list type fourcc, but it also
++    // says some files base the offset on the start of the file. We use a best effort approach to
++    // figure out which is the case. See:
++    // https://docs.microsoft.com/en-us/previous-versions/windows/desktop/api/Aviriff/ns-aviriff-avioldindex#dwoffset.
++    if (idx1Body.bytesLeft() < 16) {
++      // There are no full entries in the index, meaning we don't need to apply an offset.
++      return 0;
++    }
++    int startingPosition = idx1Body.getPosition();
++    idx1Body.skipBytes(8); // Skip chunkId (4 bytes) and flags (4 bytes).
++    int offset = idx1Body.readLittleEndianInt();
++
++    // moviStart points at the start of the LIST, while the seek offset is based at the start of the
++    // movi fourCC, so we add 8 to reconcile the difference.
++    long seekOffset = offset > moviStart ? 0L : moviStart + 8;
++    idx1Body.setPosition(startingPosition);
++    return seekOffset;
++  }
++
++  @Nullable
++  private ChunkReader getChunkReader(int chunkId) {
++    for (ChunkReader chunkReader : chunkReaders) {
++      if (chunkReader.handlesChunkId(chunkId)) {
++        return chunkReader;
++      }
++    }
++    return null;
++  }
++
++  private int readMoviChunks(ExtractorInput input) throws IOException {
++    if (!followsRiffSegments && input.getPosition() >= moviEnd) {
++      return C.RESULT_END_OF_INPUT;
++    } else if (currentChunkReader != null) {
++      if (currentChunkReader.onChunkData(input)) {
++        currentChunkReader = null;
++      }
++    } else {
++      if (!alignInputToEvenPosition(input)
++          || !input.peekFully(scratch.getData(), /* offset= */ 0, 8, /* allowEndOfInput= */ true)) {
++        return C.RESULT_END_OF_INPUT;
++      }
++      scratch.setPosition(0);
++      int chunkType = scratch.readLittleEndianInt();
++      if (chunkType == FOURCC_LIST || (followsRiffSegments && chunkType == FOURCC_RIFF)) {
++        // Step into the list (movi, or 'rec ' groups of interleaved chunks) past its type. A RIFF
++        // AVIX segment holds the next movi list.
++        input.skipFully(12);
++        input.resetPeekPosition();
++        return RESULT_CONTINUE;
++      }
++      int size = scratch.readLittleEndianInt();
++      if (chunkType == FOURCC_JUNK) {
++        pendingReposition = input.getPosition() + size + 8;
++        return RESULT_CONTINUE;
++      }
++      input.skipFully(8);
++      input.resetPeekPosition();
++      ChunkReader chunkReader = getChunkReader(chunkType);
++      if (chunkReader == null) {
++        // No handler for this chunk. We skip it.
++        pendingReposition = input.getPosition() + size;
++        return RESULT_CONTINUE;
++      } else {
++        chunkReader.onChunkStart(size);
++        this.currentChunkReader = chunkReader;
++      }
++    }
++    return RESULT_CONTINUE;
++  }
++
++  @Nullable
++  private ChunkReader processStreamList(ListChunk streamList, int streamId) {
++    AviStreamHeaderChunk aviStreamHeaderChunk = streamList.getChild(AviStreamHeaderChunk.class);
++    StreamFormatChunk streamFormatChunk = streamList.getChild(StreamFormatChunk.class);
++    if (aviStreamHeaderChunk == null) {
++      Log.w(TAG, "Missing Stream Header");
++      return null;
++    }
++    if (streamFormatChunk == null) {
++      Log.w(TAG, "Missing Stream Format");
++      return null;
++    }
++    long durationUs = aviStreamHeaderChunk.getDurationUs();
++    Format streamFormat = streamFormatChunk.format;
++    Format.Builder builder = streamFormat.buildUpon();
++    builder.setId(streamId);
++    int suggestedBufferSize = aviStreamHeaderChunk.suggestedBufferSize;
++    if (suggestedBufferSize != 0) {
++      builder.setMaxInputSize(suggestedBufferSize);
++    }
++    StreamNameChunk streamName = streamList.getChild(StreamNameChunk.class);
++    if (streamName != null) {
++      builder.setLabel(streamName.name);
++    }
++    int trackType = MimeTypes.getTrackType(streamFormat.sampleMimeType);
++    if (trackType == C.TRACK_TYPE_AUDIO || trackType == C.TRACK_TYPE_VIDEO) {
++      TrackOutput trackOutput = extractorOutput.track(streamId, trackType);
++      trackOutput.format(builder.build());
++      trackOutput.durationUs(durationUs);
++      this.durationUs = max(this.durationUs, durationUs);
++      return new ChunkReader(streamId, aviStreamHeaderChunk, trackOutput);
++    } else {
++      // We don't currently support tracks other than video and audio.
++      return null;
++    }
++  }
++
++  /**
++   * Skips one byte from the given {@code input} if the current position is odd.
++   *
++   * <p>This isn't documented anywhere, but AVI files are aligned to even bytes and fill gaps with
++   * zeros.
++   */
++  private static boolean alignInputToEvenPosition(ExtractorInput input) throws IOException {
++    if ((input.getPosition() & 1) == 1) {
++      return input.skipFully(1, /* allowEndOfInput= */ true);
++    }
++    return true;
++  }
++
++  // Internal classes.
++
++  private class AviSeekMap implements SeekMap {
++
++    private final long durationUs;
++
++    public AviSeekMap(long durationUs) {
++      this.durationUs = durationUs;
++    }
++
++    @Override
++    public boolean isSeekable() {
++      return true;
++    }
++
++    @Override
++    public long getDurationUs() {
++      return durationUs;
++    }
++
++    @Override
++    public SeekPoints getSeekPoints(long timeUs) {
++      SeekPoints result = chunkReaders[0].getSeekPoints(timeUs);
++      for (int i = 1; i < chunkReaders.length; i++) {
++        SeekPoints seekPoints = chunkReaders[i].getSeekPoints(timeUs);
++        if (seekPoints.first.position < result.first.position) {
++          result = seekPoints;
++        }
++      }
++      return result;
++    }
++  }
++
++  /** Index entries in growable arrays, as read from idx1 or from the OpenDML indexes. */
++  private static final class IndexEntries {
++    private static final int INITIAL_CAPACITY = 1024;
++    private static final int INDEX_BITS = 22;
++
++    public int[] chunkIds = new int[0];
++    public int[] flags = new int[0];
++    public long[] positions = new long[0];
++    public int[] sizes = new int[0];
++    public int count;
++
++    public void add(int chunkId, int flag, long position, int size) {
++      if (count == positions.length) {
++        int capacity = max(INITIAL_CAPACITY, count * 2);
++        chunkIds = Arrays.copyOf(chunkIds, capacity);
++        flags = Arrays.copyOf(flags, capacity);
++        positions = Arrays.copyOf(positions, capacity);
++        sizes = Arrays.copyOf(sizes, capacity);
++      }
++      chunkIds[count] = chunkId;
++      flags[count] = flag;
++      positions[count] = position;
++      sizes[count] = size;
++      count++;
++    }
++
++    public void clear() {
++      count = 0;
++    }
++
++    public void release() {
++      chunkIds = new int[0];
++      flags = new int[0];
++      positions = new long[0];
++      sizes = new int[0];
++      count = 0;
++    }
++
++    /** Puts the entries in file order: each standard index lists one stream of one segment. */
++    public void sortByPosition() {
++      if (count >= 1 << INDEX_BITS) {
++        return;
++      }
++      long[] keys = new long[count];
++      for (int i = 0; i < count; i++) {
++        keys[i] = (positions[i] << INDEX_BITS) | i;
++      }
++      Arrays.sort(keys);
++      int[] sortedChunkIds = new int[count];
++      int[] sortedFlags = new int[count];
++      long[] sortedPositions = new long[count];
++      int[] sortedSizes = new int[count];
++      for (int i = 0; i < count; i++) {
++        int from = (int) (keys[i] & ((1 << INDEX_BITS) - 1));
++        sortedChunkIds[i] = chunkIds[from];
++        sortedFlags[i] = flags[from];
++        sortedPositions[i] = positions[from];
++        sortedSizes[i] = sizes[from];
++      }
++      chunkIds = sortedChunkIds;
++      flags = sortedFlags;
++      positions = sortedPositions;
++      sizes = sortedSizes;
++    }
++  }
++
++  private static class ChunkHeaderHolder {
++    public int chunkType;
++    public int size;
++    public int listType;
++
++    public void populateWithListHeaderFrom(ParsableByteArray headerBytes) throws ParserException {
++      populateFrom(headerBytes);
++      if (chunkType != AviExtractor.FOURCC_LIST) {
++        throw ParserException.createForMalformedContainer(
++            /* message= */ "LIST expected, found: " + chunkType, /* cause= */ null);
++      }
++      listType = headerBytes.readLittleEndianInt();
++    }
++
++    public void populateFrom(ParsableByteArray headerBytes) {
++      chunkType = headerBytes.readLittleEndianInt();
++      size = headerBytes.readLittleEndianInt();
++      listType = 0;
++    }
++  }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/avi/AviMainHeaderChunk.java b/app/src/main/java/com/nuvio/tv/core/player/avi/AviMainHeaderChunk.java
+new file mode 100644
+index 0000000..c0a8c8c
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/player/avi/AviMainHeaderChunk.java
+@@ -0,0 +1,56 @@
++/*
++ * Copyright 2022 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.nuvio.tv.core.player.avi;
++
++import androidx.media3.common.util.ParsableByteArray;
++
++/** Wrapper around the AVIMAINHEADER structure */
++/* package */ final class AviMainHeaderChunk implements AviChunk {
++
++  private static final int AVIF_HAS_INDEX = 0x10;
++
++  public static AviMainHeaderChunk parseFrom(ParsableByteArray body) {
++    int microSecPerFrame = body.readLittleEndianInt();
++    body.skipBytes(8); // Skip dwMaxBytesPerSec (4 bytes), dwPaddingGranularity (4 bytes).
++    int flags = body.readLittleEndianInt();
++    int totalFrames = body.readLittleEndianInt();
++    body.skipBytes(4); // dwInitialFrames (4 bytes).
++    int streams = body.readLittleEndianInt();
++    body.skipBytes(12); // dwSuggestedBufferSize (4 bytes), dwWidth (4 bytes), dwHeight (4 bytes).
++    return new AviMainHeaderChunk(microSecPerFrame, flags, totalFrames, streams);
++  }
++
++  public final int frameDurationUs;
++  public final int flags;
++  public final int totalFrames;
++  public final int streams;
++
++  private AviMainHeaderChunk(int frameDurationUs, int flags, int totalFrames, int streams) {
++    this.frameDurationUs = frameDurationUs;
++    this.flags = flags;
++    this.totalFrames = totalFrames;
++    this.streams = streams;
++  }
++
++  @Override
++  public int getType() {
++    return AviExtractor.FOURCC_avih;
++  }
++
++  public boolean hasIndex() {
++    return (flags & AVIF_HAS_INDEX) == AVIF_HAS_INDEX;
++  }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/avi/AviStreamHeaderChunk.java b/app/src/main/java/com/nuvio/tv/core/player/avi/AviStreamHeaderChunk.java
+new file mode 100644
+index 0000000..907c4a4
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/player/avi/AviStreamHeaderChunk.java
+@@ -0,0 +1,97 @@
++/*
++ * Copyright 2022 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.nuvio.tv.core.player.avi;
++
++import androidx.media3.common.C;
++import androidx.media3.common.util.Log;
++import androidx.media3.common.util.ParsableByteArray;
++import androidx.media3.common.util.Util;
++
++/** Parses and holds information from the AVISTREAMHEADER structure. */
++/* package */ final class AviStreamHeaderChunk implements AviChunk {
++  private static final String TAG = "AviStreamHeaderChunk";
++
++  public static AviStreamHeaderChunk parseFrom(ParsableByteArray body) {
++    int streamType = body.readLittleEndianInt();
++    body.skipBytes(12); // fccHandler (4 bytes), dwFlags (4 bytes), wPriority (2 bytes),
++    // wLanguage (2 bytes).
++    int initialFrames = body.readLittleEndianInt();
++    int scale = body.readLittleEndianInt();
++    int rate = body.readLittleEndianInt();
++    body.skipBytes(4); // dwStart (4 bytes).
++    int length = body.readLittleEndianInt();
++    int suggestedBufferSize = body.readLittleEndianInt();
++    body.skipBytes(4); // dwQuality (4 bytes).
++    int sampleSize = body.readLittleEndianInt();
++    return new AviStreamHeaderChunk(
++        streamType, initialFrames, scale, rate, length, suggestedBufferSize, sampleSize);
++  }
++
++  public final int streamType;
++  public final int initialFrames;
++  public final int scale;
++  public final int rate;
++  public final int length;
++  public final int suggestedBufferSize;
++  public final int sampleSize;
++
++  private AviStreamHeaderChunk(
++      int streamType,
++      int initialFrames,
++      int scale,
++      int rate,
++      int length,
++      int suggestedBufferSize,
++      int sampleSize) {
++    this.streamType = streamType;
++    this.initialFrames = initialFrames;
++    this.scale = scale;
++    this.rate = rate;
++    this.length = length;
++    this.suggestedBufferSize = suggestedBufferSize;
++    this.sampleSize = sampleSize;
++  }
++
++  @Override
++  public int getType() {
++    return AviExtractor.FOURCC_strh;
++  }
++
++  public @C.TrackType int getTrackType() {
++    switch (streamType) {
++      case AviExtractor.FOURCC_auds:
++        return C.TRACK_TYPE_AUDIO;
++      case AviExtractor.FOURCC_vids:
++        return C.TRACK_TYPE_VIDEO;
++      case AviExtractor.FOURCC_txts:
++        return C.TRACK_TYPE_TEXT;
++      default:
++        Log.w(TAG, "Found unsupported streamType fourCC: " + Integer.toHexString(streamType));
++        return C.TRACK_TYPE_UNKNOWN;
++    }
++  }
++
++  public float getFrameRate() {
++    return rate / (float) scale;
++  }
++
++  public long getDurationUs() {
++    return Util.scaleLargeTimestamp(
++        /* timestamp= */ length,
++        /* multiplier= */ C.MICROS_PER_SECOND * scale,
++        /* divisor= */ rate);
++  }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/avi/ChunkReader.java b/app/src/main/java/com/nuvio/tv/core/player/avi/ChunkReader.java
+new file mode 100644
+index 0000000..394345a
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/player/avi/ChunkReader.java
+@@ -0,0 +1,228 @@
++/*
++ * Copyright 2022 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.nuvio.tv.core.player.avi;
++
++import static androidx.media3.common.C.TRACK_TYPE_AUDIO;
++import static androidx.media3.common.C.TRACK_TYPE_VIDEO;
++import static androidx.media3.common.util.Assertions.checkArgument;
++import static java.lang.annotation.ElementType.TYPE_USE;
++
++import androidx.annotation.IntDef;
++import androidx.media3.common.C;
++import androidx.media3.common.util.Util;
++import androidx.media3.extractor.ExtractorInput;
++import androidx.media3.extractor.SeekMap;
++import androidx.media3.extractor.SeekPoint;
++import androidx.media3.extractor.TrackOutput;
++import java.io.IOException;
++import java.lang.annotation.Documented;
++import java.lang.annotation.Retention;
++import java.lang.annotation.RetentionPolicy;
++import java.lang.annotation.Target;
++import java.util.Arrays;
++
++/** Reads chunks holding sample data. */
++/* package */ final class ChunkReader {
++
++  /** Parser states. */
++  @Documented
++  @Retention(RetentionPolicy.SOURCE)
++  @Target(TYPE_USE)
++  @IntDef({
++    CHUNK_TYPE_VIDEO_COMPRESSED,
++    CHUNK_TYPE_VIDEO_UNCOMPRESSED,
++    CHUNK_TYPE_AUDIO,
++  })
++  private @interface ChunkType {}
++
++  private static final int INITIAL_INDEX_SIZE = 512;
++  private static final int CHUNK_TYPE_VIDEO_COMPRESSED = ('d' << 16) | ('c' << 24);
++  private static final int CHUNK_TYPE_VIDEO_UNCOMPRESSED = ('d' << 16) | ('b' << 24);
++  private static final int CHUNK_TYPE_AUDIO = ('w' << 16) | ('b' << 24);
++
++  private final AviStreamHeaderChunk streamHeaderChunk;
++  private final TrackOutput trackOutput;
++
++  /** The chunk id fourCC (example: `01wb`), as defined in the index and the movi. */
++  private final int chunkId;
++
++  /** Secondary chunk id. Bad muxers sometimes use an uncompressed video id (db) for key frames. */
++  private final int alternativeChunkId;
++
++  private final long durationUs;
++
++  private int chunkCount;
++  private int currentChunkSize;
++  private int bytesRemainingInCurrentChunk;
++
++  /** Number of chunks as calculated by the index. */
++  private int currentChunkIndex;
++
++  private int indexChunkCount;
++  private int indexSize;
++  private long firstIndexChunkOffset;
++  private long[] keyFrameOffsets;
++  private int[] keyFrameIndices;
++
++  public ChunkReader(int id, AviStreamHeaderChunk streamHeaderChunk, TrackOutput trackOutput) {
++    this.streamHeaderChunk = streamHeaderChunk;
++    @C.TrackType int trackType = streamHeaderChunk.getTrackType();
++    checkArgument(trackType == TRACK_TYPE_AUDIO || trackType == TRACK_TYPE_VIDEO);
++    @ChunkType
++    int chunkType = trackType == TRACK_TYPE_VIDEO ? CHUNK_TYPE_VIDEO_COMPRESSED : CHUNK_TYPE_AUDIO;
++    chunkId = getChunkIdFourCc(id, chunkType);
++    durationUs = streamHeaderChunk.getDurationUs();
++    this.trackOutput = trackOutput;
++    alternativeChunkId =
++        trackType == TRACK_TYPE_VIDEO ? getChunkIdFourCc(id, CHUNK_TYPE_VIDEO_UNCOMPRESSED) : -1;
++    firstIndexChunkOffset = C.INDEX_UNSET;
++    keyFrameOffsets = new long[INITIAL_INDEX_SIZE];
++    keyFrameIndices = new int[INITIAL_INDEX_SIZE];
++    chunkCount = streamHeaderChunk.length;
++  }
++
++  public void appendIndexChunk(long offset, boolean isKeyFrame) {
++    if (firstIndexChunkOffset == C.INDEX_UNSET) {
++      firstIndexChunkOffset = offset;
++    }
++    if (isKeyFrame) {
++      if (indexSize == keyFrameIndices.length) {
++        keyFrameOffsets = Arrays.copyOf(keyFrameOffsets, keyFrameOffsets.length * 3 / 2);
++        keyFrameIndices = Arrays.copyOf(keyFrameIndices, keyFrameIndices.length * 3 / 2);
++      }
++      keyFrameOffsets[indexSize] = offset;
++      keyFrameIndices[indexSize] = indexChunkCount;
++      indexSize++;
++    }
++    indexChunkCount++;
++  }
++
++  public void advanceCurrentChunk() {
++    currentChunkIndex++;
++  }
++
++  public long getCurrentChunkTimestampUs() {
++    return getChunkTimestampUs(currentChunkIndex);
++  }
++
++  public long getFrameDurationUs() {
++    return getChunkTimestampUs(/* chunkIndex= */ 1);
++  }
++
++  public void commitIndex() {
++    keyFrameOffsets = Arrays.copyOf(keyFrameOffsets, indexSize);
++    keyFrameIndices = Arrays.copyOf(keyFrameIndices, indexSize);
++    if (isAudio() && streamHeaderChunk.sampleSize != 0 && indexSize > 0) {
++      // In some files the AVI stream header chunk for audio has the number of bytes of audio in
++      // dwLength instead of the number of chunks. Overwrite the chunk size to use the size of the
++      // index, which should match the number of chunks because we only support formats where every
++      // audio sample is a sync sample, and every sync sample should be in the index.
++      chunkCount = indexSize;
++    }
++  }
++
++  public boolean handlesChunkId(int chunkId) {
++    return this.chunkId == chunkId || alternativeChunkId == chunkId;
++  }
++
++  public boolean isCurrentFrameAKeyFrame() {
++    return Arrays.binarySearch(keyFrameIndices, currentChunkIndex) >= 0;
++  }
++
++  public boolean isVideo() {
++    return (chunkId & CHUNK_TYPE_VIDEO_COMPRESSED) == CHUNK_TYPE_VIDEO_COMPRESSED;
++  }
++
++  public boolean isAudio() {
++    return (chunkId & CHUNK_TYPE_AUDIO) == CHUNK_TYPE_AUDIO;
++  }
++
++  /** Prepares for parsing a chunk with the given {@code size}. */
++  public void onChunkStart(int size) {
++    currentChunkSize = size;
++    bytesRemainingInCurrentChunk = size;
++  }
++
++  /**
++   * Provides data associated to the current chunk and returns whether the full chunk has been
++   * parsed.
++   */
++  public boolean onChunkData(ExtractorInput input) throws IOException {
++    bytesRemainingInCurrentChunk -=
++        trackOutput.sampleData(input, bytesRemainingInCurrentChunk, false);
++    boolean done = bytesRemainingInCurrentChunk == 0;
++    if (done) {
++      if (currentChunkSize > 0) {
++        trackOutput.sampleMetadata(
++            getCurrentChunkTimestampUs(),
++            (isCurrentFrameAKeyFrame() ? C.BUFFER_FLAG_KEY_FRAME : 0),
++            currentChunkSize,
++            0,
++            null);
++      }
++      advanceCurrentChunk();
++    }
++    return done;
++  }
++
++  public void seekToPosition(long position) {
++    if (indexSize == 0) {
++      currentChunkIndex = 0;
++    } else {
++      int index =
++          Util.binarySearchFloor(
++              keyFrameOffsets, position, /* inclusive= */ true, /* stayInBounds= */ true);
++      currentChunkIndex = keyFrameIndices[index];
++    }
++  }
++
++  public SeekMap.SeekPoints getSeekPoints(long timeUs) {
++    if (indexSize == 0) {
++      // Return the offset of the first chunk as there are no keyframes in the index.
++      return new SeekMap.SeekPoints(
++          new SeekPoint(/* timeUs= */ 0, /* position= */ firstIndexChunkOffset));
++    }
++    int targetFrameIndex = (int) (timeUs / getFrameDurationUs());
++    int keyFrameIndex =
++        Util.binarySearchFloor(
++            keyFrameIndices, targetFrameIndex, /* inclusive= */ true, /* stayInBounds= */ true);
++    if (keyFrameIndices[keyFrameIndex] == targetFrameIndex) {
++      return new SeekMap.SeekPoints(getSeekPoint(keyFrameIndex));
++    }
++    // The target frame is not a key frame, we look for the two closest ones.
++    SeekPoint precedingKeyFrameSeekPoint = getSeekPoint(keyFrameIndex);
++    if (keyFrameIndex + 1 < keyFrameOffsets.length) {
++      return new SeekMap.SeekPoints(precedingKeyFrameSeekPoint, getSeekPoint(keyFrameIndex + 1));
++    } else {
++      return new SeekMap.SeekPoints(precedingKeyFrameSeekPoint);
++    }
++  }
++
++  private long getChunkTimestampUs(int chunkIndex) {
++    return durationUs * chunkIndex / chunkCount;
++  }
++
++  private SeekPoint getSeekPoint(int keyFrameIndex) {
++    return new SeekPoint(
++        keyFrameIndices[keyFrameIndex] * getFrameDurationUs(), keyFrameOffsets[keyFrameIndex]);
++  }
++
++  private static int getChunkIdFourCc(int streamId, @ChunkType int chunkType) {
++    int tens = streamId / 10;
++    int ones = streamId % 10;
++    return (('0' + ones) << 8) | ('0' + tens) | chunkType;
++  }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/avi/ListChunk.java b/app/src/main/java/com/nuvio/tv/core/player/avi/ListChunk.java
+new file mode 100644
+index 0000000..d7a2ede
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/player/avi/ListChunk.java
+@@ -0,0 +1,98 @@
++/*
++ * Copyright 2022 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.nuvio.tv.core.player.avi;
++
++import androidx.annotation.Nullable;
++import androidx.media3.common.C;
++import androidx.media3.common.util.ParsableByteArray;
++import com.google.common.collect.ImmutableList;
++
++/** Represents an AVI LIST. */
++/* package */ final class ListChunk implements AviChunk {
++
++  public static ListChunk parseFrom(int listType, ParsableByteArray body) {
++    ImmutableList.Builder<AviChunk> builder = new ImmutableList.Builder<>();
++    int listBodyEndPosition = body.limit();
++    @C.TrackType int currentTrackType = C.TRACK_TYPE_NONE;
++    while (body.bytesLeft() > 8) {
++      int type = body.readLittleEndianInt();
++      int size = body.readLittleEndianInt();
++      int innerBoxBodyEndPosition = body.getPosition() + size;
++      body.setLimit(innerBoxBodyEndPosition);
++      @Nullable AviChunk aviChunk;
++      if (type == AviExtractor.FOURCC_LIST) {
++        int innerListType = body.readLittleEndianInt();
++        aviChunk = parseFrom(innerListType, body);
++      } else {
++        aviChunk = createBox(type, currentTrackType, body);
++      }
++      if (aviChunk != null) {
++        if (aviChunk.getType() == AviExtractor.FOURCC_strh) {
++          currentTrackType = ((AviStreamHeaderChunk) aviChunk).getTrackType();
++        }
++        builder.add(aviChunk);
++      }
++      body.setPosition(innerBoxBodyEndPosition);
++      body.setLimit(listBodyEndPosition);
++    }
++    return new ListChunk(listType, builder.build());
++  }
++
++  public final ImmutableList<AviChunk> children;
++  private final int type;
++
++  private ListChunk(int type, ImmutableList<AviChunk> children) {
++    this.type = type;
++    this.children = children;
++  }
++
++  @Override
++  public int getType() {
++    return type;
++  }
++
++  @Nullable
++  @SuppressWarnings("unchecked")
++  public <T extends AviChunk> T getChild(Class<T> c) {
++    for (AviChunk aviChunk : children) {
++      if (aviChunk.getClass() == c) {
++        return (T) aviChunk;
++      }
++    }
++    return null;
++  }
++
++  @Nullable
++  private static AviChunk createBox(
++      int chunkType, @C.TrackType int trackType, ParsableByteArray body) {
++    switch (chunkType) {
++      case AviExtractor.FOURCC_avih:
++        return AviMainHeaderChunk.parseFrom(body);
++      case AviExtractor.FOURCC_strh:
++        return AviStreamHeaderChunk.parseFrom(body);
++      case AviExtractor.FOURCC_strf:
++        return StreamFormatChunk.parseFrom(trackType, body);
++      case AviExtractor.FOURCC_strn:
++        return StreamNameChunk.parseFrom(body);
++      case AviExtractor.FOURCC_indx:
++        return SuperIndexChunk.parseFrom(body);
++      case AviExtractor.FOURCC_dmlh:
++        return OpenDmlHeaderChunk.parseFrom(body);
++      default:
++        return null;
++    }
++  }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/avi/OpenDmlHeaderChunk.java b/app/src/main/java/com/nuvio/tv/core/player/avi/OpenDmlHeaderChunk.java
+new file mode 100644
+index 0000000..5a58e66
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/player/avi/OpenDmlHeaderChunk.java
+@@ -0,0 +1,22 @@
++package com.nuvio.tv.core.player.avi;
++
++import androidx.media3.common.util.ParsableByteArray;
++
++/** The OpenDML extended header ('dmlh'): the frame count of the whole file, not only the first RIFF. */
++/* package */ final class OpenDmlHeaderChunk implements AviChunk {
++
++  public static OpenDmlHeaderChunk parseFrom(ParsableByteArray body) {
++    return new OpenDmlHeaderChunk(body.bytesLeft() >= 4 ? body.readLittleEndianUnsignedInt() : 0);
++  }
++
++  public final long totalFrames;
++
++  private OpenDmlHeaderChunk(long totalFrames) {
++    this.totalFrames = totalFrames;
++  }
++
++  @Override
++  public int getType() {
++    return AviExtractor.FOURCC_dmlh;
++  }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/avi/StreamFormatChunk.java b/app/src/main/java/com/nuvio/tv/core/player/avi/StreamFormatChunk.java
+new file mode 100644
+index 0000000..a89ead8
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/player/avi/StreamFormatChunk.java
+@@ -0,0 +1,149 @@
++/*
++ * Copyright 2022 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.nuvio.tv.core.player.avi;
++
++import androidx.annotation.Nullable;
++import androidx.media3.common.C;
++import androidx.media3.common.Format;
++import androidx.media3.common.MimeTypes;
++import androidx.media3.common.util.Log;
++import androidx.media3.common.util.ParsableByteArray;
++import androidx.media3.common.util.Util;
++import com.google.common.collect.ImmutableList;
++
++/** Holds the {@link Format} information contained in an STRF chunk. */
++/* package */ final class StreamFormatChunk implements AviChunk {
++  private static final String TAG = "StreamFormatChunk";
++
++  @Nullable
++  public static AviChunk parseFrom(int trackType, ParsableByteArray body) {
++    if (trackType == C.TRACK_TYPE_VIDEO) {
++      return parseBitmapInfoHeader(body);
++    } else if (trackType == C.TRACK_TYPE_AUDIO) {
++      return parseWaveFormatEx(body);
++    } else {
++      Log.w(
++          TAG,
++          "Ignoring strf box for unsupported track type: " + Util.getTrackTypeString(trackType));
++      return null;
++    }
++  }
++
++  public final Format format;
++
++  public StreamFormatChunk(Format format) {
++    this.format = format;
++  }
++
++  @Override
++  public int getType() {
++    return AviExtractor.FOURCC_strf;
++  }
++
++  @Nullable
++  private static AviChunk parseBitmapInfoHeader(ParsableByteArray body) {
++    body.skipBytes(4); // biSize.
++    int width = body.readLittleEndianInt();
++    int height = body.readLittleEndianInt();
++    body.skipBytes(4); // biPlanes (2 bytes), biBitCount (2 bytes).
++    int compression = body.readLittleEndianInt();
++    String mimeType = getMimeTypeFromCompression(compression);
++    if (mimeType == null) {
++      Log.w(TAG, "Ignoring track with unsupported compression " + compression);
++      return null;
++    }
++    Format.Builder formatBuilder = new Format.Builder();
++    formatBuilder.setWidth(width).setHeight(height).setSampleMimeType(mimeType);
++    return new StreamFormatChunk(formatBuilder.build());
++  }
++
++  // Syntax defined by the WAVEFORMATEX structure. See
++  // https://docs.microsoft.com/en-us/previous-versions/dd757713(v=vs.85).
++  @Nullable
++  private static AviChunk parseWaveFormatEx(ParsableByteArray body) {
++    int formatTag = body.readLittleEndianUnsignedShort();
++    @Nullable String mimeType = getMimeTypeFromTag(formatTag);
++    if (mimeType == null) {
++      Log.w(TAG, "Ignoring track with unsupported format tag " + formatTag);
++      return null;
++    }
++    int channelCount = body.readLittleEndianUnsignedShort();
++    int samplesPerSecond = body.readLittleEndianInt();
++    body.skipBytes(6); // averageBytesPerSecond (4 bytes), nBlockAlign (2 bytes).
++    int bitsPerSample = body.readLittleEndianUnsignedShort();
++    int pcmEncoding = Util.getPcmEncoding(bitsPerSample);
++    int cbSize = body.bytesLeft() > 0 ? body.readLittleEndianUnsignedShort() : 0;
++    Format.Builder formatBuilder = new Format.Builder();
++    formatBuilder
++        .setSampleMimeType(mimeType)
++        .setChannelCount(channelCount)
++        .setSampleRate(samplesPerSecond);
++    if (mimeType.equals(MimeTypes.AUDIO_RAW) && pcmEncoding != C.ENCODING_INVALID) {
++      formatBuilder.setPcmEncoding(pcmEncoding);
++    }
++    if (mimeType.equals(MimeTypes.AUDIO_AAC) && cbSize > 0) {
++      byte[] codecData = new byte[cbSize];
++      body.readBytes(codecData, /* offset= */ 0, codecData.length);
++      formatBuilder.setInitializationData(ImmutableList.of(codecData));
++    }
++    return new StreamFormatChunk(formatBuilder.build());
++  }
++
++  @Nullable
++  private static String getMimeTypeFromTag(int tag) {
++    switch (tag) {
++      case 0x1: // WAVE_FORMAT_PCM
++        return MimeTypes.AUDIO_RAW;
++      case 0x55: // WAVE_FORMAT_MPEGLAYER3
++        return MimeTypes.AUDIO_MPEG;
++      case 0xff: // WAVE_FORMAT_AAC
++        return MimeTypes.AUDIO_AAC;
++      case 0x2000: // WAVE_FORMAT_DVM - AC3
++        return MimeTypes.AUDIO_AC3;
++      case 0x2001: // WAVE_FORMAT_DTS2
++        return MimeTypes.AUDIO_DTS;
++      default:
++        return null;
++    }
++  }
++
++  @Nullable
++  private static String getMimeTypeFromCompression(int compression) {
++    switch (compression) {
++      case 0x3234504d: // MP42
++        return MimeTypes.VIDEO_MP42;
++      case 0x3334504d: // MP43
++        return MimeTypes.VIDEO_MP43;
++      case 0x34363248: // H264
++      case 0x31637661: // avc1
++      case 0x31435641: // AVC1
++        return MimeTypes.VIDEO_H264;
++      case 0x44495633: // 3VID
++      case 0x78766964: // divx
++      case 0x58564944: // DIVX
++      case 0x30355844: // DX50
++      case 0x34504d46: // FMP4
++      case 0x64697678: // xvid
++      case 0x44495658: // XVID
++        return MimeTypes.VIDEO_MP4V;
++      case 0x47504a4d: // MJPG
++      case 0x67706a6d: // mjpg
++        return MimeTypes.VIDEO_MJPEG;
++      default:
++        return null;
++    }
++  }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/avi/StreamNameChunk.java b/app/src/main/java/com/nuvio/tv/core/player/avi/StreamNameChunk.java
+new file mode 100644
+index 0000000..1df541a
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/player/avi/StreamNameChunk.java
+@@ -0,0 +1,37 @@
++/*
++ * Copyright 2022 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.nuvio.tv.core.player.avi;
++
++import androidx.media3.common.util.ParsableByteArray;
++
++/** Parses and contains the name from the STRN chunk. */
++/* package */ final class StreamNameChunk implements AviChunk {
++
++  public static StreamNameChunk parseFrom(ParsableByteArray body) {
++    return new StreamNameChunk(body.readString(body.bytesLeft()));
++  }
++
++  public final String name;
++
++  private StreamNameChunk(String name) {
++    this.name = name;
++  }
++
++  @Override
++  public int getType() {
++    return AviExtractor.FOURCC_strn;
++  }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/avi/SuperIndexChunk.java b/app/src/main/java/com/nuvio/tv/core/player/avi/SuperIndexChunk.java
+new file mode 100644
+index 0000000..96cb1f3
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/player/avi/SuperIndexChunk.java
+@@ -0,0 +1,61 @@
++package com.nuvio.tv.core.player.avi;
++
++import androidx.annotation.Nullable;
++import androidx.media3.common.util.ParsableByteArray;
++import java.util.Arrays;
++
++/** An OpenDML super index ('indx' in a stream list): where the stream's standard index chunks are. */
++/* package */ final class SuperIndexChunk implements AviChunk {
++
++  private static final int AVI_INDEX_OF_INDEXES = 0;
++  private static final int ENTRY_LONGS = 4;
++  private static final int HEADER_BYTES = 24;
++
++  @Nullable
++  public static SuperIndexChunk parseFrom(ParsableByteArray body) {
++    if (body.bytesLeft() < HEADER_BYTES) {
++      return null;
++    }
++    int longsPerEntry = body.readLittleEndianUnsignedShort();
++    body.skipBytes(1); // bIndexSubType.
++    int indexType = body.readUnsignedByte();
++    long entriesInUse = body.readLittleEndianUnsignedInt();
++    body.skipBytes(16); // dwChunkId, dwReserved[3].
++    if (indexType != AVI_INDEX_OF_INDEXES || longsPerEntry != ENTRY_LONGS) {
++      return null;
++    }
++    int count = (int) Math.min(entriesInUse, body.bytesLeft() / (ENTRY_LONGS * 4));
++    long[] offsets = new long[count];
++    int[] sizes = new int[count];
++    int used = 0;
++    for (int i = 0; i < count; i++) {
++      long offset = body.readLittleEndianLong();
++      long size = body.readLittleEndianUnsignedInt();
++      body.skipBytes(4); // dwDuration.
++      if (offset > 0) {
++        offsets[used] = offset;
++        sizes[used] = (int) Math.min(size, Integer.MAX_VALUE);
++        used++;
++      }
++    }
++    if (used == 0) {
++      return null;
++    }
++    return new SuperIndexChunk(Arrays.copyOf(offsets, used), Arrays.copyOf(sizes, used));
++  }
++
++  /** File positions of the standard index chunks ('ix##'), at their chunk header. */
++  public final long[] indexOffsets;
++
++  public final int[] indexSizes;
++
++  private SuperIndexChunk(long[] indexOffsets, int[] indexSizes) {
++    this.indexOffsets = indexOffsets;
++    this.indexSizes = indexSizes;
++  }
++
++  @Override
++  public int getType() {
++    return AviExtractor.FOURCC_indx;
++  }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/avi/package-info.java b/app/src/main/java/com/nuvio/tv/core/player/avi/package-info.java
+new file mode 100644
+index 0000000..f1a6b3e
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/player/avi/package-info.java
+@@ -0,0 +1,25 @@
++/*
++ * Copyright 2022 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/**
++ * App-level copy of AndroidX Media3's AVI extractor (1.8.0), relocated out of {@code
++ * androidx.media3.extractor.avi} so it can be compiled into the app alongside the prebuilt Media3
++ * AARs and extended for OpenDML (AVI 2.0) files.
++ */
++@NonNullApi
++package com.nuvio.tv.core.player.avi;
++
++import androidx.media3.common.util.NonNullApi;
