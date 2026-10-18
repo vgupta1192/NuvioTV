@@ -1960,7 +1960,7 @@ index 288e5a135..8e7ed81ce 100644
                      val showNextEpisodeButton = uiState.nextEpisode?.hasAired == true &&
                          (uiState.postPlayMode as? PostPlayMode.AutoPlay)?.let {
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt
-index 911ad1369..42b0bed49 100644
+index 911ad1369..2be3733b8 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt
 @@ -208,6 +208,32 @@ object SyncedSubtitles {
@@ -1996,13 +1996,25 @@ index 911ad1369..42b0bed49 100644
          }
      }
  
-@@ -268,7 +294,20 @@ object SyncedSubtitles {
+@@ -268,7 +294,32 @@ object SyncedSubtitles {
      /** The saved synced subtitle for [url] in this playback, if any. */
      fun savedFor(url: String): Saved? {
          val (playback, saved) = _saved.value ?: return null
 -        return saved[url]?.takeIf { playback == _playback.value }
 +        if (playback != _playback.value) return null
 +        return saved[url] ?: saved.values.firstOrNull { sameSubtitleFile(it.subtitleUrl, url) }
++    }
++
++    /**
++     * Nuvio fork: the add-on's subtitle URLs rotate between sessions (fresh redirect tokens in
++     * the path), so a saved timing is matched to the current list by the stable file name at
++     * the end of the URL when the exact URL is no longer present.
++     */
++    fun sameSubtitleFile(savedUrl: String, listUrl: String): Boolean {
++        if (savedUrl == listUrl) return true
++        val a = savedUrl.substringBefore('?').substringAfterLast('/')
++        val b = listUrl.substringBefore('?').substringAfterLast('/')
++        return a.isNotEmpty() && a == b
 +    }
 +
 +    /**
@@ -2033,10 +2045,18 @@ index 5eabc80fc..8ea64f1ae 100644
      scope.launch {
          var waitedMs = 0L
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncSyncedLabel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncSyncedLabel.kt
-index 92786e5bb..60ba7b5ee 100644
+index 92786e5bb..217f742cc 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncSyncedLabel.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncSyncedLabel.kt
-@@ -41,11 +41,17 @@ internal object AutoSyncSyncedSubtitle {
+@@ -13,6 +13,7 @@ import androidx.compose.runtime.collectAsState
+ import androidx.compose.runtime.getValue
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.res.stringResource
+ import androidx.compose.ui.unit.dp
+ import androidx.tv.material3.Icon
+@@ -41,16 +42,33 @@ internal object AutoSyncSyncedSubtitle {
      }
  }
  
@@ -2054,5 +2074,39 @@ index 92786e5bb..60ba7b5ee 100644
 +    } == true
 +    if (!liveSynced && !hasSavedTiming) return
  
-     val contentColor = NuvioTheme.colors.OnSecondary.copy(alpha = 0.9f)
+-    val contentColor = NuvioTheme.colors.OnSecondary.copy(alpha = 0.9f)
++    // Match the source chip's colours per state - the OnSecondary palette is only readable on
++    // the selected (highlighted) card; unselected cards sit on the dark overlay surface.
++    val chipContent = if (selected) {
++        NuvioTheme.colors.OnSecondary.copy(alpha = 0.9f)
++    } else {
++        Color.White.copy(alpha = 0.85f)
++    }
++    val chipBackground = if (selected) {
++        NuvioTheme.colors.OnSecondary.copy(alpha = 0.14f)
++    } else {
++        Color.White.copy(alpha = 0.08f)
++    }
      Row(
+         modifier = Modifier
+-            .background(NuvioTheme.colors.OnSecondary.copy(alpha = 0.14f), RoundedCornerShape(999.dp))
++            .background(chipBackground, RoundedCornerShape(999.dp))
+             .padding(horizontal = NuvioTheme.spacing.sm, vertical = 3.dp),
+         horizontalArrangement = Arrangement.spacedBy(4.dp),
+         verticalAlignment = Alignment.CenterVertically,
+@@ -58,13 +76,13 @@ internal fun AutoSyncedChip(subtitleUrl: String, selected: Boolean) {
+         Icon(
+             imageVector = Icons.Default.Sync,
+             contentDescription = null,
+-            tint = contentColor,
++            tint = chipContent,
+             modifier = Modifier.size(12.dp),
+         )
+         Text(
+             text = stringResource(R.string.autosync_label_synced),
+             style = MaterialTheme.typography.labelSmall,
+-            color = contentColor,
++            color = chipContent,
+         )
+     }
+ }
