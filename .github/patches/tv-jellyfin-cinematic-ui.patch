@@ -1960,10 +1960,43 @@ index 288e5a135..8e7ed81ce 100644
                      val showNextEpisodeButton = uiState.nextEpisode?.hasAired == true &&
                          (uiState.postPlayMode as? PostPlayMode.AutoPlay)?.let {
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt
-index 911ad1369..fe84488b0 100644
+index 911ad1369..42b0bed49 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt
-@@ -268,7 +268,20 @@ object SyncedSubtitles {
+@@ -208,6 +208,32 @@ object SyncedSubtitles {
+                 }.getOrNull().orEmpty()
+                 if (remote.isNotEmpty() && _playback.value == next) merge(next, remote, store = true)
+             }
++            // Nuvio fork: nothing under THIS device's stream keys - other devices (or earlier
++            // sessions with rotated stream URLs) saved under different keys for the same title.
++            // Pull every key known for the video and merge without persisting locally.
++            if (_playback.value == next && _saved.value?.second.isNullOrEmpty()) {
++                val allKeys = runCatching {
++                    val result = GeneratedSubtitleSync.postgrest()!!.rpc(
++                        "synced_subtitles_list",
++                        buildJsonObject { put("p_video_id", next.videoId) },
++                    )
++                    json.decodeFromString<List<String>>(result.data)
++                }.getOrNull().orEmpty()
++                for (key in allKeys) {
++                    if (_playback.value != next) break
++                    val remote = runCatching {
++                        val result = GeneratedSubtitleSync.postgrest()!!.rpc(
++                            "synced_subtitles_pull_all",
++                            buildJsonObject {
++                                put("p_video_id", next.videoId)
++                                put("p_stream_key", key)
++                            },
++                        )
++                        decodeList(result.data)
++                    }.getOrNull().orEmpty()
++                    if (remote.isNotEmpty() && _playback.value == next) merge(next, remote, store = false)
++                }
++            }
+         }
+     }
+ 
+@@ -268,7 +294,20 @@ object SyncedSubtitles {
      /** The saved synced subtitle for [url] in this playback, if any. */
      fun savedFor(url: String): Saved? {
          val (playback, saved) = _saved.value ?: return null
