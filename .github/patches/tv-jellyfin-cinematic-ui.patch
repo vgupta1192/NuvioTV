@@ -694,10 +694,10 @@ index afb19866a..477257327 100644
      data object Tracking : Screen("trakt")
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
 new file mode 100644
-index 000000000..402f40c76
+index 000000000..c76fc95b0
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
-@@ -0,0 +1,569 @@
+@@ -0,0 +1,570 @@
 +@file:OptIn(ExperimentalTvMaterial3Api::class)
 +
 +package com.nuvio.tv.ui.screens.jellyfin
@@ -948,7 +948,8 @@ index 000000000..402f40c76
 +            modifier = Modifier
 +                .align(Alignment.TopStart)
 +                .padding(24.dp)
-+                .focusRequester(backFocus),
++                .focusRequester(backFocus)
++                .focusProperties { down = playFocusRequester },
 +        ) {
 +            Row(verticalAlignment = Alignment.CenterVertically) {
 +                Icon(
@@ -1933,6 +1934,31 @@ index 97184f353..8bf354314 100644
 -    val minutes = (totalSeconds % 3600) / 60
 -    return if (hours > 0) "${hours}h ${minutes.toString().padStart(2, '0')}m" else "${minutes}m"
 -}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+index 288e5a135..8e7ed81ce 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+@@ -65,6 +65,7 @@ import androidx.compose.material.icons.filled.AspectRatio
+ import androidx.compose.material.icons.filled.BugReport
+ import androidx.compose.material.icons.filled.Check
+ import androidx.compose.material.icons.filled.ClosedCaption
++import com.nuvio.tv.ui.screens.player.GeneratedSubtitles
+ import androidx.compose.material.icons.filled.Info
+ import androidx.compose.material.icons.filled.Pause
+ import androidx.compose.material.icons.filled.PlayArrow
+@@ -2637,7 +2638,11 @@ private fun PlayerControlsOverlay(
+                     verticalAlignment = Alignment.CenterVertically
+                 ) {
+                     val hasEpisodeContext = uiState.currentSeason != null && uiState.currentEpisode != null
+-                    val hasSubtitleControl = uiState.subtitleTracks.isNotEmpty() || uiState.addonSubtitles.isNotEmpty()
++                    // Nuvio fork: the generated-subtitle entries (online + on-device) must keep
++                    // the CC button reachable even when this stream has no subtitle tracks and
++                    // no add-on subtitles were found.
++                    val generatedSubsAvailable = GeneratedSubtitles.groqKey.value.isNotBlank() || GeneratedSubtitles.onDevice.value
++                    val hasSubtitleControl = uiState.subtitleTracks.isNotEmpty() || uiState.addonSubtitles.isNotEmpty() || (GeneratedSubtitles.supported && generatedSubsAvailable)
+                     val hasAudioControl = uiState.audioTracks.isNotEmpty()
+                     val showNextEpisodeButton = uiState.nextEpisode?.hasAired == true &&
+                         (uiState.postPlayMode as? PostPlayMode.AutoPlay)?.let {
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitlesPlayerHooks.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitlesPlayerHooks.kt
 index 5eabc80fc..8ea64f1ae 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitlesPlayerHooks.kt
@@ -1947,3 +1973,25 @@ index 5eabc80fc..8ea64f1ae 100644
      val url = subtitle.url
      scope.launch {
          var waitedMs = 0L
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncSyncedLabel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncSyncedLabel.kt
+index 92786e5bb..b5c0e71ec 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncSyncedLabel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncSyncedLabel.kt
+@@ -41,11 +41,15 @@ internal object AutoSyncSyncedSubtitle {
+     }
+ }
+ 
+-/** "Auto synced" chip for the selected add-on subtitle in the subtitle list; empty otherwise. */
++/** "Auto synced" chip: live for the subtitle AutoSync just corrected, and shown for every
++ *  add-on subtitle that already has a saved synced timing for this title + stream. */
+ @Composable
+ internal fun AutoSyncedChip(subtitleUrl: String, selected: Boolean) {
+     val syncedUrl by AutoSyncSyncedSubtitle.url.collectAsState()
+-    if (!selected || syncedUrl != subtitleUrl) return
++    val saved by com.nuvio.tv.ui.screens.player.SyncedSubtitles.saved.collectAsState()
++    val liveSynced = selected && syncedUrl == subtitleUrl
++    val hasSavedTiming = saved?.second?.containsKey(subtitleUrl) == true
++    if (!liveSynced && !hasSavedTiming) return
+ 
+     val contentColor = NuvioTheme.colors.OnSecondary.copy(alpha = 0.9f)
+     Row(
