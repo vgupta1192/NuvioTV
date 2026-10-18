@@ -1959,6 +1959,32 @@ index 288e5a135..8e7ed81ce 100644
                      val hasAudioControl = uiState.audioTracks.isNotEmpty()
                      val showNextEpisodeButton = uiState.nextEpisode?.hasAired == true &&
                          (uiState.postPlayMode as? PostPlayMode.AutoPlay)?.let {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt
+index 911ad1369..fe84488b0 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt
+@@ -268,7 +268,20 @@ object SyncedSubtitles {
+     /** The saved synced subtitle for [url] in this playback, if any. */
+     fun savedFor(url: String): Saved? {
+         val (playback, saved) = _saved.value ?: return null
+-        return saved[url]?.takeIf { playback == _playback.value }
++        if (playback != _playback.value) return null
++        return saved[url] ?: saved.values.firstOrNull { sameSubtitleFile(it.subtitleUrl, url) }
++    }
++
++    /**
++     * Nuvio fork: the add-on's subtitle URLs rotate between sessions (fresh redirect tokens in
++     * the path), so a saved timing is matched to the current list by the stable file name at
++     * the end of the URL when the exact URL is no longer present.
++     */
++    fun sameSubtitleFile(savedUrl: String, listUrl: String): Boolean {
++        if (savedUrl == listUrl) return true
++        val a = savedUrl.substringBefore('?').substringAfterLast('/')
++        val b = listUrl.substringBefore('?').substringAfterLast('/')
++        return a.isNotEmpty() && a == b
+     }
+ 
+     /** AutoSync or the audio sync synced [url] to [srt] in this playback: keep it for next time. */
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitlesPlayerHooks.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitlesPlayerHooks.kt
 index 5eabc80fc..8ea64f1ae 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitlesPlayerHooks.kt
@@ -1974,10 +2000,10 @@ index 5eabc80fc..8ea64f1ae 100644
      scope.launch {
          var waitedMs = 0L
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncSyncedLabel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncSyncedLabel.kt
-index 92786e5bb..b5c0e71ec 100644
+index 92786e5bb..60ba7b5ee 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncSyncedLabel.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncSyncedLabel.kt
-@@ -41,11 +41,15 @@ internal object AutoSyncSyncedSubtitle {
+@@ -41,11 +41,17 @@ internal object AutoSyncSyncedSubtitle {
      }
  }
  
@@ -1990,7 +2016,9 @@ index 92786e5bb..b5c0e71ec 100644
 -    if (!selected || syncedUrl != subtitleUrl) return
 +    val saved by com.nuvio.tv.ui.screens.player.SyncedSubtitles.saved.collectAsState()
 +    val liveSynced = selected && syncedUrl == subtitleUrl
-+    val hasSavedTiming = saved?.second?.containsKey(subtitleUrl) == true
++    val hasSavedTiming = saved?.second?.values?.any {
++        com.nuvio.tv.ui.screens.player.SyncedSubtitles.sameSubtitleFile(it.subtitleUrl, subtitleUrl)
++    } == true
 +    if (!liveSynced && !hasSavedTiming) return
  
      val contentColor = NuvioTheme.colors.OnSecondary.copy(alpha = 0.9f)
