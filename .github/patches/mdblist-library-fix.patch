@@ -1,0 +1,527 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/tracking/TrackingLibraryProvider.kt b/app/src/main/java/com/nuvio/tv/core/tracking/TrackingLibraryProvider.kt
+index 5a4799a2a..17050cd8e 100644
+--- a/app/src/main/java/com/nuvio/tv/core/tracking/TrackingLibraryProvider.kt
++++ b/app/src/main/java/com/nuvio/tv/core/tracking/TrackingLibraryProvider.kt
+@@ -22,6 +22,8 @@ interface TrackingLibraryProvider {
+     fun observeMembership(itemId: String, itemType: String): Flow<Set<String>>
+     fun toggledDefaultMembership(currentMembership: Map<String, Boolean>): Map<String, Boolean>
+     suspend fun getMembershipSnapshot(item: LibraryEntryInput): ListMembershipSnapshot
++    /** Membership for the one-press library toggle; may use the cached library without refreshing it first. */
++    suspend fun getDefaultMembershipSnapshot(item: LibraryEntryInput): ListMembershipSnapshot = getMembershipSnapshot(item)
+     suspend fun membershipRemovalConfirmation(
+         item: LibraryEntryInput,
+         changes: ListMembershipChanges
+diff --git a/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListLibraryRemote.kt b/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListLibraryRemote.kt
+index b7a971c58..3720ba7ae 100644
+--- a/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListLibraryRemote.kt
++++ b/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListLibraryRemote.kt
+@@ -22,7 +22,10 @@ internal class MdbListLibraryRemote(private val api: MdbListApiClient, private v
+         val previousUpdatedAt = previous?.lists.orEmpty().associate { it.key to it.updatedAt } +
+             previous?.dynamicLists.orEmpty().associate { it.key to it.updatedAt }
+         val addedOrders = previous?.addedOrders.orEmpty().toMutableMap().apply { remove(MDBLIST_WATCHLIST_KEY) }
+-        val hidden = previous?.hiddenListKeys.orEmpty()
++        val known = previous?.tabs().orEmpty().mapTo(mutableSetOf()) { it.key }
++        val hidden = previous?.hiddenListKeys.orEmpty().toMutableSet()
++        // Dynamic and liked lists can hold thousands of titles each, so new ones start hidden until turned on in settings.
++        dynamicLists.filterNot { it.key in known }.mapTo(hidden) { it.key }
+         for ((key, updatedAt) in lists.map { it.key to it.updatedAt } + dynamicLists.map { it.key to it.updatedAt }) {
+             // Hidden lists are not shown anywhere, so skip downloading their items.
+             if (key in hidden) {
+@@ -31,10 +34,10 @@ internal class MdbListLibraryRemote(private val api: MdbListApiClient, private v
+             }
+             items[key] = cachedOrFetched(previous, key, updatedAt, previousUpdatedAt[key], reuseItems, addedOrders)
+         }
+-        val externalLists = synchronizeOptional("External", previous, previous?.externalLists.orEmpty(), hidden, reuseItems,
+-            items, addedOrders) { decodeMdbListExternalLists(api.get("/external/lists/user", scope = scope).body) }
+-        val likedLists = synchronizeOptional("Liked", previous, previous?.likedLists.orEmpty(), hidden, reuseItems,
+-            items, addedOrders) { likedLists(accountId) }
++        val externalLists = synchronizeOptional("External", previous, previous?.externalLists.orEmpty(), hidden, null,
++            reuseItems, items, addedOrders) { decodeMdbListExternalLists(api.get("/external/lists/user", scope = scope).body) }
++        val likedLists = synchronizeOptional("Liked", previous, previous?.likedLists.orEmpty(), hidden, known,
++            reuseItems, items, addedOrders) { likedLists(accountId) }
+         val snapshot = MdbListLibrarySnapshot(lists, items, now, addedOrders = addedOrders.filterKeys { it in items },
+             itemsOrder = MDBLIST_ITEMS_ORDER, externalLists = externalLists, dynamicLists = dynamicLists,
+             likedLists = likedLists)
+@@ -48,7 +51,9 @@ internal class MdbListLibraryRemote(private val api: MdbListApiClient, private v
+         label: String,
+         previous: MdbListLibrarySnapshot?,
+         previousLists: List<T>,
+-        hidden: Set<String>,
++        hidden: MutableSet<String>,
++        // Lists missing from these keys start hidden; null keeps new lists shown.
++        knownKeys: Set<String>?,
+         reuseItems: Boolean,
+         items: MutableMap<String, List<MdbListLibraryItem>>,
+         addedOrders: MutableMap<String, Map<String, List<MdbListLibraryOrderItem>>>,
+@@ -59,6 +64,7 @@ internal class MdbListLibraryRemote(private val api: MdbListApiClient, private v
+             val lists = fetchLists()
+             val previousUpdatedAt = previousLists.associate { it.key to it.updatedAt }
+             for (list in lists) {
++                if (knownKeys != null && list.key !in knownKeys) hidden += list.key
+                 if (list.key in hidden) {
+                     addedOrders.remove(list.key)
+                     continue
+@@ -119,18 +125,22 @@ internal class MdbListLibraryRemote(private val api: MdbListApiClient, private v
+             else mapOf("sort" to sort, "order" to order)
+         var query = initial
+         val visited = mutableSetOf<Map<String, String>>()
+-        val items = mutableListOf<MdbListLibraryItem>()
++        val items = linkedMapOf<String, MdbListLibraryItem>()
++        val readOnly = isMdbListReadOnlyListKey(key)
+         repeat(1_000) {
+             if (!visited.add(query)) throw MdbListDecodingException()
+             val response = api.get(path, query, scope)
+             val page = decodeMdbListLibraryPage(response.body)
+-            items += page.items
++            val before = items.size
++            page.items.forEach { item -> if (item.key !in items) items[item.key] = item }
++            // A read-only list page that repeats earlier titles means the server is looping, so stop there.
++            if (readOnly && items.size == before) return items.values.toList()
+             val nextCursor = page.nextCursor ?: response.header("X-Next-Cursor")?.takeIf { it.isNotBlank() }
+             query = when {
+                 nextCursor != null -> initial + ("cursor" to nextCursor)
+                 page.nextOffset != null -> initial + ("offset" to page.nextOffset.toString())
+                 response.header("X-Has-More").equals("true", ignoreCase = true) -> throw MdbListDecodingException()
+-                else -> return items.distinctBy { it.key }
++                else -> return items.values.toList()
+             }
+         }
+         throw MdbListDecodingException()
+diff --git a/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListLibraryService.kt b/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListLibraryService.kt
+index 9a0f2bc1e..bae105b09 100644
+--- a/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListLibraryService.kt
++++ b/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListLibraryService.kt
+@@ -1,5 +1,6 @@
+ package com.nuvio.tv.data.mdblist
+ 
++import android.util.Log
+ import com.nuvio.tv.core.tracking.TrackingListManager
+ import com.nuvio.tv.core.tracking.TrackingLibrarySorter
+ import com.nuvio.tv.core.tracking.TrackingRefreshGate
+@@ -37,7 +38,10 @@ class MdbListLibraryService(
+         }
+     }.distinctUntilChanged()
+     private val snapshots = allSnapshots.onEach { refreshAsync() }
+-    private val projection = snapshots.map { MdbListLibraryProjection(it?.visible() ?: MdbListLibrarySnapshot()) }
++    private val projection = combine(snapshots, writer.pendingWrites) { library, _ ->
++        val writes = writer.pendingWrites(runCatching { sync.currentScope() }.getOrNull())
++        MdbListLibraryProjection((library ?: MdbListLibrarySnapshot()).withWrites(writes).visible())
++    }
+ 
+     /** Every list that can be hidden, with whether it is shown in the library, for MDBList settings. */
+     val listOptions = allSnapshots.map { it?.listOptions().orEmpty() }.distinctUntilChanged()
+@@ -54,19 +58,40 @@ class MdbListLibraryService(
+         val scope = sync.currentScope()
+         refresh(TrackingRefreshIntent.AUTOMATIC)
+         if (sync.currentScope() != scope) throw CancellationException("MDBList account changed")
+-        val library = sync.currentSnapshot()?.library ?: throw loadState.value.error ?: MdbListDecodingException()
+-        val target = runCatching { input.mdbListLibraryItem() }.getOrNull()
+-        return ListMembershipSnapshot(library.visibleTabs().associate { tab ->
+-            tab.key to library.itemsByList[tab.key].orEmpty().any { item ->
+-                target?.matches(item) == true || item.type == mdbListLibraryType(input.itemType) && input.itemId in item.media.ids.aliases()
+-            }
+-        })
++        val library = writer.currentLibrary() ?: throw loadState.value.error ?: MdbListDecodingException()
++        return library.membership(input)
+     }
+ 
++    /**
++     * Membership for the Add to library button: the cached library as it is shown, so the press acts
++     * at once. Without a cached library only the watchlist is read.
++     */
++    suspend fun getDefaultMembershipSnapshot(input: LibraryEntryInput): ListMembershipSnapshot {
++        writer.currentLibrary()?.let { return it.membership(input) }
++        val scope = sync.currentScope()
++        val watchlist = MdbListLibraryRemote(api, scope).items(MDBLIST_WATCHLIST_KEY)
++        if (sync.currentScope() != scope) throw CancellationException("MDBList account changed")
++        return MdbListLibrarySnapshot(itemsByList = mapOf(MDBLIST_WATCHLIST_KEY to watchlist))
++            .withWrites(writer.pendingWrites(scope))
++            .membership(input)
++    }
++
++    /** Writes first; the cached library is updated and refreshed in the background afterwards. */
+     suspend fun applyMembershipChanges(input: LibraryEntryInput, changes: ListMembershipChanges) {
+         val scope = sync.currentScope()
+-        refresh(TrackingRefreshIntent.AUTOMATIC)
+-        writer.applyMembershipChanges(scope, input, changes)
++        writer.applyMembershipChanges(scope, input, changes, coroutineScope) {
++            refresh(TrackingRefreshIntent.AUTOMATIC)
++            writer.commitPending(scope)
++        }
++    }
++
++    private fun MdbListLibrarySnapshot.membership(input: LibraryEntryInput): ListMembershipSnapshot {
++        val target = runCatching { input.mdbListLibraryItem() }.getOrNull()
++        return ListMembershipSnapshot(visibleTabs().associate { tab ->
++            tab.key to itemsByList[tab.key].orEmpty().any { item ->
++                target?.matches(item) == true || item.type == mdbListLibraryType(input.itemType) && input.itemId in item.media.ids.aliases()
++            }
++        })
+     }
+ 
+     suspend fun setListVisible(key: String, visible: Boolean) {
+@@ -114,6 +139,10 @@ class MdbListLibraryService(
+                 loadState.value = LibraryLoadState(scope)
+                 throw error
+             } catch (error: Exception) {
++                val cached = sync.currentSnapshot()?.library
++                Log.w(TAG, "Library refresh failed (cached lists ${cached?.lists?.size ?: 0}, dynamic " +
++                    "${cached?.dynamicLists?.size ?: 0}, liked ${cached?.likedLists?.size ?: 0}, external " +
++                    "${cached?.externalLists?.size ?: 0}, hidden ${cached?.hiddenListKeys?.size ?: 0})", error)
+                 loadState.value = LibraryLoadState(scope, error = error, attemptedAt = now())
+             }
+         }
+@@ -135,6 +164,10 @@ class MdbListLibraryService(
+         return library.invalidated || library.checkedAtEpochMs?.let { time - it !in 0 until MdbListSyncRepository.AUTOMATIC_INTERVAL_MS } != false
+     }
+ 
++    private companion object {
++        const val TAG = "MdbListLibrary"
++    }
++
+     private data class LibraryLoadState(
+         val scope: MdbListAuthScope? = null,
+         val refreshing: Boolean = false,
+diff --git a/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListLibraryWriter.kt b/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListLibraryWriter.kt
+index 24638cc0c..954f85df9 100644
+--- a/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListLibraryWriter.kt
++++ b/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListLibraryWriter.kt
+@@ -6,7 +6,16 @@ import com.nuvio.tv.core.tracking.supportsMembershipFor
+ import com.nuvio.tv.domain.model.LibraryEntryInput
+ import com.nuvio.tv.domain.model.LibraryListPrivacy
+ import com.nuvio.tv.domain.model.ListMembershipChanges
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.NonCancellable
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.flow.update
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
+ import kotlinx.coroutines.withContext
+ import kotlinx.serialization.json.buildJsonObject
+ import kotlinx.serialization.json.put
+@@ -62,32 +71,113 @@ internal class MdbListLibraryWriter(
+         }
+     }
+ 
+-    suspend fun applyMembershipChanges(scope: MdbListAuthScope, input: LibraryEntryInput, changes: ListMembershipChanges) {
++    private val membershipMutex = Mutex()
++    private val pending = MutableStateFlow<List<MdbListMembershipWrite>>(emptyList())
++
++    /** Membership changes MDBList accepted that are not in the cached library yet. */
++    val pendingWrites: StateFlow<List<MdbListMembershipWrite>> = pending.asStateFlow()
++
++    fun pendingWrites(scope: MdbListAuthScope?): List<MdbListMembershipWrite> = pending.value.filter { it.scope == scope }
++
++    suspend fun currentLibrary(): MdbListLibrarySnapshot? {
++        if (sync.currentSnapshot() == null) sync.ensureLoaded()
++        val scope = runCatching { sync.currentScope() }.getOrNull() ?: return null
++        return sync.currentSnapshot()?.library?.withWrites(pendingWrites(scope))
++    }
++
++    /**
++     * Sends the changes against the cached library without taking the sync lock, so a running library
++     * or history sync does not hold the write back. With [commitScope] the cache is updated there
++     * afterwards and [afterCommit] runs; until then [pendingWrites] carries the changes.
++     */
++    suspend fun applyMembershipChanges(
++        scope: MdbListAuthScope,
++        input: LibraryEntryInput,
++        changes: ListMembershipChanges,
++        commitScope: CoroutineScope? = null,
++        afterCommit: suspend () -> Unit = {}
++    ) {
+         val suppliedTarget = runCatching { input.mdbListLibraryItem() }.getOrNull()
+-        for ((key, desired) in changes.desiredMembership) {
+-            if (isMdbListReadOnlyListKey(key)) continue
+-            mdbListLibraryItemsPath(key)
+-            write(scope) { library ->
+-                val tab = library.tabs().firstOrNull { it.key == key }
+-                require(tab != null) { "This list is no longer available" }
+-                if (!desired && !tab.supportsMembershipFor(input.itemType)) return@write library
+-                require(tab.supportsMembershipFor(input.itemType)) { "This list does not accept this item" }
+-                val current = library.itemsByList[key].orEmpty()
+-                val resolved = suppliedTarget ?: current.firstOrNull {
+-                    it.type == mdbListLibraryType(input.itemType) && input.itemId in it.media.ids.aliases()
++        val keys = changes.desiredMembership.keys.filterNot(::isMdbListReadOnlyListKey)
++        if (keys.isEmpty()) return
++        membershipMutex.withLock {
++            var written = false
++            var failed = true
++            try {
++                var library = libraryFor(scope, keys)
++                for (key in keys) {
++                    val desired = changes.desiredMembership.getValue(key)
++                    mdbListLibraryItemsPath(key)
++                    val current = library?.let { cached ->
++                        val tab = cached.tabs().firstOrNull { it.key == key }
++                        require(tab != null) { "This list is no longer available" }
++                        if (!desired && !tab.supportsMembershipFor(input.itemType)) {
++                            null
++                        } else {
++                            require(tab.supportsMembershipFor(input.itemType)) { "This list does not accept this item" }
++                            cached.itemsByList[key].orEmpty()
++                        }
++                    }
++                    if (library != null && current == null) continue
++                    val resolved = suppliedTarget ?: current?.firstOrNull {
++                        it.type == mdbListLibraryType(input.itemType) && input.itemId in it.media.ids.aliases()
++                    }
++                    if (resolved == null && !desired) continue
++                    val target = requireNotNull(resolved) { "An external movie or show ID is required" }
++                    if (current != null && current.any(target::matches) == desired) continue
++                    val action = if (desired) "add" else "remove"
++                    val response = api.post("${mdbListLibraryItemsPath(key)}/$action", target.membershipBody(key == MDBLIST_WATCHLIST_KEY), scope)
++                    verifyMdbListMembershipResponse(response.body, target.type, desired)
++                    val write = MdbListMembershipWrite(scope, key, target, desired, now())
++                    pending.update { it + write }
++                    library = library?.withWrite(write)
++                    written = true
+                 }
+-                if (resolved == null && !desired) return@write library
+-                val target = requireNotNull(resolved) { "An external movie or show ID is required" }
+-                if (current.any(target::matches) == desired) return@write library
+-                val action = if (desired) "add" else "remove"
+-                val response = api.post("${mdbListLibraryItemsPath(key)}/$action", target.membershipBody(key == MDBLIST_WATCHLIST_KEY), scope)
+-                verifyMdbListMembershipResponse(response.body, target.type, desired)
+-                val items = current.filterNot(target::matches) + if (desired) listOf(target.copy(
+-                    listedAt = now(), rank = (current.mapNotNull { it.rank }.maxOrNull() ?: 0) + 1
+-                )) else emptyList()
+-                library.copy(itemsByList = library.itemsByList + (key to items), addedOrders = library.addedOrders - key)
++                failed = false
++            } finally {
++                if (written || failed) {
++                    val invalidate = failed
++                    if (commitScope != null) {
++                        commitScope.launch {
++                            commitPending(scope, invalidate)
++                            afterCommit()
++                        }
++                    } else {
++                        withContext(NonCancellable) { commitPending(scope, invalidate) }
++                    }
++                }
++            }
++        }
++    }
++
++    /** Moves [pendingWrites] into the cached library; they stay pending while there is no cached library. */
++    suspend fun commitPending(scope: MdbListAuthScope, invalidate: Boolean = false) {
++        val applied = try {
++            sync.mutate(scope) { previous ->
++                val library = previous.library ?: return@mutate previous to emptyList()
++                val writes = pendingWrites(scope)
++                val updated = library.withWrites(writes).let { if (invalidate) it.copy(invalidated = true) else it }
++                previous.copy(library = updated) to writes
+             }
++        } catch (_: CancellationException) {
++            pending.update { writes -> writes.filter { it.scope != scope } }
++            return
++        } catch (_: Exception) {
++            return
+         }
++        val currentScope = runCatching { sync.currentScope() }.getOrNull()
++        pending.update { writes -> writes.filterNot { write -> applied.any { it === write } || write.scope != currentScope } }
++    }
++
++    private suspend fun libraryFor(scope: MdbListAuthScope, keys: Collection<String>): MdbListLibrarySnapshot? {
++        if (sync.currentSnapshot() == null) sync.ensureLoaded()
++        sync.currentSnapshot()?.library?.let { return it.withWrites(pendingWrites(scope)) }
++        // Without a cached library a watchlist change needs no list details.
++        if (keys.all { it == MDBLIST_WATCHLIST_KEY }) return null
++        return sync.mutate(scope) { previous ->
++            val library = previous.library ?: MdbListLibraryRemote(api, scope).synchronize(null, previous.accountId, now())
++            previous.copy(library = library) to library
++        }.withWrites(pendingWrites(scope))
+     }
+ 
+     private fun metadataBody(name: String, description: String?, privacy: LibraryListPrivacy): String {
+@@ -114,3 +204,25 @@ internal class MdbListLibraryWriter(
+         }
+     }
+ }
++
++internal data class MdbListMembershipWrite(
++    val scope: MdbListAuthScope,
++    val key: String,
++    val target: MdbListLibraryItem,
++    val desired: Boolean,
++    val writtenAt: Long
++)
++
++internal fun MdbListLibrarySnapshot.withWrites(writes: List<MdbListMembershipWrite>): MdbListLibrarySnapshot =
++    writes.fold(this) { library, write -> library.withWrite(write) }
++
++internal fun MdbListLibrarySnapshot.withWrite(write: MdbListMembershipWrite): MdbListLibrarySnapshot {
++    val current = itemsByList[write.key] ?: if (write.key == MDBLIST_WATCHLIST_KEY) emptyList() else return this
++    if (current.any(write.target::matches) == write.desired) return this
++    val items = if (write.desired) {
++        current + write.target.copy(listedAt = write.writtenAt, rank = (current.mapNotNull { it.rank }.maxOrNull() ?: 0) + 1)
++    } else {
++        current.filterNot(write.target::matches)
++    }
++    return copy(itemsByList = itemsByList + (write.key to items), addedOrders = addedOrders - write.key)
++}
+diff --git a/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListTrackingLibraryProvider.kt b/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListTrackingLibraryProvider.kt
+index b5c0f9782..686ce0894 100644
+--- a/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListTrackingLibraryProvider.kt
++++ b/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListTrackingLibraryProvider.kt
+@@ -31,6 +31,8 @@ class MdbListTrackingLibraryProvider @Inject constructor(
+ 
+     override suspend fun getMembershipSnapshot(item: LibraryEntryInput) = service.getMembershipSnapshot(item)
+ 
++    override suspend fun getDefaultMembershipSnapshot(item: LibraryEntryInput) = service.getDefaultMembershipSnapshot(item)
++
+     override suspend fun applyMembershipChanges(item: LibraryEntryInput, changes: ListMembershipChanges, destructiveRemovalConfirmed: Boolean) =
+         service.applyMembershipChanges(item, changes)
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/LibraryRepositoryImpl.kt b/app/src/main/java/com/nuvio/tv/data/repository/LibraryRepositoryImpl.kt
+index 3a46aab70..d866a3c0c 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/LibraryRepositoryImpl.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/LibraryRepositoryImpl.kt
+@@ -191,7 +191,7 @@ class LibraryRepositoryImpl @Inject constructor(
+         val provider = sourceMode.first().providerId?.let(trackingProviders::provider)
+         if (provider != null) {
+             if (item.isServerItem) throw IllegalStateException(appContext.getString(R.string.library_server_title_unsupported))
+-            val currentMembership = provider.getMembershipSnapshot(item).listMembership
++            val currentMembership = provider.getDefaultMembershipSnapshot(item).listMembership
+             val changes = ListMembershipChanges(
+                 provider.toggledDefaultMembership(currentMembership)
+             )
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/TraktLibraryService.kt b/app/src/main/java/com/nuvio/tv/data/repository/TraktLibraryService.kt
+index 8b1abdc99..95012e6a6 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/TraktLibraryService.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/TraktLibraryService.kt
+@@ -64,6 +64,7 @@ class TraktLibraryService @Inject constructor(
+     private val refreshingState = MutableStateFlow(false)
+     private val refreshMutex = Mutex()
+     private var lastRefreshMs: Long = 0L
++    @Volatile private var writeSequence = 0L
+ 
+     private val cacheTtlMs = 60_000L
+     private val listFetchConcurrency = 3
+@@ -112,28 +113,47 @@ class TraktLibraryService @Inject constructor(
+ 
+     suspend fun getMembershipSnapshot(item: LibraryEntryInput): ListMembershipSnapshot {
+         ensureFresh()
+-        val snapshot = snapshotState.value
+-        val key = contentKey(item.itemId, item.itemType)
+-        val memberships = snapshot.membershipByContent[key].orEmpty()
+-        val map = snapshot.listTabs.associate { tab ->
+-            tab.key to memberships.contains(tab.key)
+-        }
+-        return ListMembershipSnapshot(listMembership = map)
++        return cachedMembership(item)
++    }
++
++    /**
++     * Membership for the Add to library button: the loaded lists as they are shown, so the press acts
++     * at once. Before the first load only the watchlist is read.
++     */
++    suspend fun getDefaultMembershipSnapshot(item: LibraryEntryInput): ListMembershipSnapshot {
++        if (hasLoadedLists()) return cachedMembership(item)
++        val watchlist = rebuildSnapshot(emptyList(), mapOf(WATCHLIST_KEY to fetchWatchlistEntries()))
++        val inWatchlist = WATCHLIST_KEY in watchlist.membershipByContent[contentKey(item.itemId, item.itemType)].orEmpty()
++        return ListMembershipSnapshot(listMembership = mapOf(WATCHLIST_KEY to inWatchlist))
+     }
+ 
++    /** Writes against the loaded lists straight away; the lists are refreshed in the background afterwards. */
+     suspend fun applyMembershipChanges(
+         item: LibraryEntryInput,
+         changes: ListMembershipChanges
+     ) {
+-        ensureFresh()
+-        val current = getMembershipSnapshot(item).listMembership
++        try {
++            applyMembershipChangesNow(item, changes)
++        } finally {
++            scope.launch { ensureFresh() }
++        }
++    }
++
++    private suspend fun applyMembershipChangesNow(
++        item: LibraryEntryInput,
++        changes: ListMembershipChanges
++    ) {
++        val loaded = hasLoadedLists()
++        val current = if (loaded) cachedMembership(item).listMembership else emptyMap()
+         val desired = changes.desiredMembership
+         val keys = (current.keys + desired.keys).distinct()
+ 
+         keys.forEach { listKey ->
+             val before = current[listKey] == true
+             val after = desired[listKey] == true
+-            if (before == after) return@forEach
++            // Before the first load the current state is unknown, so every requested change is sent.
++            if (loaded && before == after) return@forEach
++            if (!loaded && listKey !in desired) return@forEach
+ 
+             if (listKey == WATCHLIST_KEY) {
+                 if (after) {
+@@ -320,6 +340,16 @@ class TraktLibraryService @Inject constructor(
+         refresh(force = false)
+     }
+ 
++    private fun hasLoadedLists(): Boolean = snapshotState.value.listTabs.isNotEmpty()
++
++    private fun cachedMembership(item: LibraryEntryInput): ListMembershipSnapshot {
++        val snapshot = snapshotState.value
++        val memberships = snapshot.membershipByContent[contentKey(item.itemId, item.itemType)].orEmpty()
++        return ListMembershipSnapshot(listMembership = snapshot.listTabs.associate { tab ->
++            tab.key to memberships.contains(tab.key)
++        })
++    }
++
+     private suspend fun refresh(force: Boolean): Boolean {
+         val now = System.currentTimeMillis()
+         return refreshMutex.withLock {
+@@ -329,9 +359,14 @@ class TraktLibraryService @Inject constructor(
+ 
+             refreshingState.value = true
+             try {
+-                val previous = snapshotState.value
++                val writesBefore = writeSequence
+                 val refreshed = runCatching { fetchSnapshot() }.getOrNull()
+-                val snapshotToUse = refreshed ?: previous
++                if (refreshed != null && writeSequence != writesBefore) {
++                    // A write landed while the lists were downloading; keep it and load again next time.
++                    lastRefreshMs = 0L
++                    return@withLock false
++                }
++                val snapshotToUse = refreshed ?: snapshotState.value
+                 snapshotState.value = snapshotToUse
+                 lastRefreshMs = now
+                 refreshed != null
+@@ -347,12 +382,15 @@ class TraktLibraryService @Inject constructor(
+     ) {
+         val before = snapshotState.value
+         val optimisticSnapshot = optimistic(before)
++        writeSequence++
+         snapshotState.value = optimisticSnapshot
+         try {
+             mutation()
+         } catch (error: Throwable) {
+             snapshotState.value = before
+             throw error
++        } finally {
++            writeSequence++
+         }
+     }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/TraktTrackingLibraryProvider.kt b/app/src/main/java/com/nuvio/tv/data/repository/TraktTrackingLibraryProvider.kt
+index c0c9dadf0..61337e58d 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/TraktTrackingLibraryProvider.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/TraktTrackingLibraryProvider.kt
+@@ -66,6 +66,9 @@ class TraktTrackingLibraryProvider @Inject constructor(
+     override suspend fun getMembershipSnapshot(item: LibraryEntryInput) =
+         service.getMembershipSnapshot(item)
+ 
++    override suspend fun getDefaultMembershipSnapshot(item: LibraryEntryInput) =
++        service.getDefaultMembershipSnapshot(item)
++
+     override suspend fun applyMembershipChanges(
+         item: LibraryEntryInput,
+         changes: ListMembershipChanges,
