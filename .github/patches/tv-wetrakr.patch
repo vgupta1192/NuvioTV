@@ -1,0 +1,681 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/di/TrackingModule.kt b/app/src/main/java/com/nuvio/tv/core/di/TrackingModule.kt
+index 31693a1ce..26ea2a2b4 100644
+--- a/app/src/main/java/com/nuvio/tv/core/di/TrackingModule.kt
++++ b/app/src/main/java/com/nuvio/tv/core/di/TrackingModule.kt
+@@ -113,4 +113,16 @@ abstract class TrackingModule {
+     abstract fun bindSimklTrackingProvider(
+         provider: SimklTrackingProvider
+     ): TrackingProvider
++
++    @Binds
++    @IntoSet
++    abstract fun bindWeTrakrTrackingProvider(
++        provider: com.nuvio.tv.data.wetrakr.WeTrakrTrackingProvider
++    ): TrackingProvider
++
++    @Binds
++    @IntoSet
++    abstract fun bindWeTrakrTrackingHistoryWriter(
++        writer: com.nuvio.tv.data.wetrakr.WeTrakrTrackingHistoryWriter
++    ): TrackingHistoryWriter
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/core/tracking/TrackingProvider.kt b/app/src/main/java/com/nuvio/tv/core/tracking/TrackingProvider.kt
+index ec7e02287..4385a75f0 100644
+--- a/app/src/main/java/com/nuvio/tv/core/tracking/TrackingProvider.kt
++++ b/app/src/main/java/com/nuvio/tv/core/tracking/TrackingProvider.kt
+@@ -7,7 +7,8 @@ import javax.inject.Singleton
+ enum class TrackingProviderId(val storageId: String) {
+     TRAKT("trakt"),
+     SIMKL("simkl"),
+-    MDBLIST("mdblist");
++    MDBLIST("mdblist"),
++    WETRAKR("wetrakr");
+ 
+     companion object {
+         fun fromStorage(value: String?): TrackingProviderId? {
+diff --git a/app/src/main/java/com/nuvio/tv/data/wetrakr/WeTrakrService.kt b/app/src/main/java/com/nuvio/tv/data/wetrakr/WeTrakrService.kt
+new file mode 100644
+index 000000000..bec40bb5c
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/wetrakr/WeTrakrService.kt
+@@ -0,0 +1,382 @@
++package com.nuvio.tv.data.wetrakr
++
++import android.content.Context
++import com.nuvio.tv.core.profile.ProfileManager
++import com.nuvio.tv.core.profile.ProtectedProfilePreferences
++import com.nuvio.tv.core.tracking.TrackingEpisode
++import com.nuvio.tv.core.tracking.TrackingHistoryItem
++import com.nuvio.tv.core.tracking.TrackingMediaKind
++import com.nuvio.tv.core.tracking.TrackingMediaReference
++import com.nuvio.tv.core.tracking.TrackingMutationResult
++import com.nuvio.tv.core.tracking.TrackingScrobbleAction
++import com.nuvio.tv.core.tracking.TrackingScrobbleEvent
++import dagger.hilt.android.qualifiers.ApplicationContext
++import java.text.SimpleDateFormat
++import java.util.Date
++import java.util.Locale
++import java.util.TimeZone
++import javax.inject.Inject
++import javax.inject.Singleton
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.flow.update
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
++import kotlinx.coroutines.withContext
++import okhttp3.MediaType.Companion.toMediaType
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.RequestBody.Companion.toRequestBody
++import org.json.JSONArray
++import org.json.JSONObject
++
++data class WeTrakrUiState(
++    val isConnected: Boolean = false,
++    val username: String? = null,
++    val userCode: String? = null,
++    val verificationUrl: String? = null,
++    val busy: Boolean = false,
++    val error: String? = null
++)
++
++/**
++ * WeTrakr account for the fork (ported from NuvioMobile-Enhanced): device-code sign-in, live scrobbling and
++ * watched-history writes. Library, progress and ratings reads are not part of the TV port.
++ */
++@Singleton
++class WeTrakrService @Inject constructor(
++    @ApplicationContext context: Context,
++    private val http: OkHttpClient,
++    private val profiles: ProfileManager
++) {
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++    private val store = ProtectedProfilePreferences(context, "wetrakr_auth", "com.nuvio.tv.wetrakr.credentials.v1")
++    private val refreshMutex = Mutex()
++    private val writeMutex = Mutex()
++    private var pollJob: Job? = null
++    private var activeProfile = profiles.activeProfileId.value
++
++    private val mutableState = MutableStateFlow(loadState(activeProfile))
++    val state: StateFlow<WeTrakrUiState> = mutableState.asStateFlow()
++
++    init {
++        scope.launch {
++            profiles.activeProfileId.collect { profileId ->
++                if (profileId == activeProfile) return@collect
++                cancelPolling()
++                activeProfile = profileId
++                mutableState.value = loadState(profileId)
++            }
++        }
++    }
++
++    fun connect() {
++        if (mutableState.value.isConnected || pollJob?.isActive == true) return
++        val profileId = activeProfile
++        mutableState.update { it.copy(busy = true, error = null) }
++        pollJob = scope.launch {
++            try {
++                val device = requestDeviceCode()
++                mutableState.update {
++                    it.copy(busy = false, userCode = device.userCode, verificationUrl = device.verificationUrl)
++                }
++                pollForTokens(profileId, device)
++            } catch (error: CancellationException) {
++                throw error
++            } catch (error: Exception) {
++                mutableState.update { it.copy(busy = false, userCode = null, verificationUrl = null, error = error.message ?: "WeTrakr request failed") }
++            }
++        }
++    }
++
++    fun cancelConnect() {
++        cancelPolling()
++        mutableState.update { it.copy(busy = false, userCode = null, verificationUrl = null) }
++    }
++
++    fun disconnect() {
++        cancelPolling()
++        val profileId = activeProfile
++        val auth = readAuth(profileId)
++        store.write(profileId, null)
++        mutableState.value = WeTrakrUiState()
++        if (auth?.accessToken != null && auth.refreshToken != null) {
++            scope.launch {
++                runCatching {
++                    send("POST", "/oauth/logout", JSONObject().put("refresh_token", auth.refreshToken), auth.accessToken)
++                }
++            }
++        }
++    }
++
++    suspend fun scrobble(action: TrackingScrobbleAction, event: TrackingScrobbleEvent) {
++        if (!mutableState.value.isConnected || !event.progressPercent.isFinite()) return
++        val media = event.media
++        val ids = media.toIds() ?: return
++        val isMovie = media.kind == TrackingMediaKind.MOVIE
++        val episode = media.episode
++        if (!isMovie && episode == null) return
++        val body = JSONObject()
++        if (isMovie) {
++            body.put("movie", titleObject(media, ids))
++        } else {
++            body.put("show", titleObject(media, ids))
++            body.put("episode", JSONObject().put("season", episode?.season ?: 1).put("number", episode?.number ?: 1))
++        }
++        body.put("progress", event.progressPercent.coerceIn(0.0, 100.0))
++        authorizedPost("/scrobble/${action.wireValue}", body)
++    }
++
++    suspend fun addToHistory(items: Collection<TrackingHistoryItem>): TrackingMutationResult {
++        if (!mutableState.value.isConnected) return TrackingMutationResult(0)
++        val document = historyDocument(items.map { it.media to it.watchedAtEpochMs })
++            ?: return TrackingMutationResult(items.size, items.size)
++        writeMutex.withLock { authorizedPost("/sync/tracking", document) }
++        return TrackingMutationResult(items.size)
++    }
++
++    suspend fun removeFromHistory(items: Collection<TrackingMediaReference>): TrackingMutationResult {
++        if (!mutableState.value.isConnected) return TrackingMutationResult(0)
++        val document = historyDocument(items.map { it to null })
++            ?: return TrackingMutationResult(items.size, items.size)
++        writeMutex.withLock { authorizedPost("/sync/tracking/remove/all", document) }
++        return TrackingMutationResult(items.size)
++    }
++
++    private fun historyDocument(entries: List<Pair<TrackingMediaReference, Long?>>): JSONObject? {
++        val movies = JSONArray()
++        val shows = linkedMapOf<String, Pair<JSONObject, MutableMap<Int, MutableMap<Int, Long?>>>>()
++        entries.forEach { (media, watchedAt) ->
++            val ids = media.toIds() ?: return@forEach
++            if (media.kind == TrackingMediaKind.MOVIE) {
++                val entry = JSONObject().put("ids", ids).put("status", WATCHED)
++                watchedAt?.let { entry.put("tracked_at", isoTimestamp(it)) }
++                movies.put(entry)
++                return@forEach
++            }
++            // A show-level mark would flip every episode; only explicit episodes are written.
++            val episode: TrackingEpisode = media.episode ?: return@forEach
++            val key = ids.toString()
++            val show = shows.getOrPut(key) {
++                JSONObject().put("ids", ids).put("status", WATCHED) to linkedMapOf()
++            }
++            show.second.getOrPut(episode.season ?: 1) { linkedMapOf() }[episode.number] = watchedAt
++        }
++        if (movies.length() == 0 && shows.isEmpty()) return null
++        val showArray = JSONArray()
++        shows.values.forEach { (show, seasons) ->
++            val seasonArray = JSONArray()
++            seasons.toSortedMap().forEach { (season, episodes) ->
++                val episodeArray = JSONArray()
++                episodes.toSortedMap().forEach { (number, watchedAt) ->
++                    val entry = JSONObject().put("number", number).put("status", WATCHED)
++                    watchedAt?.let { entry.put("tracked_at", isoTimestamp(it)) }
++                    episodeArray.put(entry)
++                }
++                seasonArray.put(JSONObject().put("number", season).put("episodes", episodeArray))
++            }
++            showArray.put(show.put("seasons", seasonArray))
++        }
++        return JSONObject().put("movies", movies).put("shows", showArray)
++    }
++
++    private fun TrackingMediaReference.toIds(): JSONObject? {
++        val json = JSONObject()
++        ids.imdb?.takeIf(String::isNotBlank)?.let { json.put("imdb", it) }
++        ids.tmdb?.let { json.put("tmdb", it) }
++        ids.tvdb?.toLongOrNull()?.let { json.put("tvdb", it) }
++        return json.takeIf { it.length() > 0 }
++    }
++
++    private fun titleObject(media: TrackingMediaReference, ids: JSONObject): JSONObject = JSONObject().apply {
++        media.title?.takeIf(String::isNotBlank)?.let { put("title", it) }
++        media.year?.let { put("year", it) }
++        put("ids", ids)
++    }
++
++    private fun isoTimestamp(epochMs: Long): String =
++        SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
++            .apply { timeZone = TimeZone.getTimeZone("UTC") }
++            .format(Date(epochMs))
++
++    // --- auth ---
++
++    private data class DeviceCode(val deviceCode: String, val userCode: String, val verificationUrl: String, val intervalSeconds: Long, val expiresAtEpochMs: Long)
++    private data class StoredAuth(val accessToken: String?, val refreshToken: String?, val expiresAtEpochMs: Long?, val username: String?)
++    private data class Response(val status: Int, val body: String)
++
++    private suspend fun requestDeviceCode(): DeviceCode {
++        val response = send("POST", "/oauth/device/code", JSONObject().put("client_id", CLIENT_ID), null)
++        if (response.status !in 200..299) throw IllegalStateException(if (response.status == 429) "WeTrakr is rate limiting requests, try again shortly" else "WeTrakr sign-in is unavailable (${response.status})")
++        val root = JSONObject(response.body)
++        val userCode = root.optString("user_code").takeIf(String::isNotBlank) ?: throw IllegalStateException("WeTrakr sent no code")
++        val deviceCode = root.optString("device_code").takeIf(String::isNotBlank) ?: throw IllegalStateException("WeTrakr sent no code")
++        val url = root.optString("verification_url").ifBlank { root.optString("verification_uri") }.ifBlank { DEFAULT_VERIFICATION_URL }
++        val interval = root.optLong("interval", 5L).coerceIn(1L, 60L)
++        val expiresIn = root.optLong("expires_in", 600L).coerceIn(60L, 3_600L)
++        return DeviceCode(deviceCode, userCode, url, interval, System.currentTimeMillis() + expiresIn * 1_000L)
++    }
++
++    private suspend fun pollForTokens(profileId: Int, device: DeviceCode) {
++        var interval = device.intervalSeconds
++        while (System.currentTimeMillis() < device.expiresAtEpochMs) {
++            delay(interval * 1_000L)
++            val response = send(
++                "POST",
++                "/oauth/device/token",
++                JSONObject().put("code", device.deviceCode).put("device_code", device.deviceCode).put("client_id", CLIENT_ID),
++                null
++            )
++            when {
++                response.status in 200..299 -> {
++                    val auth = parseTokens(response.body)
++                    if (auth == null) {
++                        finishConnect(error = "WeTrakr sent an invalid sign-in response")
++                    } else {
++                        store.write(profileId, auth.toJson())
++                        if (profileId == activeProfile) {
++                            mutableState.value = WeTrakrUiState(isConnected = true, username = auth.username)
++                        }
++                    }
++                    return
++                }
++                response.status == 429 -> interval = (interval + 5L).coerceAtMost(60L)
++                response.status == 400 -> {
++                    val code = errorCode(response.body)
++                    when {
++                        code.contains("slow", ignoreCase = true) -> interval = (interval + 5L).coerceAtMost(60L)
++                        code.contains("expired", ignoreCase = true) -> return finishConnect("The code expired. Start again.")
++                        code.contains("denied", ignoreCase = true) -> return finishConnect("Sign-in was denied.")
++                        else -> Unit
++                    }
++                }
++                response.status == 410 -> return finishConnect("The code expired. Start again.")
++                response.status == 418 -> return finishConnect("Sign-in was denied.")
++                response.status in 500..599 -> Unit
++                else -> return finishConnect("WeTrakr sign-in failed (${response.status})")
++            }
++        }
++        finishConnect("The code expired. Start again.")
++    }
++
++    private fun finishConnect(error: String) {
++        mutableState.update { it.copy(busy = false, userCode = null, verificationUrl = null, error = error) }
++    }
++
++    private fun cancelPolling() {
++        pollJob?.cancel()
++        pollJob = null
++    }
++
++    private fun errorCode(body: String): String = runCatching {
++        val root = JSONObject(body)
++        root.optString("error").takeIf { it.isNotBlank() && !it.startsWith("{") }
++            ?: root.optJSONObject("error")?.optString("code")
++            ?: root.optString("code")
++    }.getOrNull().orEmpty()
++
++    private fun parseTokens(body: String): StoredAuth? = runCatching {
++        val root = JSONObject(body)
++        val access = root.optString("access_token").takeIf(String::isNotBlank) ?: return null
++        val refresh = root.optString("refresh_token").ifBlank { root.optString("new_refresh_token") }.takeIf(String::isNotBlank) ?: return null
++        val expiresIn = root.optLong("expires_in", 0L)
++        val expiresAt = if (expiresIn > 0L) System.currentTimeMillis() + expiresIn * 1_000L else null
++        val username = root.optString("username").takeIf(String::isNotBlank)
++            ?: root.optJSONObject("user")?.optString("username")?.takeIf(String::isNotBlank)
++        StoredAuth(access, refresh, expiresAt, username)
++    }.getOrNull()
++
++    private fun StoredAuth.toJson(): String = JSONObject().apply {
++        put("access", accessToken)
++        put("refresh", refreshToken)
++        expiresAtEpochMs?.let { put("expiresAt", it) }
++        username?.let { put("username", it) }
++    }.toString()
++
++    private fun readAuth(profileId: Int): StoredAuth? = runCatching {
++        val root = JSONObject(store.read(profileId) ?: return null)
++        StoredAuth(
++            accessToken = root.optString("access").takeIf(String::isNotBlank),
++            refreshToken = root.optString("refresh").takeIf(String::isNotBlank),
++            expiresAtEpochMs = if (root.has("expiresAt")) root.optLong("expiresAt") else null,
++            username = root.optString("username").takeIf(String::isNotBlank)
++        )
++    }.getOrNull()
++
++    private fun loadState(profileId: Int): WeTrakrUiState {
++        val auth = readAuth(profileId)
++        return WeTrakrUiState(isConnected = auth?.refreshToken != null, username = auth?.username)
++    }
++
++    private suspend fun accessToken(profileId: Int, forceRefresh: Boolean): String? = refreshMutex.withLock {
++        val auth = readAuth(profileId) ?: return null
++        val expired = auth.expiresAtEpochMs?.let { it - System.currentTimeMillis() <= REFRESH_MARGIN_MS } == true
++        if (!forceRefresh && !expired && auth.accessToken != null) return auth.accessToken
++        val refresh = auth.refreshToken ?: return null
++        val response = send("POST", "/oauth/token/refresh", JSONObject().put("refresh_token", refresh), null)
++        when {
++            response.status in 200..299 -> {
++                val renewed = parseTokens(response.body) ?: return null
++                val merged = renewed.copy(username = renewed.username ?: auth.username)
++                store.write(profileId, merged.toJson())
++                merged.accessToken
++            }
++            response.status == 400 || response.status == 401 -> {
++                store.write(profileId, null)
++                if (profileId == activeProfile) {
++                    mutableState.value = WeTrakrUiState(error = "WeTrakr sign-in was revoked. Connect again.")
++                }
++                null
++            }
++            else -> auth.accessToken.takeIf { !forceRefresh }
++        }
++    }
++
++    private suspend fun authorizedPost(path: String, body: JSONObject): Response? {
++        val profileId = activeProfile
++        var token = accessToken(profileId, forceRefresh = false) ?: return null
++        var response = send("POST", path, body, token)
++        if (response.status == 401) {
++            token = accessToken(profileId, forceRefresh = true) ?: return null
++            response = send("POST", path, body, token)
++        }
++        if (response.status == 404) return response
++        if (response.status !in 200..299) throw IllegalStateException("WeTrakr $path failed (${response.status})")
++        return response
++    }
++
++    private suspend fun send(method: String, path: String, body: JSONObject?, token: String?): Response =
++        withContext(Dispatchers.IO) {
++            val request = Request.Builder()
++                .url(API_BASE_URL + path)
++                .header("Accept", "application/json")
++                .header("User-Agent", USER_AGENT)
++                .header("wetrakr-api-key", CLIENT_ID)
++                .header("wetrakr-api-version", API_VERSION)
++                .apply { token?.let { header("Authorization", "Bearer $it") } }
++                .method(method, body?.toString()?.toRequestBody(JSON))
++                .build()
++            http.newCall(request).execute().use { response ->
++                Response(response.code, response.body?.string().orEmpty())
++            }
++        }
++
++    private companion object {
++        const val CLIENT_ID = "193cadea493eaf3f7f4cdcbba020f577"
++        const val API_BASE_URL = "https://api.wetrakr.com"
++        const val API_VERSION = "1"
++        const val DEFAULT_VERIFICATION_URL = "https://wetrakr.com/activate"
++        const val USER_AGENT = "NuvioTV"
++        const val WATCHED = "watched"
++        const val REFRESH_MARGIN_MS = 120_000L
++        val JSON = "application/json".toMediaType()
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/data/wetrakr/WeTrakrTrackingProvider.kt b/app/src/main/java/com/nuvio/tv/data/wetrakr/WeTrakrTrackingProvider.kt
+new file mode 100644
+index 000000000..fa3f0139f
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/wetrakr/WeTrakrTrackingProvider.kt
+@@ -0,0 +1,65 @@
++package com.nuvio.tv.data.wetrakr
++
++import com.nuvio.tv.core.tracking.TrackingCapability
++import com.nuvio.tv.core.tracking.TrackingHistoryItem
++import com.nuvio.tv.core.tracking.TrackingHistoryWriter
++import com.nuvio.tv.core.tracking.TrackingMediaReference
++import com.nuvio.tv.core.tracking.TrackingMutationResult
++import com.nuvio.tv.core.tracking.TrackingProvider
++import com.nuvio.tv.core.tracking.TrackingProviderDescriptor
++import com.nuvio.tv.core.tracking.TrackingProviderId
++import com.nuvio.tv.core.tracking.TrackingScrobbleAction
++import com.nuvio.tv.core.tracking.TrackingScrobbleEvent
++import com.nuvio.tv.core.tracking.TrackingScrobbler
++import javax.inject.Inject
++import javax.inject.Singleton
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.flow.SharingStarted
++import kotlinx.coroutines.flow.map
++import kotlinx.coroutines.flow.stateIn
++
++@Singleton
++class WeTrakrTrackingScrobbler @Inject constructor(
++    private val service: WeTrakrService
++) : TrackingScrobbler {
++    override val providerId = TrackingProviderId.WETRAKR
++
++    override suspend fun scrobble(action: TrackingScrobbleAction, event: TrackingScrobbleEvent) {
++        service.scrobble(action, event)
++    }
++}
++
++@Singleton
++class WeTrakrTrackingHistoryWriter @Inject constructor(
++    private val service: WeTrakrService
++) : TrackingHistoryWriter {
++    override val providerId = TrackingProviderId.WETRAKR
++
++    override suspend fun addToHistory(profileId: Int, items: Collection<TrackingHistoryItem>): TrackingMutationResult =
++        service.addToHistory(items)
++
++    override suspend fun removeFromHistory(profileId: Int, items: Collection<TrackingMediaReference>): TrackingMutationResult =
++        service.removeFromHistory(items)
++}
++
++@Singleton
++class WeTrakrTrackingProvider @Inject constructor(
++    service: WeTrakrService,
++    override val scrobbler: WeTrakrTrackingScrobbler
++) : TrackingProvider {
++    override val descriptor = TrackingProviderDescriptor(
++        TrackingProviderId.WETRAKR,
++        "WeTrakr",
++        setOf(
++            TrackingCapability.AUTHENTICATION,
++            TrackingCapability.WATCHED_WRITE,
++            TrackingCapability.PROGRESS_WRITE,
++            TrackingCapability.SCROBBLE
++        )
++    )
++    override val isAuthenticated = service.state
++        .map { it.isConnected }
++        .stateIn(CoroutineScope(SupervisorJob() + Dispatchers.IO), SharingStarted.Eagerly, service.state.value.isConnected)
++}
+diff --git a/app/src/main/java/com/nuvio/tv/domain/model/LibraryListTabLocalization.kt b/app/src/main/java/com/nuvio/tv/domain/model/LibraryListTabLocalization.kt
+index 4525078b3..ebe93a77c 100644
+--- a/app/src/main/java/com/nuvio/tv/domain/model/LibraryListTabLocalization.kt
++++ b/app/src/main/java/com/nuvio/tv/domain/model/LibraryListTabLocalization.kt
+@@ -12,6 +12,7 @@ fun LibraryListTab.localizedMembershipTitle(): String {
+         TrackingProviderId.TRAKT -> stringResource(R.string.trakt_name)
+         TrackingProviderId.SIMKL -> stringResource(R.string.simkl_name)
+         TrackingProviderId.MDBLIST -> stringResource(R.string.mdblist_name)
++        TrackingProviderId.WETRAKR -> stringResource(R.string.wetrakr_name)
+         null -> null
+     }
+     return provider?.let { "$it · ${localizedTitle()}" } ?: localizedTitle()
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TrackingSettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TrackingSettingsScreen.kt
+index 5e4ba5762..f1cad846e 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TrackingSettingsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TrackingSettingsScreen.kt
+@@ -558,6 +558,7 @@ internal fun TrackingSettingsOverview(
+                                 .focusRequester(mdbListFocusRequester)
+                                 .testTag(TrackingSettingsTestTags.MDBLIST_PROVIDER)
+                         )
++                        WeTrakrSettingsRow()
+                     }
+                 }
+                 item(key = "tracking_sources") {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/WeTrakrSettingsRow.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/WeTrakrSettingsRow.kt
+new file mode 100644
+index 000000000..bef6f714f
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/WeTrakrSettingsRow.kt
+@@ -0,0 +1,141 @@
++package com.nuvio.tv.ui.screens.settings
++
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.unit.dp
++import androidx.hilt.navigation.compose.hiltViewModel
++import androidx.lifecycle.ViewModel
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import androidx.tv.material3.ExperimentalTvMaterial3Api
++import androidx.tv.material3.MaterialTheme
++import androidx.tv.material3.Text
++import com.nuvio.tv.R
++import com.nuvio.tv.data.wetrakr.WeTrakrService
++import com.nuvio.tv.data.wetrakr.WeTrakrUiState
++import com.nuvio.tv.ui.components.NuvioDialog
++import com.nuvio.tv.ui.theme.NuvioTheme
++import dagger.hilt.android.lifecycle.HiltViewModel
++import javax.inject.Inject
++import kotlinx.coroutines.flow.StateFlow
++
++@HiltViewModel
++class WeTrakrSettingsViewModel @Inject constructor(
++    private val service: WeTrakrService
++) : ViewModel() {
++    val state: StateFlow<WeTrakrUiState> = service.state
++
++    fun connect() = service.connect()
++    fun cancel() = service.cancelConnect()
++    fun disconnect() = service.disconnect()
++}
++
++/** WeTrakr entry in Tracking settings (fork): sign in with a device code, scrobble and watched history. */
++@OptIn(ExperimentalTvMaterial3Api::class)
++@Composable
++internal fun WeTrakrSettingsRow(viewModel: WeTrakrSettingsViewModel = hiltViewModel()) {
++    val state by viewModel.state.collectAsStateWithLifecycle()
++    var showDialog by remember { mutableStateOf(false) }
++
++    SettingsActionRow(
++        title = stringResource(R.string.wetrakr_name),
++        subtitle = when {
++            state.isConnected -> stringResource(R.string.wetrakr_connected_as, state.username ?: stringResource(R.string.wetrakr_account_fallback))
++            state.userCode != null -> stringResource(R.string.tracking_finish_connection)
++            else -> state.error ?: stringResource(R.string.wetrakr_description)
++        },
++        value = when {
++            state.isConnected -> stringResource(R.string.tracking_status_connected)
++            state.userCode != null -> stringResource(R.string.tracking_status_waiting)
++            else -> stringResource(R.string.tracking_status_disconnected)
++        },
++        valueColor = when {
++            state.isConnected -> NuvioTheme.colors.Success
++            state.userCode != null -> NuvioTheme.colors.Warning
++            else -> NuvioTheme.colors.TextSecondary
++        },
++        onClick = {
++            if (!state.isConnected && state.userCode == null) viewModel.connect()
++            showDialog = true
++        }
++    )
++
++    if (showDialog) {
++        val dismiss = {
++            if (!state.isConnected) viewModel.cancel()
++            showDialog = false
++        }
++        NuvioDialog(
++            onDismiss = dismiss,
++            title = stringResource(R.string.wetrakr_name),
++            subtitle = if (state.isConnected) {
++                stringResource(R.string.wetrakr_connected_as, state.username ?: stringResource(R.string.wetrakr_account_fallback))
++            } else {
++                stringResource(R.string.wetrakr_dialog_subtitle)
++            },
++            width = 520.dp,
++            suppressFirstKeyUp = false
++        ) {
++            if (!state.isConnected) {
++                Column(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
++                    val url = state.verificationUrl
++                    val code = state.userCode
++                    when {
++                        code != null -> {
++                            Text(
++                                text = stringResource(R.string.wetrakr_open_url, url ?: ""),
++                                style = MaterialTheme.typography.bodyLarge,
++                                color = NuvioTheme.colors.TextSecondary
++                            )
++                            Text(
++                                text = code,
++                                style = MaterialTheme.typography.displaySmall,
++                                color = NuvioTheme.colors.TextPrimary,
++                                modifier = Modifier.padding(top = 12.dp)
++                            )
++                        }
++                        state.error != null -> Text(
++                            text = state.error.orEmpty(),
++                            style = MaterialTheme.typography.bodyLarge,
++                            color = NuvioTheme.colors.Warning
++                        )
++                        else -> Text(
++                            text = stringResource(R.string.tracking_status_connecting),
++                            style = MaterialTheme.typography.bodyLarge,
++                            color = NuvioTheme.colors.TextSecondary
++                        )
++                    }
++                }
++            }
++            SettingsDialogActionRow {
++                SettingsDialogActionButton(
++                    text = stringResource(R.string.action_cancel),
++                    onClick = dismiss
++                )
++                if (state.isConnected) {
++                    SettingsDialogActionButton(
++                        text = stringResource(R.string.trakt_disconnect),
++                        onClick = {
++                            viewModel.disconnect()
++                            showDialog = false
++                        },
++                        primary = true
++                    )
++                } else if (state.userCode == null && !state.busy) {
++                    SettingsDialogActionButton(
++                        text = stringResource(R.string.wetrakr_try_again),
++                        onClick = viewModel::connect,
++                        primary = true
++                    )
++                }
++            }
++        }
++    }
++}
+diff --git a/app/src/main/res/values/strings_wetrakr.xml b/app/src/main/res/values/strings_wetrakr.xml
+new file mode 100644
+index 000000000..effeea5a6
+--- /dev/null
++++ b/app/src/main/res/values/strings_wetrakr.xml
+@@ -0,0 +1,10 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="wetrakr_name">WeTrakr</string>
++    <string name="wetrakr_description">Send what you watch to WeTrakr. Sign in with a code.</string>
++    <string name="wetrakr_connected_as">Connected as %1$s</string>
++    <string name="wetrakr_account_fallback">your account</string>
++    <string name="wetrakr_dialog_subtitle">Sign in to send watch updates to WeTrakr</string>
++    <string name="wetrakr_open_url">On your phone or computer, open %1$s and enter this code:</string>
++    <string name="wetrakr_try_again">Try again</string>
++</resources>
