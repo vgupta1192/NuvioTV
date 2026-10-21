@@ -1,0 +1,128 @@
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/CatalogRepositoryImpl.kt b/app/src/main/java/com/nuvio/tv/data/repository/CatalogRepositoryImpl.kt
+index 8490d68e4..91591703f 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/CatalogRepositoryImpl.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/CatalogRepositoryImpl.kt
+@@ -70,39 +70,21 @@ class CatalogRepositoryImpl @Inject constructor(
+ 
+         when (val result = safeApiCall(context) { api.getCatalog(url) }) {
+             is NetworkResult.Success -> {
+-                val rawItemCount = result.data.metas.size
+-                val posterPattern = layoutPreferenceDataStore.customPosterUrlPattern
+-                    .let { flow -> flow.first() }
+-                val enabledScreens = layoutPreferenceDataStore.customPosterEnabledScreens.first()
+-
+-                val items = result.data.metas
+-                    .mapNotNull { it?.toDomainOrNull(type, addonBaseUrl) }
+-                    .distinctBy { it.id }
+-                    .withCustomPosterUrls(
+-                        com.nuvio.tv.core.poster.patternForScreen(posterPattern, posterScreen, enabledScreens)
+-                    )
+-                Log.d(
+-                    TAG,
+-                    "Catalog fetch success addonId=$addonId type=$type catalogId=$catalogId items=${items.size}"
+-                )
+-
+-                val catalogRow = CatalogRow(
++                val catalogRow = buildCatalogRow(
++                    dto = result.data,
++                    addonBaseUrl = addonBaseUrl,
+                     addonId = addonId,
+                     addonName = addonName,
+-                    addonBaseUrl = addonBaseUrl,
+                     catalogId = catalogId,
+                     catalogName = catalogName,
+-                    type = ContentType.fromString(type),
+-                    rawType = type,
+-                    items = items,
+-                    isLoading = false,
+-                    hasMore = supportsSkip && rawItemCount > 0,
+-                    currentPage = if (skipStep > 0) skip / skipStep else 0,
+-                    supportsSkip = supportsSkip,
++                    type = type,
++                    skip = skip,
+                     skipStep = skipStep,
+-                    nextSkip = if (supportsSkip && rawItemCount > 0) skip + rawItemCount else skip,
+-                    extraArgs = extraArgs
++                    supportsSkip = supportsSkip,
++                    extraArgs = extraArgs,
++                    posterScreen = posterScreen,
+                 )
++                writeSnapshot(url, result.data)
+                 emit(NetworkResult.Success(catalogRow))
+             }
+             is NetworkResult.Error -> {
+@@ -116,6 +98,74 @@ class CatalogRepositoryImpl @Inject constructor(
+         }
+     }
+ 
++
++    private suspend fun buildCatalogRow(
++        dto: com.nuvio.tv.data.remote.dto.CatalogResponseDto,
++        addonBaseUrl: String,
++        addonId: String,
++        addonName: String,
++        catalogId: String,
++        catalogName: String,
++        type: String,
++        skip: Int,
++        skipStep: Int,
++        supportsSkip: Boolean,
++        extraArgs: Map<String, String>,
++        posterScreen: com.nuvio.tv.core.poster.CustomPosterScreen,
++    ): CatalogRow {
++        val rawItemCount = dto.metas.size
++        val posterPattern = layoutPreferenceDataStore.customPosterUrlPattern.first()
++        val enabledScreens = layoutPreferenceDataStore.customPosterEnabledScreens.first()
++        val items = dto.metas
++            .mapNotNull { it?.toDomainOrNull(type, addonBaseUrl) }
++            .distinctBy { it.id }
++            .withCustomPosterUrls(
++                com.nuvio.tv.core.poster.patternForScreen(posterPattern, posterScreen, enabledScreens)
++            )
++        return CatalogRow(
++            addonId = addonId,
++            addonName = addonName,
++            addonBaseUrl = addonBaseUrl,
++            catalogId = catalogId,
++            catalogName = catalogName,
++            type = ContentType.fromString(type),
++            rawType = type,
++            items = items,
++            isLoading = false,
++            hasMore = supportsSkip && rawItemCount > 0,
++            currentPage = if (skipStep > 0) skip / skipStep else 0,
++            supportsSkip = supportsSkip,
++            skipStep = skipStep,
++            nextSkip = if (supportsSkip && rawItemCount > 0) skip + rawItemCount else skip,
++            extraArgs = extraArgs
++        )
++    }
++
++    private val snapshotDir by lazy { java.io.File(context.filesDir, "catalog-snapshots").apply { mkdirs() } }
++    private val snapshotAdapter by lazy {
++        com.squareup.moshi.Moshi.Builder().build()
++            .adapter(com.nuvio.tv.data.remote.dto.CatalogResponseDto::class.java)
++    }
++
++    private fun snapshotFile(url: String) =
++        java.io.File(snapshotDir, Integer.toHexString(url.hashCode()) + "_" + url.length + ".json")
++
++    private suspend fun readSnapshot(url: String): com.nuvio.tv.data.remote.dto.CatalogResponseDto? =
++        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
++            runCatching {
++                val file = snapshotFile(url)
++                if (file.isFile) snapshotAdapter.fromJson(file.readText()) else null
++            }.getOrNull()
++        }
++
++    private suspend fun writeSnapshot(url: String, dto: com.nuvio.tv.data.remote.dto.CatalogResponseDto) {
++        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
++            runCatching {
++                if (dto.metas.isNotEmpty()) snapshotFile(url).writeText(snapshotAdapter.toJson(dto))
++            }
++        }
++    }
++
+     private fun buildCatalogUrl(
+         baseUrl: String,
+         type: String,
