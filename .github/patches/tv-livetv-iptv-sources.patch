@@ -1,0 +1,1187 @@
+diff --git a/app/src/main/java/com/nuvio/tv/data/iptv/IptvModels.kt b/app/src/main/java/com/nuvio/tv/data/iptv/IptvModels.kt
+new file mode 100644
+index 000000000..9b0c78657
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/iptv/IptvModels.kt
+@@ -0,0 +1,73 @@
++package com.nuvio.tv.data.iptv
++
++import org.json.JSONArray
++import org.json.JSONObject
++
++/**
++ * Fork feature: custom IPTV sources for Live TV next to the addon channels. A source is an M3U
++ * playlist URL, an Xtream Codes login or a Stalker (MAG) portal.
++ */
++enum class IptvKind { M3U, XTREAM, STALKER }
++
++data class IptvSource(
++    val id: String,
++    val kind: IptvKind,
++    val name: String,
++    /** M3U playlist URL, Xtream server URL or Stalker portal URL. */
++    val url: String,
++    val username: String = "",
++    val password: String = "",
++    /** Stalker only. */
++    val mac: String = "",
++    /** Optional XMLTV guide URL (Xtream and M3U playlists often carry their own). */
++    val epgUrl: String = "",
++    val isEnabled: Boolean = true,
++) {
++    val isConfigured: Boolean
++        get() = when (kind) {
++            IptvKind.M3U -> url.isNotBlank()
++            IptvKind.XTREAM -> url.isNotBlank() && username.isNotBlank() && password.isNotBlank()
++            IptvKind.STALKER -> url.isNotBlank() && mac.isNotBlank()
++        }
++
++    val kindLabel: String
++        get() = when (kind) {
++            IptvKind.M3U -> "M3U playlist"
++            IptvKind.XTREAM -> "Xtream Codes"
++            IptvKind.STALKER -> "Stalker portal"
++        }
++
++    fun toJson(): JSONObject = JSONObject()
++        .put("id", id).put("kind", kind.name).put("name", name).put("url", url)
++        .put("username", username).put("password", password).put("mac", mac)
++        .put("epgUrl", epgUrl).put("isEnabled", isEnabled)
++
++    companion object {
++        fun fromJson(o: JSONObject): IptvSource? {
++            val kind = runCatching { IptvKind.valueOf(o.optString("kind")) }.getOrNull() ?: return null
++            val id = o.optString("id").takeIf { it.isNotBlank() } ?: return null
++            return IptvSource(
++                id = id,
++                kind = kind,
++                name = o.optString("name"),
++                url = o.optString("url"),
++                username = o.optString("username"),
++                password = o.optString("password"),
++                mac = o.optString("mac"),
++                epgUrl = o.optString("epgUrl"),
++                isEnabled = o.optBoolean("isEnabled", true),
++            )
++        }
++
++        fun listToJson(list: List<IptvSource>): String =
++            JSONArray().also { arr -> list.forEach { arr.put(it.toJson()) } }.toString()
++
++        fun listFromJson(text: String?): List<IptvSource> {
++            if (text.isNullOrBlank()) return emptyList()
++            return runCatching {
++                val arr = JSONArray(text)
++                (0 until arr.length()).mapNotNull { fromJson(arr.getJSONObject(it)) }
++            }.getOrDefault(emptyList())
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/data/iptv/IptvRepository.kt b/app/src/main/java/com/nuvio/tv/data/iptv/IptvRepository.kt
+new file mode 100644
+index 000000000..19a9454b0
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/iptv/IptvRepository.kt
+@@ -0,0 +1,455 @@
++package com.nuvio.tv.data.iptv
++
++import android.content.Context
++import android.util.Log
++import com.nuvio.tv.data.repository.epg.EpgSourceConfig
++import com.nuvio.tv.domain.model.ProxyHeaders
++import com.nuvio.tv.domain.model.Stream
++import com.nuvio.tv.domain.model.StreamBehaviorHints
++import com.nuvio.tv.domain.model.TvChannelItem
++import dagger.hilt.android.qualifiers.ApplicationContext
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.async
++import kotlinx.coroutines.awaitAll
++import kotlinx.coroutines.coroutineScope
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.flow.update
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.sync.Semaphore
++import kotlinx.coroutines.sync.withPermit
++import kotlinx.coroutines.withContext
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import org.json.JSONArray
++import org.json.JSONObject
++import java.net.URLEncoder
++import java.util.concurrent.ConcurrentHashMap
++import java.util.concurrent.TimeUnit
++import javax.inject.Inject
++import javax.inject.Singleton
++
++/** What one source returned: its channels plus the XMLTV guide URLs it knows about. */
++data class IptvLoadResult(
++    val channels: List<TvChannelItem>,
++    val epgUrls: List<String>,
++)
++
++@Singleton
++class IptvRepository @Inject constructor(
++    @ApplicationContext private val context: Context,
++    okHttpClient: OkHttpClient,
++) {
++    companion object {
++        private const val TAG = "IptvRepository"
++        private const val PREFS = "nuvio_iptv"
++        private const val KEY_SOURCES = "sources"
++        private const val STALKER_UA =
++            "Mozilla/5.0 (QtEmbedded; U; Linux; MAG254; en) AppleWebKit/533.3 MAG200 stbapp ver: 4 rev: 2721 Mobile Safari/533.3"
++        private val STREAM_HEADERS = mapOf("User-Agent" to "Mozilla/5.0", "Accept" to "*/*")
++        private val ATTR_REGEX = Regex("""([A-Za-z0-9_-]+)="([^"]*)"""")
++    }
++
++    private val http: OkHttpClient = okHttpClient.newBuilder()
++        .connectTimeout(20, TimeUnit.SECONDS)
++        .readTimeout(60, TimeUnit.SECONDS)
++        .followRedirects(true)
++        .build()
++
++    private val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++
++    private val _sources = MutableStateFlow(IptvSource.listFromJson(prefs.getString(KEY_SOURCES, null)))
++    val sources: StateFlow<List<IptvSource>> = _sources.asStateFlow()
++
++    private val _channels = MutableStateFlow<List<TvChannelItem>>(emptyList())
++    val channels: StateFlow<List<TvChannelItem>> = _channels.asStateFlow()
++
++    private val _guides = MutableStateFlow<List<EpgSourceConfig>>(emptyList())
++    val guides: StateFlow<List<EpgSourceConfig>> = _guides.asStateFlow()
++
++    private val _errors = MutableStateFlow<Map<String, String>>(emptyMap())
++    val errors: StateFlow<Map<String, String>> = _errors.asStateFlow()
++
++    private val _isLoading = MutableStateFlow(false)
++    val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
++
++    private val cache = ConcurrentHashMap<String, IptvLoadResult>()
++    private val stalkerTokens = ConcurrentHashMap<String, String>()
++    private var loadJob: Job? = null
++    private var started = false
++
++    fun initialize() {
++        if (started) return
++        started = true
++        load(forceReload = false)
++    }
++
++    fun refresh() = load(forceReload = true)
++
++    fun addSource(source: IptvSource) {
++        persist(_sources.value.filterNot { it.id == source.id } + source)
++        load(forceReload = true)
++    }
++
++    fun removeSource(sourceId: String) {
++        persist(_sources.value.filterNot { it.id == sourceId })
++        cache.remove(sourceId)
++        load(forceReload = false)
++    }
++
++    fun toggleSource(sourceId: String) {
++        persist(_sources.value.map { if (it.id == sourceId) it.copy(isEnabled = !it.isEnabled) else it })
++        load(forceReload = false)
++    }
++
++    private fun persist(sources: List<IptvSource>) {
++        _sources.value = sources
++        prefs.edit().putString(KEY_SOURCES, IptvSource.listToJson(sources)).apply()
++    }
++
++    private fun load(forceReload: Boolean) {
++        loadJob?.cancel()
++        val sources = _sources.value.filter { it.isEnabled && it.isConfigured }
++        cache.keys.retainAll(sources.map { it.id }.toSet())
++        if (sources.isEmpty()) {
++            _channels.value = emptyList()
++            _guides.value = emptyList()
++            _errors.value = emptyMap()
++            _isLoading.value = false
++            return
++        }
++        _isLoading.value = true
++        _errors.value = emptyMap()
++        loadJob = scope.launch {
++            val gate = Semaphore(3)
++            val results = coroutineScope {
++                sources.map { source ->
++                    async {
++                        gate.withPermit {
++                            val cached = cache[source.id]
++                            if (cached != null && !forceReload) return@withPermit Triple(source, cached, null as String?)
++                            try {
++                                val loaded = loadSource(source)
++                                cache[source.id] = loaded
++                                Triple(source, loaded, null as String?)
++                            } catch (e: CancellationException) {
++                                throw e
++                            } catch (e: Throwable) {
++                                Log.w(TAG, "IPTV source ${source.name} failed: ${e.message}")
++                                Triple(source, null as IptvLoadResult?, e.message?.take(120) ?: "Could not load this source")
++                            }
++                        }
++                    }
++                }.awaitAll()
++            }
++            _errors.value = results.mapNotNull { (source, _, error) -> error?.let { source.id to it } }.toMap()
++            val seen = HashSet<String>()
++            _channels.value = results.flatMap { (_, loaded, _) -> loaded?.channels.orEmpty() }
++                .filter { seen.add(it.stableKey()) }
++            _guides.value = results.flatMap { (source, loaded, _) ->
++                loaded?.epgUrls.orEmpty().distinct().mapIndexed { index, url ->
++                    EpgSourceConfig(id = "iptv_${source.id}_$index", name = source.name, url = url, isEnabled = true)
++                }
++            }
++            _isLoading.value = false
++        }
++    }
++
++    /** Streams for an IPTV channel; Stalker channels get a fresh play link first. */
++    suspend fun resolveStreams(channel: TvChannelItem): List<Stream> {
++        val sourceId = channel.iptvSourceId ?: return emptyList()
++        val source = _sources.value.firstOrNull { it.id == sourceId } ?: return emptyList()
++        var url = channel.directUrl?.takeIf { it.isNotBlank() }
++        var headers = channel.directHeaders
++        val command = channel.stalkerCommand?.takeIf { it.isNotBlank() }
++        if (source.kind == IptvKind.STALKER && command != null) {
++            val token = stalkerToken(source)
++            val result = stalkerRequest(source, token, "itv", "create_link", mapOf("cmd" to command)).js()
++            val created = (result.str("cmd") ?: result.str("url") ?: result.str("stream_url"))?.playableUrl()
++            url = created?.takeIf { it.isNotBlank() } ?: url
++            headers = stalkerHeaders(source, token)
++        }
++        val resolved = url ?: return emptyList()
++        return listOf(
++            Stream(
++                name = channel.name,
++                title = channel.name,
++                description = source.name,
++                url = resolved,
++                ytId = null,
++                infoHash = null,
++                fileIdx = null,
++                externalUrl = null,
++                behaviorHints = StreamBehaviorHints(
++                    notWebReady = null,
++                    bingeGroup = null,
++                    countryWhitelist = null,
++                    proxyHeaders = headers.takeIf { it.isNotEmpty() }?.let { ProxyHeaders(request = it, response = null) },
++                ),
++                addonName = source.name,
++                addonLogo = null,
++            )
++        )
++    }
++
++    // ---- loading ----
++
++    private suspend fun loadSource(source: IptvSource): IptvLoadResult = withContext(Dispatchers.IO) {
++        when (source.kind) {
++            IptvKind.M3U -> loadM3u(source)
++            IptvKind.XTREAM -> loadXtream(source)
++            IptvKind.STALKER -> loadStalker(source)
++        }
++    }
++
++    private fun channel(
++        source: IptvSource,
++        key: String,
++        name: String,
++        logo: String?,
++        group: String?,
++        directUrl: String?,
++        headers: Map<String, String>,
++        epgId: String?,
++        stalkerCommand: String? = null,
++    ): TvChannelItem {
++        val category = group?.trim()?.takeIf { it.isNotEmpty() } ?: source.name
++        return TvChannelItem(
++            id = "${source.id}:${key.hashCode()}",
++            type = "tv",
++            name = name.trim(),
++            poster = logo,
++            logo = logo,
++            genres = listOf(category),
++            addonName = source.name,
++            addonManifestUrl = "iptv:${source.id}",
++            catalogId = source.id,
++            catalogName = category,
++            directUrl = directUrl,
++            directHeaders = headers,
++            stalkerCommand = stalkerCommand,
++            epgId = epgId,
++            iptvSourceId = source.id,
++        )
++    }
++
++    // ---- M3U ----
++
++    private fun loadM3u(source: IptvSource): IptvLoadResult =
++        parseM3u(httpGet(source.url.trim(), emptyMap()), source)
++
++    internal fun parseM3u(text: String, source: IptvSource): IptvLoadResult {
++        val epgUrls = mutableListOf<String>()
++        val channels = mutableListOf<TvChannelItem>()
++        var attrs: Map<String, String> = emptyMap()
++        var name: String? = null
++        var group: String? = null
++        var userAgent: String? = null
++        var referrer: String? = null
++        for (raw in text.lineSequence()) {
++            val line = raw.trim()
++            if (line.isEmpty()) continue
++            when {
++                line.startsWith("#EXTM3U", ignoreCase = true) -> {
++                    val header = ATTR_REGEX.findAll(line).associate { it.groupValues[1].lowercase() to it.groupValues[2] }
++                    (header["url-tvg"] ?: header["x-tvg-url"] ?: header["tvg-url"])
++                        ?.split(',', ' ')
++                        ?.map { it.trim() }
++                        ?.filter { it.startsWith("http", ignoreCase = true) }
++                        ?.let(epgUrls::addAll)
++                }
++                line.startsWith("#EXTINF", ignoreCase = true) -> {
++                    attrs = ATTR_REGEX.findAll(line).associate { it.groupValues[1].lowercase() to it.groupValues[2] }
++                    val tail = line.substringAfterLast('"', line)
++                    name = tail.substringAfter(',', "").trim().ifBlank { attrs["tvg-name"] }
++                    group = attrs["group-title"]?.trim()?.takeIf { it.isNotEmpty() }
++                }
++                line.startsWith("#EXTGRP:", ignoreCase = true) -> {
++                    if (group == null) group = line.substringAfter(':').trim().takeIf { it.isNotEmpty() }
++                }
++                line.startsWith("#EXTVLCOPT:", ignoreCase = true) -> {
++                    val option = line.substringAfter(':')
++                    when (option.substringBefore('=').lowercase()) {
++                        "http-user-agent" -> userAgent = option.substringAfter('=').trim()
++                        "http-referrer", "http-referer" -> referrer = option.substringAfter('=').trim()
++                    }
++                }
++                line.startsWith("#") -> Unit
++                else -> {
++                    val channelName = name
++                    if (!channelName.isNullOrBlank()) {
++                        val headers = buildMap {
++                            userAgent?.takeIf { it.isNotBlank() }?.let { put("User-Agent", it) }
++                            referrer?.takeIf { it.isNotBlank() }?.let { put("Referer", it) }
++                        }
++                        channels += channel(
++                            source = source,
++                            key = line,
++                            name = channelName,
++                            logo = attrs["tvg-logo"]?.takeIf { it.isNotBlank() },
++                            group = group,
++                            directUrl = line,
++                            headers = headers,
++                            epgId = attrs["tvg-id"]?.takeIf { it.isNotBlank() },
++                        )
++                    }
++                    attrs = emptyMap(); name = null; group = null; userAgent = null; referrer = null
++                }
++            }
++        }
++        val extra = source.epgUrl.trim().takeIf { it.isNotBlank() }
++        return IptvLoadResult(channels.distinctBy { it.id }, listOfNotNull(extra) + epgUrls)
++    }
++
++    // ---- Xtream Codes ----
++
++    private fun enc(value: String) = URLEncoder.encode(value, "UTF-8").replace("+", "%20")
++
++    private fun loadXtream(source: IptvSource): IptvLoadResult {
++        val server = source.url.trim().trimEnd('/').substringBefore("/player_api.php").trimEnd('/')
++        val user = source.username.trim()
++        val pass = source.password.trim()
++        fun call(action: String): Any? {
++            val url = "$server/player_api.php?username=${enc(user)}&password=${enc(pass)}&action=${enc(action)}"
++            val body = httpGet(url, mapOf("Accept" to "application/json, text/plain, */*", "User-Agent" to "Nuvio/1.0")).trim()
++            return when {
++                body.startsWith("[") -> JSONArray(body)
++                body.startsWith("{") -> JSONObject(body)
++                else -> null
++            }
++        }
++        fun rows(value: Any?): List<JSONObject> {
++            val arr = when (value) {
++                is JSONArray -> value
++                is JSONObject -> value.optJSONArray("data") ?: JSONArray()
++                else -> JSONArray()
++            }
++            return (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
++        }
++        val categories = rows(call("get_live_categories")).mapNotNull { item ->
++            val id = item.str("category_id") ?: item.str("id") ?: return@mapNotNull null
++            id to (item.str("category_name") ?: item.str("name") ?: id)
++        }.toMap()
++        val channels = rows(call("get_live_streams")).mapNotNull { item ->
++            val name = item.str("name") ?: return@mapNotNull null
++            val streamId = item.str("stream_id") ?: item.str("id") ?: return@mapNotNull null
++            val extension = item.str("container_extension")?.trim()?.trimStart('.')?.ifBlank { null } ?: "ts"
++            val direct = item.str("direct_source")?.takeIf { it.startsWith("http://") || it.startsWith("https://") }
++            val url = direct ?: "$server/live/${enc(user)}/${enc(pass)}/${enc(streamId)}.${enc(extension)}"
++            channel(
++                source = source,
++                key = "x$streamId",
++                name = name,
++                logo = item.str("stream_icon") ?: item.str("logo"),
++                group = item.str("category_id")?.let(categories::get),
++                directUrl = url,
++                headers = STREAM_HEADERS,
++                epgId = item.str("epg_channel_id"),
++            )
++        }.distinctBy { it.id }
++        val epg = source.epgUrl.trim().ifBlank { "$server/xmltv.php?username=${enc(user)}&password=${enc(pass)}" }
++        return IptvLoadResult(channels, listOf(epg))
++    }
++
++    // ---- Stalker (MAG) portal ----
++
++    private fun loadStalker(source: IptvSource): IptvLoadResult {
++        stalkerTokens.remove(source.id)
++        val token = stalkerToken(source)
++        val genres = stalkerRequest(source, token, "itv", "get_genres").js().arr("data").mapNotNull { item ->
++            val id = item.str("id") ?: item.str("alias") ?: return@mapNotNull null
++            id to (item.str("title") ?: item.str("name") ?: id)
++        }.toMap()
++        val channels = mutableListOf<TvChannelItem>()
++        for (page in 1..60) {
++            val data = stalkerRequest(source, token, "itv", "get_ordered_list", mapOf("p" to page.toString())).js().arr("data")
++            if (data.isEmpty()) break
++            data.forEachIndexed { index, item ->
++                val command = item.str("cmd") ?: item.str("mc_cmd") ?: item.str("url") ?: return@forEachIndexed
++                val name = item.str("name") ?: item.str("title") ?: return@forEachIndexed
++                val url = command.playableUrl()
++                channels += channel(
++                    source = source,
++                    key = "s${item.str("id") ?: "$page:$index"}",
++                    name = name,
++                    logo = item.str("logo") ?: item.str("logo_url"),
++                    group = (item.str("tv_genre_id") ?: item.str("genre_id"))?.let(genres::get),
++                    directUrl = url.takeIf { it.startsWith("http") },
++                    headers = stalkerHeaders(source, token),
++                    epgId = item.str("xmltv_id"),
++                    stalkerCommand = command,
++                )
++            }
++        }
++        return IptvLoadResult(channels.distinctBy { it.id }, listOfNotNull(source.epgUrl.trim().takeIf { it.isNotBlank() }))
++    }
++
++    private fun stalkerToken(source: IptvSource): String =
++        stalkerTokens[source.id] ?: run {
++            val token = stalkerRequest(source, null, "stb", "handshake").js().str("token").orEmpty()
++            require(token.isNotBlank()) { "Stalker portal did not return an authorization token" }
++            stalkerTokens[source.id] = token
++            token
++        }
++
++    private fun stalkerRequest(
++        source: IptvSource,
++        token: String?,
++        type: String,
++        action: String,
++        extra: Map<String, String> = emptyMap(),
++    ): JSONObject {
++        val parameters = linkedMapOf("type" to type, "action" to action, "JsHttpRequest" to "1-xml")
++        if (!token.isNullOrBlank()) parameters["token"] = token
++        if (source.username.isNotBlank()) parameters["login"] = source.username.trim()
++        if (source.password.isNotBlank()) parameters["password"] = source.password.trim()
++        parameters.putAll(extra)
++        val endpoint = stalkerEndpoint(source)
++        val query = parameters.entries.joinToString("&", prefix = if ('?' in endpoint) "&" else "?") { (k, v) -> "${enc(k)}=${enc(v)}" }
++        return JSONObject(httpGet(endpoint + query, stalkerHeaders(source, token)))
++    }
++
++    private fun stalkerEndpoint(source: IptvSource): String {
++        val url = source.url.trim().trimEnd('/')
++        return when {
++            url.contains("portal.php", ignoreCase = true) -> url
++            url.contains("server/load.php", ignoreCase = true) -> url
++            url.endsWith("/c", ignoreCase = true) -> url.dropLast(2) + "/portal.php"
++            else -> "$url/portal.php"
++        }
++    }
++
++    private fun stalkerHeaders(source: IptvSource, token: String?): Map<String, String> = buildMap {
++        val base = source.url.trim().substringBefore("/portal.php").substringBefore("/server/load.php").trimEnd('/').removeSuffix("/c")
++        put("User-Agent", STALKER_UA)
++        put("X-User-Agent", "Model: MAG254; Link: Ethernet")
++        put("Referer", "$base/c/")
++        put("Cookie", "mac=${source.mac.trim().uppercase()}; stb_lang=en; timezone=Europe%2FIstanbul")
++        if (!token.isNullOrBlank()) put("Authorization", "Bearer $token")
++    }
++
++    // ---- helpers ----
++
++    private fun httpGet(url: String, headers: Map<String, String>): String {
++        val request = Request.Builder().url(url).apply { headers.forEach { (k, v) -> header(k, v) } }.build()
++        http.newCall(request).execute().use { response ->
++            if (!response.isSuccessful) error("HTTP ${response.code} from ${request.url.host}")
++            return response.body?.string().orEmpty()
++        }
++    }
++
++    private fun String.playableUrl() = trim().removePrefix("ffmpeg ").removePrefix("auto ").substringBefore(' ').trim()
++    private fun JSONObject.js(): JSONObject = optJSONObject("js") ?: this
++    private fun JSONObject.str(key: String): String? =
++        if (isNull(key)) null else opt(key)?.toString()?.trim()?.takeIf { it.isNotBlank() }
++    private fun JSONObject.arr(key: String): List<JSONObject> {
++        val arr = optJSONArray(key) ?: return emptyList()
++        return (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
+index 374476150..766c6b029 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
+@@ -46,7 +46,8 @@ class TvChannelsRepository @Inject constructor(
+     private val addonRepository: AddonRepository,
+     private val addonApi: AddonApi,
+     private val tvChannelsDataStore: TvChannelsDataStore,
+-    private val tvEpgRepository: TvEpgRepository
++    private val tvEpgRepository: TvEpgRepository,
++    private val iptvRepository: com.nuvio.tv.data.iptv.IptvRepository
+ ) {
+     companion object {
+         private const val TAG = "TvChannelsRepo"
+@@ -64,11 +65,14 @@ class TvChannelsRepository @Inject constructor(
+     // Cache em memória para resposta instantânea
+     private val channelsMemoryCache = mutableMapOf<Set<String>, List<TvChannelItem>>()
+     private val streamMemoryCache = mutableMapOf<String, List<Stream>>()
++    private var lastTvAddons: List<Addon>? = null
++    private var lastSelectedUrls: Set<String> = emptySet()
+ 
+     fun initialize() {
+         if (isInitialized) return
+         isInitialized = true
+         tvEpgRepository.initialize()
++        iptvRepository.initialize()
+ 
+         // 1. Observa mudanças nos addons instalados e addons selecionados pelo usuário
+         scope.launch {
+@@ -160,6 +164,24 @@ class TvChannelsRepository @Inject constructor(
+                 _uiState.update { it.copy(channelAutoplay = autoplay) }
+             }
+         }
++
++        // 6. Fork: IPTV sources (M3U / Xtream / Stalker) merged into the channel list
++        scope.launch {
++            combine(iptvRepository.sources, iptvRepository.errors, iptvRepository.isLoading) { sources, errors, loading ->
++                Triple(sources, errors, loading)
++            }.collectLatest { (sources, errors, loading) ->
++                _uiState.update { it.copy(iptvSources = sources, iptvErrors = errors, isIptvLoading = loading) }
++            }
++        }
++        scope.launch {
++            iptvRepository.guides.collectLatest { tvEpgRepository.setIptvGuides(it) }
++        }
++        scope.launch {
++            iptvRepository.channels.collectLatest {
++                channelsMemoryCache.clear()
++                lastTvAddons?.let { loadChannels(it, lastSelectedUrls) }
++            }
++        }
+     }
+ 
+     /** Live TV lists only addons that publish Live TV catalogs, trimmed to just those catalogs. */
+@@ -173,6 +195,8 @@ class TvChannelsRepository @Inject constructor(
+         val availableUrls = tvAddons.map { it.baseUrl }.toSet()
+         // Saved selection may reference addons that are gone or no longer publish TV catalogs.
+         val effectiveSelectedUrls = explicitSelectedUrls?.intersect(availableUrls) ?: availableUrls
++        lastTvAddons = tvAddons
++        lastSelectedUrls = effectiveSelectedUrls
+ 
+         _uiState.update { current ->
+             current.copy(
+@@ -195,6 +219,7 @@ class TvChannelsRepository @Inject constructor(
+     fun refresh() {
+         channelsMemoryCache.clear()
+         streamMemoryCache.clear()
++        iptvRepository.refresh()
+         _uiState.update { it.copy(isLoadingChannels = true, channelsErrorMessage = null) }
+         scope.launch {
+             // Força sincronização de EPG
+@@ -213,7 +238,7 @@ class TvChannelsRepository @Inject constructor(
+     ) {
+         loadChannelsJob?.cancel()
+ 
+-        if (selectedUrls.isEmpty()) {
++        if (selectedUrls.isEmpty() && iptvRepository.channels.value.isEmpty()) {
+             _uiState.update { current ->
+                 current.copy(
+                     allChannels = emptyList(),
+@@ -320,6 +345,10 @@ class TvChannelsRepository @Inject constructor(
+                 }
+             }
+ 
++            for (iptvChannel in iptvRepository.channels.value) {
++                if (seenKeys.add(iptvChannel.stableKey())) loadedChannels.add(iptvChannel)
++            }
++
+             val favKeys = runCatching { tvChannelsDataStore.favoriteChannelKeys.first() }.getOrDefault(_uiState.value.favoriteKeys)
+             val enrichedChannels = loadedChannels.map { channel ->
+                 channel.copy(
+@@ -665,6 +694,7 @@ class TvChannelsRepository @Inject constructor(
+ 
+         loadStreamJob = scope.launch(Dispatchers.IO) {
+             runCatching {
++                if (channel.iptvSourceId != null) return@runCatching iptvRepository.resolveStreams(channel)
+                 val streamUrl = buildStreamUrl(channel.addonManifestUrl, channel.type, channel.id)
+                 val response = safeApiCall(context) { addonApi.getStreams(streamUrl) }
+                 val dtoList = when (response) {
+@@ -737,6 +767,14 @@ class TvChannelsRepository @Inject constructor(
+             if (!streamMemoryCache.containsKey(adjChannel.stableKey())) {
+                 scope.launch(Dispatchers.IO) {
+                     runCatching {
++                        if (adjChannel.iptvSourceId != null) {
++                            // Stalker play links are short-lived, so only direct streams are prefetched.
++                            if (adjChannel.stalkerCommand == null) {
++                                iptvRepository.resolveStreams(adjChannel).takeIf { it.isNotEmpty() }
++                                    ?.let { streamMemoryCache[adjChannel.stableKey()] = it }
++                            }
++                            return@runCatching
++                        }
+                         val streamUrl = buildStreamUrl(adjChannel.addonManifestUrl, adjChannel.type, adjChannel.id)
+                         val response = safeApiCall(context) { addonApi.getStreams(streamUrl) }
+                         val dtoList = when (response) {
+@@ -771,6 +809,16 @@ class TvChannelsRepository @Inject constructor(
+         _uiState.update { it.copy(isFullscreen = fullscreen) }
+     }
+ 
++    fun setIptvDialogVisible(visible: Boolean) {
++        _uiState.update { it.copy(isIptvDialogVisible = visible) }
++    }
++
++    fun addIptvSource(source: com.nuvio.tv.data.iptv.IptvSource) = iptvRepository.addSource(source)
++
++    fun removeIptvSource(sourceId: String) = iptvRepository.removeSource(sourceId)
++
++    fun toggleIptvSource(sourceId: String) = iptvRepository.toggleSource(sourceId)
++
+     fun setAddonsDialogVisible(visible: Boolean) {
+         _uiState.update { it.copy(isAddonsDialogVisible = visible) }
+     }
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/epg/TvEpgRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/epg/TvEpgRepository.kt
+index d055201d1..29e272350 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/epg/TvEpgRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/epg/TvEpgRepository.kt
+@@ -115,6 +115,7 @@ class TvEpgRepository @Inject constructor(
+ 
+     private var syncJob: Job? = null
+     private var isInitialized = false
++    private var iptvGuides: List<EpgSourceConfig> = emptyList()
+ 
+     private val epgHttpClient: OkHttpClient by lazy {
+         okHttpClient.newBuilder()
+@@ -156,7 +157,7 @@ class TvEpgRepository @Inject constructor(
+         syncJob?.cancel()
+         syncJob = scope.launch(Dispatchers.IO) {
+             _uiState.update { it.copy(isLoading = true, errorMessage = null) }
+-            val activeSources = _uiState.value.epgSources.filter { it.isEnabled }
++            val activeSources = _uiState.value.epgSources.filter { it.isEnabled } + iptvGuides
+             var totalPrograms = 0
+ 
+             synchronized(this@TvEpgRepository) {
+@@ -209,6 +210,13 @@ class TvEpgRepository @Inject constructor(
+         }
+     }
+ 
++    /** Guides that IPTV sources bring along (Xtream xmltv.php, M3U url-tvg); always on. */
++    fun setIptvGuides(guides: List<EpgSourceConfig>) {
++        if (iptvGuides == guides) return
++        iptvGuides = guides
++        syncEpg(forceRefresh = false)
++    }
++
+     fun toggleEpgSource(sourceId: String) {
+         val currentSources = _uiState.value.epgSources
+         val target = currentSources.firstOrNull { it.id == sourceId } ?: return
+@@ -264,7 +272,7 @@ class TvEpgRepository @Inject constructor(
+             if (channelMatchCache.containsKey(key)) {
+                 channelMatchCache[key]
+             } else {
+-                val matched = matchChannelId(channel.name)
++                val matched = exactChannelId(channel.epgId) ?: matchChannelId(channel.name)
+                 channelMatchCache[key] = matched
+                 matched
+             }
+@@ -286,6 +294,13 @@ class TvEpgRepository @Inject constructor(
+         )
+     }
+ 
++    /** The channel's own XMLTV id (tvg-id / epg_channel_id), when the loaded guides know it. */
++    private fun exactChannelId(epgId: String?): String? {
++        val raw = epgId?.trim()?.takeIf { it.isNotEmpty() } ?: return null
++        if (cachedProgramsByChannelId.containsKey(raw)) return raw
++        return keyToChannelIds[normalizeText(raw.substringBefore('.'))]?.firstOrNull()
++    }
++
+     private fun matchChannelId(channelName: String): String? {
+         val norm = normalizeText(channelName)
+         if (norm.isBlank()) return null
+diff --git a/app/src/main/java/com/nuvio/tv/domain/model/TvChannelsModels.kt b/app/src/main/java/com/nuvio/tv/domain/model/TvChannelsModels.kt
+index 39fe034b7..e4dacc169 100644
+--- a/app/src/main/java/com/nuvio/tv/domain/model/TvChannelsModels.kt
++++ b/app/src/main/java/com/nuvio/tv/domain/model/TvChannelsModels.kt
+@@ -19,6 +19,13 @@ data class TvChannelItem(
+     val catalogName: String,
+     val isFavorite: Boolean = false,
+     val epgInfo: ChannelEpgInfo? = null,
++    /** IPTV source channels (M3U / Xtream / Stalker) carry their own stream instead of an addon. */
++    val directUrl: String? = null,
++    val directHeaders: Map<String, String> = emptyMap(),
++    val stalkerCommand: String? = null,
++    /** XMLTV channel id (tvg-id / epg_channel_id) used to match the programme guide exactly. */
++    val epgId: String? = null,
++    val iptvSourceId: String? = null,
+ ) {
+     val displayLogo: String?
+         get() = logo?.takeIf { it.isNotBlank() } ?: poster?.takeIf { it.isNotBlank() }
+@@ -73,6 +80,10 @@ data class TvChannelsUiState(
+     val isFullscreen: Boolean = false,
+     val hideAdultChannels: Boolean = true,
+     val channelAutoplay: Boolean = false,
++    val iptvSources: List<com.nuvio.tv.data.iptv.IptvSource> = emptyList(),
++    val iptvErrors: Map<String, String> = emptyMap(),
++    val isIptvLoading: Boolean = false,
++    val isIptvDialogVisible: Boolean = false,
+ ) {
+     val activeStream: Stream?
+         get() = previewStreams.getOrNull(selectedStreamIndex)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
+index 3175aa007..0b2a2b723 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
+@@ -1011,7 +1011,7 @@ fun TvChannelsScreen(
+                         .fillMaxHeight()
+                 ) {
+                     when {
+-                        state.selectedAddonUrls.isEmpty() -> {
++                        state.selectedAddonUrls.isEmpty() && state.iptvSources.none { it.isEnabled } -> {
+                             Box(
+                                 modifier = Modifier.fillMaxSize(),
+                                 contentAlignment = Alignment.Center
+@@ -1202,7 +1202,12 @@ fun TvChannelsScreen(
+         onToggleAddon = viewModel::toggleAddonSelection,
+         onSelectAll = viewModel::selectAllAddons,
+         onClearAll = viewModel::deselectAllAddons,
+-        onDismiss = { viewModel.setAddonsDialogVisible(false) }
++        onDismiss = { viewModel.setAddonsDialogVisible(false) },
++        iptvSources = state.iptvSources,
++        iptvErrors = state.iptvErrors,
++        onToggleIptv = viewModel::toggleIptvSource,
++        onRemoveIptv = viewModel::removeIptvSource,
++        onAddIptv = viewModel::addIptvSource
+     )
+ 
+     TvChannelScheduleDialog(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsViewModel.kt
+index 5b4767416..ff0b5df97 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsViewModel.kt
+@@ -127,6 +127,22 @@ class TvChannelsViewModel @Inject constructor(
+         repository.setAddonsDialogVisible(visible)
+     }
+ 
++    fun setIptvDialogVisible(visible: Boolean) {
++        repository.setIptvDialogVisible(visible)
++    }
++
++    fun addIptvSource(source: com.nuvio.tv.data.iptv.IptvSource) {
++        repository.addIptvSource(source)
++    }
++
++    fun removeIptvSource(sourceId: String) {
++        repository.removeIptvSource(sourceId)
++    }
++
++    fun toggleIptvSource(sourceId: String) {
++        repository.toggleIptvSource(sourceId)
++    }
++
+     fun setScheduleDialogVisible(visible: Boolean) {
+         repository.setScheduleDialogVisible(visible)
+     }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvAddonsSelectionDialog.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvAddonsSelectionDialog.kt
+index fa37c2f01..7b4945960 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvAddonsSelectionDialog.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvAddonsSelectionDialog.kt
+@@ -11,6 +11,9 @@ import androidx.compose.foundation.layout.Spacer
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.verticalScroll
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.layout.size
+ import androidx.compose.foundation.layout.width
+@@ -61,7 +64,12 @@ fun TvAddonsSelectionDialog(
+     onToggleAddon: (String) -> Unit,
+     onSelectAll: () -> Unit,
+     onClearAll: () -> Unit,
+-    onDismiss: () -> Unit
++    onDismiss: () -> Unit,
++    iptvSources: List<com.nuvio.tv.data.iptv.IptvSource> = emptyList(),
++    iptvErrors: Map<String, String> = emptyMap(),
++    onToggleIptv: (String) -> Unit = {},
++    onRemoveIptv: (String) -> Unit = {},
++    onAddIptv: (com.nuvio.tv.data.iptv.IptvSource) -> Unit = {}
+ ) {
+     if (!visible) return
+ 
+@@ -77,7 +85,10 @@ fun TvAddonsSelectionDialog(
+         val onSecondaryColor = if (isLightAccent) Color.Black else Color.White
+ 
+         Column(
+-            modifier = Modifier.fillMaxWidth()
++            modifier = Modifier
++                .fillMaxWidth()
++                .heightIn(max = 400.dp)
++                .verticalScroll(rememberScrollState())
+         ) {
+             // Ações Rápidas: Selecionar Todos / Desmarcar Todos
+             Row(
+@@ -248,6 +259,16 @@ fun TvAddonsSelectionDialog(
+ 
+             Spacer(modifier = Modifier.height(10.dp))
+ 
++            TvIptvSourcesSection(
++                sources = iptvSources,
++                errors = iptvErrors,
++                onToggle = onToggleIptv,
++                onRemove = onRemoveIptv,
++                onAdd = onAddIptv
++            )
++
++            Spacer(modifier = Modifier.height(10.dp))
++
+             var isOkFocused by remember { mutableStateOf(false) }
+ 
+             // Botão Concluir com tamanho fixo, texto centralizado e contraste dinâmico
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvIptvSourcesSection.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvIptvSourcesSection.kt
+new file mode 100644
+index 000000000..5c053c46e
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvIptvSourcesSection.kt
+@@ -0,0 +1,312 @@
++package com.nuvio.tv.ui.screens.tvchannels.components
++
++import androidx.compose.foundation.BorderStroke
++import androidx.compose.foundation.border
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.items
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.rounded.Check
++import androidx.compose.material.icons.rounded.Close
++import androidx.compose.material3.Icon
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import androidx.tv.material3.Border
++import androidx.tv.material3.Button
++import androidx.tv.material3.ButtonDefaults
++import androidx.tv.material3.ClickableSurfaceDefaults
++import androidx.tv.material3.ExperimentalTvMaterial3Api
++import androidx.tv.material3.MaterialTheme
++import androidx.tv.material3.Surface
++import androidx.tv.material3.Text
++import com.nuvio.tv.data.iptv.IptvKind
++import com.nuvio.tv.data.iptv.IptvSource
++import com.nuvio.tv.ui.components.NuvioDialog
++import com.nuvio.tv.ui.screens.collection.NuvioTextField
++import com.nuvio.tv.ui.theme.NuvioTheme
++
++/** Fork feature: IPTV sources (M3U / Xtream / Stalker) section of the Live TV sources dialog. */
++@OptIn(ExperimentalTvMaterial3Api::class)
++@Composable
++fun TvIptvSourcesSection(
++    sources: List<IptvSource>,
++    errors: Map<String, String>,
++    onToggle: (String) -> Unit,
++    onRemove: (String) -> Unit,
++    onAdd: (IptvSource) -> Unit,
++) {
++    var showAdd by remember { mutableStateOf(false) }
++
++    Text(
++        text = "IPTV sources",
++        style = MaterialTheme.typography.labelLarge,
++        fontWeight = FontWeight.SemiBold,
++        color = Color.White.copy(alpha = 0.7f),
++    )
++    Spacer(modifier = Modifier.height(6.dp))
++
++    if (sources.isEmpty()) {
++        Text(
++            text = "Add an M3U playlist, an Xtream Codes login or a Stalker portal.",
++            style = MaterialTheme.typography.bodySmall,
++            color = Color.White.copy(alpha = 0.5f),
++        )
++    } else {
++        LazyColumn(
++            modifier = Modifier
++                .fillMaxWidth()
++                .height((sources.size.coerceAtMost(3) * 52).dp),
++            verticalArrangement = Arrangement.spacedBy(6.dp),
++        ) {
++            items(sources, key = { it.id }) { source ->
++                val shape = RoundedCornerShape(8.dp)
++                Row(
++                    modifier = Modifier.fillMaxWidth(),
++                    verticalAlignment = Alignment.CenterVertically,
++                    horizontalArrangement = Arrangement.spacedBy(6.dp),
++                ) {
++                    Surface(
++                        onClick = { onToggle(source.id) },
++                        modifier = Modifier.weight(1f),
++                        shape = ClickableSurfaceDefaults.shape(shape),
++                        scale = ClickableSurfaceDefaults.scale(focusedScale = 1.02f),
++                        colors = ClickableSurfaceDefaults.colors(
++                            containerColor = if (source.isEnabled) {
++                                NuvioTheme.colors.Secondary.copy(alpha = 0.16f)
++                            } else {
++                                Color.White.copy(alpha = 0.05f)
++                            },
++                            focusedContainerColor = NuvioTheme.colors.Secondary.copy(alpha = 0.35f),
++                        ),
++                        border = ClickableSurfaceDefaults.border(
++                            focusedBorder = Border(BorderStroke(2.dp, NuvioTheme.colors.Secondary), shape),
++                            border = Border(BorderStroke(1.dp, Color.White.copy(alpha = 0.08f)), shape),
++                        ),
++                    ) {
++                        Row(
++                            modifier = Modifier
++                                .fillMaxWidth()
++                                .padding(horizontal = 12.dp, vertical = 8.dp),
++                            verticalAlignment = Alignment.CenterVertically,
++                            horizontalArrangement = Arrangement.spacedBy(10.dp),
++                        ) {
++                            Column(modifier = Modifier.weight(1f)) {
++                                Text(
++                                    text = source.name,
++                                    style = MaterialTheme.typography.labelLarge,
++                                    fontWeight = FontWeight.SemiBold,
++                                    color = Color.White,
++                                    maxLines = 1,
++                                    overflow = TextOverflow.Ellipsis,
++                                )
++                                val error = errors[source.id]
++                                Text(
++                                    text = error ?: source.kindLabel,
++                                    style = MaterialTheme.typography.bodySmall,
++                                    color = if (error != null) Color(0xFFFF8A80) else Color.White.copy(alpha = 0.45f),
++                                    fontSize = 11.sp,
++                                    maxLines = 1,
++                                    overflow = TextOverflow.Ellipsis,
++                                )
++                            }
++                            Box(
++                                modifier = Modifier
++                                    .size(22.dp)
++                                    .clip(RoundedCornerShape(4.dp))
++                                    .border(
++                                        1.dp,
++                                        if (source.isEnabled) NuvioTheme.colors.Secondary else Color.White.copy(alpha = 0.3f),
++                                        RoundedCornerShape(4.dp),
++                                    ),
++                                contentAlignment = Alignment.Center,
++                            ) {
++                                if (source.isEnabled) {
++                                    Icon(
++                                        imageVector = Icons.Rounded.Check,
++                                        contentDescription = null,
++                                        tint = NuvioTheme.colors.Secondary,
++                                        modifier = Modifier.size(14.dp),
++                                    )
++                                }
++                            }
++                        }
++                    }
++                    Button(
++                        onClick = { onRemove(source.id) },
++                        shape = ButtonDefaults.shape(shape = RoundedCornerShape(8.dp)),
++                        colors = ButtonDefaults.colors(
++                            containerColor = Color.White.copy(alpha = 0.10f),
++                            focusedContainerColor = Color(0xFFFF5252),
++                            focusedContentColor = Color.White,
++                        ),
++                    ) {
++                        Icon(
++                            imageVector = Icons.Rounded.Close,
++                            contentDescription = "Remove source",
++                            modifier = Modifier.size(16.dp),
++                        )
++                    }
++                }
++            }
++        }
++    }
++
++    Spacer(modifier = Modifier.height(8.dp))
++    Button(
++        onClick = { showAdd = true },
++        shape = ButtonDefaults.shape(shape = RoundedCornerShape(8.dp)),
++        colors = ButtonDefaults.colors(
++            containerColor = Color.White.copy(alpha = 0.10f),
++            focusedContainerColor = Color.White,
++            focusedContentColor = Color.Black,
++        ),
++        modifier = Modifier.fillMaxWidth(),
++    ) {
++        Text(text = "+ Add IPTV source", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
++    }
++
++    if (showAdd) {
++        TvIptvAddDialog(
++            onDismiss = { showAdd = false },
++            onAdd = {
++                onAdd(it)
++                showAdd = false
++            },
++        )
++    }
++}
++
++@OptIn(ExperimentalTvMaterial3Api::class)
++@Composable
++private fun TvIptvAddDialog(onDismiss: () -> Unit, onAdd: (IptvSource) -> Unit) {
++    var kind by remember { mutableStateOf(IptvKind.M3U) }
++    var name by remember { mutableStateOf("") }
++    var url by remember { mutableStateOf("") }
++    var username by remember { mutableStateOf("") }
++    var password by remember { mutableStateOf("") }
++    var mac by remember { mutableStateOf("00:1A:79:") }
++    var epgUrl by remember { mutableStateOf("") }
++
++    val draft = IptvSource(
++        id = "src" + System.currentTimeMillis(),
++        kind = kind,
++        name = name.trim().ifBlank {
++            when (kind) {
++                IptvKind.M3U -> "M3U playlist"
++                IptvKind.XTREAM -> "Xtream"
++                IptvKind.STALKER -> "Stalker"
++            }
++        },
++        url = url.trim(),
++        username = username.trim(),
++        password = password.trim(),
++        mac = mac.trim(),
++        epgUrl = epgUrl.trim(),
++    )
++
++    NuvioDialog(
++        onDismiss = onDismiss,
++        title = "Add IPTV source",
++        width = 540.dp,
++        contentPadding = 16.dp,
++        contentSpacing = 8.dp,
++    ) {
++        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++            IptvKind.entries.forEach { option ->
++                Button(
++                    onClick = { kind = option },
++                    shape = ButtonDefaults.shape(shape = RoundedCornerShape(8.dp)),
++                    colors = ButtonDefaults.colors(
++                        containerColor = if (option == kind) NuvioTheme.colors.Secondary else Color.White.copy(alpha = 0.10f),
++                        focusedContainerColor = Color.White,
++                        focusedContentColor = Color.Black,
++                    ),
++                    modifier = Modifier.weight(1f),
++                ) {
++                    Text(
++                        text = when (option) {
++                            IptvKind.M3U -> "M3U"
++                            IptvKind.XTREAM -> "Xtream"
++                            IptvKind.STALKER -> "Stalker"
++                        },
++                        fontSize = 12.sp,
++                        fontWeight = FontWeight.SemiBold,
++                    )
++                }
++            }
++        }
++        NuvioTextField(value = name, onValueChange = { name = it }, modifier = Modifier.fillMaxWidth(), placeholder = "Name (optional)")
++        NuvioTextField(
++            value = url,
++            onValueChange = { url = it },
++            modifier = Modifier.fillMaxWidth(),
++            placeholder = when (kind) {
++                IptvKind.M3U -> "Playlist URL (.m3u / .m3u8)"
++                IptvKind.XTREAM -> "Server URL, e.g. http://host:8080"
++                IptvKind.STALKER -> "Portal URL, e.g. http://host/c/"
++            },
++        )
++        if (kind != IptvKind.M3U) {
++            NuvioTextField(
++                value = username,
++                onValueChange = { username = it },
++                modifier = Modifier.fillMaxWidth(),
++                placeholder = if (kind == IptvKind.XTREAM) "Username" else "Login (optional)",
++            )
++            NuvioTextField(
++                value = password,
++                onValueChange = { password = it },
++                modifier = Modifier.fillMaxWidth(),
++                placeholder = if (kind == IptvKind.XTREAM) "Password" else "Password (optional)",
++            )
++        }
++        if (kind == IptvKind.STALKER) {
++            NuvioTextField(value = mac, onValueChange = { mac = it }, modifier = Modifier.fillMaxWidth(), placeholder = "MAC address")
++        } else {
++            NuvioTextField(value = epgUrl, onValueChange = { epgUrl = it }, modifier = Modifier.fillMaxWidth(), placeholder = "Guide URL (optional XMLTV)")
++        }
++        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++            Button(
++                onClick = onDismiss,
++                shape = ButtonDefaults.shape(shape = RoundedCornerShape(8.dp)),
++                colors = ButtonDefaults.colors(
++                    containerColor = Color.White.copy(alpha = 0.10f),
++                    focusedContainerColor = Color.White,
++                    focusedContentColor = Color.Black,
++                ),
++                modifier = Modifier.weight(1f),
++            ) { Text(text = "Cancel", fontSize = 12.sp, fontWeight = FontWeight.SemiBold) }
++            Button(
++                onClick = { if (draft.isConfigured) onAdd(draft) },
++                shape = ButtonDefaults.shape(shape = RoundedCornerShape(8.dp)),
++                colors = ButtonDefaults.colors(
++                    containerColor = NuvioTheme.colors.Secondary,
++                    focusedContainerColor = Color.White,
++                    focusedContentColor = Color.Black,
++                ),
++                modifier = Modifier.weight(1f),
++            ) { Text(text = if (draft.isConfigured) "Add" else "Fill the fields", fontSize = 12.sp, fontWeight = FontWeight.Bold) }
++        }
++    }
++}
