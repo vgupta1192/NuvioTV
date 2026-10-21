@@ -12,93 +12,22 @@ index 5a4799a2a..17050cd8e 100644
          item: LibraryEntryInput,
          changes: ListMembershipChanges
 diff --git a/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListLibraryRemote.kt b/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListLibraryRemote.kt
-index b7a971c58..3720ba7ae 100644
+index bff788988..7c231d3dd 100644
 --- a/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListLibraryRemote.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListLibraryRemote.kt
-@@ -22,7 +22,10 @@ internal class MdbListLibraryRemote(private val api: MdbListApiClient, private v
-         val previousUpdatedAt = previous?.lists.orEmpty().associate { it.key to it.updatedAt } +
-             previous?.dynamicLists.orEmpty().associate { it.key to it.updatedAt }
-         val addedOrders = previous?.addedOrders.orEmpty().toMutableMap().apply { remove(MDBLIST_WATCHLIST_KEY) }
--        val hidden = previous?.hiddenListKeys.orEmpty()
-+        val known = previous?.tabs().orEmpty().mapTo(mutableSetOf()) { it.key }
-+        val hidden = previous?.hiddenListKeys.orEmpty().toMutableSet()
-+        // Dynamic and liked lists can hold thousands of titles each, so new ones start hidden until turned on in settings.
-+        dynamicLists.filterNot { it.key in known }.mapTo(hidden) { it.key }
-         for ((key, updatedAt) in lists.map { it.key to it.updatedAt } + dynamicLists.map { it.key to it.updatedAt }) {
-             // Hidden lists are not shown anywhere, so skip downloading their items.
-             if (key in hidden) {
-@@ -31,10 +34,10 @@ internal class MdbListLibraryRemote(private val api: MdbListApiClient, private v
+@@ -71,6 +71,7 @@ internal class MdbListLibraryRemote(private val api: MdbListApiClient, private v
+                 if (otherNewLists + newKeys.size > MDBLIST_NEW_LISTS_SHOWN_LIMIT) hidden += newKeys
              }
-             items[key] = cachedOrFetched(previous, key, updatedAt, previousUpdatedAt[key], reuseItems, addedOrders)
-         }
--        val externalLists = synchronizeOptional("External", previous, previous?.externalLists.orEmpty(), hidden, reuseItems,
--            items, addedOrders) { decodeMdbListExternalLists(api.get("/external/lists/user", scope = scope).body) }
--        val likedLists = synchronizeOptional("Liked", previous, previous?.likedLists.orEmpty(), hidden, reuseItems,
--            items, addedOrders) { likedLists(accountId) }
-+        val externalLists = synchronizeOptional("External", previous, previous?.externalLists.orEmpty(), hidden, null,
-+            reuseItems, items, addedOrders) { decodeMdbListExternalLists(api.get("/external/lists/user", scope = scope).body) }
-+        val likedLists = synchronizeOptional("Liked", previous, previous?.likedLists.orEmpty(), hidden, known,
-+            reuseItems, items, addedOrders) { likedLists(accountId) }
-         val snapshot = MdbListLibrarySnapshot(lists, items, now, addedOrders = addedOrders.filterKeys { it in items },
-             itemsOrder = MDBLIST_ITEMS_ORDER, externalLists = externalLists, dynamicLists = dynamicLists,
-             likedLists = likedLists)
-@@ -48,7 +51,9 @@ internal class MdbListLibraryRemote(private val api: MdbListApiClient, private v
-         label: String,
-         previous: MdbListLibrarySnapshot?,
-         previousLists: List<T>,
--        hidden: Set<String>,
-+        hidden: MutableSet<String>,
-+        // Lists missing from these keys start hidden; null keeps new lists shown.
-+        knownKeys: Set<String>?,
-         reuseItems: Boolean,
-         items: MutableMap<String, List<MdbListLibraryItem>>,
-         addedOrders: MutableMap<String, Map<String, List<MdbListLibraryOrderItem>>>,
-@@ -59,6 +64,7 @@ internal class MdbListLibraryRemote(private val api: MdbListApiClient, private v
-             val lists = fetchLists()
-             val previousUpdatedAt = previousLists.associate { it.key to it.updatedAt }
              for (list in lists) {
 +                if (knownKeys != null && list.key !in knownKeys) hidden += list.key
                  if (list.key in hidden) {
                      addedOrders.remove(list.key)
                      continue
-@@ -119,18 +125,22 @@ internal class MdbListLibraryRemote(private val api: MdbListApiClient, private v
-             else mapOf("sort" to sort, "order" to order)
-         var query = initial
-         val visited = mutableSetOf<Map<String, String>>()
--        val items = mutableListOf<MdbListLibraryItem>()
-+        val items = linkedMapOf<String, MdbListLibraryItem>()
-+        val readOnly = isMdbListReadOnlyListKey(key)
-         repeat(1_000) {
-             if (!visited.add(query)) throw MdbListDecodingException()
-             val response = api.get(path, query, scope)
-             val page = decodeMdbListLibraryPage(response.body)
--            items += page.items
-+            val before = items.size
-+            page.items.forEach { item -> if (item.key !in items) items[item.key] = item }
-+            // A read-only list page that repeats earlier titles means the server is looping, so stop there.
-+            if (readOnly && items.size == before) return items.values.toList()
-             val nextCursor = page.nextCursor ?: response.header("X-Next-Cursor")?.takeIf { it.isNotBlank() }
-             query = when {
-                 nextCursor != null -> initial + ("cursor" to nextCursor)
-                 page.nextOffset != null -> initial + ("offset" to page.nextOffset.toString())
-                 response.header("X-Has-More").equals("true", ignoreCase = true) -> throw MdbListDecodingException()
--                else -> return items.distinctBy { it.key }
-+                else -> return items.values.toList()
-             }
-         }
-         throw MdbListDecodingException()
 diff --git a/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListLibraryService.kt b/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListLibraryService.kt
-index 9a0f2bc1e..bae105b09 100644
+index 0cdffc6f6..bae105b09 100644
 --- a/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListLibraryService.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListLibraryService.kt
-@@ -1,5 +1,6 @@
- package com.nuvio.tv.data.mdblist
- 
-+import android.util.Log
- import com.nuvio.tv.core.tracking.TrackingListManager
- import com.nuvio.tv.core.tracking.TrackingLibrarySorter
- import com.nuvio.tv.core.tracking.TrackingRefreshGate
-@@ -37,7 +38,10 @@ class MdbListLibraryService(
+@@ -38,7 +38,10 @@ class MdbListLibraryService(
          }
      }.distinctUntilChanged()
      private val snapshots = allSnapshots.onEach { refreshAsync() }
@@ -110,7 +39,7 @@ index 9a0f2bc1e..bae105b09 100644
  
      /** Every list that can be hidden, with whether it is shown in the library, for MDBList settings. */
      val listOptions = allSnapshots.map { it?.listOptions().orEmpty() }.distinctUntilChanged()
-@@ -54,19 +58,40 @@ class MdbListLibraryService(
+@@ -55,19 +58,40 @@ class MdbListLibraryService(
          val scope = sync.currentScope()
          refresh(TrackingRefreshIntent.AUTOMATIC)
          if (sync.currentScope() != scope) throw CancellationException("MDBList account changed")
@@ -123,8 +52,8 @@ index 9a0f2bc1e..bae105b09 100644
 -        })
 +        val library = writer.currentLibrary() ?: throw loadState.value.error ?: MdbListDecodingException()
 +        return library.membership(input)
-     }
- 
++    }
++
 +    /**
 +     * Membership for the Add to library button: the cached library as it is shown, so the press acts
 +     * at once. Without a cached library only the watchlist is read.
@@ -137,8 +66,8 @@ index 9a0f2bc1e..bae105b09 100644
 +        return MdbListLibrarySnapshot(itemsByList = mapOf(MDBLIST_WATCHLIST_KEY to watchlist))
 +            .withWrites(writer.pendingWrites(scope))
 +            .membership(input)
-+    }
-+
+     }
+ 
 +    /** Writes first; the cached library is updated and refreshed in the background afterwards. */
      suspend fun applyMembershipChanges(input: LibraryEntryInput, changes: ListMembershipChanges) {
          val scope = sync.currentScope()
@@ -160,28 +89,6 @@ index 9a0f2bc1e..bae105b09 100644
      }
  
      suspend fun setListVisible(key: String, visible: Boolean) {
-@@ -114,6 +139,10 @@ class MdbListLibraryService(
-                 loadState.value = LibraryLoadState(scope)
-                 throw error
-             } catch (error: Exception) {
-+                val cached = sync.currentSnapshot()?.library
-+                Log.w(TAG, "Library refresh failed (cached lists ${cached?.lists?.size ?: 0}, dynamic " +
-+                    "${cached?.dynamicLists?.size ?: 0}, liked ${cached?.likedLists?.size ?: 0}, external " +
-+                    "${cached?.externalLists?.size ?: 0}, hidden ${cached?.hiddenListKeys?.size ?: 0})", error)
-                 loadState.value = LibraryLoadState(scope, error = error, attemptedAt = now())
-             }
-         }
-@@ -135,6 +164,10 @@ class MdbListLibraryService(
-         return library.invalidated || library.checkedAtEpochMs?.let { time - it !in 0 until MdbListSyncRepository.AUTOMATIC_INTERVAL_MS } != false
-     }
- 
-+    private companion object {
-+        const val TAG = "MdbListLibrary"
-+    }
-+
-     private data class LibraryLoadState(
-         val scope: MdbListAuthScope? = null,
-         val refreshing: Boolean = false,
 diff --git a/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListLibraryWriter.kt b/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListLibraryWriter.kt
 index 24638cc0c..954f85df9 100644
 --- a/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListLibraryWriter.kt
@@ -392,10 +299,10 @@ index 3a46aab70..d866a3c0c 100644
                  provider.toggledDefaultMembership(currentMembership)
              )
 diff --git a/app/src/main/java/com/nuvio/tv/data/repository/TraktLibraryService.kt b/app/src/main/java/com/nuvio/tv/data/repository/TraktLibraryService.kt
-index 8b1abdc99..95012e6a6 100644
+index 12c78e821..09431ff00 100644
 --- a/app/src/main/java/com/nuvio/tv/data/repository/TraktLibraryService.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/repository/TraktLibraryService.kt
-@@ -64,6 +64,7 @@ class TraktLibraryService @Inject constructor(
+@@ -63,6 +63,7 @@ class TraktLibraryService @Inject constructor(
      private val refreshingState = MutableStateFlow(false)
      private val refreshMutex = Mutex()
      private var lastRefreshMs: Long = 0L
@@ -403,7 +310,7 @@ index 8b1abdc99..95012e6a6 100644
  
      private val cacheTtlMs = 60_000L
      private val listFetchConcurrency = 3
-@@ -112,28 +113,47 @@ class TraktLibraryService @Inject constructor(
+@@ -105,28 +106,47 @@ class TraktLibraryService @Inject constructor(
  
      suspend fun getMembershipSnapshot(item: LibraryEntryInput): ListMembershipSnapshot {
          ensureFresh()
@@ -461,7 +368,7 @@ index 8b1abdc99..95012e6a6 100644
  
              if (listKey == WATCHLIST_KEY) {
                  if (after) {
-@@ -320,6 +340,16 @@ class TraktLibraryService @Inject constructor(
+@@ -313,6 +333,16 @@ class TraktLibraryService @Inject constructor(
          refresh(force = false)
      }
  
@@ -478,7 +385,7 @@ index 8b1abdc99..95012e6a6 100644
      private suspend fun refresh(force: Boolean): Boolean {
          val now = System.currentTimeMillis()
          return refreshMutex.withLock {
-@@ -329,9 +359,14 @@ class TraktLibraryService @Inject constructor(
+@@ -322,9 +352,14 @@ class TraktLibraryService @Inject constructor(
  
              refreshingState.value = true
              try {
@@ -495,7 +402,7 @@ index 8b1abdc99..95012e6a6 100644
                  snapshotState.value = snapshotToUse
                  lastRefreshMs = now
                  refreshed != null
-@@ -347,12 +382,15 @@ class TraktLibraryService @Inject constructor(
+@@ -340,12 +375,15 @@ class TraktLibraryService @Inject constructor(
      ) {
          val before = snapshotState.value
          val optimisticSnapshot = optimistic(before)
