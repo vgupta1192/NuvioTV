@@ -1,0 +1,173 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/privacy/PrivateViewing.kt b/app/src/main/java/com/nuvio/tv/core/privacy/PrivateViewing.kt
+new file mode 100644
+index 000000000..c0d296974
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/privacy/PrivateViewing.kt
+@@ -0,0 +1,62 @@
++package com.nuvio.tv.core.privacy
++
++import android.content.Context
++import dagger.hilt.android.qualifiers.ApplicationContext
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import javax.inject.Inject
++import javax.inject.Singleton
++
++/**
++ * Private viewing (ported idea from NuvioMobile-Enhanced): while on, playback is not saved to watch
++ * progress / Continue Watching and is not scrobbled to Trakt, Simkl, MDBList and the like.
++ * Per device. Repositories inject this class so the stored value is loaded at app start; the
++ * settings row uses the static state below.
++ */
++object PrivateViewingState {
++    private const val PREFS = "nuvio_private_viewing"
++    private const val KEY = "enabled"
++
++    private val _enabled = MutableStateFlow(false)
++
++    @Volatile
++    private var loaded = false
++
++    fun ensureLoaded(context: Context) {
++        if (loaded) return
++        synchronized(this) {
++            if (loaded) return
++            _enabled.value = prefs(context).getBoolean(KEY, false)
++            loaded = true
++        }
++    }
++
++    fun enabled(context: Context): StateFlow<Boolean> {
++        ensureLoaded(context)
++        return _enabled.asStateFlow()
++    }
++
++    fun isEnabled(): Boolean = _enabled.value
++
++    fun setEnabled(context: Context, value: Boolean) {
++        _enabled.value = value
++        loaded = true
++        prefs(context).edit().putBoolean(KEY, value).apply()
++    }
++
++    private fun prefs(context: Context) =
++        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++}
++
++@Singleton
++class PrivateViewing @Inject constructor(
++    @ApplicationContext context: Context,
++) {
++    init {
++        PrivateViewingState.ensureLoaded(context)
++    }
++
++    val isEnabled: Boolean
++        get() = PrivateViewingState.isEnabled()
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/tracking/TrackingScrobbleCoordinator.kt b/app/src/main/java/com/nuvio/tv/core/tracking/TrackingScrobbleCoordinator.kt
+index b6ea8683c..ad991f246 100644
+--- a/app/src/main/java/com/nuvio/tv/core/tracking/TrackingScrobbleCoordinator.kt
++++ b/app/src/main/java/com/nuvio/tv/core/tracking/TrackingScrobbleCoordinator.kt
+@@ -15,12 +15,14 @@ data class TrackingScrobbleFailure(
+ 
+ @Singleton
+ class TrackingScrobbleCoordinator @Inject constructor(
+-    private val providerRegistry: TrackingProviderRegistry
++    private val providerRegistry: TrackingProviderRegistry,
++    private val privateViewing: com.nuvio.tv.core.privacy.PrivateViewing,
+ ) {
+     suspend fun scrobble(
+         action: TrackingScrobbleAction,
+         event: TrackingScrobbleEvent
+     ): List<TrackingScrobbleFailure> {
++        if (privateViewing.isEnabled) return emptyList() // Nuvio fork: private viewing
+         val scrobblers = providerRegistry.connectedScrobblers()
+         Log.d(
+             TRACKING_SCROBBLE_DIAGNOSTIC_TAG,
+@@ -45,7 +47,9 @@ class TrackingScrobbleCoordinator @Inject constructor(
+     suspend fun scrobbleSeek(
+         action: TrackingScrobbleAction,
+         event: TrackingScrobbleEvent
+-    ): List<TrackingScrobbleFailure> = dispatchSeek(
++    ): List<TrackingScrobbleFailure> = if (privateViewing.isEnabled) {
++        emptyList() // Nuvio fork: private viewing
++    } else dispatchSeek(
+         scrobblers = providerRegistry.connectedScrobblers(),
+         action = action,
+         event = event
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/WatchProgressRepositoryImpl.kt b/app/src/main/java/com/nuvio/tv/data/repository/WatchProgressRepositoryImpl.kt
+index 787706b1a..e805678e0 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/WatchProgressRepositoryImpl.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/WatchProgressRepositoryImpl.kt
+@@ -142,6 +142,7 @@ class WatchProgressRepositoryImpl @Inject constructor(
+     private val trackingHistoryWriters: TrackingHistoryWriterRegistry,
+     private val mutationStore: WatchStateMutationStore,
+     private val serverWatched: ServerWatched,
++    private val privateViewing: com.nuvio.tv.core.privacy.PrivateViewing,
+ ) : WatchProgressRepository {
+     companion object {
+         private const val TAG = "WatchProgressRepo"
+@@ -749,6 +750,7 @@ class WatchProgressRepositoryImpl @Inject constructor(
+         profileId: Int,
+         syncRemote: Boolean
+     ) {
++        if (privateViewing.isEnabled) return // Nuvio fork: private viewing
+         if (progress.contentType.equals("series", ignoreCase = true) ||
+             progress.contentType.equals("tv", ignoreCase = true)) {
+             traktSettingsDataStore.removeDismissedNextUpKeysForContent(progress.contentId, profileId)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPlayerSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPlayerSettings.kt
+index 32c9777d9..5b4de795a 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPlayerSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPlayerSettings.kt
+@@ -170,6 +170,7 @@ internal fun PlaybackPlayerInterfaceSection(
+         enabled = internalPlayer
+     )
+     seekPreviewSettingsRows(enabled = internalPlayer) // Nuvio fork: seek previews
++    privateViewingSettingsRow(enabled = true) // Nuvio fork: private viewing
+ }
+ 
+ @Composable
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PrivateViewingSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PrivateViewingSettingsItems.kt
+new file mode 100644
+index 000000000..0de8a0e80
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PrivateViewingSettingsItems.kt
+@@ -0,0 +1,25 @@
++@file:OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
++
++package com.nuvio.tv.ui.screens.settings
++
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.res.stringResource
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import com.nuvio.tv.R
++import com.nuvio.tv.core.privacy.PrivateViewingState
++
++/** "Private viewing" row under Playback > Player interface (fork feature). */
++@Composable
++internal fun privateViewingSettingsRow(enabled: Boolean) {
++    val context = LocalContext.current
++    val checked by PrivateViewingState.enabled(context).collectAsStateWithLifecycle()
++    SettingsToggleRow(
++        title = stringResource(R.string.settings_private_viewing),
++        subtitle = stringResource(R.string.settings_private_viewing_description),
++        checked = checked,
++        onToggle = { PrivateViewingState.setEnabled(context, !checked) },
++        enabled = enabled,
++    )
++}
+diff --git a/app/src/main/res/values/strings_private_viewing.xml b/app/src/main/res/values/strings_private_viewing.xml
+new file mode 100644
+index 000000000..67dd7b4c4
+--- /dev/null
++++ b/app/src/main/res/values/strings_private_viewing.xml
+@@ -0,0 +1,5 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="settings_private_viewing">Private viewing</string>
++    <string name="settings_private_viewing_description">Do not save watch progress or Continue Watching, and do not scrobble to Trakt, Simkl or MDBList, while this is on.</string>
++</resources>
