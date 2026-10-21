@@ -163,7 +163,7 @@ new file mode 100644
 index 000000000..378336132
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerCustomStretch.kt
-@@ -0,0 +1,473 @@
+@@ -0,0 +1,492 @@
 +package com.nuvio.tv.ui.screens.player
 +
 +import android.graphics.Bitmap
@@ -515,12 +515,19 @@ index 000000000..378336132
 +    private val thickness = FloatArray(4) { 1f }
 +    private val observations = IntArray(4)
 +    private var lastEvidence: IntArray? = null
++    /** Frames that counted as evidence (distinct shots, or a still shot seen long enough). */
 +    private var samples = 0
++    /** Every usable sample taken, including repeats of the same shot. */
++    private var attempts = 0
++    private var staticRepeats = 0
 +    private var committed: VideoContentRect? = null
 +
-+    /** Sample faster until every edge is confirmed (or enough samples were taken). */
++    /**
++     * Sample faster until every edge is confirmed (or enough samples were taken). Repeats of one
++     * still shot (a title card, a paused start) use up attempts, not the evidence budget.
++     */
 +    val isCalibrating: Boolean
-+        get() = samples < MAX_CALIBRATION_SAMPLES && observations.any { it < CONFIRMATIONS }
++        get() = attempts < MAX_CALIBRATION_ATTEMPTS && observations.any { it < CONFIRMATIONS }
 +
 +    val current: VideoContentRect? get() = committed
 +
@@ -529,16 +536,27 @@ index 000000000..378336132
 +        observations.fill(0)
 +        lastEvidence = null
 +        samples = 0
++        attempts = 0
++        staticRepeats = 0
 +        committed = null
 +    }
 +
 +    /** Feed one sample. Returns the new picture area when it changed, else null. */
 +    fun offer(sample: BarSample?): VideoContentRect? {
 +        if (sample == null) return null
++        attempts++
++        // A dark scene must not confirm itself, so a repeat of the same shot only counts after it
++        // was seen STATIC_CONFIRM_REPEATS more times. Bars are only trusted with a sharp edge, so a
++        // still frame that shows them (intro card, paused start) is real evidence.
++        if (sample.differsFrom(lastEvidence)) {
++            lastEvidence = sample.signature
++            staticRepeats = 0
++        } else {
++            staticRepeats++
++            if (staticRepeats < STATIC_CONFIRM_REPEATS) return null
++            staticRepeats = 0
++        }
 +        samples++
-+        // The same (paused or static) shot counts once: a dark scene must not confirm itself.
-+        if (!sample.differsFrom(lastEvidence)) return null
-+        lastEvidence = sample.signature
 +        val measured = sample.thickness
 +        for (edge in 0 until 4) {
 +            if (!sample.confident[edge]) continue
@@ -563,7 +581,8 @@ index 000000000..378336132
 +    companion object {
 +        const val CALIBRATION_SAMPLES = 3
 +        const val CONFIRMATIONS = 2
-+        const val MAX_CALIBRATION_SAMPLES = 16
++        const val MAX_CALIBRATION_ATTEMPTS = 50
++        const val STATIC_CONFIRM_REPEATS = 2
 +        const val SECOND_AXIS_MIN_BAR = 0.03f
 +        const val CALIBRATION_INTERVAL_MS = 1_200L
 +        const val STEADY_INTERVAL_MS = 8_000L
