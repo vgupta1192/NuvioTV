@@ -1,0 +1,218 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodeSort.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodeSort.kt
+new file mode 100644
+index 0000000..cd5f2df
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodeSort.kt
+@@ -0,0 +1,71 @@
++package com.nuvio.tv.ui.screens.detail
++
++import androidx.annotation.StringRes
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.res.stringResource
++import androidx.tv.material3.Button
++import androidx.tv.material3.ButtonDefaults
++import androidx.tv.material3.ExperimentalTvMaterial3Api
++import androidx.tv.material3.Text
++import com.nuvio.tv.R
++import com.nuvio.tv.domain.model.Video
++import com.nuvio.tv.ui.components.NuvioDialog
++import com.nuvio.tv.ui.theme.NuvioTheme
++
++/** Episode navigator sort (ported from NuvioMobile-Enhanced): changes only the order shown in the episode row. */
++enum class EpisodeSortOrder(@StringRes val labelRes: Int, @StringRes val shortLabelRes: Int) {
++    FirstToLast(R.string.episode_sort_first_to_last, R.string.episode_sort_short_default),
++    LastToFirst(R.string.episode_sort_last_to_first, R.string.episode_sort_short_last),
++    HighestRated(R.string.episode_sort_highest_rated, R.string.episode_sort_short_rated),
++    NewestAired(R.string.episode_sort_newest_aired, R.string.episode_sort_short_newest),
++    UnwatchedFirst(R.string.episode_sort_unwatched_first, R.string.episode_sort_short_unwatched),
++}
++
++fun List<Video>.sortedForNavigator(
++    sort: EpisodeSortOrder,
++    isWatched: (Video) -> Boolean,
++    ratingOf: (Video) -> Double?,
++): List<Video> = when (sort) {
++    EpisodeSortOrder.FirstToLast -> this
++    EpisodeSortOrder.LastToFirst -> asReversed()
++    EpisodeSortOrder.HighestRated -> sortedByDescending { ratingOf(it) ?: -1.0 }
++    EpisodeSortOrder.NewestAired -> sortedByDescending { it.released.orEmpty() }
++    EpisodeSortOrder.UnwatchedFirst -> sortedBy { isWatched(it) }
++}
++
++@OptIn(ExperimentalTvMaterial3Api::class)
++@Composable
++fun EpisodeSortDialog(
++    selected: EpisodeSortOrder,
++    onDismiss: () -> Unit,
++    onSelect: (EpisodeSortOrder) -> Unit,
++) {
++    val selectedFocusRequester = remember { FocusRequester() }
++    LaunchedEffect(Unit) { selectedFocusRequester.requestFocus() }
++
++    NuvioDialog(
++        onDismiss = onDismiss,
++        title = stringResource(R.string.episode_sort_title),
++    ) {
++        EpisodeSortOrder.entries.forEach { order ->
++            Button(
++                onClick = { onSelect(order) },
++                modifier = Modifier
++                    .fillMaxWidth()
++                    .then(if (order == selected) Modifier.focusRequester(selectedFocusRequester) else Modifier),
++                colors = ButtonDefaults.colors(
++                    containerColor = if (order == selected) NuvioTheme.colors.SurfaceVariant else NuvioTheme.colors.BackgroundCard,
++                    contentColor = NuvioTheme.colors.TextPrimary,
++                ),
++            ) {
++                Text(stringResource(order.labelRes))
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt
+index 182a1f8..7a3e1ce 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt
+@@ -124,7 +124,9 @@ fun SeasonTabs(
+     selectedTabFocusRequester: FocusRequester,
+     upFocusRequester: FocusRequester? = null,
+     downFocusRequester: FocusRequester? = null,
+-    isFocusEnabled: Boolean = true
++    isFocusEnabled: Boolean = true,
++    sortLabel: String? = null,
++    onSortClick: () -> Unit = {}
+ ) {
+     // Move season 0 (specials) to the end
+     val sortedSeasons = remember(seasons) {
+@@ -274,7 +276,7 @@ fun SeasonTabs(
+     ) {
+         items(sortedSeasons, key = { it }) { season ->
+             val isSelected = season == selectedSeason
+-            val isRightEdge = if (isRtl) season == sortedSeasons.first() else season == sortedSeasons.last()
++            val isRightEdge = sortLabel == null && (if (isRtl) season == sortedSeasons.first() else season == sortedSeasons.last())
+             val isLeftEdge = if (isRtl) season == sortedSeasons.last() else season == sortedSeasons.first()
+             var isFocused by remember { mutableStateOf(false) }
+             var longPressTriggered by remember { mutableStateOf(false) }
+@@ -364,6 +366,37 @@ fun SeasonTabs(
+                 )
+             }
+         }
++        if (sortLabel != null) {
++            item(key = "episode_sort") {
++                var sortFocused by remember { mutableStateOf(false) }
++                Card(
++                    onClick = onSortClick,
++                    modifier = Modifier
++                        .focusProperties {
++                            canFocus = isFocusEnabled
++                            right = FocusRequester.Cancel
++                            if (upFocusRequester != null) {
++                                up = upFocusRequester
++                            }
++                        }
++                        .onFocusChanged { sortFocused = it.isFocused },
++                    shape = CardDefaults.shape(shape = tabShape),
++                    colors = CardDefaults.colors(
++                        containerColor = NuvioTheme.colors.BackgroundCard,
++                        focusedContainerColor = NuvioTheme.colors.Secondary
++                    ),
++                    border = tabBorder,
++                    scale = tabScale
++                ) {
++                    Text(
++                        text = sortLabel,
++                        style = tabTextStyle,
++                        color = if (sortFocused) NuvioTheme.colors.OnSecondary else textSecondary,
++                        modifier = Modifier.padding(vertical = 10.dp, horizontal = 20.dp)
++                    )
++                }
++            }
++        }
+     }
+ }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
+index 88c7855..6941a0a 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
+@@ -1983,6 +1983,8 @@ private fun MetaDetailsContent(
+     }
+     var activePeopleTab by rememberSaveable(meta.id) { mutableStateOf(initialPeopleTab) }
+     var seasonOptionsDialogSeason by remember { mutableStateOf<Int?>(null) }
++    var episodeSort by remember(meta.id) { mutableStateOf(EpisodeSortOrder.FirstToLast) }
++    var showEpisodeSortDialog by remember { mutableStateOf(false) }
+     // Tracks whether the initial auto-scroll to the "next to play" episode has fired.
+     // Once it fires, no more auto-scrolls happen for the lifetime of this detail screen.
+     var initialEpisodeScrollDone by remember(meta.id) { mutableStateOf(false) }
+@@ -2547,7 +2549,9 @@ private fun MetaDetailsContent(
+                             selectedTabFocusRequester = selectedSeasonFocusRequester,
+                             upFocusRequester = heroPlayFocusRequester,
+                             downFocusRequester = seasonDownFocusRequester,
+-                            isFocusEnabled = pendingRestoreType != RestoreTarget.EPISODE
++                            isFocusEnabled = pendingRestoreType != RestoreTarget.EPISODE,
++                            sortLabel = stringResource(R.string.episode_sort_button, stringResource(episodeSort.shortLabelRes)),
++                            onSortClick = { showEpisodeSortDialog = true }
+                         )
+                     }
+                 }
+@@ -2565,7 +2569,14 @@ private fun MetaDetailsContent(
+                     }
+                     Box(modifier = Modifier.bringIntoViewResponder(episodeRowStayVerticalResponder)) {
+                         EpisodesRow(
+-                            episodes = episodesForSeason,
++                            episodes = remember(episodesForSeason, episodeSort, watchedEpisodes, visibleEpisodeImdbRatings) {
++                                episodesForSeason.sortedForNavigator(
++                                    sort = episodeSort,
++                                    isWatched = { v ->
++                                        val s = v.season
++                                        val e = v.episode
++                                        s != null && e != null && (s to e) in watchedEpisodes
++                                    },
+                                     ratingOf = { v ->
+                                         val s = v.season
+                                         val e = v.episode
+@@ -3044,6 +3055,17 @@ private fun MetaDetailsContent(
+         }
+         }
+ 
++        if (showEpisodeSortDialog) {
++            EpisodeSortDialog(
++                selected = episodeSort,
++                onDismiss = { showEpisodeSortDialog = false },
++                onSelect = {
++                    episodeSort = it
++                    showEpisodeSortDialog = false
++                }
++            )
++        }
++
+         seasonOptionsDialogSeason?.let { season ->
+             val hasPreviousSeasons = remember(season, seasons) {
+                 seasons.any { it != 0 && it < season }
+diff --git a/app/src/main/res/values/strings_episode_sort.xml b/app/src/main/res/values/strings_episode_sort.xml
+new file mode 100644
+index 0000000..757e52b
+--- /dev/null
++++ b/app/src/main/res/values/strings_episode_sort.xml
+@@ -0,0 +1,15 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="episode_sort_button">Sort: %1$s</string>
++    <string name="episode_sort_title">Sort episodes</string>
++    <string name="episode_sort_first_to_last">Episode: first to last</string>
++    <string name="episode_sort_last_to_first">Episode: last to first</string>
++    <string name="episode_sort_highest_rated">Highest rated</string>
++    <string name="episode_sort_newest_aired">Newest aired</string>
++    <string name="episode_sort_unwatched_first">Unwatched first</string>
++    <string name="episode_sort_short_default">Default</string>
++    <string name="episode_sort_short_last">Last first</string>
++    <string name="episode_sort_short_rated">Top rated</string>
++    <string name="episode_sort_short_newest">Newest</string>
++    <string name="episode_sort_short_unwatched">Unwatched</string>
++</resources>
