@@ -1,0 +1,151 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/components/DynamicHeroTint.kt b/app/src/main/java/com/nuvio/tv/ui/components/DynamicHeroTint.kt
+new file mode 100644
+index 000000000..7bc62609b
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/components/DynamicHeroTint.kt
+@@ -0,0 +1,124 @@
++package com.nuvio.tv.ui.components
++
++import android.graphics.Color as AndroidColor
++import androidx.compose.animation.animateColorAsState
++import androidx.compose.animation.core.tween
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.drawBehind
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.graphics.Brush
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import coil3.imageLoader
++import coil3.request.ImageRequest
++import coil3.request.SuccessResult
++import coil3.request.allowHardware
++import coil3.toBitmap
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++
++private const val SAMPLE_PX = 48
++private const val CACHE_CAPACITY = 128
++
++private object ArtworkTintCache {
++    private val entries = LinkedHashMap<String, Color>()
++
++    @Synchronized
++    fun get(url: String): Color? {
++        val color = entries.remove(url) ?: return null
++        entries[url] = color
++        return color
++    }
++
++    @Synchronized
++    fun put(url: String, color: Color) {
++        entries.remove(url)
++        entries[url] = color
++        if (entries.size > CACHE_CAPACITY) entries.remove(entries.keys.first())
++    }
++}
++
++/**
++ * Dynamic home background (ported idea from NuvioMobile-Enhanced): a soft glow in the dominant colour of the
++ * hero artwork that is showing, behind the hero. [urlProvider] is read here so only this layer recomposes.
++ */
++@Composable
++fun DynamicHeroTint(urlProvider: () -> String?, modifier: Modifier = Modifier) {
++    val url = urlProvider()?.takeIf { it.isNotBlank() }
++    val context = LocalContext.current
++    var sampled by remember { mutableStateOf<Color?>(null) }
++
++    LaunchedEffect(url) {
++        if (url == null) return@LaunchedEffect
++        ArtworkTintCache.get(url)?.let { sampled = it; return@LaunchedEffect }
++        val color = runCatching {
++            val request = ImageRequest.Builder(context)
++                .data(url)
++                .size(SAMPLE_PX, SAMPLE_PX)
++                .allowHardware(false)
++                .build()
++            val result = context.imageLoader.execute(request) as? SuccessResult ?: return@runCatching null
++            withContext(Dispatchers.Default) { dominantColor(result.image.toBitmap()) }
++        }.getOrNull()
++        if (color != null) {
++            ArtworkTintCache.put(url, color)
++            sampled = color
++        }
++    }
++
++    val tint by animateColorAsState(
++        targetValue = sampled ?: Color.Transparent,
++        animationSpec = tween(durationMillis = 700),
++        label = "dynamicHeroTint"
++    )
++    Box(
++        modifier = modifier
++            .fillMaxSize()
++            .drawBehind {
++                if (tint.alpha == 0f) return@drawBehind
++                drawRect(
++                    Brush.radialGradient(
++                        colors = listOf(tint.copy(alpha = 0.42f), tint.copy(alpha = 0.16f), Color.Transparent),
++                        center = Offset(size.width * 0.7f, size.height * 0.3f),
++                        radius = size.maxDimension * 0.85f
++                    )
++                )
++            }
++    )
++}
++
++/** Average of the colourful, mid-light pixels, lifted so dark artwork still gives a visible glow. */
++private fun dominantColor(bitmap: android.graphics.Bitmap): Color? {
++    val width = bitmap.width.coerceAtLeast(1)
++    val height = bitmap.height.coerceAtLeast(1)
++    val pixels = IntArray(width * height)
++    bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
++    var r = 0.0
++    var g = 0.0
++    var b = 0.0
++    var weight = 0.0
++    val hsv = FloatArray(3)
++    for (pixel in pixels) {
++        AndroidColor.colorToHSV(pixel, hsv)
++        if (hsv[2] < 0.2f || hsv[1] < 0.12f) continue
++        val w = (hsv[1] * hsv[2]).toDouble()
++        r += AndroidColor.red(pixel) * w
++        g += AndroidColor.green(pixel) * w
++        b += AndroidColor.blue(pixel) * w
++        weight += w
++    }
++    if (weight <= 0.0) return null
++    val average = AndroidColor.rgb((r / weight).toInt(), (g / weight).toInt(), (b / weight).toInt())
++    AndroidColor.colorToHSV(average, hsv)
++    hsv[1] = hsv[1].coerceIn(0.35f, 0.9f)
++    hsv[2] = hsv[2].coerceIn(0.55f, 0.9f)
++    return Color(AndroidColor.HSVToColor(hsv))
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt
+index b75d46af8..da928f37c 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt
+@@ -70,6 +70,7 @@ import androidx.tv.material3.Icon
+ import androidx.tv.material3.MaterialTheme
+ import androidx.tv.material3.Text
+ import coil3.compose.AsyncImage
++import com.nuvio.tv.ui.components.DynamicHeroTint
+ import coil3.imageLoader
+ import coil3.memory.MemoryCache
+ import coil3.request.ImageRequest
+@@ -1093,6 +1094,8 @@ fun ModernHomeContent(
+             }
+             val onFirstFrameRenderedLambda = remember { { heroTrailerFirstFrameRendered = true } }
+ 
++            DynamicHeroTint(urlProvider = { resolvedHeroState.value.first })
++
+             ModernHeroSection(
+                 heroSceneState = heroSceneStateLambda,
+                 isFullScreen = isFullScreenLambda,

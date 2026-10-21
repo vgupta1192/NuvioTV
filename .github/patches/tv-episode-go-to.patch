@@ -1,0 +1,212 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodeGoTo.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodeGoTo.kt
+new file mode 100644
+index 000000000..7564ef05c
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodeGoTo.kt
+@@ -0,0 +1,83 @@
++package com.nuvio.tv.ui.screens.detail
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.lazy.grid.GridCells
++import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
++import androidx.compose.foundation.lazy.grid.items
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.focus.onFocusChanged
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import androidx.tv.material3.Button
++import androidx.tv.material3.ButtonDefaults
++import androidx.tv.material3.ExperimentalTvMaterial3Api
++import androidx.tv.material3.MaterialTheme
++import androidx.tv.material3.Text
++import com.nuvio.tv.R
++import com.nuvio.tv.domain.model.Video
++import com.nuvio.tv.ui.components.NuvioDialog
++import com.nuvio.tv.ui.theme.NuvioTheme
++
++/** Episode navigator "go to" (ported idea from NuvioMobile-Enhanced): jump to an episode of the season by number. */
++@OptIn(ExperimentalTvMaterial3Api::class)
++@Composable
++fun EpisodeGoToDialog(
++    episodes: List<Video>,
++    onDismiss: () -> Unit,
++    onSelect: (Video) -> Unit,
++) {
++    val ordered = remember(episodes) { episodes.sortedBy { it.episode ?: Int.MAX_VALUE } }
++    val firstFocusRequester = remember { FocusRequester() }
++    var focusedTitle by remember { mutableStateOf<String?>(null) }
++    LaunchedEffect(Unit) { runCatching { firstFocusRequester.requestFocus() } }
++
++    NuvioDialog(
++        onDismiss = onDismiss,
++        title = stringResource(R.string.episode_go_to_title),
++        width = 640.dp,
++    ) {
++        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
++            Text(
++                text = focusedTitle.orEmpty(),
++                style = MaterialTheme.typography.bodyMedium,
++                color = NuvioTheme.extendedColors.textSecondary,
++                maxLines = 1,
++                overflow = TextOverflow.Ellipsis,
++                modifier = Modifier.fillMaxWidth()
++            )
++            LazyVerticalGrid(
++                columns = GridCells.Fixed(6),
++                horizontalArrangement = Arrangement.spacedBy(8.dp),
++                verticalArrangement = Arrangement.spacedBy(8.dp),
++                modifier = Modifier.heightIn(max = 340.dp)
++            ) {
++                items(ordered, key = { it.id }) { video ->
++                    Button(
++                        onClick = { onSelect(video) },
++                        modifier = Modifier
++                            .then(if (video === ordered.first()) Modifier.focusRequester(firstFocusRequester) else Modifier)
++                            .onFocusChanged { if (it.isFocused) focusedTitle = video.title },
++                        colors = ButtonDefaults.colors(
++                            containerColor = NuvioTheme.colors.BackgroundCard,
++                            contentColor = NuvioTheme.colors.TextPrimary,
++                        )
++                    ) {
++                        Text(text = (video.episode ?: 0).toString(), maxLines = 1)
++                    }
++                }
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt
+index 7a3e1cea3..e834bfc86 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt
+@@ -126,7 +126,9 @@ fun SeasonTabs(
+     downFocusRequester: FocusRequester? = null,
+     isFocusEnabled: Boolean = true,
+     sortLabel: String? = null,
+-    onSortClick: () -> Unit = {}
++    onSortClick: () -> Unit = {},
++    goToLabel: String? = null,
++    onGoToClick: () -> Unit = {}
+ ) {
+     // Move season 0 (specials) to the end
+     val sortedSeasons = remember(seasons) {
+@@ -276,7 +278,7 @@ fun SeasonTabs(
+     ) {
+         items(sortedSeasons, key = { it }) { season ->
+             val isSelected = season == selectedSeason
+-            val isRightEdge = sortLabel == null && (if (isRtl) season == sortedSeasons.first() else season == sortedSeasons.last())
++            val isRightEdge = sortLabel == null && goToLabel == null && (if (isRtl) season == sortedSeasons.first() else season == sortedSeasons.last())
+             val isLeftEdge = if (isRtl) season == sortedSeasons.last() else season == sortedSeasons.first()
+             var isFocused by remember { mutableStateOf(false) }
+             var longPressTriggered by remember { mutableStateOf(false) }
+@@ -374,7 +376,7 @@ fun SeasonTabs(
+                     modifier = Modifier
+                         .focusProperties {
+                             canFocus = isFocusEnabled
+-                            right = FocusRequester.Cancel
++                            if (goToLabel == null) right = FocusRequester.Cancel
+                             if (upFocusRequester != null) {
+                                 up = upFocusRequester
+                             }
+@@ -397,6 +399,37 @@ fun SeasonTabs(
+                 }
+             }
+         }
++        if (goToLabel != null) {
++            item(key = "episode_go_to") {
++                var goToFocused by remember { mutableStateOf(false) }
++                Card(
++                    onClick = onGoToClick,
++                    modifier = Modifier
++                        .focusProperties {
++                            canFocus = isFocusEnabled
++                            right = FocusRequester.Cancel
++                            if (upFocusRequester != null) {
++                                up = upFocusRequester
++                            }
++                        }
++                        .onFocusChanged { goToFocused = it.isFocused },
++                    shape = CardDefaults.shape(shape = tabShape),
++                    colors = CardDefaults.colors(
++                        containerColor = NuvioTheme.colors.BackgroundCard,
++                        focusedContainerColor = NuvioTheme.colors.Secondary
++                    ),
++                    border = tabBorder,
++                    scale = tabScale
++                ) {
++                    Text(
++                        text = goToLabel,
++                        style = tabTextStyle,
++                        color = if (goToFocused) NuvioTheme.colors.OnSecondary else textSecondary,
++                        modifier = Modifier.padding(vertical = 10.dp, horizontal = 20.dp)
++                    )
++                }
++            }
++        }
+     }
+ }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
+index 6941a0a99..6be0be111 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
+@@ -1985,6 +1985,7 @@ private fun MetaDetailsContent(
+     var seasonOptionsDialogSeason by remember { mutableStateOf<Int?>(null) }
+     var episodeSort by remember(meta.id) { mutableStateOf(EpisodeSortOrder.FirstToLast) }
+     var showEpisodeSortDialog by remember { mutableStateOf(false) }
++    var showEpisodeGoToDialog by remember { mutableStateOf(false) }
+     // Tracks whether the initial auto-scroll to the "next to play" episode has fired.
+     // Once it fires, no more auto-scrolls happen for the lifetime of this detail screen.
+     var initialEpisodeScrollDone by remember(meta.id) { mutableStateOf(false) }
+@@ -2551,7 +2552,9 @@ private fun MetaDetailsContent(
+                             downFocusRequester = seasonDownFocusRequester,
+                             isFocusEnabled = pendingRestoreType != RestoreTarget.EPISODE,
+                             sortLabel = stringResource(R.string.episode_sort_button, stringResource(episodeSort.shortLabelRes)),
+-                            onSortClick = { showEpisodeSortDialog = true }
++                            onSortClick = { showEpisodeSortDialog = true },
++                            goToLabel = stringResource(R.string.episode_go_to_button),
++                            onGoToClick = { showEpisodeGoToDialog = true }
+                         )
+                     }
+                 }
+@@ -3055,6 +3058,17 @@ private fun MetaDetailsContent(
+         }
+         }
+ 
++        if (showEpisodeGoToDialog) {
++            EpisodeGoToDialog(
++                episodes = episodesForSeason,
++                onDismiss = { showEpisodeGoToDialog = false },
++                onSelect = { video ->
++                    showEpisodeGoToDialog = false
++                    markEpisodeRestore(video.id, restoreOnResume = false)
++                    restoreFocusToken += 1
++                }
++            )
++        }
+         if (showEpisodeSortDialog) {
+             EpisodeSortDialog(
+                 selected = episodeSort,
+diff --git a/app/src/main/res/values/strings_episode_go_to.xml b/app/src/main/res/values/strings_episode_go_to.xml
+new file mode 100644
+index 000000000..014338bcb
+--- /dev/null
++++ b/app/src/main/res/values/strings_episode_go_to.xml
+@@ -0,0 +1,5 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="episode_go_to_button">Go to episode</string>
++    <string name="episode_go_to_title">Go to episode</string>
++</resources>

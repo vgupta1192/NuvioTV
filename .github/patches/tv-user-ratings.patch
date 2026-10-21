@@ -1,0 +1,354 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/ratings/UserRatingsRepository.kt b/app/src/main/java/com/nuvio/tv/core/ratings/UserRatingsRepository.kt
+new file mode 100644
+index 000000000..d71d96589
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/ratings/UserRatingsRepository.kt
+@@ -0,0 +1,110 @@
++package com.nuvio.tv.core.ratings
++
++import android.content.Context
++import com.nuvio.tv.data.mdblist.MdbListApiClient
++import com.nuvio.tv.data.mdblist.MdbListAuthStore
++import com.nuvio.tv.data.simkl.SimklApiClient
++import com.nuvio.tv.data.simkl.SimklApiRequest
++import com.nuvio.tv.data.simkl.SimklAuthRepository
++import com.nuvio.tv.data.simkl.SimklHttpMethod
++import com.nuvio.tv.data.simkl.SimklRetryPolicy
++import com.nuvio.tv.data.wetrakr.WeTrakrService
++import dagger.hilt.android.qualifiers.ApplicationContext
++import javax.inject.Inject
++import javax.inject.Singleton
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import org.json.JSONArray
++import org.json.JSONObject
++
++/**
++ * Your own 1-10 rating of a title (ported idea from NuvioMobile-Enhanced). A rating is sent to every connected
++ * account that can store one (Simkl, MDBList, WeTrakr); the value shown in the app is kept on this device.
++ */
++@Singleton
++class UserRatingsRepository @Inject constructor(
++    @ApplicationContext context: Context,
++    private val simklClient: SimklApiClient,
++    private val simklAuth: SimklAuthRepository,
++    private val mdbListApi: MdbListApiClient,
++    private val mdbListStore: MdbListAuthStore,
++    private val weTrakr: WeTrakrService,
++) {
++    private val prefs = context.getSharedPreferences("user_ratings", Context.MODE_PRIVATE)
++    private val _ratings = MutableStateFlow(load())
++    val ratings: StateFlow<Map<String, Int>> = _ratings.asStateFlow()
++
++    /** True when at least one connected account can store a rating. */
++    fun canRate(): Boolean =
++        simklAuth.state.value.isAuthenticated ||
++            mdbListStore.state.value.isAuthenticated ||
++            weTrakr.state.value.isConnected
++
++    /**
++     * Rates the movie or series [imdbId]; a null [rating] removes the rating. True when at least one
++     * account took it.
++     */
++    suspend fun rate(imdbId: String, isMovie: Boolean, rating: Int?): Boolean {
++        var saved = false
++        if (simklAuth.state.value.isAuthenticated) saved = attempt { simkl(imdbId, isMovie, rating) } || saved
++        if (mdbListStore.state.value.isAuthenticated) saved = attempt { mdbList(imdbId, isMovie, rating) } || saved
++        if (weTrakr.state.value.isConnected) saved = attempt { weTrakr.setTitleRating(imdbId, isMovie, rating) } || saved
++        if (saved) store(imdbId, rating)
++        return saved
++    }
++
++    private suspend fun attempt(block: suspend () -> Boolean): Boolean = try {
++        block()
++    } catch (cancel: CancellationException) {
++        throw cancel
++    } catch (_: Exception) {
++        false
++    }
++
++    private fun ratedBody(imdbId: String, isMovie: Boolean, rating: Int?): String {
++        val item = JSONObject().put("ids", JSONObject().put("imdb", imdbId))
++        rating?.let { item.put("rating", it) }
++        return JSONObject().put(if (isMovie) "movies" else "shows", JSONArray().put(item)).toString()
++    }
++
++    private suspend fun simkl(imdbId: String, isMovie: Boolean, rating: Int?): Boolean {
++        val response = simklClient.execute(
++            SimklApiRequest(
++                method = SimklHttpMethod.POST,
++                path = if (rating == null) "/sync/ratings/remove" else "/sync/ratings",
++                body = ratedBody(imdbId, isMovie, rating),
++                retryPolicy = SimklRetryPolicy.SYNC_WRITE
++            )
++        )
++        return response.status in 200..299
++    }
++
++    private suspend fun mdbList(imdbId: String, isMovie: Boolean, rating: Int?): Boolean {
++        val response = mdbListApi.post(
++            if (rating == null) "/sync/ratings/remove" else "/sync/ratings",
++            ratedBody(imdbId, isMovie, rating)
++        )
++        return response.status in 200..299
++    }
++
++    private fun store(imdbId: String, rating: Int?) {
++        val next = _ratings.value.toMutableMap()
++        if (rating == null) next.remove(imdbId) else next[imdbId] = rating
++        _ratings.value = next
++        prefs.edit().putString(KEY, JSONObject(next as Map<*, *>).toString()).apply()
++    }
++
++    private fun load(): Map<String, Int> {
++        val raw = prefs.getString(KEY, null) ?: return emptyMap()
++        return runCatching {
++            val json = JSONObject(raw)
++            json.keys().asSequence().associateWith { json.getInt(it) }
++        }.getOrDefault(emptyMap())
++    }
++
++    private companion object {
++        const val KEY = "ratings_by_imdb_id"
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/data/wetrakr/WeTrakrService.kt b/app/src/main/java/com/nuvio/tv/data/wetrakr/WeTrakrService.kt
+index bec40bb5c..ac3ca7c66 100644
+--- a/app/src/main/java/com/nuvio/tv/data/wetrakr/WeTrakrService.kt
++++ b/app/src/main/java/com/nuvio/tv/data/wetrakr/WeTrakrService.kt
+@@ -151,6 +151,18 @@ class WeTrakrService @Inject constructor(
+         return TrackingMutationResult(items.size)
+     }
+ 
++    /** Sets (or, with a null [rating], removes) the user's 1-10 rating of a whole movie or series. False when not connected. */
++    suspend fun setTitleRating(imdbId: String, isMovie: Boolean, rating: Int?): Boolean {
++        if (!mutableState.value.isConnected) return false
++        val item = JSONObject().put("ids", JSONObject().put("imdb", imdbId))
++        rating?.let { item.put("rating", it.coerceIn(1, 10)) }
++        val document = JSONObject().put(if (isMovie) "movies" else "shows", JSONArray().put(item))
++        val response = writeMutex.withLock {
++            authorizedPost(if (rating == null) "/sync/ratings/remove" else "/sync/ratings", document)
++        } ?: return false
++        return response.status in 200..299
++    }
++
+     private fun historyDocument(entries: List<Pair<TrackingMediaReference, Long?>>): JSONObject? {
+         val movies = JSONArray()
+         val shows = linkedMapOf<String, Pair<JSONObject, MutableMap<Int, MutableMap<Int, Long?>>>>()
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/HeroSection.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/HeroSection.kt
+index 0c0eedc81..f6b96ca65 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/HeroSection.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/HeroSection.kt
+@@ -72,6 +72,8 @@ import com.nuvio.tv.ui.components.SynopsisDescription
+ import com.nuvio.tv.ui.theme.NuvioTheme
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.filled.Check
++import androidx.compose.material.icons.filled.StarBorder
++import androidx.compose.material.icons.filled.Star
+ import androidx.compose.material.icons.filled.Visibility
+ import androidx.compose.material.icons.filled.VisibilityOff
+ import androidx.compose.ui.platform.LocalConfiguration
+@@ -109,6 +111,9 @@ fun HeroContentSection(
+     shuffleActionPending: Boolean = false,
+     onRandomEpisodeClick: () -> Unit = {},
+     randomEpisodeFocusRequester: FocusRequester? = null,
++    rateAvailable: Boolean = false,
++    userRating: Int? = null,
++    onRateClick: () -> Unit = {},
+     hideLogoDuringTrailer: Boolean = false,
+     mdbListRatings: MDBListRatings? = null,
+     mdbListRatingOrder: List<String> = com.nuvio.tv.domain.model.MDBListSettings.DEFAULT_RATING_ORDER,
+@@ -297,6 +302,22 @@ fun HeroContentSection(
+                             )
+                         }
+ 
++                        if (rateAvailable) {
++                            ActionIconButton(
++                                icon = if (userRating != null) Icons.Default.Star else Icons.Default.StarBorder,
++                                contentDescription = if (userRating != null) {
++                                    stringResource(R.string.user_rating_action_rated, userRating)
++                                } else {
++                                    stringResource(R.string.user_rating_action)
++                                },
++                                onClick = onRateClick,
++                                selected = userRating != null,
++                                selectedContainerColor = Color.White,
++                                selectedContentColor = Color.Black,
++                                onFocused = onHeroActionFocused
++                            )
++                        }
++
+                         if (trailerAvailable) {
+                             ActionIconButtonPainter(
+                                 painter = trailerPainter,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
+index 6be0be111..c1f0728bc 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
+@@ -1986,6 +1986,11 @@ private fun MetaDetailsContent(
+     var episodeSort by remember(meta.id) { mutableStateOf(EpisodeSortOrder.FirstToLast) }
+     var showEpisodeSortDialog by remember { mutableStateOf(false) }
+     var showEpisodeGoToDialog by remember { mutableStateOf(false) }
++    val ratingViewModel: UserRatingViewModel = androidx.hilt.navigation.compose.hiltViewModel()
++    val userRatings by ratingViewModel.ratings.collectAsStateWithLifecycle()
++    val ratedImdbId = remember(meta.id, meta.imdbId) { ratingImdbId(meta.id, meta.imdbId) }
++    val ratingContext = androidx.compose.ui.platform.LocalContext.current
++    var showUserRatingDialog by remember { mutableStateOf(false) }
+     // Tracks whether the initial auto-scroll to the "next to play" episode has fired.
+     // Once it fires, no more auto-scrolls happen for the lifetime of this detail screen.
+     var initialEpisodeScrollDone by remember(meta.id) { mutableStateOf(false) }
+@@ -2492,6 +2497,9 @@ private fun MetaDetailsContent(
+                         trailerAvailable = trailerButtonEnabled && !trailerUrl.isNullOrBlank(),
+                         onTrailerClick = onTrailerButtonClick,
+                         showRandomEpisodeButton = showRandomEpisodeButton,
++                        rateAvailable = ratedImdbId != null && ratingViewModel.canRate(),
++                        userRating = ratedImdbId?.let { userRatings[it] },
++                        onRateClick = { showUserRatingDialog = true },
+                         onRandomEpisodeClick = {
+                             if (!episodeShuffle.enabled) {
+                                 showRandomEpisodeOverlay = true
+@@ -3058,6 +3066,26 @@ private fun MetaDetailsContent(
+         }
+         }
+ 
++        if (showUserRatingDialog && ratedImdbId != null) {
++            UserRatingDialog(
++                current = userRatings[ratedImdbId],
++                onDismiss = { showUserRatingDialog = false },
++                onSelect = { rating ->
++                    showUserRatingDialog = false
++                    ratingViewModel.rate(ratedImdbId, meta.apiType == "movie", rating) { saved ->
++                        android.widget.Toast.makeText(
++                            ratingContext,
++                            when {
++                                !saved -> R.string.user_rating_failed
++                                rating == null -> R.string.user_rating_removed
++                                else -> R.string.user_rating_saved
++                            },
++                            android.widget.Toast.LENGTH_SHORT
++                        ).show()
++                    }
++                }
++            )
++        }
+         if (showEpisodeGoToDialog) {
+             EpisodeGoToDialog(
+                 episodes = episodesForSeason,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/UserRating.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/UserRating.kt
+new file mode 100644
+index 000000000..746edeba8
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/UserRating.kt
+@@ -0,0 +1,94 @@
++package com.nuvio.tv.ui.screens.detail
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.unit.dp
++import androidx.lifecycle.ViewModel
++import androidx.lifecycle.viewModelScope
++import androidx.tv.material3.Button
++import androidx.tv.material3.ButtonDefaults
++import androidx.tv.material3.ExperimentalTvMaterial3Api
++import androidx.tv.material3.Text
++import com.nuvio.tv.R
++import com.nuvio.tv.core.ratings.UserRatingsRepository
++import com.nuvio.tv.ui.components.NuvioDialog
++import com.nuvio.tv.ui.theme.NuvioTheme
++import dagger.hilt.android.lifecycle.HiltViewModel
++import javax.inject.Inject
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.launch
++
++@HiltViewModel
++class UserRatingViewModel @Inject constructor(
++    private val repository: UserRatingsRepository
++) : ViewModel() {
++    val ratings: StateFlow<Map<String, Int>> = repository.ratings
++
++    fun canRate(): Boolean = repository.canRate()
++
++    fun rate(imdbId: String, isMovie: Boolean, rating: Int?, onResult: (Boolean) -> Unit) {
++        viewModelScope.launch { onResult(repository.rate(imdbId, isMovie, rating)) }
++    }
++}
++
++/** The IMDb id a title can be rated under: the meta id or its IMDb id, when it is a "tt" id. */
++internal fun ratingImdbId(metaId: String, imdbId: String?): String? =
++    sequenceOf(imdbId, metaId.substringBefore(':'))
++        .firstOrNull { !it.isNullOrBlank() && it.startsWith("tt") }
++
++/** Rating picker (ported idea from NuvioMobile-Enhanced): 1 to 10, or remove the current rating. */
++@OptIn(ExperimentalTvMaterial3Api::class)
++@Composable
++fun UserRatingDialog(
++    current: Int?,
++    onDismiss: () -> Unit,
++    onSelect: (Int?) -> Unit,
++) {
++    val focusRequester = remember { FocusRequester() }
++    LaunchedEffect(Unit) { runCatching { focusRequester.requestFocus() } }
++
++    NuvioDialog(
++        onDismiss = onDismiss,
++        title = stringResource(R.string.user_rating_title),
++        width = 640.dp,
++    ) {
++        listOf(1..5, 6..10).forEach { range ->
++            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
++                range.forEach { value ->
++                    Button(
++                        onClick = { onSelect(value) },
++                        modifier = Modifier.then(
++                            if (value == (current ?: 8)) Modifier.focusRequester(focusRequester) else Modifier
++                        ),
++                        colors = ButtonDefaults.colors(
++                            containerColor = if (value == current) NuvioTheme.colors.SurfaceVariant else NuvioTheme.colors.BackgroundCard,
++                            contentColor = NuvioTheme.colors.TextPrimary,
++                        )
++                    ) {
++                        Text(value.toString())
++                    }
++                }
++            }
++        }
++        if (current != null) {
++            Button(
++                onClick = { onSelect(null) },
++                modifier = Modifier.fillMaxWidth(),
++                colors = ButtonDefaults.colors(
++                    containerColor = NuvioTheme.colors.BackgroundCard,
++                    contentColor = NuvioTheme.colors.TextPrimary,
++                )
++            ) {
++                Text(stringResource(R.string.user_rating_remove))
++            }
++        }
++    }
++}
+diff --git a/app/src/main/res/values/strings_user_rating.xml b/app/src/main/res/values/strings_user_rating.xml
+new file mode 100644
+index 000000000..0abf0b188
+--- /dev/null
++++ b/app/src/main/res/values/strings_user_rating.xml
+@@ -0,0 +1,10 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="user_rating_title">Your rating</string>
++    <string name="user_rating_remove">Remove rating</string>
++    <string name="user_rating_action">Rate</string>
++    <string name="user_rating_action_rated">Your rating: %1$d</string>
++    <string name="user_rating_saved">Rating saved</string>
++    <string name="user_rating_removed">Rating removed</string>
++    <string name="user_rating_failed">Could not save the rating. Connect Simkl, MDBList or WeTrakr under Tracking.</string>
++</resources>

@@ -1,0 +1,250 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/AudioSelectionOverlay.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/AudioSelectionOverlay.kt
+index efd358f25..5d1257d5a 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/AudioSelectionOverlay.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/AudioSelectionOverlay.kt
+@@ -76,8 +76,12 @@ internal fun AudioSelectionOverlay(
+     onCenterMixLevelChange: (Int) -> Unit,
+     onPersistAmplificationChange: (Boolean) -> Unit,
+     onDismiss: () -> Unit,
+-    modifier: Modifier = Modifier
++    modifier: Modifier = Modifier,
++    exoPlayer: androidx.media3.exoplayer.ExoPlayer? = null
+ ) {
++    var videoQualities by remember(visible) {
++        mutableStateOf(if (visible) exoPlayer?.extractVideoQualities().orEmpty() else emptyList())
++    }
+     val tracksFocusRequester = remember { FocusRequester() }
+     val delayMinusFocusRequester = remember { FocusRequester() }
+     val delayPlusFocusRequester = remember { FocusRequester() }
+@@ -196,7 +200,12 @@ internal fun AudioSelectionOverlay(
+                             else -> persistFocusRequester
+                         },
+                         onTrackFocused = { lastFocusedAudioIndex = it },
+-                        onTrackSelected = onTrackSelected
++                        onTrackSelected = onTrackSelected,
++                        videoQualities = videoQualities,
++                        onVideoQualitySelected = { heightPx ->
++                            exoPlayer?.applyVideoQuality(heightPx)
++                            videoQualities = videoQualities.map { it.copy(isSelected = it.heightPx == heightPx) }
++                        }
+                     )
+                 }
+                 Column(modifier = Modifier.width(268.dp)) {
+@@ -237,7 +246,9 @@ private fun AudioTracksContent(
+     initialFocusRequester: FocusRequester,
+     rightFocusRequester: FocusRequester,
+     onTrackFocused: (Int) -> Unit,
+-    onTrackSelected: (Int) -> Unit
++    onTrackSelected: (Int) -> Unit,
++    videoQualities: List<VideoQualityOption> = emptyList(),
++    onVideoQualitySelected: (Int?) -> Unit = {}
+ ) {
+     if (tracks.isEmpty()) {
+         Text(
+@@ -273,6 +284,33 @@ private fun AudioTracksContent(
+                 }
+             )
+         }
++        if (videoQualities.size > 1) {
++            item(key = "video_quality_header") {
++                Text(
++                    text = stringResource(R.string.player_video_quality),
++                    style = MaterialTheme.typography.titleLarge,
++                    color = Color.White,
++                    modifier = Modifier.padding(top = NuvioTheme.spacing.md, bottom = NuvioTheme.spacing.xs)
++                )
++            }
++            val pinned = videoQualities.any { it.isSelected }
++            item(key = "video_quality_auto") {
++                VideoQualityCard(
++                    label = stringResource(R.string.player_video_quality_auto),
++                    isSelected = !pinned,
++                    onClick = { onVideoQualitySelected(null) },
++                    rightFocusRequester = rightFocusRequester
++                )
++            }
++            items(items = videoQualities, key = { option -> "video_quality_${option.heightPx}" }) { option ->
++                VideoQualityCard(
++                    label = option.label,
++                    isSelected = option.isSelected,
++                    onClick = { onVideoQualitySelected(option.heightPx) },
++                    rightFocusRequester = rightFocusRequester
++                )
++            }
++        }
+     }
+ }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+index eef889e05..a470d09fc 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+@@ -2010,7 +2010,8 @@ fun PlayerScreen(
+             onDismiss = { viewModel.onEvent(PlayerEvent.OnDismissTransientOverlay) },
+             modifier = Modifier
+                 .fillMaxSize()
+-                .zIndex(2.6f)
++                .zIndex(2.6f),
++            exoPlayer = viewModel.exoPlayer
+         )
+ 
+         SubtitleSelectionOverlay(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/VideoQualitySelection.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/VideoQualitySelection.kt
+new file mode 100644
+index 000000000..8cf5166dd
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/VideoQualitySelection.kt
+@@ -0,0 +1,142 @@
++package com.nuvio.tv.ui.screens.player
++
++import androidx.annotation.OptIn
++import androidx.compose.foundation.BorderStroke
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.Check
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusProperties
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.unit.dp
++import androidx.media3.common.C
++import androidx.media3.common.TrackSelectionOverride
++import androidx.media3.common.Tracks
++import androidx.media3.common.util.UnstableApi
++import androidx.media3.exoplayer.ExoPlayer
++import androidx.tv.material3.Border
++import androidx.tv.material3.Card
++import androidx.tv.material3.CardDefaults
++import androidx.tv.material3.ExperimentalTvMaterial3Api
++import androidx.tv.material3.Icon
++import androidx.tv.material3.MaterialTheme
++import androidx.tv.material3.Text
++import com.nuvio.tv.ui.theme.NuvioTheme
++
++/**
++ * Video quality chooser (ported idea from NuvioMobile-Enhanced): pins one video variant of an adaptive (HLS/DASH)
++ * stream by its pixel height, or goes back to automatic. Shown in the audio panel when the stream has several.
++ */
++internal data class VideoQualityOption(
++    val heightPx: Int,
++    val label: String,
++    val bitrate: Int?,
++    val isSelected: Boolean,
++)
++
++@OptIn(UnstableApi::class)
++internal fun ExoPlayer.extractVideoQualities(): List<VideoQualityOption> {
++    val pinnedHeight = trackSelectionParameters.overrides.values
++        .firstOrNull { it.mediaTrackGroup.type == C.TRACK_TYPE_VIDEO }
++        ?.let { pin -> pin.mediaTrackGroup.getFormat(pin.trackIndices.first()).height }
++    val byHeight = LinkedHashMap<Int, VideoQualityOption>()
++    for (group in currentTracks.groups) {
++        if (group.type != C.TRACK_TYPE_VIDEO) continue
++        for (i in 0 until group.length) {
++            if (!group.isTrackSupported(i)) continue
++            val format = group.getTrackFormat(i)
++            if (format.height <= 0) continue
++            val existing = byHeight[format.height]
++            if (existing == null || format.bitrate > (existing.bitrate ?: 0)) {
++                byHeight[format.height] = VideoQualityOption(
++                    heightPx = format.height,
++                    label = "${format.height}p",
++                    bitrate = format.bitrate.takeIf { it > 0 },
++                    isSelected = pinnedHeight == format.height,
++                )
++            }
++        }
++    }
++    return byHeight.values.sortedByDescending { it.heightPx }
++}
++
++@OptIn(UnstableApi::class)
++internal fun ExoPlayer.applyVideoQuality(heightPx: Int?) {
++    val builder = trackSelectionParameters.buildUpon().clearOverridesOfType(C.TRACK_TYPE_VIDEO)
++    if (heightPx != null) {
++        var best: Pair<Tracks.Group, Int>? = null
++        for (group in currentTracks.groups) {
++            if (group.type != C.TRACK_TYPE_VIDEO) continue
++            for (i in 0 until group.length) {
++                val format = group.getTrackFormat(i)
++                if (format.height != heightPx || !group.isTrackSupported(i)) continue
++                val currentBest = best?.let { it.first.getTrackFormat(it.second).bitrate } ?: -1
++                if (format.bitrate > currentBest) best = group to i
++            }
++        }
++        best?.let { (group, index) ->
++            builder.setOverrideForType(TrackSelectionOverride(group.mediaTrackGroup, listOf(index)))
++        }
++    }
++    trackSelectionParameters = builder.build()
++}
++
++@OptIn(ExperimentalTvMaterial3Api::class)
++@Composable
++internal fun VideoQualityCard(
++    label: String,
++    isSelected: Boolean,
++    onClick: () -> Unit,
++    rightFocusRequester: FocusRequester,
++) {
++    Card(
++        onClick = onClick,
++        modifier = Modifier
++            .fillMaxWidth()
++            .focusProperties { right = rightFocusRequester },
++        colors = CardDefaults.colors(
++            containerColor = if (isSelected) NuvioTheme.colors.Secondary else Color.Transparent,
++            focusedContainerColor = if (isSelected) NuvioTheme.colors.Secondary else Color.Transparent
++        ),
++        shape = CardDefaults.shape(RoundedCornerShape(NuvioTheme.radii.md)),
++        border = CardDefaults.border(
++            border = Border(
++                border = BorderStroke(NuvioTheme.spacing.xxs, Color.Transparent),
++                shape = RoundedCornerShape(NuvioTheme.radii.md)
++            ),
++            focusedBorder = Border(
++                border = NuvioTheme.focusRing.border(NuvioTheme.spacing.xxs),
++                shape = RoundedCornerShape(NuvioTheme.radii.md)
++            )
++        ),
++        scale = CardDefaults.scale(focusedScale = 1f, pressedScale = 1f)
++    ) {
++        Row(
++            modifier = Modifier
++                .fillMaxWidth()
++                .padding(horizontal = NuvioTheme.spacing.md, vertical = NuvioTheme.spacing.sm),
++            horizontalArrangement = Arrangement.SpaceBetween,
++            verticalAlignment = Alignment.CenterVertically
++        ) {
++            Text(
++                text = label,
++                style = MaterialTheme.typography.titleMedium,
++                color = if (isSelected) NuvioTheme.colors.OnSecondary else Color.White
++            )
++            if (isSelected) {
++                Icon(
++                    imageVector = Icons.Default.Check,
++                    contentDescription = null,
++                    tint = NuvioTheme.colors.OnSecondary
++                )
++            }
++        }
++    }
++}
+diff --git a/app/src/main/res/values/strings_video_quality.xml b/app/src/main/res/values/strings_video_quality.xml
+new file mode 100644
+index 000000000..7629a7b28
+--- /dev/null
++++ b/app/src/main/res/values/strings_video_quality.xml
+@@ -0,0 +1,5 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="player_video_quality">Video quality</string>
++    <string name="player_video_quality_auto">Auto</string>
++</resources>
