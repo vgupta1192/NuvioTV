@@ -1,0 +1,195 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/streams/PinnedStreamSources.kt b/app/src/main/java/com/nuvio/tv/core/streams/PinnedStreamSources.kt
+new file mode 100644
+index 000000000..12f1bd0a4
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/streams/PinnedStreamSources.kt
+@@ -0,0 +1,64 @@
++package com.nuvio.tv.core.streams
++
++import android.content.Context
++import com.nuvio.tv.domain.model.Stream
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++
++/**
++ * Pinned stream sources (ported idea from NuvioMobile-Enhanced): hold OK on a source chip to pin it.
++ * Pinned sources are listed first, in the chip row and in the stream list.
++ */
++object PinnedStreamSources {
++    private const val PREFS = "nuvio_pinned_stream_sources"
++    private const val KEY = "pinned"
++    private const val SEPARATOR = "\n"
++
++    private val _pinned = MutableStateFlow<List<String>>(emptyList())
++    val pinned: StateFlow<List<String>> = _pinned.asStateFlow()
++
++    private var loaded = false
++
++    fun ensureLoaded(context: Context) {
++        if (loaded) return
++        loaded = true
++        _pinned.value = context.applicationContext
++            .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++            .getString(KEY, null)
++            ?.split(SEPARATOR)
++            ?.map(String::trim)
++            ?.filter { it.isNotEmpty() }
++            ?.distinct()
++            .orEmpty()
++    }
++
++    fun toggle(context: Context, sourceName: String) {
++        ensureLoaded(context)
++        val name = sourceName.trim()
++        if (name.isEmpty()) return
++        val current = _pinned.value
++        val updated = if (name in current) current - name else current + name
++        _pinned.value = updated
++        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++            .edit().putString(KEY, updated.joinToString(SEPARATOR)).apply()
++    }
++
++    /** Names with pinned ones first (in pin order); everything else keeps its order. */
++    fun sortNames(names: List<String>, pinned: List<String>): List<String> {
++        if (pinned.isEmpty()) return names
++        val rank = pinned.withIndex().associate { it.value to it.index }
++        return names.withIndex()
++            .sortedWith(compareBy({ rank[it.value] ?: Int.MAX_VALUE }, { it.index }))
++            .map { it.value }
++    }
++
++    /** Streams from pinned sources first (in pin order); the order inside a source is kept. */
++    fun sortStreams(streams: List<Stream>, pinned: List<String>): List<Stream> {
++        if (pinned.isEmpty()) return streams
++        val rank = pinned.withIndex().associate { it.value to it.index }
++        return streams.withIndex()
++            .sortedWith(compareBy({ rank[it.value.addonName] ?: Int.MAX_VALUE }, { it.index }))
++            .map { it.value }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamComponents.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamComponents.kt
+index 12446e01d..4c43db188 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamComponents.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamComponents.kt
+@@ -37,6 +37,7 @@ import androidx.compose.ui.unit.LayoutDirection
+ import androidx.compose.foundation.lazy.LazyRow
+ import androidx.compose.foundation.lazy.items
+ import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+@@ -45,6 +46,7 @@ import androidx.compose.ui.focus.focusProperties
+ import androidx.compose.ui.focus.focusRestorer
+ import androidx.compose.ui.focus.onFocusChanged
+ import androidx.compose.ui.input.key.onKeyEvent
++import androidx.compose.ui.input.key.onPreviewKeyEvent
+ import androidx.compose.ui.input.key.key
+ import androidx.compose.ui.input.key.Key
+ import androidx.tv.material3.Border
+@@ -264,11 +266,17 @@ internal fun AddonFilterChips(
+ ) {
+     val isRtl = androidx.compose.ui.platform.LocalLayoutDirection.current == androidx.compose.ui.unit.LayoutDirection.Rtl
+     val chipMap = sourceChips.associateBy { it.name }
+-    val orderedNames = externalOrderedNames ?: remember(addons, sourceChips) {
+-        buildList {
+-            addAll(addons)
+-            sourceChips.forEach { chip -> if (chip.name !in this) add(chip.name) }
+-        }
++    val pinnedContext = androidx.compose.ui.platform.LocalContext.current
++    androidx.compose.runtime.LaunchedEffect(Unit) { com.nuvio.tv.core.streams.PinnedStreamSources.ensureLoaded(pinnedContext) }
++    val pinnedSources by com.nuvio.tv.core.streams.PinnedStreamSources.pinned.collectAsState()
++    val orderedNames = externalOrderedNames ?: remember(addons, sourceChips, pinnedSources) {
++        com.nuvio.tv.core.streams.PinnedStreamSources.sortNames(
++            buildList {
++                addAll(addons)
++                sourceChips.forEach { chip -> if (chip.name !in this) add(chip.name) }
++            },
++            pinnedSources,
++        )
+     }
+     val hasRefresh = onRefresh != null
+     val refreshFocusRequester = remember { FocusRequester() }
+@@ -457,12 +465,24 @@ internal fun AddonFilterChips(
+             val isSelectable = addon in addons && chipStatus == SourceChipStatus.SUCCESS
+             val requesterIdx = if (hasRefresh) i + 2 else i + 1
+             SourceStatusFilterChip(
+-                name = addon,
++                name = if (addon in pinnedSources) "\u2605 $addon" else addon,
+                 isSelected = selectedAddon == addon,
+                 status = chipStatus,
+                 isSelectable = isSelectable,
+                 onClick = { if (isSelectable) onAddonSelected(addon) },
+                 modifier = Modifier
++                    .onPreviewKeyEvent { event ->
++                        // Hold OK on a source to pin it to the top (or unpin it again).
++                        if (event.type == androidx.compose.ui.input.key.KeyEventType.KeyDown &&
++                            event.nativeKeyEvent.isLongPress &&
++                            (event.key == Key.DirectionCenter || event.key == Key.Enter || event.key == Key.NumPadEnter)
++                        ) {
++                            com.nuvio.tv.core.streams.PinnedStreamSources.toggle(pinnedContext, addon)
++                            true
++                        } else {
++                            false
++                        }
++                    }
+                     .focusRequester(focusRequesters[requesterIdx])
+                     .onFocusChanged {
+                         if (it.isFocused) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreen.kt
+index b4b3f62da..57fe5f236 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreen.kt
+@@ -35,6 +35,7 @@ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.filled.Warning
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+@@ -460,7 +461,7 @@ fun StreamScreen(
+                     isLoading = uiState.isLoading,
+                     resumeText = resumeText,
+                     error = uiState.error,
+-                    streams = uiState.filteredStreams,
++                    streamsInput = uiState.filteredStreams,
+                     availableAddons = uiState.availableAddons,
+                     sourceChips = uiState.sourceChips,
+                     selectedAddonFilter = uiState.selectedAddonFilter,
+@@ -757,7 +758,7 @@ private fun RightStreamSection(
+     isLoading: Boolean,
+     resumeText: String?,
+     error: String?,
+-    streams: List<Stream>,
++    streamsInput: List<Stream>,
+     availableAddons: List<String>,
+     sourceChips: List<SourceChipItem>,
+     selectedAddonFilter: String?,
+@@ -788,11 +789,20 @@ private fun RightStreamSection(
+     var firstResultFocusAssigned by remember { mutableStateOf(shouldRestoreFocusedStream) }
+     val scope = rememberCoroutineScope()
+     var focusJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+-    val orderedAddonNames = remember(availableAddons, sourceChips) {
+-        buildList {
+-            addAll(availableAddons)
+-            sourceChips.forEach { if (it.name !in this) add(it.name) }
+-        }
++    val pinnedContext = androidx.compose.ui.platform.LocalContext.current
++    androidx.compose.runtime.LaunchedEffect(Unit) { com.nuvio.tv.core.streams.PinnedStreamSources.ensureLoaded(pinnedContext) }
++    val pinnedSources by com.nuvio.tv.core.streams.PinnedStreamSources.pinned.collectAsState()
++    val orderedAddonNames = remember(availableAddons, sourceChips, pinnedSources) {
++        com.nuvio.tv.core.streams.PinnedStreamSources.sortNames(
++            buildList {
++                addAll(availableAddons)
++                sourceChips.forEach { if (it.name !in this) add(it.name) }
++            },
++            pinnedSources,
++        )
++    }
++    val streams = remember(streamsInput, pinnedSources) {
++        com.nuvio.tv.core.streams.PinnedStreamSources.sortStreams(streamsInput, pinnedSources)
+     }
+     val firstStreamKey = streams.firstOrNull()?.stableKey(0)
+     val refreshFocusRequester = remember { FocusRequester() }
