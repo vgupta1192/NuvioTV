@@ -1,0 +1,70 @@
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
+index 766c6b029..0c378e468 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
+@@ -47,7 +47,8 @@ class TvChannelsRepository @Inject constructor(
+     private val addonApi: AddonApi,
+     private val tvChannelsDataStore: TvChannelsDataStore,
+     private val tvEpgRepository: TvEpgRepository,
+-    private val iptvRepository: com.nuvio.tv.data.iptv.IptvRepository
++    private val iptvRepository: com.nuvio.tv.data.iptv.IptvRepository,
++    private val youTubeStreamResolver: com.nuvio.tv.core.streams.YouTubeStreamResolver
+ ) {
+     companion object {
+         private const val TAG = "TvChannelsRepo"
+@@ -184,6 +185,22 @@ class TvChannelsRepository @Inject constructor(
+         }
+     }
+ 
++    private val youTubeWatchLink =
++        Regex("""^https?://(?:www\.|m\.)?(?:youtube\.com/watch\?(?:[^#]*&)?v=|youtu\.be/)([A-Za-z0-9_-]{11})""")
++
++    /**
++     * YouTube rows (a ytId, or a watch-page link) carry no media address: resolve them on the
++     * device so the player gets a stream it can open. Null when the video can't be resolved.
++     */
++    private suspend fun resolveYouTubeStream(stream: Stream): Stream? {
++        var candidate = stream
++        if (candidate.url.isNullOrBlank()) {
++            val id = candidate.externalUrl?.let { youTubeWatchLink.find(it.trim())?.groupValues?.get(1) }
++            if (id != null) candidate = candidate.copy(ytId = id, externalUrl = null)
++        }
++        return youTubeStreamResolver.resolve(candidate)
++    }
++
+     /** Live TV lists only addons that publish Live TV catalogs, trimmed to just those catalogs. */
+     private fun List<Addon>.liveTvOnly(): List<Addon> =
+         filter { it.hasLiveTvCatalogs() }.map { it.onlyLiveTvCatalogs() }
+@@ -703,7 +720,8 @@ class TvChannelsRepository @Inject constructor(
+                 }
+ 
+                 dtoList.mapNotNull { dto ->
+-                    val domainStream = dto.toDomain(channel.addonName, channel.addonLogo)
++                    val domainStream = resolveYouTubeStream(dto.toDomain(channel.addonName, channel.addonLogo))
++                        ?: return@mapNotNull null
+                     val resolvedUrl = resolvePlayableTvStreamUrl(domainStream)
+                     if (!resolvedUrl.isNullOrBlank()) {
+                         if (domainStream.url != resolvedUrl) domainStream.copy(url = resolvedUrl) else domainStream
+@@ -782,7 +800,8 @@ class TvChannelsRepository @Inject constructor(
+                             else -> emptyList()
+                         }
+                         val resolved = dtoList.mapNotNull { dto ->
+-                            val domainStream = dto.toDomain(adjChannel.addonName, adjChannel.addonLogo)
++                            val domainStream = resolveYouTubeStream(dto.toDomain(adjChannel.addonName, adjChannel.addonLogo))
++                                ?: return@mapNotNull null
+                             val rUrl = resolvePlayableTvStreamUrl(domainStream)
+                             if (!rUrl.isNullOrBlank()) {
+                                 if (domainStream.url != rUrl) domainStream.copy(url = rUrl) else domainStream
+diff --git a/app/src/main/java/com/nuvio/tv/domain/model/LiveTvCatalogs.kt b/app/src/main/java/com/nuvio/tv/domain/model/LiveTvCatalogs.kt
+index 295aff201..f1c4ab791 100644
+--- a/app/src/main/java/com/nuvio/tv/domain/model/LiveTvCatalogs.kt
++++ b/app/src/main/java/com/nuvio/tv/domain/model/LiveTvCatalogs.kt
+@@ -10,7 +10,7 @@ object LiveTvCatalogs {
+     private val TYPES = setOf(
+         "tv", "channel", "channels", "iptv", "live", "livetv", "live_tv",
+         "stream", "streams", "broadcast", "broadcasts", "radio", "sports",
+-        "sport", "events", "event", "news", "cctv", "feed", "feeds"
++        "sport", "events", "event", "news", "cctv", "feed", "feeds", "youtube"
+     )
+ 
+     fun isLiveTvType(type: String?): Boolean =
