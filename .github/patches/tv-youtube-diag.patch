@@ -1,0 +1,222 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+index 3cafd78e5..fe387d9ee 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+@@ -1106,6 +1106,7 @@ internal fun PlayerRuntimeController.initializePlayer(
+                 // so onRenderedFirstFrame() never fires — TunneledFirstReady starts on READY.
+                 playWhenReady = false
+                 prepare()
++                YouTubeDiag.attach(this)
+ 
+                 addListener(object : Player.Listener {
+                     override fun onPositionDiscontinuity(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeDiag.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeDiag.kt
+new file mode 100644
+index 000000000..bf4d2c1fe
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeDiag.kt
+@@ -0,0 +1,204 @@
++package com.nuvio.tv.ui.screens.player
++
++import android.os.Build
++import android.os.SystemClock
++import android.util.Log
++import androidx.media3.common.PlaybackException
++import androidx.media3.common.Player
++import java.net.HttpURLConnection
++import java.net.URL
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
++import org.json.JSONArray
++import org.json.JSONObject
++
++/**
++ * Nuvio TV fork: playback diagnostics for YouTube streams.
++ *
++ * When the player opens a googlevideo.com address, this probes the same address from the
++ * device (manifest, variant playlist, first segment: status, bytes, speed) and sends the
++ * result with the app's own recent log lines to the fork owner's receiver. It fires again
++ * if playback has not become ready after [STALL_MS], on a player error, and when playback
++ * becomes ready, so a report shows whether the network or the player is at fault.
++ * Nothing is sent for any other stream.
++ */
++internal object YouTubeDiag {
++    private const val TAG = "NuvioYtDiag"
++    private const val CLIENT = "tv"
++    private const val ENDPOINT = "https://nuviodiag.kissmissi.duckdns.org/d/yt"
++    private const val STALL_MS = 15_000L
++    private const val SEGMENT_BYTES = 1_500_000
++    private const val LOG_LINES = 160
++    private const val CHROME_UA =
++        "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Mobile Safari/537.36"
++    private const val VISIONOS_UA =
++        "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15"
++
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++
++    @Volatile private var job: Job? = null
++    @Volatile private var startedAtMs = 0L
++    @Volatile private var ready = false
++
++    fun isYouTubeMedia(url: String?): Boolean = runCatching {
++        URL(url).host.lowercase().endsWith("googlevideo.com")
++    }.getOrDefault(false)
++
++    /** Watches [player]: reports on prepare, stall, error and ready for a googlevideo.com stream. */
++    fun attach(player: Player) {
++        val url = player.currentMediaItem?.localConfiguration?.uri?.toString() ?: return
++        if (!isYouTubeMedia(url)) return
++        onPrepare(url)
++        player.addListener(object : Player.Listener {
++            override fun onPlaybackStateChanged(state: Int) {
++                when (state) {
++                    Player.STATE_READY -> onReady(url)
++                    Player.STATE_IDLE, Player.STATE_ENDED -> job?.cancel()
++                }
++            }
++
++            override fun onPlayerError(error: PlaybackException) {
++                onError(url, "${error.errorCodeName}: ${error.message}")
++            }
++        })
++    }
++
++    fun onPrepare(url: String) {
++        if (!isYouTubeMedia(url)) return
++        job?.cancel()
++        startedAtMs = SystemClock.elapsedRealtime()
++        ready = false
++        job = scope.launch {
++            send("prepare", url, probe(url))
++            delay(STALL_MS)
++            if (!ready) send("stall", url, null)
++        }
++    }
++
++    fun onReady(url: String) {
++        if (!isYouTubeMedia(url) || ready) return
++        ready = true
++        job?.cancel()
++        scope.launch { send("ready", url, null) }
++    }
++
++    fun onError(url: String, summary: String) {
++        if (!isYouTubeMedia(url)) return
++        job?.cancel()
++        scope.launch { send("error", url, JSONObject().put("playerError", summary)) }
++    }
++
++    private fun send(kind: String, url: String, extra: JSONObject?) {
++        runCatching {
++            val doc = JSONObject()
++                .put("kind", kind)
++                .put("client", CLIENT)
++                .put("sinceStartMs", SystemClock.elapsedRealtime() - startedAtMs)
++                .put("device", "${Build.MANUFACTURER} ${Build.MODEL} sdk${Build.VERSION.SDK_INT}")
++                .put("media", describe(url))
++                .put("log", recentLog())
++            extra?.let { doc.put("probe", it) }
++            val conn = URL(ENDPOINT).openConnection() as HttpURLConnection
++            conn.requestMethod = "POST"
++            conn.connectTimeout = 8_000
++            conn.readTimeout = 8_000
++            conn.doOutput = true
++            conn.setRequestProperty("Content-Type", "application/json")
++            conn.outputStream.use { it.write(doc.toString().toByteArray()) }
++            Log.i(TAG, "report kind=$kind http=${conn.responseCode}")
++            conn.disconnect()
++        }.onFailure { Log.w(TAG, "report failed: ${it.message}") }
++    }
++
++    /** Host and path only: the query carries the signed access token. */
++    private fun describe(url: String): String = runCatching {
++        val u = URL(url)
++        "${u.host}${u.path.take(120)} queryChars=${(u.query ?: "").length}"
++    }.getOrDefault("unparsable")
++
++    private fun recentLog(): JSONArray {
++        val out = JSONArray()
++        runCatching {
++            val proc = ProcessBuilder("logcat", "-d", "-t", "1500").redirectErrorStream(true).start()
++            val keep = Regex("NuvioPlayerDiag|NuvioYtDiag|ExoPlayer|YouTube|HlsAudio|ConnectionFit|Throughput|MediaCodec|PlayerRuntime|PlayerLoading")
++            val lines = proc.inputStream.bufferedReader().readLines().filter { keep.containsMatchIn(it) }
++            lines.takeLast(LOG_LINES).forEach { out.put(it.take(400)) }
++            proc.destroy()
++        }
++        return out
++    }
++
++    private class Reply(val status: Int, val bytes: Long, val ms: Long, val text: String?, val error: String?)
++
++    private fun fetch(url: String, ua: String, maxBytes: Int, keepText: Boolean): Reply {
++        val t0 = SystemClock.elapsedRealtime()
++        return try {
++            val conn = URL(url).openConnection() as HttpURLConnection
++            conn.connectTimeout = 10_000
++            conn.readTimeout = 15_000
++            conn.setRequestProperty("User-Agent", ua)
++            val status = conn.responseCode
++            var total = 0L
++            val sink = if (keepText) java.io.ByteArrayOutputStream() else null
++            val stream = if (status in 200..299) conn.inputStream else conn.errorStream
++            if (stream != null) {
++                val buf = ByteArray(16 * 1024)
++                while (total < maxBytes) {
++                    val n = stream.read(buf)
++                    if (n < 0) break
++                    total += n
++                    sink?.write(buf, 0, n)
++                }
++            }
++            conn.disconnect()
++            Reply(status, total, SystemClock.elapsedRealtime() - t0, sink?.toString("UTF-8"), null)
++        } catch (e: Exception) {
++            Reply(-1, 0, SystemClock.elapsedRealtime() - t0, null, "${e.javaClass.simpleName}: ${e.message}")
++        }
++    }
++
++    private fun Reply.json(): JSONObject = JSONObject()
++        .put("status", status).put("bytes", bytes).put("ms", ms)
++        .put("kbps", if (ms > 0) bytes * 8 / ms else 0)
++        .also { if (error != null) it.put("error", error) }
++
++    private fun probe(url: String): JSONObject {
++        val result = JSONObject()
++        runCatching {
++            if (!url.contains(".m3u8") && !url.contains("hls_playlist")) {
++                result.put("progressive", fetch(url, CHROME_UA, SEGMENT_BYTES, false).json())
++                return result
++            }
++            val master = fetch(url, CHROME_UA, 2_000_000, true)
++            result.put("master", master.json())
++            val text = master.text ?: return result
++            val variants = Regex("#EXT-X-STREAM-INF:([^\n]*)\n(\\S+)").findAll(text).toList()
++            result.put("variantCount", variants.size)
++            val summary = JSONArray()
++            variants.forEach { m ->
++                val res = Regex("RESOLUTION=(\\d+x\\d+)").find(m.groupValues[1])?.groupValues?.get(1)
++                val codec = Regex("CODECS=\"([^\"]*)\"").find(m.groupValues[1])?.groupValues?.get(1)
++                val bw = Regex("BANDWIDTH=(\\d+)").find(m.groupValues[1])?.groupValues?.get(1)
++                summary.put("$res $codec $bw")
++            }
++            result.put("variants", summary)
++            // The 720p-or-lower H.264 variant with the most bandwidth, then the top one.
++            val pick = variants.filter { m ->
++                val h = Regex("RESOLUTION=\\d+x(\\d+)").find(m.groupValues[1])?.groupValues?.get(1)?.toIntOrNull() ?: 0
++                h in 1..800 && m.groupValues[1].contains("avc1")
++            }.maxByOrNull { Regex("BANDWIDTH=(\\d+)").find(it.groupValues[1])?.groupValues?.get(1)?.toLongOrNull() ?: 0L }
++                ?: variants.firstOrNull() ?: return result
++            result.put("probedVariant", pick.groupValues[1].take(160))
++            val media = fetch(pick.groupValues[2], CHROME_UA, 2_000_000, true)
++            result.put("mediaPlaylist", media.json())
++            val seg = media.text?.lineSequence()?.firstOrNull { it.startsWith("http") } ?: return result
++            result.put("segmentChromeUa", fetch(seg, CHROME_UA, SEGMENT_BYTES, false).json())
++            result.put("segmentVisionOsUa", fetch(seg, VISIONOS_UA, SEGMENT_BYTES, false).json())
++        }.onFailure { result.put("probeError", "${it.javaClass.simpleName}: ${it.message}") }
++        return result
++    }
++}
