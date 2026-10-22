@@ -40,7 +40,7 @@ new file mode 100644
 index 000000000..911ad1369
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt
-@@ -0,0 +1,337 @@
+@@ -0,0 +1,359 @@
 +package com.nuvio.tv.ui.screens.player
 +
 +import android.content.Context
@@ -147,13 +147,32 @@ index 000000000..911ad1369
 +        val hash = torrentInfoHash?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
 +        if (hash != null) return "t:$hash:${torrentFileIdx ?: -1}"
 +        val addon = addonId?.trim().orEmpty()
++        val label = withoutLiveLines(name)
++        if (addon.isEmpty() && label.isEmpty()) return null
++        // Numbers and live lines are left out of the description: addons put values there (speed,
++        // start time, FAST/SLOW, seeders) that change on every load of the same stream.
++        val details = withoutLiveLines(description).replace(VOLATILE_NUMBER, "#").trim()
++        return "s:" + fnv64("$addon\n$label\n$details")
++    }
++
++    /** The key formula from before live lines were left out; still tried so older saves keep their mark. */
++    private fun legacyStreamKey(addonId: String?, name: String?, description: String?): String? {
++        val addon = addonId?.trim().orEmpty()
 +        val label = name?.trim().orEmpty()
 +        if (addon.isEmpty() && label.isEmpty()) return null
-+        // Numbers are left out of the description: addons put live values there (speed, start
-+        // time, seeders) that change on every load of the same stream.
 +        val details = description.orEmpty().replace(VOLATILE_NUMBER, "#").trim()
 +        return "s:" + fnv64("$addon\n$label\n$details")
 +    }
++
++    /**
++     * Drops what changes between loads of one stream: the speed test line ("starts 0.0s", "Mbps",
++     * "may buffer") and the FAST/SLOW badge inside other lines. Without this the same Stream Master
++     * row got a new key on each load and its synced-subtitles mark was lost.
++     */
++    private fun withoutLiveLines(text: String?): String = text.orEmpty().lines()
++        .filterNot { LIVE_LINE.containsMatchIn(it) }
++        .joinToString("\n") { SPEED_BADGE.replace(it, "").trim() }
++        .trim()
 +
 +    /**
 +     * Coarse fallback key that survives what the exact key cannot: an addon changing its manifest
@@ -194,6 +213,7 @@ index 000000000..911ad1369
 +        return listOfNotNull(
 +            hash?.let { streamKey(addonId, label, stream.description, it, stream.fileIdx) },
 +            streamKey(addonId, label, stream.description, null, null),
++            legacyStreamKey(addonId, label, stream.description),
 +            canonicalStreamKey(label),
 +        )
 +    }
@@ -368,6 +388,8 @@ index 000000000..911ad1369
 +    private fun indexName(videoId: String) = "i-" + fnv64(videoId) + ".txt"
 +
 +    private val VOLATILE_NUMBER = Regex("[0-9]+(?:[.,][0-9]+)?")
++    private val LIVE_LINE = Regex("(?i)\\bstarts\\s*[0-9.]+\\s*s\\b|\\bmbps\\b|may buffer")
++    private val SPEED_BADGE = Regex("(?i)(?:\u26A1|\uD83D\uDC22)[\\uFE0F\\s]*(?:fast|slow)\\b")
 +
 +    private fun fnv64(text: String): String {
 +        var hash = -0x340d631b7bdddcdbL
@@ -737,21 +759,29 @@ new file mode 100644
 index 000000000..f1b660dfe
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/SyncedSubtitlesStreamMark.kt
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,64 @@
 +package com.nuvio.tv.ui.screens.stream
 +
 +import android.content.Context
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.shape.RoundedCornerShape
 +import androidx.compose.runtime.Composable
 +import androidx.compose.runtime.collectAsState
 +import androidx.compose.runtime.getValue
 +import androidx.compose.runtime.produceState
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Color
 +import androidx.compose.ui.platform.LocalContext
-+import androidx.tv.material3.MaterialTheme
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
 +import androidx.tv.material3.Text
 +import com.nuvio.tv.domain.model.Stream
 +import com.nuvio.tv.ui.screens.player.SyncedSubtitles
 +import com.nuvio.tv.ui.screens.player.SyncedSubtitlesAddons
-+import com.nuvio.tv.ui.theme.NuvioTheme
 +
 +/*
 + * Nuvio fork: "✓ Synced subtitles" on streams that have a subtitle synced before for this title
@@ -777,9 +807,20 @@ index 000000000..f1b660dfe
 +    val context = LocalContext.current
 +    val addons by produceState(SyncedSubtitlesAddons.current()) { value = SyncedSubtitlesAddons.get(context) }
 +    if (!SyncedSubtitles.isMarked(videoId, stream, addons, marks)) return
-+    Text(
-+        text = "✓ Synced subtitles",
-+        style = MaterialTheme.typography.labelSmall,
-+        color = NuvioTheme.colors.Secondary,
-+    )
++    // Green pill, as on Nuvio Mobile.
++    Box(
++        modifier = Modifier
++            .padding(top = 4.dp)
++            .clip(RoundedCornerShape(999.dp))
++            .background(Color(0xFF2E7D32).copy(alpha = 0.85f))
++            .padding(horizontal = 10.dp, vertical = 3.dp),
++    ) {
++        Text(
++            text = "✓ Synced subtitles",
++            color = Color.White,
++            fontSize = 12.sp,
++            fontWeight = FontWeight.SemiBold,
++            maxLines = 1,
++        )
++    }
 +}
