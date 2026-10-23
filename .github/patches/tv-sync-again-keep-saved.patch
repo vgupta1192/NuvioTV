@@ -1,0 +1,77 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt
+index e360c87d8..ccbdd70fa 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt
+@@ -103,6 +103,18 @@ object SyncedSubtitles {
+         restoredUrls -= url
+     }
+ 
++    /**
++     * The audio sync found no better timing for [url]. True when the user asked to sync it again
++     * and a saved timing exists: the caller then shows the saved one instead of leaving the
++     * subtitle on its original timing.
++     */
++    fun resyncGaveUp(url: String): Boolean {
++        val pending = forceResync.filter { nvioSameSubtitleFile(it, url) }
++        if (pending.isEmpty()) return false
++        forceResync.removeAll(pending.toSet())
++        return savedFor(url) != null
++    }
++
+     /** Diagnostics: a line in the account's debug log, to trace key mismatches between devices. */
+     fun debug(tag: String, body: String) {
+         scope.launch {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSubtitleSyncController.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSubtitleSyncController.kt
+index 596735fdd..4f1fbe49d 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSubtitleSyncController.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSubtitleSyncController.kt
+@@ -51,6 +51,8 @@ internal class AudioSubtitleSyncController(
+     private val onStatus: (AudioSyncStatus) -> Unit = {},
+     /** Asks for the subtitle [url] to be shown instead of the current one (it fits the audio). */
+     private val requestSwitch: (url: String) -> Unit = SubtitleSyncStatus::requestSubtitleSwitch,
++    /** The audio could not be matched in time (see [maybeGiveUp]). */
++    private val onGaveUp: () -> Unit = {},
+ ) : AudioSampleSink, PlaybackPcmListener {
+     private val appContext = context.applicationContext
+     private val lowMemoryTv by lazy { SpotConnections.isLowMemoryTv(appContext) }
+@@ -673,6 +675,7 @@ internal class AudioSubtitleSyncController(
+         gaveUpKey = current.key
+         SyncLog.i("no audio match for ${current.key} after ${(heardMs / 1_000).toInt()}s of audio; keeping its own timing")
+         notify(AudioSyncStatus.Withdrawn)
++        onGaveUp()
+     }
+ 
+     fun onAudioTrackSelected(format: Format?) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSyncFallback.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSyncFallback.kt
+index 650e486dc..d45b40420 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSyncFallback.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSyncFallback.kt
+@@ -17,6 +17,8 @@ import com.nuvio.tv.R
+ import com.nuvio.tv.domain.model.Subtitle
+ import com.nuvio.tv.ui.screens.player.PlayerPlaybackNetworking
+ import com.nuvio.tv.ui.screens.player.PlayerRuntimeController
++import com.nuvio.tv.ui.screens.player.SyncedSubtitles
++import com.nuvio.tv.ui.screens.player.restoreSyncedSubtitle
+ import com.nuvio.tv.ui.screens.player.autosync.AutomaticSubtitleSync
+ import com.nuvio.tv.ui.screens.player.autosync.AutoSyncSyncedSubtitle
+ import com.nuvio.tv.ui.screens.player.autosync.bubble.AutoSyncBubbleKind
+@@ -63,8 +65,19 @@ internal class AudioSyncFallback private constructor(
+         manualDelayMs = { 0 },
+         onStatus = ::onStatus,
+         requestSwitch = ::replaceSubtitle,
++        onGaveUp = ::restoreSavedAfterSyncAgain,
+     )
+ 
++    /** "Sync again" found nothing better: show the saved synced timing again. */
++    private fun restoreSavedAfterSyncAgain() {
++        val url = target.get()?.url ?: return
++        if (!SyncedSubtitles.resyncGaveUp(url)) return
++        scope.launch(Dispatchers.Main.immediate) {
++            val subtitle = runtime.uiState.value.selectedAddonSubtitle?.takeIf { it.url == url } ?: return@launch
++            runtime.restoreSyncedSubtitle(subtitle)
++        }
++    }
++
+     /** The subtitle being synced, with its original cues and the sidecar attachment it lives in. */
+     private class Target(val url: String, val cues: List<CuesWithTiming>, val generation: Long)
+ 
