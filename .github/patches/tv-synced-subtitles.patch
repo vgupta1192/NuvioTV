@@ -40,7 +40,7 @@ new file mode 100644
 index 000000000..911ad1369
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt
-@@ -0,0 +1,387 @@
+@@ -0,0 +1,424 @@
 +package com.nuvio.tv.ui.screens.player
 +
 +import android.content.Context
@@ -137,6 +137,28 @@ index 000000000..911ad1369
 +    /** Subtitles restored from [saved] in this playback; their "synced" state is not saved again. */
 +    val restoredUrls: MutableSet<String> = mutableSetOf()
 +
++    /** Diagnostics: a line in the account's debug log, to trace key mismatches between devices. */
++    fun debug(tag: String, body: String) {
++        scope.launch {
++            runCatching {
++                GeneratedSubtitleSync.postgrest()!!.rpc(
++                    "synced_subtitles_debug",
++                    buildJsonObject {
++                        put("p_tag", tag)
++                        put("p_body", body)
++                    },
++                )
++            }
++        }
++    }
++
++    private val debugSeen: MutableSet<String> = mutableSetOf()
++
++    /** [debug] once per distinct [body]. */
++    fun debugOnce(tag: String, body: String) {
++        if (debugSeen.add("$tag|$body")) debug(tag, body)
++    }
++
 +    fun streamKey(
 +        addonId: String?,
 +        name: String?,
@@ -221,6 +243,17 @@ index 000000000..911ad1369
 +        )
 +    }
 +
++    /** Diagnostics: the text a listed stream is keyed by, and whether the account marks it. */
++    fun debugList(videoId: String, stream: Stream, addons: List<Addon>) {
++        val keys = streamKeys(stream, addons)
++        val marked = _marks.value[videoId].orEmpty()
++        debugOnce(
++            "list",
++            "video=$videoId addons=${addons.size} addonId=${addonInstanceId(stream.addonName, addons)} marks=${marked.size} " +
++                "hit=${keys.any { it in marked }} keys=$keys name=${stream.name?.replace("\n", "|")} desc=${stream.description?.replace("\n", "|")?.take(400)}",
++        )
++    }
++
 +    fun isMarked(videoId: String?, stream: Stream, addons: List<Addon>, marks: Map<String, Set<String>>): Boolean {
 +        val keys = marks[videoId ?: return false] ?: return false
 +        return keys.isNotEmpty() && streamKeys(stream, addons).any { it in keys }
@@ -232,7 +265,7 @@ index 000000000..911ad1369
 +        scope.launch {
 +            val local = localLoad?.invoke(indexName(videoId))?.lines()?.filter { it.isNotBlank() }?.toSet().orEmpty()
 +            if (local.isNotEmpty()) _marks.update { it + (videoId to (it[videoId].orEmpty() + local)) }
-+            val remote = runCatching {
++            val remoteResult = runCatching {
 +                val result = GeneratedSubtitleSync.postgrest()!!.rpc(
 +                    "synced_subtitles_list",
 +                    buildJsonObject { put("p_video_id", videoId) },
@@ -240,7 +273,10 @@ index 000000000..911ad1369
 +                (Json.parseToJsonElement(result.data) as? JsonArray)
 +                    ?.mapNotNull { it.jsonPrimitive.contentOrNull }
 +                    ?.toSet()
-+            }.getOrNull() ?: return@launch
++            }
++            val remote = remoteResult.getOrNull()
++            debug("marks", "video=$videoId local=${local.size} remote=${remote?.size} error=${remoteResult.exceptionOrNull()}")
++            remote ?: return@launch
 +            _marks.update { it + (videoId to (it[videoId].orEmpty() + remote)) }
 +        }
 +    }
@@ -257,6 +293,7 @@ index 000000000..911ad1369
 +        userPicked = false
 +        next ?: return
 +        requestMarks(next.videoId)
++        debug("play", "video=${next.videoId} key=${next.streamKey} canonical=$playbackCanonicalKey")
 +        scope.launch {
 +            val local = localLoad?.invoke(fileName(next))?.let(::decodeList).orEmpty()
 +            if (local.isNotEmpty() && _playback.value == next) merge(next, local, store = false)
@@ -433,7 +470,7 @@ new file mode 100644
 index 000000000..5eabc80fc
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitlesPlayerHooks.kt
-@@ -0,0 +1,325 @@
+@@ -0,0 +1,330 @@
 +@file:OptIn(androidx.media3.common.util.UnstableApi::class)
 +
 +package com.nuvio.tv.ui.screens.player
@@ -500,6 +537,11 @@ index 000000000..5eabc80fc
 +private fun PlayerRuntimeController.syncedStreamKey(addons: List<Addon>): String? {
 +    val torrent = isTorrentStream && currentInfoHash != null
 +    val label = _uiState.value.currentStreamName?.takeIf { it.isNotBlank() } ?: streamName?.takeIf { it.isNotBlank() } ?: "Stream"
++    SyncedSubtitles.debugOnce(
++        "playtext",
++        "addons=${addons.size} addonId=${SyncedSubtitles.addonInstanceId(currentAddonName, addons)} torrent=$torrent name=${label.replace("\n", "|")} " +
++            "desc=${currentStreamDescription?.replace("\n", "|")?.take(400)}",
++    )
 +    return SyncedSubtitles.streamKey(
 +        addonId = SyncedSubtitles.addonInstanceId(currentAddonName, addons),
 +        name = label,
@@ -788,7 +830,7 @@ new file mode 100644
 index 000000000..f1b660dfe
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/SyncedSubtitlesStreamMark.kt
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,65 @@
 +package com.nuvio.tv.ui.screens.stream
 +
 +import android.content.Context
@@ -831,6 +873,7 @@ index 000000000..f1b660dfe
 +@Composable
 +internal fun SyncedSubtitlesStreamMark(stream: Stream) {
 +    val videoId = listVideoId ?: return
++    SyncedSubtitles.debugList(videoId, stream, SyncedSubtitlesAddons.current())
 +    val marks by SyncedSubtitles.marks.collectAsState()
 +    if (marks[videoId].isNullOrEmpty()) return
 +    val context = LocalContext.current
