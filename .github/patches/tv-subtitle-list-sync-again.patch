@@ -1,0 +1,72 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/SubtitleSelectionOverlay.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/SubtitleSelectionOverlay.kt
+index 073a91551..c43525936 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/SubtitleSelectionOverlay.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/SubtitleSelectionOverlay.kt
+@@ -787,7 +787,16 @@ private fun SubtitleOptionsRail(
+                                     }
+                                 }
+                             },
+-                            onLongClick = { onOptionLongPressed(option.id) }
++                            onLongClick = {
++                                // Hold OK on an add-on subtitle: AutoSync it again, ignoring its saved timing.
++                                val addon = option.addonSubtitle
++                                if (option.kind == SubtitleOptionKind.ADDON && addon != null) {
++                                    SyncedSubtitles.requestResync(addon.url)
++                                    onAddonSubtitleSelected(option.id, addon)
++                                } else {
++                                    onOptionLongPressed(option.id)
++                                }
++                            }
+                         )
+                     }
+                 }
+@@ -1258,6 +1267,13 @@ private fun SubtitleOptionCard(
+                 ) {
+                     SourceChip(label = item.sourceLabel, selected = item.isSelected)
+                     item.addonSubtitle?.let { AutoSyncedChip(it.url, item.isSelected) } // AutoSync hook
++                    if (item.addonSubtitle != null) {
++                        Text(
++                            text = "Hold OK: sync again",
++                            style = MaterialTheme.typography.labelSmall,
++                            color = metaColor
++                        )
++                    }
+                 }
+                 Text(
+                     text = item.title,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt
+index 5b8e456b7..e360c87d8 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt
+@@ -94,6 +94,15 @@ object SyncedSubtitles {
+     /** Subtitles restored from [saved] in this playback; their "synced" state is not saved again. */
+     val restoredUrls: MutableSet<String> = mutableSetOf()
+ 
++    /** Subtitles the user asked to AutoSync again from the list: their saved timing is ignored until the new run saves. */
++    val forceResync: MutableSet<String> = mutableSetOf()
++
++    /** The subtitle list's "sync again": forget the saved timing of [url] so the next pick runs AutoSync on it. */
++    fun requestResync(url: String) {
++        forceResync += url
++        restoredUrls -= url
++    }
++
+     /** Diagnostics: a line in the account's debug log, to trace key mismatches between devices. */
+     fun debug(tag: String, body: String) {
+         scope.launch {
+@@ -356,6 +365,7 @@ object SyncedSubtitles {
+ 
+     /** The saved synced subtitle for [url] in this playback, if any. */
+     fun savedFor(url: String): Saved? {
++        if (forceResync.any { nvioSameSubtitleFile(it, url) }) return null
+         val (playback, saved) = _saved.value ?: return null
+         if (playback != _playback.value) return null
+         saved[url]?.let { return it }
+@@ -386,6 +396,7 @@ object SyncedSubtitles {
+ 
+     /** AutoSync or the audio sync synced [url] to [srt] in this playback: keep it for next time. */
+     fun save(url: String, srt: String, method: String, nowMs: Long) {
++        forceResync.removeAll { nvioSameSubtitleFile(it, url) }
+         val playback = _playback.value ?: return
+         if (srt.isBlank() || url in restoredUrls || GeneratedSubtitles.isGenerated(url)) return
+         val subtitle = describeSubtitle(url)
