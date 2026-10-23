@@ -10,11 +10,33 @@ index 191945932..c4442854e 100644
      AutoSyncPreferences.ensureLoaded(context)
      if (!AutoSyncPreferences.isEnabled(context)) return
      if (selectedSubtitle.lang.isBlank()) return
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
+index a47f59f48..5d7fb8da4 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
+@@ -661,7 +661,7 @@ private fun PlayerRuntimeController.applyStreamMetadata(stream: Stream) {
+     streamSubtitles = stream.subtitles
+     currentAddonName = stream.addonName
+     currentAddonLogo = stream.addonLogo
+-    currentStreamDescription = stream.description
++    currentStreamDescription = stream.description ?: stream.title
+     currentVideoCodec = null
+     currentVideoWidth = null
+     currentVideoHeight = null
+@@ -719,7 +719,7 @@ internal fun PlayerRuntimeController.handleStreamRedirect(requestedUrl: String,
+         currentStreamBingeGroup = target.behaviorHints?.bingeGroup
+         currentAddonName = target.addonName
+         currentAddonLogo = target.addonLogo
+-        currentStreamDescription = target.description
++        currentStreamDescription = target.description ?: target.title
+         persistBingeGroup(currentStreamBingeGroup)
+         _uiState.update {
+             it.copy(
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
-index 8c9ecba6b..ad9f6ff33 100644
+index e7f1a263b..f067e17a9 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
-@@ -2020,7 +2020,7 @@ fun PlayerScreen(
+@@ -2018,7 +2018,7 @@ fun PlayerScreen(
              } else {
                  uiState.serverSubtitleTracks.firstOrNull { it.isSelected }?.index ?: -1
              },
@@ -37,7 +59,7 @@ index db4e5b551..456820535 100644
      val uiState: StateFlow<PlayerUiState>
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt
 new file mode 100644
-index 000000000..911ad1369
+index 000000000..948fb48d4
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt
 @@ -0,0 +1,424 @@
@@ -237,9 +259,9 @@ index 000000000..911ad1369
 +        val label = stream.name?.takeIf { it.isNotBlank() } ?: "Stream"
 +        val hash = stream.infoHash ?: stream.clientResolve?.infoHash
 +        return listOfNotNull(
-+            hash?.let { streamKey(addonId, label, stream.description, it, stream.fileIdx) },
-+            streamKey(addonId, label, stream.description, null, null),
-+            legacyStreamKey(addonId, label, stream.description),
++            hash?.let { streamKey(addonId, label, stream.description ?: stream.title, it, stream.fileIdx) },
++            streamKey(addonId, label, stream.description ?: stream.title, null, null),
++            legacyStreamKey(addonId, label, stream.description ?: stream.title),
 +        )
 +    }
 +
@@ -250,7 +272,7 @@ index 000000000..911ad1369
 +        debugOnce(
 +            "list",
 +            "video=$videoId addons=${addons.size} addonId=${addonInstanceId(stream.addonName, addons)} marks=${marked.size} " +
-+                "hit=${keys.any { it in marked }} keys=$keys name=${stream.name?.replace("\n", "|")} desc=${stream.description?.replace("\n", "|")?.take(400)}",
++                "hit=${keys.any { it in marked }} keys=$keys name=${stream.name?.replace("\n", "|")} desc=${(stream.description ?: stream.title)?.replace("\n", "|")?.take(400)}",
 +        )
 +    }
 +
@@ -467,7 +489,7 @@ index 000000000..911ad1369
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitlesPlayerHooks.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitlesPlayerHooks.kt
 new file mode 100644
-index 000000000..5eabc80fc
+index 000000000..a0ba22695
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitlesPlayerHooks.kt
 @@ -0,0 +1,330 @@
@@ -814,7 +836,7 @@ index 97025f836..b4b3f62da 100644
                  if (hasBadges && badgePlacement == StreamBadgePlacement.BOTTOM) {
                      if (stream.badges.isNotEmpty() || (showFileSizeBadges && stream.behaviorHints?.videoSize != null)) {
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
-index a1ce9208d..ac74dc393 100644
+index 1988b5417..8f72f93f7 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
 @@ -131,6 +131,7 @@ class StreamScreenViewModel @Inject constructor(
@@ -825,9 +847,18 @@ index a1ce9208d..ac74dc393 100644
      private val contentType: String = savedStateHandle["contentType"] ?: ""
      private val title: String = savedStateHandle["title"] ?: ""
      private val poster: String? = savedStateHandle.getOptionalString("poster")
+@@ -1583,7 +1584,7 @@ class StreamScreenViewModel @Inject constructor(
+             videoSize = stream.behaviorHints?.videoSize,
+             addonName = stream.addonName,
+             addonLogo = stream.addonLogo,
+-            streamDescription = stream.description,
++            streamDescription = stream.description ?: stream.title,
+             fileIdx = stream.getEffectiveFileIdx(),
+             sources = stream.sources,
+             contentLanguage = contentLanguage,
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/stream/SyncedSubtitlesStreamMark.kt b/app/src/main/java/com/nuvio/tv/ui/screens/stream/SyncedSubtitlesStreamMark.kt
 new file mode 100644
-index 000000000..f1b660dfe
+index 000000000..c6c0b8ffb
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/SyncedSubtitlesStreamMark.kt
 @@ -0,0 +1,65 @@
