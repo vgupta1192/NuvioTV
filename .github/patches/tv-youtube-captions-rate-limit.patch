@@ -1,0 +1,67 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeCaptions.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeCaptions.kt
+index 0063eaccd..917fca897 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeCaptions.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeCaptions.kt
+@@ -25,6 +25,11 @@ import java.util.concurrent.TimeUnit
+ internal object YouTubeCaptions {
+     private const val ID_PREFIX = "youstream:"
+     private const val TIMEOUT_MS = 25_000L
++    private const val BLOCK_COOLDOWN_MS = 10 * 60_000L
++    @Volatile private var blockedAt = 0L
++
++    /** YouTube answers HTTP 429 to every caption download once it counts too many requests: stop asking for a while. */
++    private fun isBlocked(): Boolean = blockedAt != 0L && System.currentTimeMillis() - blockedAt < BLOCK_COOLDOWN_MS
+     private const val MAX_TRACKS = 8
+     private val VIDEO_ID = Regex("^[A-Za-z0-9_-]{11}$")
+     private val API_KEY = Regex("\"INNERTUBE_API_KEY\":\"([^\"]+)\"")
+@@ -136,6 +141,10 @@ internal object YouTubeCaptions {
+ 
+     /** One fetch per video, shared: a caller that is cancelled and asks again joins the running fetch instead of restarting it. */
+     suspend fun fetch(youtubeId: String): List<Subtitle> {
++        if (isBlocked()) {
++            SyncLog.i("youtube captions: YouTube said HTTP 429 a moment ago, not asking again for $youtubeId yet")
++            return emptyList()
++        }
+         val job = fetchLock.withLock {
+             cache[youtubeId]?.let {
+                 SyncLog.i("youtube captions: ${it.size} rows from memory for $youtubeId")
+@@ -153,7 +162,7 @@ internal object YouTubeCaptions {
+ 
+     private suspend fun fetchWithRetry(youtubeId: String): List<Subtitle> {
+         val first = fetchOnce(youtubeId)
+-        if (first.isNotEmpty()) return first
++        if (first.isNotEmpty() || isBlocked()) return first
+         kotlinx.coroutines.delay(1_500)
+         SyncLog.i("youtube captions: nothing the first time, asking once more for $youtubeId")
+         return fetchOnce(youtubeId)
+@@ -192,6 +201,7 @@ internal object YouTubeCaptions {
+         val sources: List<Client?> = listOf<Client?>(null) + CLIENTS + EXTRA_CLIENTS
+         var anyTracks = false
+         for (client in sources) {
++            if (isBlocked()) break
+             val name = client?.name ?: "watch page"
+             val tracks = runCatching {
+                 if (client == null) pageTracks(watch) else playerTracks(youtubeId, client, apiKey, visitorData)
+@@ -299,6 +309,7 @@ internal object YouTubeCaptions {
+     private fun readableUrl(source: String, track: Track): String? {
+         val srt = withFormat(track.baseUrl, "srt")
+         if (download(source, track, srt)?.let(::isSrt) == true) return srt
++        if (isBlocked()) return null
+         val vtt = withFormat(track.baseUrl, "vtt")
+         if (download(source, track, vtt)?.let(::isVtt) == true) return vtt
+         return null
+@@ -315,7 +326,13 @@ internal object YouTubeCaptions {
+         .onSuccess {
+             SyncLog.i("youtube captions: $source ${track.languageCode} ${url.substringAfterLast("fmt=")} -> ${it.length} chars ${it.take(40).replace('\n', ' ')}")
+         }
+-        .onFailure { SyncLog.w("youtube captions: $source ${track.languageCode} download failed: ${it.message}") }
++        .onFailure {
++            SyncLog.w("youtube captions: $source ${track.languageCode} download failed: ${it.message}")
++            if ("429" in it.message.orEmpty()) {
++                blockedAt = System.currentTimeMillis()
++                SyncLog.w("youtube captions: HTTP 429, pausing caption requests for 10 min")
++            }
++        }
+         .getOrNull()
+ 
+     private fun isVtt(text: String) = text.trimStart('﻿', ' ', '\r', '\n', '\t').startsWith("WEBVTT") && "-->" in text
