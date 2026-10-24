@@ -1,0 +1,99 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeCaptions.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeCaptions.kt
+index cd427422b..f9c9db2be 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeCaptions.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeCaptions.kt
+@@ -204,22 +204,11 @@ internal object YouTubeCaptions {
+                 SyncLog.i("youtube captions: ${it.size} rows saved on this device for $youtubeId, YouTube not asked")
+                 return it
+             }
+-            if (isBlocked()) {
+-                SyncLog.i("youtube captions: YouTube said HTTP 429 not long ago, not asking for $youtubeId yet")
+-                return emptyList()
+-            }
+-            val now = System.currentTimeMillis()
+-            while (recentFetches.isNotEmpty() && now - recentFetches.first() > HOUR_MS) recentFetches.removeFirst()
+-            if (inflight[youtubeId] == null && recentFetches.size >= MAX_VIDEOS_PER_HOUR) {
+-                SyncLog.i("youtube captions: $MAX_VIDEOS_PER_HOUR videos asked this hour, not asking for $youtubeId yet")
+-                return emptyList()
+-            }
+-            if (inflight[youtubeId] == null) recentFetches.addLast(now)
+             cache[youtubeId]?.let {
+                 SyncLog.i("youtube captions: ${it.size} rows from memory for $youtubeId")
+                 return it
+             }
+-            inflight.getOrPut(youtubeId) { fetchScope.async { networkLock.withLock { fetchWithRetry(youtubeId) } } }
++            inflight.getOrPut(youtubeId) { fetchScope.async { fetchSharedOrNetwork(youtubeId) } }
+         }
+         val result = job.await()
+         fetchLock.withLock {
+@@ -229,6 +218,70 @@ internal object YouTubeCaptions {
+         return result
+     }
+ 
++    /** The copy in the user's account first (another device may have fetched it), YouTube only when there is none. */
++    private suspend fun fetchSharedOrNetwork(youtubeId: String): List<Subtitle> {
++        pullShared(youtubeId)?.let { return it }
++        if (isBlocked()) {
++            SyncLog.i("youtube captions: YouTube said HTTP 429 not long ago, not asking for $youtubeId yet")
++            return emptyList()
++        }
++        val now = System.currentTimeMillis()
++        val allowed = fetchLock.withLock {
++            while (recentFetches.isNotEmpty() && now - recentFetches.first() > HOUR_MS) recentFetches.removeFirst()
++            if (recentFetches.size >= MAX_VIDEOS_PER_HOUR) false else { recentFetches.addLast(now); true }
++        }
++        if (!allowed) {
++            SyncLog.i("youtube captions: $MAX_VIDEOS_PER_HOUR videos asked this hour, not asking for $youtubeId yet")
++            return emptyList()
++        }
++        val rows = networkLock.withLock { fetchWithRetry(youtubeId) }
++        if (rows.isNotEmpty()) pushShared(youtubeId)
++        return rows
++    }
++
++    private fun sharedKey(youtubeId: String) = "yt-captions|$youtubeId"
++
++    private suspend fun pullShared(youtubeId: String): List<Subtitle>? {
++        if (captionsDir == null) return null
++        val raw = GeneratedSubtitleSync.pull(sharedKey(youtubeId)) ?: return null
++        val root = runCatching { JSONObject(raw) }.getOrNull() ?: return null
++        val savedAt = root.optLong("savedAt", 0L)
++        if (System.currentTimeMillis() - savedAt !in 0 until CAPTIONS_TTL_MS) return null
++        val tracks = root.optJSONArray("tracks") ?: return null
++        val index = StringBuilder(savedAt.toString())
++        var count = 0
++        for (i in 0 until tracks.length()) {
++            val track = tracks.optJSONObject(i) ?: continue
++            val lang = track.optString("lang").takeIf { it.isNotBlank() } ?: continue
++            val label = track.optString("label").ifBlank { lang }
++            val ext = if (track.optString("ext") == "vtt") "vtt" else "srt"
++            val text = track.optString("text").takeIf { it.isNotBlank() } ?: continue
++            val fileName = "$youtubeId.$count.$lang.$ext"
++            if (!writeFile(fileName, text)) return null
++            index.append('\n').append(lang).append('\t').append(label.replace('\t', ' ').replace('\n', ' ')).append("\t-\t").append(fileName)
++            count++
++        }
++        if (count == 0) return null
++        writeFile("$youtubeId.idx", index.toString())
++        SyncLog.i("youtube captions: $count tracks from the account for $youtubeId, YouTube not asked")
++        return readDisk(youtubeId)
++    }
++
++    private suspend fun pushShared(youtubeId: String) {
++        val lines = readFile("$youtubeId.idx")?.lines()?.filter { it.isNotBlank() } ?: return
++        val tracks = JSONArray()
++        for (line in lines.drop(1)) {
++            val parts = line.split('\t')
++            if (parts.size < 4) continue
++            val text = readFile(parts[3]) ?: continue
++            tracks.put(JSONObject().put("lang", parts[0]).put("label", parts[1]).put("ext", parts[3].substringAfterLast('.')).put("text", text))
++        }
++        if (tracks.length() == 0) return
++        val payload = JSONObject().put("v", 1).put("savedAt", lines.first().trim().toLongOrNull() ?: System.currentTimeMillis()).put("tracks", tracks)
++        val ok = GeneratedSubtitleSync.push(sharedKey(youtubeId), "youstream:$youtubeId", payload.toString())
++        SyncLog.i("youtube captions: saved to the account for $youtubeId: $ok")
++    }
++
+     private suspend fun fetchWithRetry(youtubeId: String): List<Subtitle> {
+         val first = fetchOnce(youtubeId)
+         if (first.isNotEmpty() || isBlocked() || readFile("$youtubeId.idx") != null) return first
