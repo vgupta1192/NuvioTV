@@ -48,10 +48,10 @@ index 84a22cd1b..c14eba677 100644
  internal fun PlayerRuntimeController.fetchAddonSubtitles() {
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeCaptions.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeCaptions.kt
 new file mode 100644
-index 000000000..3313eafd0
+index 0000000..6985097
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeCaptions.kt
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,301 @@
 +package com.nuvio.tv.ui.screens.player
 +
 +import com.nuvio.tv.domain.model.Subtitle
@@ -129,6 +129,45 @@ index 000000000..3313eafd0
 +        )
 +    }
 +
++    private val EXTRA_CLIENTS by lazy {
++        val webUa = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
++        listOf(
++            Client(
++                name = "TVHTML5",
++                id = "7",
++                version = "7.20250219.14.00",
++                userAgent = "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
++                context = JSONObject()
++                    .put("clientName", "TVHTML5")
++                    .put("clientVersion", "7.20250219.14.00")
++                    .put("hl", "en")
++                    .put("gl", "US"),
++            ),
++            Client(
++                name = "WEB_EMBEDDED",
++                id = "56",
++                version = "1.20250310.01.00",
++                userAgent = webUa,
++                context = JSONObject()
++                    .put("clientName", "WEB_EMBEDDED_PLAYER")
++                    .put("clientVersion", "1.20250310.01.00")
++                    .put("hl", "en")
++                    .put("gl", "US"),
++            ),
++            Client(
++                name = "MWEB",
++                id = "2",
++                version = "2.20250310.01.00",
++                userAgent = webUa,
++                context = JSONObject()
++                    .put("clientName", "MWEB")
++                    .put("clientVersion", "2.20250310.01.00")
++                    .put("hl", "en")
++                    .put("gl", "US"),
++            ),
++        )
++    }
++
 +    private class Track(val languageCode: String, val label: String, val auto: Boolean, val baseUrl: String)
 +
 +    /** The YouTube video id of a YouStream content id, or null for anything else. */
@@ -152,31 +191,6 @@ index 000000000..3313eafd0
 +    }
 +
 +    private fun load(youtubeId: String): List<Subtitle> {
-+        val tracks = findTracks(youtubeId)
-+        if (tracks.isEmpty()) {
-+            SyncLog.i("youtube captions: none offered for $youtubeId")
-+            return emptyList()
-+        }
-+        val found = mutableListOf<Subtitle>()
-+        for (track in tracks.take(MAX_TRACKS)) {
-+            val url = readableUrl(track)
-+            if (url == null) {
-+                SyncLog.i("youtube captions: ${track.languageCode} would not download as srt or vtt")
-+                continue
-+            }
-+            found += Subtitle(
-+                id = "youtube_${youtubeId}_${track.languageCode}_${found.size}",
-+                url = url,
-+                lang = track.languageCode,
-+                addonName = if (track.auto) "YouTube auto-captions" else "YouTube",
-+                addonLogo = null,
-+            )
-+        }
-+        SyncLog.i("youtube captions: ${found.size} of ${tracks.size} tracks listed for $youtubeId")
-+        return found
-+    }
-+
-+    private fun findTracks(youtubeId: String): List<Track> {
 +        val watch = runCatching {
 +            get(
 +                "https://www.youtube.com/watch?v=$youtubeId&hl=en",
@@ -185,17 +199,76 @@ index 000000000..3313eafd0
 +                    "User-Agent" to "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36",
 +                ),
 +            )
-+        }.getOrNull().orEmpty()
++        }.onFailure { SyncLog.w("youtube captions: watch page failed: ${it.message}") }.getOrNull().orEmpty()
 +        val apiKey = API_KEY.find(watch)?.groupValues?.get(1)
 +        val visitorData = VISITOR_DATA.find(watch)?.groupValues?.get(1)
-+        for (client in CLIENTS) {
-+            val tracks = runCatching { playerTracks(youtubeId, client, apiKey, visitorData) }
-+                .onFailure { SyncLog.w("youtube captions: ${client.name} failed: ${it.message}") }
-+                .getOrNull()
-+                .orEmpty()
-+            if (tracks.isNotEmpty()) return tracks
++        SyncLog.i("youtube captions: watch page ${watch.length} chars, key ${apiKey != null}, visitor ${visitorData != null}")
++        // Each source (the watch page, then each YouTube client) is probed with its first track; the first
++        // source whose track really downloads as srt or vtt wins, because the others may need a token.
++        val sources: List<Client?> = listOf<Client?>(null) + CLIENTS + EXTRA_CLIENTS
++        var anyTracks = false
++        for (client in sources) {
++            val name = client?.name ?: "watch page"
++            val tracks = runCatching {
++                if (client == null) pageTracks(watch) else playerTracks(youtubeId, client, apiKey, visitorData)
++            }
++                .onFailure { SyncLog.w("youtube captions: $name failed: ${it.message}") }
++                .getOrNull().orEmpty()
++            if (tracks.isEmpty()) {
++                SyncLog.i("youtube captions: $name offers no tracks")
++                continue
++            }
++            anyTracks = true
++            val urls = mutableListOf<Pair<Track, String>>()
++            for (track in tracks.take(MAX_TRACKS)) {
++                val url = readableUrl(name, track)
++                if (url != null) urls += track to url
++                else if (urls.isEmpty()) break
++            }
++            if (urls.isEmpty()) {
++                SyncLog.i("youtube captions: $name tracks would not download as srt or vtt")
++                continue
++            }
++            SyncLog.i("youtube captions: $name gives ${urls.size} of ${tracks.size} tracks for $youtubeId")
++            return urls.mapIndexed { index, (track, url) ->
++                Subtitle(
++                    id = "youtube_${youtubeId}_${track.languageCode}_$index",
++                    url = url,
++                    lang = track.languageCode,
++                    addonName = if (track.auto) "YouTube auto-captions" else "YouTube",
++                    addonLogo = null,
++                )
++            }
 +        }
++        SyncLog.i(
++            if (anyTracks) "youtube captions: tracks found but none downloads for $youtubeId"
++            else "youtube captions: none offered for $youtubeId",
++        )
 +        return emptyList()
++    }
++
++    /** The caption tracks inside the watch page's own player response. */
++    private fun pageTracks(watch: String): List<Track> {
++        val start = watch.indexOf("\"captionTracks\":")
++        if (start < 0) return emptyList()
++        val open = watch.indexOf('[', start)
++        if (open < 0) return emptyList()
++        var depth = 0
++        var index = open
++        var inString = false
++        while (index < watch.length) {
++            val c = watch[index]
++            if (inString) {
++                if (c == '\\') index++ else if (c == '"') inString = false
++            } else when (c) {
++                '"' -> inString = true
++                '[' -> depth++
++                ']' -> { depth--; if (depth == 0) break }
++            }
++            index++
++        }
++        if (depth != 0) return emptyList()
++        return tracksFrom(JSONArray(watch.substring(open, index + 1)))
 +    }
 +
 +    private fun playerTracks(youtubeId: String, client: Client, apiKey: String?, visitorData: String?): List<Track> {
@@ -214,10 +287,16 @@ index 000000000..3313eafd0
 +            .put("context", JSONObject().put("client", client.context))
 +            .toString()
 +        val response = JSONObject(post(endpoint, body, headers))
++        val status = response.optJSONObject("playabilityStatus")
++        SyncLog.i("youtube captions: ${client.name} ${status?.optString("status")} ${status?.optString("reason").orEmpty()}")
 +        val list: JSONArray = response.optJSONObject("captions")
 +            ?.optJSONObject("playerCaptionsTracklistRenderer")
 +            ?.optJSONArray("captionTracks")
 +            ?: return emptyList()
++        return tracksFrom(list)
++    }
++
++    private fun tracksFrom(list: JSONArray): List<Track> {
 +        return (0 until list.length()).mapNotNull { index ->
 +            val track = list.optJSONObject(index) ?: return@mapNotNull null
 +            val baseUrl = track.optString("baseUrl").takeIf { it.isNotBlank() } ?: return@mapNotNull null
@@ -231,11 +310,11 @@ index 000000000..3313eafd0
 +    }
 +
 +    /** The track's address in a format the player reads as it is, or null when neither downloads. */
-+    private fun readableUrl(track: Track): String? {
++    private fun readableUrl(source: String, track: Track): String? {
 +        val srt = withFormat(track.baseUrl, "srt")
-+        if (download(srt)?.let(::isSrt) == true) return srt
++        if (download(source, track, srt)?.let(::isSrt) == true) return srt
 +        val vtt = withFormat(track.baseUrl, "vtt")
-+        if (download(vtt)?.let(::isVtt) == true) return vtt
++        if (download(source, track, vtt)?.let(::isVtt) == true) return vtt
 +        return null
 +    }
 +
@@ -246,7 +325,12 @@ index 000000000..3313eafd0
 +        return cleaned + (if ('?' in cleaned) "&" else "?") + "fmt=$format"
 +    }
 +
-+    private fun download(url: String): String? = runCatching { get(url, emptyMap()) }.getOrNull()
++    private fun download(source: String, track: Track, url: String): String? = runCatching { get(url, emptyMap()) }
++        .onSuccess {
++            SyncLog.i("youtube captions: $source ${track.languageCode} ${url.substringAfterLast("fmt=")} -> ${it.length} chars ${it.take(40).replace('\n', ' ')}")
++        }
++        .onFailure { SyncLog.w("youtube captions: $source ${track.languageCode} download failed: ${it.message}") }
++        .getOrNull()
 +
 +    private fun isVtt(text: String) = text.trimStart('﻿', ' ', '\r', '\n', '\t').startsWith("WEBVTT") && "-->" in text
 +
