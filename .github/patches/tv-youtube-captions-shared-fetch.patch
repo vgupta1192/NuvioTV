@@ -1,0 +1,83 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/SubtitleSelectionOverlay.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/SubtitleSelectionOverlay.kt
+index c43525936..8852f3f0e 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/SubtitleSelectionOverlay.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/SubtitleSelectionOverlay.kt
+@@ -790,7 +790,7 @@ private fun SubtitleOptionsRail(
+                             onLongClick = {
+                                 // Hold OK on an add-on subtitle: AutoSync it again, ignoring its saved timing.
+                                 val addon = option.addonSubtitle
+-                                if (option.kind == SubtitleOptionKind.ADDON && addon != null) {
++                                if (option.kind == SubtitleOptionKind.ADDON && addon != null && !GeneratedSubtitles.isGenerated(addon.url)) {
+                                     SyncedSubtitles.requestResync(addon.url)
+                                     onAddonSubtitleSelected(option.id, addon)
+                                 } else {
+@@ -1267,7 +1267,7 @@ private fun SubtitleOptionCard(
+                 ) {
+                     SourceChip(label = item.sourceLabel, selected = item.isSelected)
+                     item.addonSubtitle?.let { AutoSyncedChip(it.url, item.isSelected) } // AutoSync hook
+-                    if (item.addonSubtitle != null) {
++                    if (item.addonSubtitle != null && !GeneratedSubtitles.isGenerated(item.addonSubtitle.url)) {
+                         Text(
+                             text = "Hold OK: sync again",
+                             style = MaterialTheme.typography.labelSmall,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeCaptions.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeCaptions.kt
+index a517038f3..0063eaccd 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeCaptions.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeCaptions.kt
+@@ -4,6 +4,8 @@ import com.nuvio.tv.domain.model.Subtitle
+ import com.nuvio.tv.ui.screens.player.audiosync.SyncLog
+ import kotlinx.coroutines.CancellationException
+ import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.async
++import kotlinx.coroutines.sync.withLock
+ import kotlinx.coroutines.withContext
+ import kotlinx.coroutines.withTimeoutOrNull
+ import okhttp3.MediaType.Companion.toMediaType
+@@ -127,13 +129,44 @@ internal object YouTubeCaptions {
+     fun isCaptionUrl(url: String): Boolean =
+         url.substringAfter("://", "").substringBefore('/').endsWith("youtube.com") && "/api/timedtext" in url
+ 
+-    suspend fun fetch(youtubeId: String): List<Subtitle> = try {
++    private val fetchScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + Dispatchers.Default)
++    private val fetchLock = kotlinx.coroutines.sync.Mutex()
++    private val inflight = mutableMapOf<String, kotlinx.coroutines.Deferred<List<Subtitle>>>()
++    private val cache = mutableMapOf<String, List<Subtitle>>()
++
++    /** One fetch per video, shared: a caller that is cancelled and asks again joins the running fetch instead of restarting it. */
++    suspend fun fetch(youtubeId: String): List<Subtitle> {
++        val job = fetchLock.withLock {
++            cache[youtubeId]?.let {
++                SyncLog.i("youtube captions: ${it.size} rows from memory for $youtubeId")
++                return it
++            }
++            inflight.getOrPut(youtubeId) { fetchScope.async { fetchWithRetry(youtubeId) } }
++        }
++        val result = job.await()
++        fetchLock.withLock {
++            inflight.remove(youtubeId)
++            if (result.isNotEmpty()) cache[youtubeId] = result
++        }
++        return result
++    }
++
++    private suspend fun fetchWithRetry(youtubeId: String): List<Subtitle> {
++        val first = fetchOnce(youtubeId)
++        if (first.isNotEmpty()) return first
++        kotlinx.coroutines.delay(1_500)
++        SyncLog.i("youtube captions: nothing the first time, asking once more for $youtubeId")
++        return fetchOnce(youtubeId)
++    }
++
++    private suspend fun fetchOnce(youtubeId: String): List<Subtitle> = try {
+         SyncLog.i("youtube captions: asking for $youtubeId")
+-        withTimeoutOrNull(TIMEOUT_MS) { withContext(Dispatchers.IO) { load(youtubeId) } }
++        val startedAt = System.currentTimeMillis()
++        (withTimeoutOrNull(TIMEOUT_MS) { withContext(Dispatchers.IO) { load(youtubeId) } }
+             ?: run {
+                 SyncLog.w("youtube captions: gave up after ${TIMEOUT_MS / 1000} s for $youtubeId")
+                 emptyList()
+-            }
++            }).also { SyncLog.i("youtube captions: finished in ${System.currentTimeMillis() - startedAt} ms with ${it.size} rows") }
+     } catch (error: CancellationException) {
+         throw error
+     } catch (error: Exception) {
