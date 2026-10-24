@@ -1,0 +1,95 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
+index 55d4b9cb8..de7111471 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
+@@ -1,5 +1,6 @@
+ package com.nuvio.tv.ui.screens.tvchannels.components
+ 
++import android.view.View
+ import android.view.ViewGroup
+ import android.widget.FrameLayout
+ import androidx.annotation.OptIn
+@@ -39,7 +40,17 @@ import com.nuvio.tv.core.player.LiveTvRobustness
+ import com.nuvio.tv.core.player.TvChannelPreviewPlayerPool
+ import com.nuvio.tv.core.player.TvLiveMediaSourceFactory
+ import com.nuvio.tv.ui.components.LoadingIndicator
++import com.nuvio.tv.ui.screens.player.AspectMode
++import com.nuvio.tv.ui.screens.player.BlackBarTracker
++import com.nuvio.tv.ui.screens.player.CustomStretchMemory
++import com.nuvio.tv.ui.screens.player.VideoContentRect
++import com.nuvio.tv.ui.screens.player.addExoAspectLayoutChangeListener
++import com.nuvio.tv.ui.screens.player.applyExoAspectMode
++import com.nuvio.tv.ui.screens.player.captureVideoLuma
++import com.nuvio.tv.ui.screens.player.exoVideoSurfaceView
++import com.nuvio.tv.ui.screens.player.setExoCustomStretchRect
+ import kotlinx.coroutines.delay
++import kotlinx.coroutines.isActive
+ 
+ @OptIn(UnstableApi::class)
+ @Composable
+@@ -68,6 +79,57 @@ fun TvChannelPreviewPlayer(
+     val player = remember(playerPool) {
+         playerPool.acquire()
+     }
++    var playerView by remember { mutableStateOf<PlayerView?>(null) }
++
++    // Live TV always plays with Custom Stretch: the picture area (without baked-in black bars)
++    // is stretched over the whole player, in the preview and in fullscreen.
++    DisposableEffect(playerView, player) {
++        val view = playerView
++        val activePlayer = player
++        if (view == null || activePlayer == null) return@DisposableEffect onDispose {}
++        val sync = { view.post { applyExoAspectMode(view, AspectMode.CUSTOM_STRETCH) } }
++        val playerListener = object : Player.Listener {
++            override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
++                sync()
++            }
++
++            override fun onRenderedFirstFrame() {
++                sync()
++            }
++        }
++        val layoutListener = View.OnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> sync() }
++        activePlayer.addListener(playerListener)
++        val removeLayoutListener = addExoAspectLayoutChangeListener(view, layoutListener)
++        sync()
++        onDispose {
++            activePlayer.removeListener(playerListener)
++            removeLayoutListener()
++        }
++    }
++
++    LaunchedEffect(playerView, player, streamUrl) {
++        val view = playerView ?: return@LaunchedEffect
++        if (player == null || streamUrl.isNullOrBlank()) return@LaunchedEffect
++        fun applyRect(rect: VideoContentRect?) {
++            setExoCustomStretchRect(view, rect)
++            applyExoAspectMode(view, AspectMode.CUSTOM_STRETCH)
++        }
++        applyRect(null)
++        val tracker = BlackBarTracker()
++        CustomStretchMemory.get(streamUrl)?.let {
++            tracker.seed(it)
++            applyRect(it)
++        }
++        delay(BlackBarTracker.FIRST_SAMPLE_DELAY_MS)
++        while (isActive) {
++            val sample = exoVideoSurfaceView(view)?.captureVideoLuma()?.detectContent()
++            tracker.offer(sample)?.let {
++                applyRect(it)
++                CustomStretchMemory.put(streamUrl, it)
++            }
++            delay(tracker.nextIntervalMs)
++        }
++    }
+ 
+     DisposableEffect(lifecycleOwner, player) {
+         val observer = LifecycleEventObserver { _, event ->
+@@ -182,6 +244,7 @@ fun TvChannelPreviewPlayer(
+                             ViewGroup.LayoutParams.MATCH_PARENT
+                         )
+                         this.player = player
++                        playerView = this
+                     }
+                 },
+                 update = { view ->
