@@ -1,5 +1,5 @@
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
-index 55d4b9cb8..de7111471 100644
+index 55d4b9cb8..585634273 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
 @@ -1,5 +1,6 @@
@@ -9,7 +9,7 @@ index 55d4b9cb8..de7111471 100644
  import android.view.ViewGroup
  import android.widget.FrameLayout
  import androidx.annotation.OptIn
-@@ -39,7 +40,17 @@ import com.nuvio.tv.core.player.LiveTvRobustness
+@@ -39,7 +40,21 @@ import com.nuvio.tv.core.player.LiveTvRobustness
  import com.nuvio.tv.core.player.TvChannelPreviewPlayerPool
  import com.nuvio.tv.core.player.TvLiveMediaSourceFactory
  import com.nuvio.tv.ui.components.LoadingIndicator
@@ -24,10 +24,14 @@ index 55d4b9cb8..de7111471 100644
 +import com.nuvio.tv.ui.screens.player.setExoCustomStretchRect
  import kotlinx.coroutines.delay
 +import kotlinx.coroutines.isActive
++
++private const val LIVE_FIRST_SAMPLE_DELAY_MS = 2_500L
++private const val LIVE_CALIBRATION_INTERVAL_MS = 2_000L
++private const val LIVE_STEADY_INTERVAL_MS = 30_000L
  
  @OptIn(UnstableApi::class)
  @Composable
-@@ -68,6 +79,57 @@ fun TvChannelPreviewPlayer(
+@@ -68,6 +83,66 @@ fun TvChannelPreviewPlayer(
      val player = remember(playerPool) {
          playerPool.acquire()
      }
@@ -39,7 +43,7 @@ index 55d4b9cb8..de7111471 100644
 +        val view = playerView
 +        val activePlayer = player
 +        if (view == null || activePlayer == null) return@DisposableEffect onDispose {}
-+        val sync = { view.post { applyExoAspectMode(view, AspectMode.CUSTOM_STRETCH) } }
++        val sync = { view.post { runCatching { applyExoAspectMode(view, AspectMode.CUSTOM_STRETCH) } } }
 +        val playerListener = object : Player.Listener {
 +            override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
 +                sync()
@@ -64,7 +68,7 @@ index 55d4b9cb8..de7111471 100644
 +        if (player == null || streamUrl.isNullOrBlank()) return@LaunchedEffect
 +        fun applyRect(rect: VideoContentRect?) {
 +            setExoCustomStretchRect(view, rect)
-+            applyExoAspectMode(view, AspectMode.CUSTOM_STRETCH)
++            runCatching { applyExoAspectMode(view, AspectMode.CUSTOM_STRETCH) }
 +        }
 +        applyRect(null)
 +        val tracker = BlackBarTracker()
@@ -72,20 +76,29 @@ index 55d4b9cb8..de7111471 100644
 +            tracker.seed(it)
 +            applyRect(it)
 +        }
-+        delay(BlackBarTracker.FIRST_SAMPLE_DELAY_MS)
++        delay(LIVE_FIRST_SAMPLE_DELAY_MS)
 +        while (isActive) {
-+            val sample = exoVideoSurfaceView(view)?.captureVideoLuma()?.detectContent()
-+            tracker.offer(sample)?.let {
-+                applyRect(it)
-+                CustomStretchMemory.put(streamUrl, it)
++            // Capture the video surface only while a frame is really on screen. Reading the
++            // surface during a channel change or a codec restart can crash weak TV boxes.
++            val ready = hasRenderedFirstFrame &&
++                player.playbackState == Player.STATE_READY &&
++                player.isPlaying
++            if (ready) {
++                val sample = runCatching {
++                    exoVideoSurfaceView(view)?.captureVideoLuma()?.detectContent()
++                }.getOrNull()
++                tracker.offer(sample)?.let {
++                    applyRect(it)
++                    CustomStretchMemory.put(streamUrl, it)
++                }
 +            }
-+            delay(tracker.nextIntervalMs)
++            delay(if (tracker.isCalibrating) LIVE_CALIBRATION_INTERVAL_MS else LIVE_STEADY_INTERVAL_MS)
 +        }
 +    }
  
      DisposableEffect(lifecycleOwner, player) {
          val observer = LifecycleEventObserver { _, event ->
-@@ -182,6 +244,7 @@ fun TvChannelPreviewPlayer(
+@@ -182,6 +257,7 @@ fun TvChannelPreviewPlayer(
                              ViewGroup.LayoutParams.MATCH_PARENT
                          )
                          this.player = player
