@@ -1,0 +1,161 @@
+diff --git a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
+index fe3c20c52..5ddef23e6 100644
+--- a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
++++ b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
+@@ -82,6 +82,7 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+     override fun onCreate() {
+         super.onCreate()
+         SentryInitializer.start(this, sentrySettingsDataStore)
++        com.nuvio.tv.core.diagnostics.ForkCrashReporter.install(this) // Nuvio fork: local crash reports, shown in Debug logs to phone
+         PluginRuntimeHooks.onApplicationCreate(this)
+         com.nuvio.tv.reshaped.subtitlefont.SubtitleFontStore.warmUp(this) // Nuvio fork: custom subtitle font, loaded off the main thread
+         com.nuvio.tv.ui.screens.player.PlayerEffects.ensureLoaded(this) // Nuvio fork: picture and sound effects, read by stream auto-play
+diff --git a/app/src/main/java/com/nuvio/tv/core/diagnostics/ForkCrashReporter.kt b/app/src/main/java/com/nuvio/tv/core/diagnostics/ForkCrashReporter.kt
+new file mode 100644
+index 000000000..e177b7945
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/diagnostics/ForkCrashReporter.kt
+@@ -0,0 +1,130 @@
++package com.nuvio.tv.core.diagnostics
++
++import android.app.ActivityManager
++import android.app.ApplicationExitInfo
++import android.content.Context
++import android.os.Build
++import android.util.Log
++import java.io.File
++import java.text.SimpleDateFormat
++import java.util.Date
++import java.util.Locale
++
++/**
++ * Nuvio TV fork: local crash reports.
++ *
++ * A Java crash is saved by an uncaught-exception handler (stack trace plus the app's own recent
++ * log lines). On the next start, the system's record of how the previous runs ended (native
++ * crash, ANR, low memory kill) is saved too. Reports are plain text files in the AutoSync debug
++ * folder, so they show on the "Debug logs to phone" page (Settings, AutoSync) next to the
++ * AutoSync reports. Nothing leaves the device.
++ */
++object ForkCrashReporter {
++    private const val TAG = "NuvioCrashReport"
++    private const val PREFS = "fork_crash_reporter"
++    private const val KEY_LAST_EXIT_TS = "last_exit_ts"
++    private const val LOG_LINES = 300
++    private const val TRACE_CHARS = 6_000
++    private const val MAX_FILES = 10
++
++    fun install(context: Context) {
++        val app = context.applicationContext
++        val previous = Thread.getDefaultUncaughtExceptionHandler()
++        Thread.setDefaultUncaughtExceptionHandler { thread, error ->
++            runCatching {
++                val text = buildString {
++                    appendLine("Java crash")
++                    appendLine(deviceLine())
++                    appendLine("thread=${thread.name}")
++                    appendLine()
++                    appendLine(Log.getStackTraceString(error).take(12_000))
++                    appendLine("--- recent log ---")
++                    appendLine(recentLog("logcat", "-d", "-t", "500"))
++                }
++                save(app, "autosync-crash-java", text)
++            }
++            previous?.uncaughtException(thread, error)
++        }
++        Thread({ saveLastExits(app) }, "NuvioCrashReport").apply { isDaemon = true }.start()
++    }
++
++    private fun saveLastExits(app: Context) {
++        runCatching {
++            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
++            val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++            val lastTs = prefs.getLong(KEY_LAST_EXIT_TS, 0L)
++            val manager = app.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
++            val all = manager.getHistoricalProcessExitReasons(app.packageName, 0, 8)
++            val exits = all.filter { it.timestamp > lastTs && it.reason in reportedReasons() }
++            if (exits.isNotEmpty()) {
++                val text = buildString {
++                    appendLine("Previous runs ended abnormally")
++                    appendLine(deviceLine())
++                    exits.forEach { info ->
++                        appendLine()
++                        appendLine("reason=${reasonName(info.reason)} status=${info.status} at=${stamp(info.timestamp)}")
++                        appendLine("description=${info.description ?: ""}")
++                        appendLine("importance=${info.importance} pssKb=${info.pss} rssKb=${info.rss}")
++                        appendLine(readTrace(info))
++                    }
++                    appendLine("--- crash log buffer ---")
++                    appendLine(recentLog("logcat", "-b", "crash", "-d", "-t", "200"))
++                }
++                save(app, "autosync-crash-exit", text)
++            }
++            all.maxOfOrNull { it.timestamp }?.let { prefs.edit().putLong(KEY_LAST_EXIT_TS, it).apply() }
++        }.onFailure { Log.w(TAG, "exit report failed: ${it.message}") }
++    }
++
++    private fun save(app: Context, prefix: String, text: String) {
++        val directory = File(app.cacheDir, "autosync-debug").apply { mkdirs() }
++        File(directory, "$prefix-${System.currentTimeMillis()}.txt").writeText(text)
++        directory.listFiles { f -> f.name.startsWith("autosync-crash-") }
++            .orEmpty()
++            .sortedByDescending(File::lastModified)
++            .drop(MAX_FILES)
++            .forEach(File::delete)
++    }
++
++    private fun reportedReasons(): Set<Int> = setOf(
++        ApplicationExitInfo.REASON_CRASH,
++        ApplicationExitInfo.REASON_CRASH_NATIVE,
++        ApplicationExitInfo.REASON_ANR,
++        ApplicationExitInfo.REASON_LOW_MEMORY,
++        ApplicationExitInfo.REASON_SIGNALED,
++        ApplicationExitInfo.REASON_INITIALIZATION_FAILURE,
++        ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE,
++    )
++
++    private fun reasonName(reason: Int): String = when (reason) {
++        ApplicationExitInfo.REASON_CRASH -> "CRASH"
++        ApplicationExitInfo.REASON_CRASH_NATIVE -> "CRASH_NATIVE"
++        ApplicationExitInfo.REASON_ANR -> "ANR"
++        ApplicationExitInfo.REASON_LOW_MEMORY -> "LOW_MEMORY"
++        ApplicationExitInfo.REASON_SIGNALED -> "SIGNALED"
++        ApplicationExitInfo.REASON_INITIALIZATION_FAILURE -> "INITIALIZATION_FAILURE"
++        ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> "EXCESSIVE_RESOURCE_USAGE"
++        else -> reason.toString()
++    }
++
++    /** ANR traces are text; a native crash trace is a protobuf, so keep only its readable strings. */
++    private fun readTrace(info: ApplicationExitInfo): String = runCatching {
++        val bytes = info.traceInputStream?.use { it.readBytes() } ?: return@runCatching ""
++        val text = String(bytes, Charsets.ISO_8859_1)
++        Regex("[ -~\\n\\t]{6,}").findAll(text).joinToString("\n") { it.value }.take(TRACE_CHARS)
++    }.getOrDefault("")
++
++    private fun stamp(time: Long): String =
++        SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date(time))
++
++    private fun deviceLine(): String =
++        "device=${Build.MANUFACTURER} ${Build.MODEL} (${Build.DEVICE}) Android ${Build.VERSION.RELEASE} " +
++            "sdk ${Build.VERSION.SDK_INT} abi=${Build.SUPPORTED_ABIS.joinToString()} time=${stamp(System.currentTimeMillis())}"
++
++    private fun recentLog(vararg command: String): String = runCatching {
++        val proc = ProcessBuilder(*command).redirectErrorStream(true).start()
++        val lines = proc.inputStream.bufferedReader().readLines()
++        proc.destroy()
++        lines.takeLast(LOG_LINES).joinToString("\n") { it.take(400) }
++    }.getOrDefault("")
++}
+diff --git a/app/src/main/java/com/nuvio/tv/reshaped/debuglog/DebugLogServer.kt b/app/src/main/java/com/nuvio/tv/reshaped/debuglog/DebugLogServer.kt
+index eeef0f26d..01a6d0a58 100644
+--- a/app/src/main/java/com/nuvio/tv/reshaped/debuglog/DebugLogServer.kt
++++ b/app/src/main/java/com/nuvio/tv/reshaped/debuglog/DebugLogServer.kt
+@@ -49,7 +49,7 @@ internal class DebugLogServer(
+         val rows = reports().joinToString("\n") { file ->
+             val kb = (file.length() + 1023) / 1024
+             """<a class="row" href="${h(filePrefix + file.name)}" download="${h(file.name)}">
+-<span>AutoSync report · ${h(time.format(Date(file.lastModified())))}</span><span class="size">$kb KB</span></a>"""
++<span>${if (file.name.startsWith("autosync-crash-")) "Crash report" else "AutoSync report"} · ${h(time.format(Date(file.lastModified())))}</span><span class="size">$kb KB</span></a>"""
+         }.ifEmpty {
+             """<p class="empty">No AutoSync report yet. With Debug logs on, one is saved each time AutoSync finishes.</p>"""
+         }
