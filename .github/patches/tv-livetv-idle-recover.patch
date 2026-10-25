@@ -1,0 +1,90 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
+@@ -55,6 +55,7 @@
+ private const val LIVE_FIRST_SAMPLE_DELAY_MS = 2_500L
+ private const val LIVE_CALIBRATION_INTERVAL_MS = 2_000L
+ private const val LIVE_STEADY_INTERVAL_MS = 30_000L
++private const val LIVE_IDLE_MAX_RETRIES = 5
+ 
+ @OptIn(UnstableApi::class)
+ @Composable
+@@ -79,6 +80,8 @@
+ 
+     var hasRenderedFirstFrame by remember(streamUrl) { mutableStateOf(false) }
+     var isBuffering by remember(streamUrl) { mutableStateOf(true) }
++    var idleRetryCount by remember(streamUrl) { mutableStateOf(0) }
++    var retryNonce by remember(streamUrl) { mutableStateOf(0) }
+ 
+     val player = remember(playerPool) {
+         playerPool.acquire()
+@@ -159,6 +162,13 @@
+         }
+     }
+ 
++    // Fullscreen Live TV must never hit the screensaver: hold the window flag while a channel is requested.
++    DisposableEffect(isPlaying) {
++        val window = (context as? android.app.Activity)?.window
++        if (isPlaying) window?.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
++        onDispose { window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
++    }
++
+     DisposableEffect(lifecycleOwner, player) {
+         val observer = LifecycleEventObserver { _, event ->
+             when (event) {
+@@ -187,13 +197,29 @@
+             }
+ 
+             override fun onPlaybackStateChanged(playbackState: Int) {
++                com.nuvio.tv.core.diagnostics.ForkStability.note(
++                    "live tv player state=$playbackState requestedPlay=$currentIsPlaying retries=$idleRetryCount"
++                )
+                 when (playbackState) {
+                     Player.STATE_BUFFERING -> isBuffering = true
+                     Player.STATE_READY -> {
+                         isBuffering = false
+                         hasRenderedFirstFrame = true
++                        idleRetryCount = 0
++                    }
++                    Player.STATE_ENDED -> {
++                        isBuffering = false
++                        if (currentIsPlaying && !currentUrl.isNullOrBlank()) retryNonce++
++                    }
++                    Player.STATE_IDLE -> {
++                        // Dropped to idle with no error while Live TV should play: prepare the stream again.
++                        if (currentIsPlaying && !currentUrl.isNullOrBlank() && idleRetryCount < LIVE_IDLE_MAX_RETRIES &&
++                            lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
++                        ) {
++                            idleRetryCount++
++                            retryNonce++
++                        }
+                     }
+-                    Player.STATE_ENDED -> isBuffering = false
+                     else -> Unit
+                 }
+             }
+@@ -202,6 +228,9 @@
+                 // Fell behind the live window after a pause or stall: rejoin the live edge.
+                 if (LiveTvRobustness.tryRejoinLiveEdge(error, activePlayer)) return
+                 Log.e("TvPreviewPlayer", "ExoPlayer playback error: ${error.errorCodeName} (${error.errorCode})", error)
++                com.nuvio.tv.core.diagnostics.ForkStability.note(
++                    "live tv player error ${error.errorCodeName} (${error.errorCode}): ${error.message}"
++                )
+                 isBuffering = false
+                 currentOnError(error.localizedMessage ?: "Erro ao reproduzir stream ao vivo")
+             }
+@@ -225,8 +254,13 @@
+         }
+     }
+ 
+-    LaunchedEffect(player, streamUrl, headers, isPlaying, isMuted) {
++    LaunchedEffect(player, streamUrl, headers, isPlaying, isMuted, retryNonce) {
+         val activePlayer = player ?: return@LaunchedEffect
++        if (retryNonce > 0) {
++            val wait = (1_000L * idleRetryCount).coerceIn(1_000L, 8_000L)
++            com.nuvio.tv.core.diagnostics.ForkStability.note("live tv player retry #$retryNonce in ${wait}ms")
++            delay(wait)
++        }
+         activePlayer.volume = if (isMuted) 0f else 1f
+ 
+         if (isPlaying && !streamUrl.isNullOrBlank()) {
