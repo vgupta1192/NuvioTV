@@ -1,0 +1,57 @@
+diff --git a/app/src/main/java/com/nuvio/tv/MainActivity.kt b/app/src/main/java/com/nuvio/tv/MainActivity.kt
+--- a/app/src/main/java/com/nuvio/tv/MainActivity.kt
++++ b/app/src/main/java/com/nuvio/tv/MainActivity.kt
+@@ -1256,11 +1256,16 @@
+                             LaunchedEffect(isTrailerPlaying) {
+                                 if (!isTrailerPlaying) ambientIdleController.onInteraction()
+                             }
++                            val isLiveTvPlaying by com.nuvio.tv.core.diagnostics.LiveTvIdleGuard.active.collectAsState()
++                            LaunchedEffect(isLiveTvPlaying) {
++                                if (!isLiveTvPlaying) ambientIdleController.onInteraction()
++                            }
+                             AmbientModeHost(
+                                 controller = ambientIdleController,
+                                 allowed = currentRoute?.startsWith("player/") != true &&
+                                     autoNextOverlay == null &&
+-                                    !isTrailerPlaying,
++                                    !isTrailerPlaying &&
++                                    !isLiveTvPlaying,
+                                 onShown = { trailerPlayerPool.stop() }
+                             )
+                         }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
+@@ -169,6 +169,12 @@
+         onDispose { window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
+     }
+ 
++    // Upstream Ambient mode (idle slideshow) would cover the channel after 5 minutes without key presses.
++    DisposableEffect(isPlaying, streamUrl) {
++        if (isPlaying && !streamUrl.isNullOrBlank()) com.nuvio.tv.core.diagnostics.LiveTvIdleGuard.set(true)
++        onDispose { com.nuvio.tv.core.diagnostics.LiveTvIdleGuard.set(false) }
++    }
++
+     DisposableEffect(lifecycleOwner, player) {
+         val observer = LifecycleEventObserver { _, event ->
+             when (event) {
+diff --git a/app/src/main/java/com/nuvio/tv/core/diagnostics/LiveTvIdleGuard.kt b/app/src/main/java/com/nuvio/tv/core/diagnostics/LiveTvIdleGuard.kt
+new file mode 100644
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/diagnostics/LiveTvIdleGuard.kt
+@@ -0,0 +1,15 @@
++package com.nuvio.tv.core.diagnostics
++
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++
++/** True while Live TV plays a channel. Ambient mode (idle slideshow) must stay off then. */
++object LiveTvIdleGuard {
++    private val _active = MutableStateFlow(false)
++    val active: StateFlow<Boolean> = _active.asStateFlow()
++
++    fun set(value: Boolean) {
++        _active.value = value
++    }
++}
