@@ -1,0 +1,108 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerCustomStretch.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerCustomStretch.kt
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerCustomStretch.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerCustomStretch.kt
+@@ -425,7 +425,14 @@
+  * bars that vanish (a wider scene). More picture is shown at once; less picture needs the same
+  * result on [CHANGE_CONFIRMATIONS] checks in a row.
+  */
+-internal class BlackBarTracker {
++internal class BlackBarTracker(private val liveTv: Boolean = false) {
++    /** Why the last sample did not lead to a crop (for the Live TV breadcrumbs). */
++    var lastRefusal: String? = null
++        private set
++
++    // TV channels often carry wide bars of their own (letterboxed songs, logos and tickers in the bars).
++    private val maxPictureAspect get() = if (liveTv) LIVE_MAX_PICTURE_ASPECT else MAX_PICTURE_ASPECT
++    private val maxBarAsymmetry get() = if (liveTv) LIVE_MAX_BAR_ASYMMETRY else MAX_BAR_ASYMMETRY
+     private val recent = Array(4) { ArrayDeque<Float>() }
+     private var lastEvidence: IntArray? = null
+     /** Signatures of the different shots that gave evidence (see [MIN_DISTINCT_SHOTS]). */
+@@ -514,6 +521,7 @@
+     /** Feed one sample. Returns the new picture area when it changed, else null. */
+     fun offer(sample: BarSample?): VideoContentRect? {
+         polls++
++        lastRefusal = null
+         if (sample == null) return null
+         attempts++
+         lastViaCrop = sample.viaCrop
+@@ -531,7 +539,10 @@
+         }
+         // Letterbox and pillarbox bars never take most of a frame. A "picture" that small is a
+         // logo on black, a title card or a dark scene, and cropping to it would hide the film.
+-        if (sample.rect.width * sample.rect.height < MIN_PICTURE_AREA) return null
++        if (sample.rect.width * sample.rect.height < MIN_PICTURE_AREA) {
++            lastRefusal = "picture area too small ${sample.rect.width * sample.rect.height}"
++            return null
++        }
+         samples++
+         if (shotSignatures.none { !sample.differsFrom(it, SHOT_CHANGE_DIFFERENCE) }) {
+             shotSignatures.addLast(sample.signature)
+@@ -549,8 +560,14 @@
+         val enoughShots = shotSignatures.size >= MIN_DISTINCT_SHOTS
+         val edge = FloatArray(4) { if (enoughShots) steadyBar(recent[it]) else UNSURE }
+         // Baked bars are centred: two sides of one axis that disagree are not a bar.
+-        if (edge[0] >= 0f && edge[2] >= 0f && abs(edge[0] - edge[2]) > MAX_BAR_ASYMMETRY) { edge[0] = UNSURE; edge[2] = UNSURE }
+-        if (edge[1] >= 0f && edge[3] >= 0f && abs(edge[1] - edge[3]) > MAX_BAR_ASYMMETRY) { edge[1] = UNSURE; edge[3] = UNSURE }
++        if (edge[0] >= 0f && edge[2] >= 0f && abs(edge[0] - edge[2]) > maxBarAsymmetry) {
++            lastRefusal = "left/right bars differ ${edge[0]} ${edge[2]}"
++            edge[0] = UNSURE; edge[2] = UNSURE
++        }
++        if (edge[1] >= 0f && edge[3] >= 0f && abs(edge[1] - edge[3]) > maxBarAsymmetry) {
++            lastRefusal = "top/bottom bars differ ${edge[1]} ${edge[3]}"
++            edge[1] = UNSURE; edge[3] = UNSURE
++        }
+         // No clear answer for an edge keeps what is committed: missing or mixed evidence must never
+         // switch the stretch off and on again. Only trusted, agreeing measurements change it.
+         val held = committed
+@@ -570,7 +587,10 @@
+         val rect = VideoContentRect(horizontal, vertical, 1f - horizontal, 1f - vertical)
+         // A picture wider than any film format (or narrower than a 4:3 one) that the frame itself
+         // is not: the crop ate real picture, for example a dark top of the scene.
+-        if (!plausible(sample.aspect, rect)) return null
++        if (!plausible(sample.aspect, rect)) {
++            lastRefusal = "implausible picture aspect ${sample.aspect * rect.width / rect.height}"
++            return null
++        }
+         val previous = committed
+         if (previous != null && previous.isCloseTo(rect)) {
+             pending = null
+@@ -611,7 +631,7 @@
+     private fun plausible(sourceAspect: Float, rect: VideoContentRect): Boolean {
+         if (sourceAspect <= 0f || rect.height <= 0f) return true
+         val picture = sourceAspect * rect.width / rect.height
+-        if (picture > MAX_PICTURE_ASPECT && picture > sourceAspect + ASPECT_SLACK) return false
++        if (picture > maxPictureAspect && picture > sourceAspect + ASPECT_SLACK) return false
+         if (picture < MIN_PICTURE_ASPECT && picture < sourceAspect - ASPECT_SLACK) return false
+         return true
+     }
+@@ -625,6 +645,8 @@
+         const val MIN_DISTINCT_SHOTS = 2
+         /** Widest film format is about 2.39:1 (a few reach 2.76); narrowest is 4:3. */
+         const val MAX_PICTURE_ASPECT = 2.6f
++        const val LIVE_MAX_PICTURE_ASPECT = 3.3f
++        const val LIVE_MAX_BAR_ASYMMETRY = 0.07f
+         const val MIN_PICTURE_ASPECT = 1.2f
+         const val ASPECT_SLACK = 0.08f
+         const val CONFIRMATIONS = 3
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
+@@ -126,7 +126,7 @@
+             runCatching { applyExoAspectMode(view, AspectMode.CUSTOM_STRETCH) }
+         }
+         applyRect(null)
+-        val tracker = BlackBarTracker()
++        val tracker = BlackBarTracker(liveTv = true)
+         CustomStretchMemory.get(streamUrl)?.let {
+             tracker.seed(it)
+             applyRect(it)
+@@ -147,7 +147,8 @@
+                 com.nuvio.tv.core.diagnostics.ForkStability.note(
+                     "live tv stretch: video=${size.width}x${size.height} view=${view.width}x${view.height} " +
+                         "surface=${surface?.javaClass?.simpleName} frame=${frame != null} " +
+-                        "sample=${sample != null} committed=${committed ?: tracker.current}"
++                        "sample=${sample != null} committed=${committed ?: tracker.current} " +
++                        "picture=${sample?.rect} trusted=${sample?.confident?.joinToString(",")} refusal=${tracker.lastRefusal}"
+                 )
+                 committed?.let {
+                     applyRect(it)
