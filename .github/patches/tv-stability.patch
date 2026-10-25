@@ -1,0 +1,386 @@
+diff --git a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
+index 5ddef23e6..0e7918d42 100644
+--- a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
++++ b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
+@@ -83,6 +83,7 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+         super.onCreate()
+         SentryInitializer.start(this, sentrySettingsDataStore)
+         com.nuvio.tv.core.diagnostics.ForkCrashReporter.install(this) // Nuvio fork: local crash reports, shown in Debug logs to phone
++        com.nuvio.tv.core.diagnostics.ForkStability.install(this) // Nuvio fork: breadcrumbs and main thread freeze watchdog
+         PluginRuntimeHooks.onApplicationCreate(this)
+         com.nuvio.tv.reshaped.subtitlefont.SubtitleFontStore.warmUp(this) // Nuvio fork: custom subtitle font, loaded off the main thread
+         com.nuvio.tv.ui.screens.player.PlayerEffects.ensureLoaded(this) // Nuvio fork: picture and sound effects, read by stream auto-play
+diff --git a/app/src/main/java/com/nuvio/tv/core/diagnostics/ForkCrashReporter.kt b/app/src/main/java/com/nuvio/tv/core/diagnostics/ForkCrashReporter.kt
+index 5a7f1d2ef..db86d44e3 100644
+--- a/app/src/main/java/com/nuvio/tv/core/diagnostics/ForkCrashReporter.kt
++++ b/app/src/main/java/com/nuvio/tv/core/diagnostics/ForkCrashReporter.kt
+@@ -40,6 +40,8 @@ object ForkCrashReporter {
+                     appendLine(Log.getStackTraceString(error).take(12_000))
+                     appendLine("--- recent log ---")
+                     appendLine(recentLog("logcat", "-d", "-t", "500"))
++                    appendLine("--- breadcrumbs ---")
++                    appendLine(ForkStability.tail())
+                 }
+                 save(app, "autosync-crash-java", text)
+             }
+@@ -69,6 +71,8 @@ object ForkCrashReporter {
+                     }
+                     appendLine("--- crash log buffer ---")
+                     appendLine(recentLog("logcat", "-b", "crash", "-d", "-t", "200"))
++                    appendLine("--- breadcrumbs ---")
++                    appendLine(ForkStability.tail())
+                 }
+                 save(app, "autosync-crash-exit", text)
+             }
+diff --git a/app/src/main/java/com/nuvio/tv/core/diagnostics/ForkStability.kt b/app/src/main/java/com/nuvio/tv/core/diagnostics/ForkStability.kt
+new file mode 100644
+index 000000000..bdc623ea2
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/diagnostics/ForkStability.kt
+@@ -0,0 +1,171 @@
++package com.nuvio.tv.core.diagnostics
++
++import android.app.ActivityManager
++import android.app.Activity
++import android.app.Application
++import android.content.ComponentCallbacks2
++import android.content.Context
++import android.content.res.Configuration
++import android.os.Bundle
++import android.os.Debug
++import android.os.Handler
++import android.os.Looper
++import android.util.Log
++import java.io.File
++import java.text.SimpleDateFormat
++import java.util.Date
++import java.util.Locale
++import java.util.concurrent.Executors
++
++/**
++ * Nuvio TV fork: stability diagnostics, local only.
++ *
++ * - Breadcrumbs: a small rolling text file with app events (activity lifecycle, memory trim
++ *   levels, memory snapshots, Live TV player events, freezes). It survives the process being
++ *   killed, so the crash reports saved at the next start can include it.
++ * - Freeze watchdog: if the main thread does not answer for 2 seconds, the main thread stack is
++ *   saved at once to a "Crash report" file, before Android can kill the app for being
++ *   unresponsive.
++ */
++object ForkStability {
++    private const val TAG = "NuvioStability"
++    private const val FILE_NAME = "fork-breadcrumbs.log"
++    private const val MAX_BYTES = 200_000L
++    private const val TICK_MS = 500L
++    private const val FREEZE_MS = 2_000L
++    private const val MEMORY_EVERY_MS = 20_000L
++    private val dumpAfterMs = longArrayOf(2_000L, 4_000L, 8_000L)
++
++    @Volatile private var breadcrumbFile: File? = null
++    private val writer = Executors.newSingleThreadExecutor { r -> Thread(r, "NuvioBreadcrumbs").apply { isDaemon = true } }
++    @Volatile private var lastTick = System.currentTimeMillis()
++    private var installed = false
++
++    fun install(app: Application) {
++        if (installed) return
++        installed = true
++        breadcrumbFile = File(app.filesDir, FILE_NAME)
++        note("app start pid=${android.os.Process.myPid()} maxHeapMb=${Runtime.getRuntime().maxMemory() shr 20}")
++
++        app.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
++            override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = note("activity created ${activity.javaClass.simpleName}")
++            override fun onActivityStarted(activity: Activity) = note("activity started ${activity.javaClass.simpleName}")
++            override fun onActivityResumed(activity: Activity) = note("activity resumed ${activity.javaClass.simpleName}")
++            override fun onActivityPaused(activity: Activity) = note("activity paused ${activity.javaClass.simpleName}")
++            override fun onActivityStopped(activity: Activity) = note("activity stopped ${activity.javaClass.simpleName}")
++            override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
++            override fun onActivityDestroyed(activity: Activity) = note("activity destroyed ${activity.javaClass.simpleName}")
++        })
++        app.registerComponentCallbacks(object : ComponentCallbacks2 {
++            override fun onTrimMemory(level: Int) = note("trim memory level=$level ${memoryLine(app)}")
++            override fun onLowMemory() = note("LOW MEMORY ${memoryLine(app)}")
++            override fun onConfigurationChanged(newConfig: Configuration) = Unit
++        })
++
++        val mainHandler = Handler(Looper.getMainLooper())
++        val tick = object : Runnable {
++            override fun run() { lastTick = System.currentTimeMillis() }
++        }
++        Thread({ watchLoop(app, mainHandler, tick) }, "NuvioFreezeWatchdog").apply { isDaemon = true; priority = Thread.NORM_PRIORITY + 1 }.start()
++    }
++
++    fun note(message: String) {
++        val file = breadcrumbFile ?: return
++        val line = "${stamp(System.currentTimeMillis())} $message\n"
++        runCatching {
++            writer.execute {
++                runCatching {
++                    if (file.length() > MAX_BYTES) {
++                        val kept = file.readText().takeLast((MAX_BYTES / 2).toInt())
++                        file.writeText(kept.substringAfter('\n', kept))
++                    }
++                    file.appendText(line)
++                }
++            }
++        }
++    }
++
++    fun tail(lines: Int = 150): String = runCatching {
++        breadcrumbFile?.takeIf(File::exists)?.readLines()?.takeLast(lines)?.joinToString("\n").orEmpty()
++    }.getOrDefault("")
++
++    private fun watchLoop(app: Application, handler: Handler, tick: Runnable) {
++        var freezeStart = 0L
++        var dumps = 0
++        var freezeFile: File? = null
++        var lastMemory = 0L
++        while (true) {
++            runCatching {
++                handler.post(tick)
++                Thread.sleep(TICK_MS)
++                val now = System.currentTimeMillis()
++                val blockedFor = now - lastTick
++                if (blockedFor >= FREEZE_MS) {
++                    if (freezeStart == 0L) {
++                        freezeStart = now - blockedFor
++                        dumps = 0
++                        freezeFile = null
++                        note("FREEZE started, main thread blocked ${blockedFor}ms")
++                    }
++                    if (dumps < dumpAfterMs.size && blockedFor >= dumpAfterMs[dumps]) {
++                        dumps++
++                        freezeFile = saveFreeze(app, freezeFile, blockedFor)
++                    }
++                } else if (freezeStart != 0L) {
++                    note("FREEZE ended after ~${now - freezeStart}ms")
++                    freezeStart = 0L
++                }
++                if (now - lastMemory >= MEMORY_EVERY_MS) {
++                    lastMemory = now
++                    note(memoryLine(app))
++                }
++            }
++        }
++    }
++
++    private fun saveFreeze(app: Application, existing: File?, blockedFor: Long): File? = runCatching {
++        val directory = File(app.cacheDir, "autosync-debug").apply { mkdirs() }
++        val file = existing ?: File(directory, "autosync-crash-freeze-${System.currentTimeMillis()}.txt")
++        val text = buildString {
++            appendLine("Main thread freeze (not yet an ANR if under 5 s)")
++            appendLine("blockedFor=${blockedFor}ms at=${stamp(System.currentTimeMillis())}")
++            appendLine(memoryLine(app))
++            appendLine()
++            appendLine("--- main thread stack ---")
++            Looper.getMainLooper().thread.stackTrace.forEach { appendLine("  at $it") }
++            appendLine()
++            appendLine("--- other threads (top frames) ---")
++            Thread.getAllStackTraces().entries
++                .filter { it.key != Looper.getMainLooper().thread && it.value.isNotEmpty() }
++                .take(40)
++                .forEach { (thread, frames) ->
++                    appendLine("\"${thread.name}\" ${thread.state}")
++                    frames.take(8).forEach { appendLine("  at $it") }
++                }
++            appendLine()
++            appendLine("--- breadcrumbs ---")
++            appendLine(tail(80))
++        }
++        file.writeText(text)
++        directory.listFiles { f -> f.name.startsWith("autosync-crash-") }
++            .orEmpty()
++            .sortedByDescending(File::lastModified)
++            .drop(10)
++            .forEach(File::delete)
++        file
++    }.onFailure { Log.w(TAG, "freeze report failed: ${it.message}") }.getOrNull()
++
++    private fun memoryLine(context: Context): String = runCatching {
++        val runtime = Runtime.getRuntime()
++        val usedMb = (runtime.totalMemory() - runtime.freeMemory()) shr 20
++        val maxMb = runtime.maxMemory() shr 20
++        val nativeMb = Debug.getNativeHeapAllocatedSize() shr 20
++        val info = ActivityManager.MemoryInfo()
++        (context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager).getMemoryInfo(info)
++        "mem javaMb=$usedMb/$maxMb nativeMb=$nativeMb systemFreeMb=${info.availMem shr 20} " +
++            "lowMemory=${info.lowMemory} threads=${Thread.activeCount()}"
++    }.getOrDefault("mem unavailable")
++
++    private fun stamp(time: Long): String =
++        SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US).format(Date(time))
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/diagnostics/RememberOffMain.kt b/app/src/main/java/com/nuvio/tv/core/diagnostics/RememberOffMain.kt
+new file mode 100644
+index 000000000..d8d0e57e0
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/diagnostics/RememberOffMain.kt
+@@ -0,0 +1,14 @@
++package com.nuvio.tv.core.diagnostics
++
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.State
++import androidx.compose.runtime.produceState
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++
++/** Computes [compute] on a background thread so big list work never blocks the main thread. */
++@Composable
++fun <T> rememberOffMain(initial: T, key1: Any?, key2: Any? = null, compute: () -> T): State<T> =
++    produceState(initialValue = initial, key1, key2) {
++        value = withContext(Dispatchers.Default) { compute() }
++    }
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/TvChannelPreviewPlayerPool.kt b/app/src/main/java/com/nuvio/tv/core/player/TvChannelPreviewPlayerPool.kt
+index ae30d292a..7448fe351 100644
+--- a/app/src/main/java/com/nuvio/tv/core/player/TvChannelPreviewPlayerPool.kt
++++ b/app/src/main/java/com/nuvio/tv/core/player/TvChannelPreviewPlayerPool.kt
+@@ -13,6 +13,7 @@ import androidx.media3.exoplayer.DefaultRenderersFactory
+ import androidx.media3.extractor.DefaultExtractorsFactory
+ import androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory
+ import androidx.media3.extractor.ts.TsExtractor
++import com.nuvio.tv.core.diagnostics.ForkStability
+ import com.nuvio.tv.ui.screens.player.PlayerPlaybackNetworking
+ import dagger.hilt.android.qualifiers.ApplicationContext
+ import java.util.concurrent.atomic.AtomicBoolean
+@@ -46,10 +47,11 @@ class TvChannelPreviewPlayerPool @Inject constructor(
+         if (yielded.get()) {
+             reclaim()
+         }
+-        return _player ?: createPlayer().also { _player = it }
++        return _player ?: createPlayer().also { _player = it; ForkStability.note("live tv player created (acquire)") }
+     }
+ 
+     fun stop() {
++        ForkStability.note("live tv player stop")
+         _player?.let { player ->
+             runCatching {
+                 player.playWhenReady = false
+@@ -62,6 +64,7 @@ class TvChannelPreviewPlayerPool @Inject constructor(
+     fun yield() {
+         if (yielded.compareAndSet(false, true)) {
+             Log.d(TAG, "Yielding TV preview player to free hardware decoders")
++            ForkStability.note("live tv player yield")
+             _player?.let { player ->
+                 runCatching { player.stop() }
+                 runCatching { player.clearMediaItems() }
+@@ -74,12 +77,14 @@ class TvChannelPreviewPlayerPool @Inject constructor(
+     fun reclaim() {
+         if (yielded.compareAndSet(true, false)) {
+             Log.d(TAG, "Reclaiming TV preview player")
++            ForkStability.note("live tv player reclaim")
+             _player = createPlayer()
+         }
+     }
+ 
+     fun release() {
+         if (released.compareAndSet(false, true)) {
++            ForkStability.note("live tv player release")
+             _player?.let { player ->
+                 runCatching { player.stop() }
+                 runCatching { player.clearMediaItems() }
+@@ -95,12 +100,13 @@ class TvChannelPreviewPlayerPool @Inject constructor(
+         val loadControl = DefaultLoadControl.Builder()
+             .setAllocator(DefaultAllocator(true, C.DEFAULT_BUFFER_SEGMENT_SIZE))
+             .setBufferDurationsMs(
+-                /* minBufferMs = */ 15_000,
+-                /* maxBufferMs = */ 50_000,
++                /* minBufferMs = */ 8_000,
++                /* maxBufferMs = */ 20_000,
+                 /* bufferForPlaybackMs = */ 1_500,
+                 /* bufferForPlaybackAfterRebufferMs = */ 3_000
+             )
+-            .setPrioritizeTimeOverSizeThresholds(true)
++            .setTargetBufferBytes(16 * 1024 * 1024)
++            .setPrioritizeTimeOverSizeThresholds(false)
+             .build()
+ 
+         val renderersFactory = DefaultRenderersFactory(context)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
+index b47659d32..9225d96cb 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
+@@ -346,12 +346,14 @@ fun TvChannelsScreen(
+ 
+     // 1. Modo Tela Cheia Integrado com Zapping D-pad e Gaveta Lateral
+     if (state.isFullscreen) {
+-        val eligibleChannels = remember(state.allChannels, state.hideAdultChannels) {
+-            if (state.hideAdultChannels) {
+-                state.allChannels.filter { !AdultChannelDetector.isAdult(it) }
+-            } else {
+-                state.allChannels
+-            }
++        val allChannelsNow = state.allChannels
++        val hideAdultNow = state.hideAdultChannels
++        val eligibleChannels by com.nuvio.tv.core.diagnostics.rememberOffMain(
++            initial = if (hideAdultNow) emptyList() else allChannelsNow,
++            key1 = allChannelsNow,
++            key2 = hideAdultNow
++        ) {
++            if (hideAdultNow) allChannelsNow.filter { !AdultChannelDetector.isAdult(it) } else allChannelsNow
+         }
+         val favoritesLabel = stringResource(R.string.tv_channels_favorites)
+         val hudCategories = remember(state.categories, state.favoriteKeys, favoritesLabel) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsViewModel.kt
+index ff0b5df97..2b5c26ab9 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsViewModel.kt
+@@ -54,6 +54,7 @@ class TvChannelsViewModel @Inject constructor(
+      * - Com autoplay ativado: clique abre tela cheia diretamente
+      */
+     fun onChannelClicked(channel: TvChannelItem, openFullscreen: Boolean = false) {
++        com.nuvio.tv.core.diagnostics.ForkStability.note("live tv channel click \"${channel.name}\" fullscreen=$openFullscreen")
+         focusDebounceJob?.cancel()
+         val currentUiState = uiState.value
+         val isAutoplay = currentUiState.channelAutoplay
+@@ -148,6 +149,7 @@ class TvChannelsViewModel @Inject constructor(
+     }
+ 
+     fun setFullscreen(fullscreen: Boolean) {
++        com.nuvio.tv.core.diagnostics.ForkStability.note("live tv fullscreen=$fullscreen")
+         repository.setFullscreen(fullscreen)
+     }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt
+index 4c0aba464..1048c30d3 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt
+@@ -433,23 +433,27 @@ fun TvChannelFullscreenHud(
+             }
+         }
+ 
+-        val effectiveChannels = remember(allChannels, hideAdultChannels) {
+-            if (hideAdultChannels) {
+-                allChannels.filter { !AdultChannelDetector.isAdult(it) }
+-            } else {
+-                allChannels
+-            }
++        val effectiveChannels by com.nuvio.tv.core.diagnostics.rememberOffMain(
++            initial = if (hideAdultChannels) emptyList() else allChannels,
++            key1 = allChannels,
++            key2 = hideAdultChannels
++        ) {
++            if (hideAdultChannels) allChannels.filter { !AdultChannelDetector.isAdult(it) } else allChannels
+         }
+-        val effectiveCategories = remember(categories, hideAdultChannels) {
+-            if (hideAdultChannels) {
+-                categories.filter { !AdultChannelDetector.isAdultCategory(it) }
+-            } else {
+-                categories
+-            }
++        val effectiveCategories by com.nuvio.tv.core.diagnostics.rememberOffMain(
++            initial = if (hideAdultChannels) emptyList() else categories,
++            key1 = categories,
++            key2 = hideAdultChannels
++        ) {
++            if (hideAdultChannels) categories.filter { !AdultChannelDetector.isAdultCategory(it) } else categories
+         }
+         val favoritesLabel = stringResource(R.string.tv_channels_favorites)
+         val allLabel = stringResource(R.string.tv_channels_category_all)
+-        val drawerChannels = remember(effectiveChannels, drawerCategory, favoritesLabel, allLabel) {
++        val drawerChannels by com.nuvio.tv.core.diagnostics.rememberOffMain(
++            initial = if (drawerCategory.isBlank()) effectiveChannels else emptyList(),
++            key1 = effectiveChannels,
++            key2 = drawerCategory
++        ) {
+             if (drawerCategory.isBlank() || drawerCategory.equals(allLabel, ignoreCase = true) || drawerCategory.equals("todos", ignoreCase = true) || drawerCategory.equals("all", ignoreCase = true)) {
+                 effectiveChannels
+             } else if (drawerCategory.equals(favoritesLabel, ignoreCase = true) || drawerCategory.equals("favoritos", ignoreCase = true) || drawerCategory.equals("favorites", ignoreCase = true)) {
