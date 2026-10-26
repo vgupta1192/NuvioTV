@@ -1,0 +1,334 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/DxSoundModes.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/DxSoundModes.kt
+new file mode 100644
+index 000000000..02f88f5a5
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/DxSoundModes.kt
+@@ -0,0 +1,290 @@
++package com.nuvio.tv.ui.screens.player
++
++import android.content.Context
++import android.media.audiofx.AudioEffect
++import android.media.audiofx.DynamicsProcessing
++import android.media.audiofx.LoudnessEnhancer
++import android.os.Build
++import android.util.Log
++import androidx.annotation.RequiresApi
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.padding
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import androidx.media3.common.C
++import androidx.media3.common.Player
++import androidx.media3.exoplayer.ExoPlayer
++import androidx.tv.material3.MaterialTheme
++import androidx.tv.material3.Text
++import com.nuvio.tv.ui.screens.settings.SettingsActionRow
++import com.nuvio.tv.ui.screens.settings.SettingsToggleRow
++import com.nuvio.tv.ui.theme.NuvioTheme
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++
++private const val DX_SOUND_TAG = "NuvioDxSound"
++
++/**
++ * dx.bi port: Dialogue boost and Night mode. Dialogue boost lowers booming lows, lifts the speech range and gently
++ * compresses; Night mode also evens out loud and quiet scenes more strongly. ExoPlayer applies the numbers with
++ * Android's DynamicsProcessing (API 28+) or a LoudnessEnhancer fallback; libmpv gets an ffmpeg filter chain.
++ */
++enum class DxSoundMode(
++    val id: String,
++    val label: String,
++    val hint: String,
++    val lowDb: Float,
++    val presenceDb: Float,
++    val thresholdDb: Float,
++    val ratio: Float,
++    val makeupDb: Float,
++    val limiter: Boolean,
++) {
++    NORMAL("normal", "Normal", "As the stream comes.", 0f, 0f, 0f, 1f, 0f, false),
++    DIALOGUE(
++        "dialogue", "Dialogue boost", "Raises voices and softens booming lows.",
++        -3f, 5f, -26f, 3f, 3f, false,
++    ),
++    NIGHT(
++        "night", "Night mode", "Evens out loud and quiet scenes so you can keep the volume down.",
++        -6f, 4f, -42f, 8f, 7.5f, true,
++    );
++
++    /** ffmpeg filter chain for libmpv; empty for [NORMAL]. */
++    fun mpvFilters(): String = when (this) {
++        NORMAL -> ""
++        DIALOGUE -> "lowshelf=f=200:g=-3,equalizer=f=2500:t=q:w=1:g=5,acompressor=threshold=-26dB:ratio=3:makeup=1.4"
++        NIGHT -> "lowshelf=f=200:g=-6,equalizer=f=2500:t=q:w=1:g=4,acompressor=threshold=-42dB:ratio=8:makeup=2.4,alimiter=limit=0.95"
++    }
++
++    companion object {
++        fun fromId(id: String?): DxSoundMode = values().firstOrNull { it.id == id } ?: NORMAL
++    }
++}
++
++internal object DxSound {
++    private const val PREFS = "nuvio_tv_dx_sound"
++    private val _mode = MutableStateFlow(DxSoundMode.NORMAL)
++    val mode: StateFlow<DxSoundMode> = _mode.asStateFlow()
++
++    /** Feature switch: when off the player panel hides the cards and the effect is not applied. */
++    private val _enabled = MutableStateFlow(true)
++    val enabled: StateFlow<Boolean> = _enabled.asStateFlow()
++
++    private var loaded = false
++    private var appContext: Context? = null
++
++    fun ensureLoaded(context: Context) {
++        if (loaded) return
++        loaded = true
++        val app = context.applicationContext
++        appContext = app
++        val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++        _mode.value = DxSoundMode.fromId(prefs.getString("mode", null))
++        _enabled.value = prefs.getBoolean("enabled", true)
++    }
++
++    fun setMode(next: DxSoundMode) {
++        _mode.value = next
++        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)?.edit()?.putString("mode", next.id)?.apply()
++    }
++
++    fun setEnabled(on: Boolean) {
++        _enabled.value = on
++        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)?.edit()?.putBoolean("enabled", on)?.apply()
++    }
++
++    /** Joins the mode's filters onto an mpv `af` value built elsewhere (`lavfi=[...]` or empty). */
++    fun mergeMpvChain(base: String, mode: DxSoundMode): String {
++        val extra = mode.mpvFilters()
++        if (extra.isEmpty()) return base
++        val inner = if (base.startsWith("lavfi=[") && base.endsWith("]")) base.removePrefix("lavfi=[").removeSuffix("]") else ""
++        return if (inner.isEmpty()) "lavfi=[$extra]" else "lavfi=[$inner,$extra]"
++    }
++}
++
++/** Applies the saved mode to ExoPlayer for as long as the player screen is open; returns the mode in force. */
++@Composable
++internal fun DxSoundEffect(player: ExoPlayer?): DxSoundMode {
++    val context = LocalContext.current
++    DxSound.ensureLoaded(context)
++    val mode by DxSound.mode.collectAsStateWithLifecycle()
++    val enabled by DxSound.enabled.collectAsStateWithLifecycle()
++    val effective = if (enabled) mode else DxSoundMode.NORMAL
++    val fx = remember(player) { player?.let { ExoDxSound(it) } }
++    DisposableEffect(fx) { onDispose { fx?.release() } }
++    LaunchedEffect(fx, effective) { fx?.apply(effective) }
++    return effective
++}
++
++/**
++ * DynamicsProcessing (API 28+) on the player's audio session: a pre-equaliser (lows down, speech presence up), one
++ * compressor band with make-up gain and, for Night mode, a limiter. Where it is missing or fails, a LoudnessEnhancer
++ * adds a small gain instead. Nothing is created while the mode is Normal.
++ */
++private class ExoDxSound(private val player: ExoPlayer) : Player.Listener {
++    private var mode = DxSoundMode.NORMAL
++    private var processing: AudioEffect? = null
++    private var enhancer: LoudnessEnhancer? = null
++    private var effectSession = C.AUDIO_SESSION_ID_UNSET
++    private var failedSession = C.AUDIO_SESSION_ID_UNSET
++    private var released = false
++
++    init {
++        player.addListener(this)
++    }
++
++    fun apply(next: DxSoundMode) {
++        mode = next
++        refresh()
++    }
++
++    override fun onAudioSessionIdChanged(audioSessionId: Int) {
++        refresh()
++    }
++
++    private fun refresh() {
++        if (released) return
++        if (mode == DxSoundMode.NORMAL) {
++            releaseEffects()
++            return
++        }
++        val session = player.audioSessionId
++        if (session == C.AUDIO_SESSION_ID_UNSET || session == failedSession) return
++        if (session != effectSession) releaseEffects()
++        effectSession = session
++        if (Build.VERSION.SDK_INT >= 28 && enhancer == null && tryProcessing(session)) return
++        applyFallback(session)
++    }
++
++    @RequiresApi(28)
++    private fun tryProcessing(session: Int): Boolean {
++        val effect = (processing as? DynamicsProcessing) ?: createProcessing(session)?.also { processing = it }
++            ?: return false
++        if (runCatching { configure(effect, mode) }.isSuccess) return true
++        releaseEffects()
++        effectSession = session
++        return false
++    }
++
++    @RequiresApi(28)
++    private fun createProcessing(session: Int): DynamicsProcessing? = runCatching {
++        val config = DynamicsProcessing.Config.Builder(
++            DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION,
++            2,
++            true, 4,
++            true, 1,
++            false, 0,
++            true,
++        ).build()
++        DynamicsProcessing(0, session, config)
++    }.onFailure { Log.w(DX_SOUND_TAG, "DynamicsProcessing unavailable: ${it.message}") }.getOrNull()
++
++    @RequiresApi(28)
++    private fun configure(effect: DynamicsProcessing, mode: DxSoundMode) {
++        // Pre-equaliser bands run up to their cutoff: lows, low-mid, speech presence, highs.
++        effect.setPreEqBandAllChannelsTo(0, DynamicsProcessing.EqBand(true, 200f, mode.lowDb))
++        effect.setPreEqBandAllChannelsTo(1, DynamicsProcessing.EqBand(true, 1500f, 0f))
++        effect.setPreEqBandAllChannelsTo(2, DynamicsProcessing.EqBand(true, 4000f, mode.presenceDb))
++        effect.setPreEqBandAllChannelsTo(3, DynamicsProcessing.EqBand(true, 20000f, 0f))
++        effect.setMbcBandAllChannelsTo(
++            0,
++            DynamicsProcessing.MbcBand(
++                true, 20000f, 10f, 250f, mode.ratio, mode.thresholdDb, 6f, -90f, 1f, 0f, mode.makeupDb,
++            ),
++        )
++        effect.setLimiterAllChannelsTo(
++            DynamicsProcessing.Limiter(true, mode.limiter, 0, 5f, 100f, 10f, -1f, 0f),
++        )
++        effect.setEnabled(true)
++    }
++
++    private fun applyFallback(session: Int) {
++        if (enhancer == null) {
++            enhancer = runCatching { LoudnessEnhancer(session) }
++                .onFailure {
++                    failedSession = session
++                    Log.w(DX_SOUND_TAG, "LoudnessEnhancer unavailable: ${it.message}")
++                }
++                .getOrNull() ?: return
++        }
++        enhancer?.let { effect ->
++            runCatching {
++                effect.setTargetGain(if (mode == DxSoundMode.NIGHT) 600 else 300)
++                effect.setEnabled(true)
++            }.onFailure { Log.w(DX_SOUND_TAG, "LoudnessEnhancer failed: ${it.message}") }
++        }
++    }
++
++    private fun releaseEffects() {
++        processing?.let { runCatching { it.setEnabled(false) }; runCatching { it.release() } }
++        enhancer?.let { runCatching { it.setEnabled(false) }; runCatching { it.release() } }
++        processing = null
++        enhancer = null
++        effectSession = C.AUDIO_SESSION_ID_UNSET
++    }
++
++    fun release() {
++        released = true
++        player.removeListener(this)
++        releaseEffects()
++    }
++}
++
++/** Dialogue boost and Night mode as D-pad cards in the audio overlay, under the sound mode cards. */
++@Composable
++internal fun DxSoundCards(rightFocusRequester: FocusRequester) {
++    DxSound.ensureLoaded(LocalContext.current)
++    val enabled by DxSound.enabled.collectAsStateWithLifecycle()
++    val mode by DxSound.mode.collectAsStateWithLifecycle()
++    if (!enabled) return
++    Column {
++        Text(
++            text = "Voice and night",
++            style = MaterialTheme.typography.titleLarge,
++            color = Color.White,
++            modifier = Modifier.padding(top = NuvioTheme.spacing.md, bottom = NuvioTheme.spacing.xs),
++        )
++        DxSoundMode.values().forEach { option ->
++            VideoQualityCard(
++                label = option.label,
++                isSelected = mode == option,
++                onClick = { DxSound.setMode(option) },
++                rightFocusRequester = rightFocusRequester,
++            )
++        }
++    }
++}
++
++/** Settings rows in Playback > Picture & Sound. */
++@Composable
++internal fun DxSoundSettingsRows() {
++    DxSound.ensureLoaded(LocalContext.current)
++    val enabled by DxSound.enabled.collectAsStateWithLifecycle()
++    val mode by DxSound.mode.collectAsStateWithLifecycle()
++    SettingsToggleRow(
++        title = "Dialogue boost and Night mode",
++        subtitle = "Adds voice and night choices to the player's audio panel. Off removes them and the effect.",
++        checked = enabled,
++        onToggle = { DxSound.setEnabled(!enabled) },
++    )
++    SettingsActionRow(
++        title = "Voice and night",
++        subtitle = mode.hint + " Press to change.",
++        value = mode.label,
++        enabled = enabled,
++        onClick = {
++            val all = DxSoundMode.values()
++            DxSound.setMode(all[(mode.ordinal + 1) % all.size])
++        },
++    )
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
+index 797d20448..2f7366203 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
+@@ -457,9 +457,10 @@ internal fun PlayerEffectsHost(exoPlayer: ExoPlayer?, mpvView: NuvioMpvSurfaceVi
+         exoPicture?.apply(state)
+         mpvView?.applyPictureState(state)
+     }
+-    LaunchedEffect(exoAudio, mpvView, audio) {
++    val dxSound = DxSoundEffect(exoPlayer) // dx.bi sound modes hook
++    LaunchedEffect(exoAudio, mpvView, audio, dxSound) {
+         exoAudio?.apply(audio)
+-        mpvView?.applyAudioFilter(audio.mpvFilterChain())
++        mpvView?.applyAudioFilter(DxSound.mergeMpvChain(audio.mpvFilterChain(), dxSound)) // dx.bi sound modes hook
+     }
+     SmartEnhanceBanner(modifier = Modifier.zIndex(2.7f))
+ }
+@@ -482,6 +483,7 @@ internal fun PictureSoundBlock(rightFocusRequester: FocusRequester) {
+                 rightFocusRequester = rightFocusRequester,
+             )
+         }
++        DxSoundCards(rightFocusRequester) // dx.bi sound modes hook
+         BlockHeader("Equalizer")
+         VideoQualityCard(
+             label = if (audio.eqEnabled) "Equalizer on" else "Equalizer off",
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPictureSoundSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPictureSoundSettings.kt
+index 950d45d8e..967fdec76 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPictureSoundSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPictureSoundSettings.kt
+@@ -108,6 +108,8 @@ internal fun PlaybackPictureSoundSection() {
+         },
+     )
+ 
++    com.nuvio.tv.ui.screens.player.DxSoundSettingsRows() // dx.bi sound modes hook
++
+     SettingsSectionLabel(text = "Behaviour")
+     SettingsToggleRow(
+         title = "Remember per title",

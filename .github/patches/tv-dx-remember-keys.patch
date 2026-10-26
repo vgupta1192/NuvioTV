@@ -1,0 +1,207 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/DxRemember.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/DxRemember.kt
+new file mode 100644
+index 000000000..fe20905db
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/DxRemember.kt
+@@ -0,0 +1,131 @@
++package com.nuvio.tv.ui.screens.player
++
++import android.content.Context
++import android.media.AudioManager
++import android.view.KeyEvent
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.ui.platform.LocalContext
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import com.nuvio.tv.ui.screens.settings.SettingsToggleRow
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlin.math.abs
++import kotlin.math.roundToInt
++
++/**
++ * dx.bi port: the next video starts with the playback speed you last picked and the media volume you last had in
++ * the player, and the number keys 0-9 on a remote or keyboard jump to 0%..90% of the video. A title's own saved
++ * speed still wins over the remembered one. Both parts have a Settings switch.
++ */
++internal object DxRemember {
++    private const val PREFS = "nuvio_tv_dx_remember"
++    private val _remember = MutableStateFlow(true)
++    val remember: StateFlow<Boolean> = _remember.asStateFlow()
++    private val _keys = MutableStateFlow(true)
++    val keys: StateFlow<Boolean> = _keys.asStateFlow()
++    private var loaded = false
++
++    fun ensureLoaded(context: Context) {
++        if (loaded) return
++        loaded = true
++        val prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++        _remember.value = prefs.getBoolean("remember", true)
++        _keys.value = prefs.getBoolean("keys", true)
++    }
++
++    private fun prefs(context: Context) = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++
++    fun setRemember(context: Context, enabled: Boolean) {
++        ensureLoaded(context)
++        _remember.value = enabled
++        prefs(context).edit().putBoolean("remember", enabled).apply()
++    }
++
++    fun setKeys(context: Context, enabled: Boolean) {
++        ensureLoaded(context)
++        _keys.value = enabled
++        prefs(context).edit().putBoolean("keys", enabled).apply()
++    }
++
++    val keysEnabled: Boolean get() = _keys.value
++
++    fun noteSpeed(context: Context, speed: Float) {
++        ensureLoaded(context)
++        if (!_remember.value || speed !in 0.25f..4f) return
++        prefs(context).edit().putFloat("speed", speed).apply()
++    }
++
++    /** Saved speed when it differs from 1x, else null. */
++    fun speedToRestore(context: Context): Float? {
++        ensureLoaded(context)
++        if (!_remember.value) return null
++        val speed = prefs(context).getFloat("speed", 1f)
++        return speed.takeIf { it in 0.25f..4f && abs(it - 1f) > 0.01f }
++    }
++
++    private fun audioManager(context: Context): AudioManager? =
++        context.applicationContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
++
++    fun saveVolume(context: Context) {
++        ensureLoaded(context)
++        if (!_remember.value) return
++        val audio = audioManager(context) ?: return
++        val max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
++        if (max <= 0 || audio.isVolumeFixed) return
++        val fraction = audio.getStreamVolume(AudioManager.STREAM_MUSIC).toFloat() / max
++        prefs(context).edit().putFloat("volume", fraction).apply()
++    }
++
++    fun restoreVolume(context: Context) {
++        ensureLoaded(context)
++        if (!_remember.value) return
++        val prefs = prefs(context)
++        if (!prefs.contains("volume")) return
++        val audio = audioManager(context) ?: return
++        val max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
++        if (max <= 0 || audio.isVolumeFixed) return
++        val target = (prefs.getFloat("volume", 0f).coerceIn(0f, 1f) * max).roundToInt()
++        runCatching { audio.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0) }
++    }
++
++    /** 0-9 for the digit keys (main row and number pad), else null. */
++    fun digitFor(keyCode: Int): Int? = when (keyCode) {
++        in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9 -> keyCode - KeyEvent.KEYCODE_0
++        in KeyEvent.KEYCODE_NUMPAD_0..KeyEvent.KEYCODE_NUMPAD_9 -> keyCode - KeyEvent.KEYCODE_NUMPAD_0
++        else -> null
++    }
++}
++
++/** Restores the remembered volume when the player opens and stores the volume again when it closes. */
++@Composable
++internal fun DxRememberHost() {
++    val context = LocalContext.current
++    DisposableEffect(Unit) {
++        DxRemember.restoreVolume(context)
++        onDispose { DxRemember.saveVolume(context) }
++    }
++}
++
++/** Settings rows in Playback > Player. */
++@Composable
++internal fun DxRememberSettingsRows() {
++    val context = LocalContext.current
++    DxRemember.ensureLoaded(context)
++    val remember by DxRemember.remember.collectAsStateWithLifecycle()
++    val keys by DxRemember.keys.collectAsStateWithLifecycle()
++    SettingsToggleRow(
++        title = "Remember volume and speed",
++        subtitle = "The next video starts with the media volume you last had in the player and the playback speed you last picked.",
++        checked = remember,
++        onToggle = { DxRemember.setRemember(context, !remember) },
++    )
++    SettingsToggleRow(
++        title = "Number keys jump in the video",
++        subtitle = "Keys 0 to 9 on a remote or keyboard jump to 0% to 90% of the video.",
++        checked = keys,
++        onToggle = { DxRemember.setKeys(context, !keys) },
++    )
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
+index e69c9d720..d03f5ce53 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
+@@ -474,6 +474,7 @@ internal fun PlayerEffectsHost(exoPlayer: ExoPlayer?, mpvView: NuvioMpvSurfaceVi
+         mpvView?.applyAudioFilter(DxSound.mergeMpvChain(audio.mpvFilterChain(), dxSound)) // dx.bi sound modes hook
+     }
+     SmartEnhanceBanner(modifier = Modifier.zIndex(2.7f))
++    DxRememberHost() // dx.bi remember hook
+ }
+ 
+ private val StepNames = listOf("Off", "Low", "Medium", "High")
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
+index 1adaa4355..4999b73de 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
+@@ -1624,6 +1624,7 @@ fun PlayerRuntimeController.onEvent(event: PlayerEvent) {
+             contentId?.takeIf { it.isNotBlank() }?.let { id ->
+                 scope.launch { trackPreferenceDataStore.savePlaybackSpeed(id, event.speed) }
+             }
++            DxRemember.noteSpeed(context, event.speed) // dx.bi remember hook
+             publishPartyPlayback(rate = event.speed)
+         }
+         PlayerEvent.OnToggleControls -> {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerScrobble.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerScrobble.kt
+index e9549cb1e..0985c6d5f 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerScrobble.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerScrobble.kt
+@@ -94,7 +94,7 @@ internal fun PlayerRuntimeController.preparePlaybackBeforeStart(
+             )
+         }
+         contentId?.takeIf { it.isNotBlank() }?.let { id ->
+-            trackPreferenceDataStore.loadPlaybackSpeed(id)?.let { speed ->
++            (trackPreferenceDataStore.loadPlaybackSpeed(id) ?: DxRemember.speedToRestore(context))?.let { speed -> // dx.bi remember hook
+                 _uiState.update { it.copy(playbackSpeed = speed) }
+             }
+         }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+index ccfe2059d..23f707422 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+@@ -1011,6 +1011,16 @@ fun PlayerScreen(
+                             }
+                             true
+                         }
++                        in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9,
++                        in KeyEvent.KEYCODE_NUMPAD_0..KeyEvent.KEYCODE_NUMPAD_9 -> { // dx.bi remember/keys hook
++                            val digit = DxRemember.digitFor(keyEvent.nativeKeyEvent.keyCode)
++                            if (digit != null && DxRemember.keysEnabled && uiState.duration > 0L) {
++                                viewModel.onEvent(PlayerEvent.OnSeekTo(uiState.duration / 10L * digit))
++                                true
++                            } else {
++                                false
++                            }
++                        }
+                         else -> false
+                     }
+                 } else false
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPlayerSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPlayerSettings.kt
+index 5b4de795a..d2eb5ec8c 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPlayerSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPlayerSettings.kt
+@@ -171,6 +171,7 @@ internal fun PlaybackPlayerInterfaceSection(
+     )
+     seekPreviewSettingsRows(enabled = internalPlayer) // Nuvio fork: seek previews
+     privateViewingSettingsRow(enabled = true) // Nuvio fork: private viewing
++    com.nuvio.tv.ui.screens.player.DxRememberSettingsRows() // dx.bi remember hook
+ }
+ 
+ @Composable
