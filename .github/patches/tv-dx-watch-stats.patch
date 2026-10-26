@@ -1,0 +1,341 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/DxWatchStats.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/DxWatchStats.kt
+new file mode 100644
+index 000000000..fa2264e12
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/DxWatchStats.kt
+@@ -0,0 +1,203 @@
++package com.nuvio.tv.ui.screens.player
++
++import android.content.Context
++import android.os.SystemClock
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.isActive
++import kotlinx.coroutines.launch
++import org.json.JSONObject
++import java.text.SimpleDateFormat
++import java.util.Calendar
++import java.util.Locale
++import java.util.TimeZone
++
++internal data class DxStatTitleRow(val name: String, val type: String, val seconds: Double)
++
++internal data class DxStatSummary(
++    val today: Double,
++    val week: Double,
++    val month: Double,
++    val total: Double,
++    val currentStreak: Int,
++    val bestStreak: Int,
++    val topTitles: List<DxStatTitleRow>,
++    val since: String,
++)
++
++/**
++ * dx.bi port: "Your stats". Counts the seconds a video is really playing (a once-a-second check while the
++ * player reports playing), per day and per title, on this device only. Settings has a switch to stop counting
++ * and a reset.
++ */
++internal object DxWatchStats {
++    private const val PREFS = "nuvio_tv_dx_watch_stats"
++    private val _enabled = MutableStateFlow(true)
++    val enabled: StateFlow<Boolean> = _enabled.asStateFlow()
++    private val days = HashMap<String, Double>()
++    private val titles = HashMap<String, DxStatTitleRow>()
++    private var since = ""
++    private var loaded = false
++    private var unsaved = 0.0
++
++    private fun prefs(context: Context) =
++        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++
++    @Synchronized
++    fun ensureLoaded(context: Context) {
++        if (loaded) return
++        loaded = true
++        val p = prefs(context)
++        _enabled.value = p.getBoolean("enabled", true)
++        since = p.getString("since", null) ?: dayKey(Calendar.getInstance())
++        runCatching {
++            val root = JSONObject(p.getString("data", null) ?: return@runCatching)
++            root.optJSONObject("days")?.let { o -> o.keys().forEach { days[it] = o.optDouble(it, 0.0) } }
++            root.optJSONObject("titles")?.let { o ->
++                o.keys().forEach { k ->
++                    val t = o.optJSONObject(k) ?: return@forEach
++                    titles[k] = DxStatTitleRow(t.optString("n"), t.optString("t"), t.optDouble("s", 0.0))
++                }
++            }
++        }
++    }
++
++    @Synchronized
++    fun setEnabled(context: Context, on: Boolean) {
++        ensureLoaded(context)
++        _enabled.value = on
++        prefs(context).edit().putBoolean("enabled", on).apply()
++    }
++
++    @Synchronized
++    fun reset(context: Context) {
++        ensureLoaded(context)
++        days.clear()
++        titles.clear()
++        unsaved = 0.0
++        since = dayKey(Calendar.getInstance())
++        prefs(context).edit().remove("data").putString("since", since).apply()
++    }
++
++    /** Starts the once-a-second counter for one player session. It stops when [scope] ends. */
++    fun start(
++        scope: CoroutineScope,
++        context: Context,
++        isPlaying: () -> Boolean,
++        titleId: () -> String,
++        titleName: () -> String,
++        titleType: () -> String,
++    ) {
++        ensureLoaded(context)
++        scope.launch {
++            var last = SystemClock.elapsedRealtime()
++            try {
++                while (isActive) {
++                    delay(1000L)
++                    val now = SystemClock.elapsedRealtime()
++                    val gap = (now - last) / 1000.0
++                    last = now
++                    if (_enabled.value && isPlaying() && gap in 0.1..3.0) {
++                        add(gap, titleId(), titleName(), titleType())
++                        if (unsaved >= 30.0) flush(context)
++                    }
++                }
++            } finally {
++                flush(context)
++            }
++        }
++    }
++
++    @Synchronized
++    private fun add(seconds: Double, id: String, name: String, type: String) {
++        val day = dayKey(Calendar.getInstance())
++        days[day] = (days[day] ?: 0.0) + seconds
++        if (id.isNotBlank()) {
++            val old = titles[id]
++            titles[id] = DxStatTitleRow(
++                name.ifBlank { old?.name.orEmpty() },
++                type.ifBlank { old?.type.orEmpty() },
++                (old?.seconds ?: 0.0) + seconds,
++            )
++        }
++        unsaved += seconds
++    }
++
++    @Synchronized
++    fun flush(context: Context) {
++        if (!loaded || unsaved <= 0.0) return
++        unsaved = 0.0
++        if (days.size > 800) {
++            days.keys.sorted().dropLast(800).forEach { days.remove(it) }
++        }
++        if (titles.size > 300) {
++            titles.entries.sortedByDescending { it.value.seconds }.drop(300).forEach { titles.remove(it.key) }
++        }
++        val root = JSONObject()
++        root.put("days", JSONObject().also { o -> days.forEach { (k, v) -> o.put(k, v) } })
++        root.put("titles", JSONObject().also { o ->
++            titles.forEach { (k, v) ->
++                o.put(k, JSONObject().put("n", v.name).put("t", v.type).put("s", v.seconds))
++            }
++        })
++        prefs(context).edit().putString("data", root.toString()).putString("since", since).apply()
++    }
++
++    @Synchronized
++    fun summary(context: Context): DxStatSummary {
++        ensureLoaded(context)
++        flush(context)
++        val cal = Calendar.getInstance()
++        val todayKey = dayKey(cal)
++        var week = 0.0
++        var month = 0.0
++        val activeToday = (days[todayKey] ?: 0.0) >= 60.0
++        var current = 0
++        var counting = true
++        for (i in 0 until 30) {
++            val k = dayKey(cal)
++            val sec = days[k] ?: 0.0
++            if (i < 7) week += sec
++            month += sec
++            if (counting) {
++                if (sec >= 60.0) current++ else if (i > 0 || activeToday) counting = false
++            }
++            cal.add(Calendar.DAY_OF_MONTH, -1)
++        }
++        // keep counting the streak past 30 days
++        if (counting) {
++            while (current < 800 && (days[dayKey(cal)] ?: 0.0) >= 60.0) {
++                current++
++                cal.add(Calendar.DAY_OF_MONTH, -1)
++            }
++        }
++        val utc = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") }
++        var best = 0
++        var run = 0
++        var prev = Long.MIN_VALUE
++        days.filter { it.value >= 60.0 }.keys.sorted().forEach { k ->
++            val d = (utc.parse(k)?.time ?: return@forEach) / 86_400_000L
++            run = if (prev != Long.MIN_VALUE && d - prev == 1L) run + 1 else 1
++            best = maxOf(best, run)
++            prev = d
++        }
++        return DxStatSummary(
++            today = days[todayKey] ?: 0.0,
++            week = week,
++            month = month,
++            total = days.values.sum(),
++            currentStreak = current,
++            bestStreak = maxOf(best, current),
++            topTitles = titles.values.filter { it.seconds >= 60.0 }.sortedByDescending { it.seconds }.take(5),
++            since = since,
++        )
++    }
++
++    private fun dayKey(cal: Calendar): String = String.format(
++        Locale.US, "%04d-%02d-%02d",
++        cal.get(Calendar.YEAR), cal.get(Calendar.MONTH) + 1, cal.get(Calendar.DAY_OF_MONTH),
++    )
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
+index 26fa400a4..81c3afb0c 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
+@@ -334,6 +334,14 @@ class PlayerRuntimeController(
+                     com.nuvio.tv.core.recommendations.TvRecommendationManager.isPlaybackActive.value = isPlaying
+                 }
+         }
++        DxWatchStats.start(
++            scope = scope,
++            context = context,
++            isPlaying = { _uiState.value.isPlaying },
++            titleId = { contentId ?: title },
++            titleName = { contentName ?: title },
++            titleType = { contentType.orEmpty() },
++        ) // dx.bi watch stats hook
+     }
+ 
+     internal fun consumePendingExitReason() {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/DxWatchStatsSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/DxWatchStatsSettings.kt
+new file mode 100644
+index 000000000..9116a3951
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/DxWatchStatsSettings.kt
+@@ -0,0 +1,94 @@
++@file:OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
++
++package com.nuvio.tv.ui.screens.settings
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.unit.dp
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import androidx.tv.material3.Button
++import androidx.tv.material3.MaterialTheme
++import androidx.tv.material3.Text
++import com.nuvio.tv.ui.components.NuvioDialog
++import com.nuvio.tv.ui.screens.player.DxStatSummary
++import com.nuvio.tv.ui.screens.player.DxWatchStats
++import com.nuvio.tv.ui.theme.NuvioTheme
++
++private fun dxHours(seconds: Double): String {
++    val minutes = (seconds / 60.0).toLong()
++    return if (minutes < 60) "${minutes} min" else "${minutes / 60} h ${minutes % 60} min"
++}
++
++/** Advanced settings card (dx.bi port): opens the "Your stats" page, with the Count watch time switch. */
++@Composable
++internal fun DxWatchStatsSettingsCard() {
++    val context = LocalContext.current
++    val enabled by DxWatchStats.enabled.collectAsStateWithLifecycle()
++    var showStats by remember { mutableStateOf(false) }
++    LaunchedEffectEnsureLoaded()
++    SettingsGroupCard(modifier = Modifier.fillMaxWidth(), title = "Your stats") {
++        SettingsActionRow(
++            title = "Your stats",
++            subtitle = "Hours watched, streaks and your most watched titles. Kept on this device only.",
++            onClick = { showStats = true },
++        )
++        SettingsToggleRow(
++            title = "Count watch time",
++            subtitle = "Count the time a video is really playing. Turn it off to stop collecting stats.",
++            checked = enabled,
++            onToggle = { DxWatchStats.setEnabled(context, !enabled) },
++        )
++    }
++    if (showStats) {
++        DxWatchStatsDialog(onDismiss = { showStats = false })
++    }
++}
++
++@Composable
++private fun LaunchedEffectEnsureLoaded() {
++    val context = LocalContext.current
++    remember { DxWatchStats.ensureLoaded(context); true }
++}
++
++@Composable
++private fun DxWatchStatsDialog(onDismiss: () -> Unit) {
++    val context = LocalContext.current
++    var summary by remember { mutableStateOf<DxStatSummary>(DxWatchStats.summary(context)) }
++    NuvioDialog(
++        onDismiss = onDismiss,
++        title = "Your stats",
++        subtitle = "Counting since ${summary.since}",
++        width = 640.dp,
++        contentSpacing = 8.dp,
++    ) {
++        val style = MaterialTheme.typography.bodyMedium
++        val color = NuvioTheme.colors.TextPrimary
++        Text("Today: ${dxHours(summary.today)}   Last 7 days: ${dxHours(summary.week)}", style = style, color = color)
++        Text("Last 30 days: ${dxHours(summary.month)}   All time: ${dxHours(summary.total)}", style = style, color = color)
++        Text("Streak: ${summary.currentStreak} days   Best streak: ${summary.bestStreak} days", style = style, color = color)
++        if (summary.topTitles.isEmpty()) {
++            Text("Nothing counted yet. Watch something and come back.", style = style, color = NuvioTheme.colors.TextSecondary)
++        } else {
++            Text("Most watched", style = MaterialTheme.typography.titleSmall, color = color)
++            summary.topTitles.forEachIndexed { i, row ->
++                Text("${i + 1}. ${row.name.ifBlank { "Untitled" }}  -  ${dxHours(row.seconds)}", style = style, color = color, maxLines = 1)
++            }
++        }
++        Row(modifier = Modifier.padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
++            Button(onClick = onDismiss) { Text("Close") }
++            Button(onClick = {
++                DxWatchStats.reset(context)
++                summary = DxWatchStats.summary(context)
++            }) { Text("Reset stats") }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
+index a9d5da228..18e1cac08 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
+@@ -741,6 +741,8 @@ fun AdvancedSettingsContent(
+             }
+         }
+ 
++        item(key = "dx_watch_stats") { DxWatchStatsSettingsCard() } // dx.bi watch stats hook
++
+         item(key = "clear_cw_cache") {
+             SettingsGroupCard(
+                 modifier = Modifier.fillMaxWidth(),

@@ -1,0 +1,263 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ContentDiscoverySettingsContent.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ContentDiscoverySettingsContent.kt
+index 850be2bca..3e5c8ec67 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ContentDiscoverySettingsContent.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ContentDiscoverySettingsContent.kt
+@@ -134,6 +134,7 @@ private fun ContentDiscoveryHub(
+                     }
+                 )
+             }
++            DxAddonBackupSettingsRow() // dx.bi addon backup hook
+         }
+     }
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/DxAddonBackup.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/DxAddonBackup.kt
+new file mode 100644
+index 000000000..b5740a040
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/DxAddonBackup.kt
+@@ -0,0 +1,245 @@
++@file:OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
++
++package com.nuvio.tv.ui.screens.settings
++
++import android.content.Context
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.itemsIndexed
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import androidx.tv.material3.Button
++import androidx.tv.material3.MaterialTheme
++import androidx.tv.material3.Text
++import com.nuvio.tv.core.network.NetworkResult
++import com.nuvio.tv.domain.model.Addon
++import com.nuvio.tv.domain.repository.AddonRepository
++import com.nuvio.tv.ui.components.NuvioDialog
++import com.nuvio.tv.ui.screens.addon.AddonManagementAccess
++import com.nuvio.tv.ui.theme.NuvioTheme
++import dagger.hilt.EntryPoint
++import dagger.hilt.InstallIn
++import dagger.hilt.android.EntryPointAccessors
++import dagger.hilt.components.SingletonComponent
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import org.json.JSONArray
++import org.json.JSONObject
++import java.io.File
++
++@EntryPoint
++@InstallIn(SingletonComponent::class)
++internal interface DxAddonBackupEntryPoint {
++    fun addonRepository(): AddonRepository
++    fun profileManager(): com.nuvio.tv.core.profile.ProfileManager
++}
++
++private data class DxBackupEntry(val url: String, val enabled: Boolean)
++
++private fun dxBackupFile(context: Context): File {
++    val dir = context.getExternalFilesDir(null) ?: context.filesDir
++    return File(dir, "nuvio-addons-backup.json")
++}
++
++private fun dxNormalizeUrl(input: String): String? {
++    var s = input.trim()
++    if (s.startsWith("stremio://")) s = s.replaceFirst("stremio://", "https://")
++    if (!s.startsWith("http://") && !s.startsWith("https://")) return null
++    return s.removeSuffix("/manifest.json").trimEnd('/')
++}
++
++private fun dxKey(url: String): String = url.trim().trimEnd('/').lowercase()
++
++/** JSON of installed addon base URLs, in order, with their on/off state. */
++private fun dxExportAddons(addons: List<Addon>): String {
++    val root = JSONObject()
++    root.put("app", "nuvio")
++    root.put("type", "addons")
++    root.put("version", 1)
++    root.put("addons", JSONArray().also { arr ->
++        addons.forEach { arr.put(JSONObject().put("url", it.baseUrl).put("enabled", it.enabled)) }
++    })
++    return root.toString(2)
++}
++
++/** Accepts the export format, a plain JSON array of URLs, or objects with url, manifestUrl or transportUrl. */
++private fun dxParseAddonBackup(text: String): List<DxBackupEntry>? {
++    val trimmed = text.trim()
++    val array = runCatching {
++        if (trimmed.startsWith("[")) JSONArray(trimmed) else JSONObject(trimmed).optJSONArray("addons")
++    }.getOrNull() ?: return null
++    val entries = ArrayList<DxBackupEntry>()
++    for (i in 0 until array.length()) {
++        val element = array.opt(i)
++        val entry = when (element) {
++            is String -> dxNormalizeUrl(element)?.let { DxBackupEntry(it, true) }
++            is JSONObject -> {
++                val url = listOf("url", "manifestUrl", "transportUrl")
++                    .firstNotNullOfOrNull { key -> element.optString(key, "").takeIf { it.isNotBlank() } }
++                url?.let { u -> dxNormalizeUrl(u)?.let { DxBackupEntry(it, element.optBoolean("enabled", true)) } }
++            }
++            else -> null
++        }
++        if (entry != null) entries.add(entry)
++    }
++    return entries.distinctBy { dxKey(it.url) }.takeIf { it.isNotEmpty() }
++}
++
++/** Content discovery hub row (dx.bi port): addon order and backup/restore, driven by the remote. */
++@Composable
++internal fun DxAddonBackupSettingsRow() {
++    var show by remember { mutableStateOf(false) }
++    SettingsActionRow(
++        title = "Addon order and backup",
++        subtitle = "Reorder addons, save the list to a file and restore it later.",
++        onClick = { show = true },
++    )
++    if (show) DxAddonBackupDialog(onDismiss = { show = false })
++}
++
++@Composable
++private fun DxAddonBackupDialog(onDismiss: () -> Unit) {
++    val context = LocalContext.current
++    val scope = rememberCoroutineScope()
++    val entry = remember {
++        EntryPointAccessors.fromApplication(context.applicationContext, DxAddonBackupEntryPoint::class.java)
++    }
++    val repository = entry.addonRepository()
++    val readOnly = remember { AddonManagementAccess.isReadOnly(entry.profileManager().activeProfile) }
++    val addonsFlow = remember { repository.getInstalledAddons() }
++    val addons by addonsFlow.collectAsStateWithLifecycle(initialValue = emptyList())
++    var message by remember { mutableStateOf<String?>(null) }
++    var busy by remember { mutableStateOf(false) }
++    val file = remember { dxBackupFile(context) }
++
++    NuvioDialog(
++        onDismiss = onDismiss,
++        title = "Addon order and backup",
++        subtitle = if (readOnly) "This profile uses the main profile's addons, so they cannot be changed here."
++        else "The first addon is asked first. Backup file: ${file.absolutePath}",
++        width = 760.dp,
++        contentSpacing = 8.dp,
++    ) {
++        LazyColumn(
++            modifier = Modifier.fillMaxWidth().heightIn(max = 230.dp),
++            verticalArrangement = Arrangement.spacedBy(6.dp),
++        ) {
++            itemsIndexed(addons, key = { _, a -> a.baseUrl }) { index, addon ->
++                Row(
++                    modifier = Modifier.fillMaxWidth(),
++                    verticalAlignment = Alignment.CenterVertically,
++                    horizontalArrangement = Arrangement.spacedBy(8.dp),
++                ) {
++                    Text(
++                        text = "${index + 1}. ${addon.displayName.ifBlank { addon.baseUrl }}" + if (addon.enabled) "" else " (off)",
++                        style = MaterialTheme.typography.bodyMedium,
++                        color = NuvioTheme.colors.TextPrimary,
++                        maxLines = 1,
++                        overflow = TextOverflow.Ellipsis,
++                        modifier = Modifier.weight(1f),
++                    )
++                    Button(
++                        enabled = !readOnly && index > 0,
++                        onClick = {
++                            val urls = addons.map { it.baseUrl }.toMutableList()
++                            urls.add(index - 1, urls.removeAt(index))
++                            scope.launch { repository.setAddonOrder(urls) }
++                        },
++                    ) { Text("Up") }
++                    Button(
++                        enabled = !readOnly && index < addons.lastIndex,
++                        onClick = {
++                            val urls = addons.map { it.baseUrl }.toMutableList()
++                            urls.add(index + 1, urls.removeAt(index))
++                            scope.launch { repository.setAddonOrder(urls) }
++                        },
++                    ) { Text("Down") }
++                }
++            }
++        }
++        Row(modifier = Modifier.padding(top = 4.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
++            Button(
++                enabled = addons.isNotEmpty() && !busy,
++                onClick = {
++                    scope.launch {
++                        busy = true
++                        message = withContext(Dispatchers.IO) {
++                            runCatching {
++                                file.parentFile?.mkdirs()
++                                file.writeText(dxExportAddons(addons))
++                                "Saved ${addons.size} addons to the backup file."
++                            }.getOrElse { "Could not save the backup: ${it.message}" }
++                        }
++                        busy = false
++                    }
++                },
++            ) { Text("Export (${addons.size})") }
++            Button(
++                enabled = !readOnly && !busy,
++                onClick = {
++                    scope.launch {
++                        busy = true
++                        message = "Importing..."
++                        message = dxImport(file, repository)
++                        busy = false
++                    }
++                },
++            ) { Text("Import") }
++            Button(onClick = onDismiss) { Text("Close") }
++        }
++        message?.let {
++            Text(it, style = MaterialTheme.typography.bodyMedium, color = NuvioTheme.colors.TextSecondary)
++        }
++    }
++}
++
++private suspend fun dxImport(file: File, repository: AddonRepository): String {
++    val text = withContext(Dispatchers.IO) { runCatching { file.takeIf { it.exists() }?.readText() }.getOrNull() }
++        ?: return "No backup file found. Export first, or copy a backup to the path shown above."
++    val entries = dxParseAddonBackup(text) ?: return "That is not a valid addon backup."
++    var added = 0
++    var skipped = 0
++    var failed = 0
++    val installed = repository.getInstalledAddons().first().map { dxKey(it.baseUrl) }.toMutableSet()
++    for (entry in entries) {
++        if (dxKey(entry.url) in installed) {
++            skipped++
++            continue
++        }
++        when (val result = repository.fetchAddon(entry.url)) {
++            is NetworkResult.Success -> {
++                repository.addAddon(entry.url)
++                installed.add(dxKey(result.data.baseUrl))
++                added++
++            }
++            else -> failed++
++        }
++    }
++    // apply the saved enabled state and order to everything that is installed now
++    val now = repository.getInstalledAddons().first()
++    val byKey = now.associateBy { dxKey(it.baseUrl) }
++    entries.forEach { entry ->
++        val addon = byKey[dxKey(entry.url)] ?: return@forEach
++        if (addon.enabled != entry.enabled) repository.setAddonEnabled(addon.baseUrl, entry.enabled)
++    }
++    val ordered = entries.mapNotNull { byKey[dxKey(it.url)]?.baseUrl }
++    val rest = now.map { it.baseUrl }.filter { it !in ordered }
++    if (ordered.isNotEmpty()) repository.setAddonOrder(ordered + rest)
++    return "Added $added, already installed $skipped, failed $failed. Order restored."
++}

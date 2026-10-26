@@ -1,0 +1,355 @@
+diff --git a/app/src/main/java/com/nuvio/tv/MainActivity.kt b/app/src/main/java/com/nuvio/tv/MainActivity.kt
+index 68876e047..d0e99061e 100644
+--- a/app/src/main/java/com/nuvio/tv/MainActivity.kt
++++ b/app/src/main/java/com/nuvio/tv/MainActivity.kt
+@@ -1386,6 +1386,7 @@ open class MainActivity : ComponentActivity() {
+     }
+ 
+     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
++        if (com.nuvio.tv.core.sound.DxSounds.onKey(this, event)) return true // dx.bi sounds hook
+         if (ambientIdleController.consumeKeyEvent(event)) return true
+         if (event.keyCode == KeyEvent.KEYCODE_BACK) {
+             if (longPressBackHeld.value) {
+@@ -1412,6 +1413,7 @@ open class MainActivity : ComponentActivity() {
+         // tracked; onActivityResult keeps it for a completion or dismisses it otherwise.
+         externalPlaybackTracker.raiseAutoNextOverlayOnReturn()
+         super.onStart()
++        com.nuvio.tv.core.sound.DxSounds.attachIntro(this) // dx.bi intro hook
+         startupSyncService.startPeriodicSurfacePulls()
+         androidTvChannelSyncService.onForegroundChanged(true)
+     }
+diff --git a/app/src/main/java/com/nuvio/tv/core/sound/DxSounds.kt b/app/src/main/java/com/nuvio/tv/core/sound/DxSounds.kt
+new file mode 100644
+index 000000000..3a4f28212
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/sound/DxSounds.kt
+@@ -0,0 +1,272 @@
++package com.nuvio.tv.core.sound
++
++import android.app.Activity
++import android.content.Context
++import android.media.AudioAttributes
++import android.media.AudioFormat
++import android.media.AudioTrack
++import android.view.KeyEvent
++import android.view.ViewGroup
++import androidx.compose.animation.core.Animatable
++import androidx.compose.animation.core.FastOutSlowInEasing
++import androidx.compose.animation.core.tween
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.alpha
++import androidx.compose.ui.draw.scale
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.ComposeView
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.sp
++import androidx.tv.material3.ExperimentalTvMaterial3Api
++import androidx.tv.material3.Text
++import com.nuvio.tv.core.recommendations.TvRecommendationManager
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlin.math.PI
++import kotlin.math.exp
++import kotlin.math.min
++import kotlin.math.sin
++
++/**
++ * dx.bi port: startup cinematic intro and soft interface sounds. Both are OFF by default. The sounds are
++ * synthesized (AudioTrack, no audio assets) and follow the media volume. The soft tick plays on D-pad moves
++ * outside the player.
++ */
++object DxSounds {
++    private const val PREFS = "nuvio_tv_dx_sounds"
++    const val INTRO_MS = 2600L
++    private const val SAMPLE_RATE = 22050
++
++    private var loaded = false
++    private var introShownThisLaunch = false
++    @Volatile private var introActive = false
++    private var lastClickMs = 0L
++    private var introTrack: AudioTrack? = null
++    private val lock = Any()
++
++    private val _introEnabled = MutableStateFlow(false)
++    val introEnabled: StateFlow<Boolean> = _introEnabled.asStateFlow()
++    private val _uiSoundsEnabled = MutableStateFlow(false)
++    val uiSoundsEnabled: StateFlow<Boolean> = _uiSoundsEnabled.asStateFlow()
++
++    private val introPcm: ShortArray by lazy { synthIntro() }
++    private val clickPcm: ShortArray by lazy { synthClick() }
++
++    private fun prefs(context: Context) =
++        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++
++    fun ensureLoaded(context: Context) {
++        if (loaded) return
++        loaded = true
++        val p = prefs(context)
++        _introEnabled.value = p.getBoolean("intro", false)
++        _uiSoundsEnabled.value = p.getBoolean("sounds", false)
++    }
++
++    fun setIntroEnabled(context: Context, value: Boolean) {
++        ensureLoaded(context)
++        _introEnabled.value = value
++        prefs(context).edit().putBoolean("intro", value).apply()
++    }
++
++    fun setUiSoundsEnabled(context: Context, value: Boolean) {
++        ensureLoaded(context)
++        _uiSoundsEnabled.value = value
++        prefs(context).edit().putBoolean("sounds", value).apply()
++    }
++
++    /** Preview from Settings: plays the intro sound without the overlay. */
++    fun previewIntroSound() {
++        runCatching { playIntro() }
++    }
++
++    /** Called from MainActivity.onStart: shows the intro once per app launch, only when it is switched on. */
++    fun attachIntro(activity: Activity) {
++        ensureLoaded(activity)
++        if (introShownThisLaunch || !_introEnabled.value) return
++        introShownThisLaunch = true
++        introActive = true
++        val view = ComposeView(activity)
++        view.isFocusable = false
++        view.setContent {
++            DxIntroOverlay(onFinished = {
++                introActive = false
++                runCatching { (view.parent as? ViewGroup)?.removeView(view) }
++            })
++        }
++        activity.addContentView(
++            view,
++            ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT),
++        )
++    }
++
++    /** Called first in MainActivity.dispatchKeyEvent. Returns true when the key is used up. */
++    fun onKey(activity: Activity, event: KeyEvent): Boolean {
++        if (introActive) {
++            if (event.action == KeyEvent.ACTION_DOWN) {
++                introActive = false
++                runCatching { stopIntro() }
++                skipRequested.value = true
++            }
++            return true
++        }
++        if (event.action != KeyEvent.ACTION_DOWN || event.repeatCount != 0) return false
++        when (event.keyCode) {
++            KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN,
++            KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT -> Unit
++            else -> return false
++        }
++        ensureLoaded(activity)
++        if (!_uiSoundsEnabled.value || TvRecommendationManager.isPlaybackActive.value) return false
++        val now = System.currentTimeMillis()
++        if (now - lastClickMs < 60L) return false
++        lastClickMs = now
++        runCatching { playClick() }
++        return false
++    }
++
++    private val skipRequested = MutableStateFlow(false)
++
++    @OptIn(ExperimentalTvMaterial3Api::class)
++    @Composable
++    private fun DxIntroOverlay(onFinished: () -> Unit) {
++        val fade = remember { Animatable(0f) }
++        val grow = remember { Animatable(0.82f) }
++        val out = remember { Animatable(1f) }
++        LaunchedEffect(Unit) {
++            skipRequested.value = false
++            runCatching { playIntro() }
++            fade.animateTo(1f, tween(900, easing = FastOutSlowInEasing))
++        }
++        LaunchedEffect(Unit) {
++            grow.animateTo(1.08f, tween(INTRO_MS.toInt(), easing = FastOutSlowInEasing))
++        }
++        LaunchedEffect(Unit) {
++            var waited = 0L
++            while (waited < INTRO_MS - 500L && !skipRequested.value) {
++                delay(50L)
++                waited += 50L
++            }
++            out.animateTo(0f, tween(if (skipRequested.value) 150 else 500))
++            onFinished()
++        }
++        Box(
++            modifier = Modifier
++                .fillMaxSize()
++                .alpha(out.value)
++                .background(Color.Black),
++            contentAlignment = Alignment.Center,
++        ) {
++            Text(
++                text = "NUVIO",
++                color = Color.White,
++                fontSize = 44.sp,
++                fontWeight = FontWeight.Black,
++                letterSpacing = 10.sp,
++                modifier = Modifier.alpha(fade.value).scale(grow.value),
++            )
++        }
++    }
++
++    private fun playIntro() {
++        Thread {
++            runCatching {
++                val track = buildTrack(introPcm, AudioAttributes.USAGE_MEDIA)
++                synchronized(lock) {
++                    introTrack?.let { runCatching { it.stop(); it.release() } }
++                    introTrack = track
++                }
++                track.play()
++                Thread.sleep(introPcm.size * 1000L / SAMPLE_RATE + 200L)
++                synchronized(lock) {
++                    if (introTrack === track) introTrack = null
++                }
++                runCatching { track.stop() }
++                track.release()
++            }
++        }.start()
++    }
++
++    private fun stopIntro() {
++        synchronized(lock) {
++            introTrack?.let { runCatching { it.stop(); it.release() } }
++            introTrack = null
++        }
++    }
++
++    private fun playClick() {
++        Thread {
++            runCatching {
++                val track = buildTrack(clickPcm, AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
++                track.play()
++                Thread.sleep(clickPcm.size * 1000L / SAMPLE_RATE + 120L)
++                runCatching { track.stop() }
++                track.release()
++            }
++        }.start()
++    }
++
++    private fun buildTrack(pcm: ShortArray, usage: Int): AudioTrack {
++        val attributes = AudioAttributes.Builder()
++            .setUsage(usage)
++            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
++            .build()
++        val format = AudioFormat.Builder()
++            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
++            .setSampleRate(SAMPLE_RATE)
++            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
++            .build()
++        val track = AudioTrack.Builder()
++            .setAudioAttributes(attributes)
++            .setAudioFormat(format)
++            .setBufferSizeInBytes(pcm.size * 2)
++            .setTransferMode(AudioTrack.MODE_STATIC)
++            .build()
++        track.write(pcm, 0, pcm.size)
++        return track
++    }
++
++    private fun synthClick(): ShortArray {
++        val n = SAMPLE_RATE * 45 / 1000
++        return ShortArray(n) { i ->
++            val t = i.toDouble() / SAMPLE_RATE
++            val envelope = exp(-t * 90.0) * min(1.0, t * 800.0)
++            val tone = sin(2 * PI * 1900.0 * t) * 0.7 + sin(2 * PI * 3800.0 * t) * 0.15
++            (tone * envelope * 0.22 * Short.MAX_VALUE).toInt().toShort()
++        }
++    }
++
++    /** About 2.4 s: low thump, then a rising soft chord swell that fades out. */
++    private fun synthIntro(): ShortArray {
++        val seconds = 2.4
++        val n = (SAMPLE_RATE * seconds).toInt()
++        val chord = doubleArrayOf(174.61, 220.0, 261.63, 349.23)
++        return ShortArray(n) { i ->
++            val t = i.toDouble() / SAMPLE_RATE
++            val thump = sin(2 * PI * (62.0 - 20.0 * t) * t) * exp(-t * 4.0) * 0.8
++            val swellIn = (t / 1.4).coerceIn(0.0, 1.0)
++            val fadeOut = ((seconds - t) / 0.9).coerceIn(0.0, 1.0)
++            val swell = swellIn * swellIn * fadeOut
++            var pad = 0.0
++            for (f in chord) {
++                val glide = f * (0.94 + 0.06 * swellIn)
++                pad += sin(2 * PI * glide * t) + 0.25 * sin(2 * PI * glide * 2.0 * t)
++            }
++            pad = pad / chord.size * swell * 0.55
++            val sparkleT = t - 1.35
++            val sparkle = if (sparkleT > 0.0) sin(2 * PI * 1396.9 * t) * exp(-sparkleT * 5.0) * 0.18 else 0.0
++            val start = min(1.0, t * 200.0)
++            ((thump + pad + sparkle) * start * 0.6 * Short.MAX_VALUE).toInt()
++                .coerceIn(-32768, 32767).toShort()
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/DxSoundsSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/DxSoundsSettings.kt
+new file mode 100644
+index 000000000..dc73ac422
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/DxSoundsSettings.kt
+@@ -0,0 +1,38 @@
++@file:OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
++
++package com.nuvio.tv.ui.screens.settings
++
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalContext
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import com.nuvio.tv.core.sound.DxSounds
++
++/** Advanced settings card (dx.bi port): startup intro and soft interface sounds. Both off by default. */
++@Composable
++internal fun DxSoundsSettingsCard() {
++    val context = LocalContext.current
++    remember { DxSounds.ensureLoaded(context); true }
++    val intro by DxSounds.introEnabled.collectAsStateWithLifecycle()
++    val sounds by DxSounds.uiSoundsEnabled.collectAsStateWithLifecycle()
++    SettingsGroupCard(modifier = Modifier.fillMaxWidth(), title = "Intro and sounds") {
++        SettingsToggleRow(
++            title = "Startup intro",
++            subtitle = "Plays a short cinematic intro with a sound when the app opens, once per launch. Press any key to skip. Sound follows the media volume.",
++            checked = intro,
++            onToggle = {
++                DxSounds.setIntroEnabled(context, !intro)
++                if (!intro) DxSounds.previewIntroSound()
++            },
++        )
++        SettingsToggleRow(
++            title = "Interface sounds",
++            subtitle = "A soft tick when you move with the D-pad outside the player. Follows the media volume.",
++            checked = sounds,
++            onToggle = { DxSounds.setUiSoundsEnabled(context, !sounds) },
++        )
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
+index 18e1cac08..7de677fbe 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
+@@ -478,6 +478,8 @@ fun AdvancedSettingsContent(
+             }
+         }
+ 
++        item(key = "dx_sounds") { DxSoundsSettingsCard() } // dx.bi sounds hook
++
+         item(key = "startup_settings") {
+             SettingsGroupCard(
+                 modifier = Modifier.fillMaxWidth(),

@@ -1,0 +1,312 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/components/CatalogRowSection.kt b/app/src/main/java/com/nuvio/tv/ui/components/CatalogRowSection.kt
+index 5174dc58d..0ad11bd16 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/components/CatalogRowSection.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/components/CatalogRowSection.kt
+@@ -88,6 +88,8 @@ private const val UPDATING_ROW_ALPHA = 0.4f
+ @Composable
+ fun CatalogRowSection(
+     catalogRow: CatalogRow,
++    /** dx.bi watched titles: Dim/Hide apply to this row (Home and Search rows turn it on). */
++    applyWatchedMode: Boolean = false,
+     onItemClick: (String, String, String) -> Unit,
+     onSeeAll: () -> Unit = {},
+     showSeeAll: Boolean = catalogRow.hasMore || catalogRow.items.size >= 15,
+@@ -128,6 +130,9 @@ fun CatalogRowSection(
+     upFocusRequester: FocusRequester? = null,
+     listState: LazyListState = rememberLazyListState(initialFirstVisibleItemIndex = initialScrollIndex)
+ ) {
++    val dxWatchedMode = if (applyWatchedMode) rememberDxWatchedMode() else DxWatchedMode.Show
++    @Suppress("NAME_SHADOWING")
++    val catalogRow = DxWatchedTitles.filterRow(catalogRow, dxWatchedMode, isItemWatched)
+     val catalogRowKey = remember(catalogRow) { catalogRow.stableKey() }
+     val rowItemIdentities = remember(catalogRow.items) { catalogRow.stableItemKeys() }
+ 
+@@ -471,7 +476,7 @@ fun CatalogRowSection(
+                     onBackdropExpandedChanged = null,
+                     onClick = onItemClickStable,
+                     onLongPress = onItemLongPressStable,
+-                    modifier = Modifier
++                    modifier = (if (applyWatchedMode) Modifier.dxWatchedDim(latestIsItemWatched(item)) else Modifier)
+                         .then(directionalFocusModifier)
+                         .then(
+                             if (isNonFirstPlaceholder) Modifier.focusProperties { canFocus = false }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/components/DxWatchedTitles.kt b/app/src/main/java/com/nuvio/tv/ui/components/DxWatchedTitles.kt
+new file mode 100644
+index 000000000..1e45ed480
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/components/DxWatchedTitles.kt
+@@ -0,0 +1,77 @@
++package com.nuvio.tv.ui.components
++
++import android.content.Context
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.alpha
++import androidx.compose.ui.platform.LocalContext
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import com.nuvio.tv.domain.model.CatalogRow
++import com.nuvio.tv.domain.model.MetaPreview
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++
++enum class DxWatchedMode { Show, Dim, Hide }
++
++/**
++ * dx.bi port: titles you already watched can stay as they are (Show, default), fade (Dim) or disappear (Hide)
++ * in Home rows, Discover and Search. It uses the same watched mark as the check badge on a poster. Library and
++ * details screens are never affected. A row where every title is watched is left as it is instead of emptied.
++ */
++object DxWatchedTitles {
++    private const val PREFS = "nuvio_tv_dx_watched_titles"
++    private val _mode = MutableStateFlow(DxWatchedMode.Show)
++    val mode: StateFlow<DxWatchedMode> = _mode.asStateFlow()
++    private var loaded = false
++
++    fun ensureLoaded(context: Context) {
++        if (loaded) return
++        loaded = true
++        val saved = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++            .getString("mode", null)
++        _mode.value = DxWatchedMode.values().firstOrNull { it.name == saved } ?: DxWatchedMode.Show
++    }
++
++    fun setMode(context: Context, mode: DxWatchedMode) {
++        ensureLoaded(context)
++        _mode.value = mode
++        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++            .edit().putString("mode", mode.name).apply()
++    }
++
++    fun filterItems(
++        items: List<MetaPreview>,
++        mode: DxWatchedMode,
++        isWatched: (MetaPreview) -> Boolean,
++    ): List<MetaPreview> {
++        if (mode != DxWatchedMode.Hide) return items
++        val kept = items.filterNot { isWatched(it) }
++        return if (kept.isEmpty() || kept.size == items.size) items else kept
++    }
++
++    fun filterRow(
++        row: CatalogRow,
++        mode: DxWatchedMode,
++        isWatched: (MetaPreview) -> Boolean,
++    ): CatalogRow {
++        val kept = filterItems(row.items, mode, isWatched)
++        return if (kept === row.items) row else row.copy(items = kept)
++    }
++}
++
++@Composable
++fun rememberDxWatchedMode(): DxWatchedMode {
++    val context = LocalContext.current
++    DxWatchedTitles.ensureLoaded(context)
++    val mode by DxWatchedTitles.mode.collectAsStateWithLifecycle()
++    return mode
++}
++
++/** Fades a watched poster when the mode is Dim. */
++@Composable
++fun Modifier.dxWatchedDim(isWatched: Boolean): Modifier {
++    val mode = rememberDxWatchedMode()
++    return if (isWatched && mode == DxWatchedMode.Dim) this.alpha(0.35f) else this
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/ClassicHomeContent.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/ClassicHomeContent.kt
+index 592d5c43e..b82ea0e2e 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/ClassicHomeContent.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/ClassicHomeContent.kt
+@@ -860,6 +860,7 @@ fun ClassicHomeContent(
+                         onRequestTrailerPreview = onRequestTrailerPreview,
+                         onItemFocus = handleMetaFocus,
+                         isItemWatched = isCatalogItemWatched,
++                        applyWatchedMode = true,
+                         onItemLongPress = onCatalogItemLongPress,
+                         seeAllLabel = catalogSeeAllLabel,
+                         onItemClick = { id, type, addonBaseUrl ->
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/GridHomeContent.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/GridHomeContent.kt
+index deb1cc95f..f7ae45d4f 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/GridHomeContent.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/GridHomeContent.kt
+@@ -82,6 +82,7 @@ import com.nuvio.tv.domain.model.MetaPreview
+ import com.nuvio.tv.domain.model.catalogRowStableKey
+ import com.nuvio.tv.domain.model.PosterShape
+ import com.nuvio.tv.ui.components.GridContentCard
++import com.nuvio.tv.ui.components.dxWatchedDim
+ import com.nuvio.tv.ui.components.LocalCardDepthStyle
+ import com.nuvio.tv.ui.components.LocalLandscapePosterMode
+ import com.nuvio.tv.ui.components.GridContinueWatchingSection
+@@ -189,7 +190,15 @@ fun GridHomeContent(
+     }
+ 
+     // Offset for section indices: pre-items + continue watching item (if present)
+-    val gridItems = uiState.gridItems
++    val dxWatchedMode = com.nuvio.tv.ui.components.rememberDxWatchedMode()
++    val gridItems = if (dxWatchedMode == com.nuvio.tv.ui.components.DxWatchedMode.Hide) {
++        val dxKept = uiState.gridItems.filterNot {
++            it is GridItem.Content && isCatalogItemWatched(it.item)
++        }
++        if (dxKept.size == uiState.gridItems.size) uiState.gridItems else dxKept
++    } else {
++        uiState.gridItems
++    }
+     val continueWatchingItems = remember(
+         uiState.continueWatchingEnabled,
+         uiState.continueWatchingItems,
+@@ -755,6 +764,7 @@ fun GridHomeContent(
+                             posterCardStyle = posterCardStyle,
+                             showLabel = uiState.posterLabelsEnabled,
+                             isWatched = isCatalogItemWatched(gridItem.item),
++                            modifier = Modifier.dxWatchedDim(isCatalogItemWatched(gridItem.item)),
+                             onFocused = remember(itemKey, gridItem.item) {
+                                 {
+                                     lastFocusedGridItemKey.value = itemKey
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeRows.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeRows.kt
+index 81c610e11..4273c5ab8 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeRows.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeRows.kt
+@@ -110,6 +110,7 @@ import com.nuvio.tv.R
+ import com.nuvio.tv.domain.model.FocusedPosterTrailerPlaybackTarget
+ import com.nuvio.tv.domain.model.CardDepthSurface
+ import com.nuvio.tv.domain.model.MetaPreview
++import com.nuvio.tv.ui.components.dxWatchedDim
+ import com.nuvio.tv.domain.model.ContinueWatchingCardStyle
+ import com.nuvio.tv.domain.model.PLACEHOLDER_IMAGE_URL
+ import com.nuvio.tv.domain.model.isPlaceholder
+@@ -904,6 +905,15 @@ internal fun ModernRowSection(
+                 null
+             }
+ 
++            val dxWatchedMode = com.nuvio.tv.ui.components.rememberDxWatchedMode()
++            val dxRowItems = if (dxWatchedMode == com.nuvio.tv.ui.components.DxWatchedMode.Hide &&
++                row.key != MODERN_CONTINUE_WATCHING_ROW_KEY && row.key != MODERN_UPCOMING_ROW_KEY
++            ) {
++                val dxKept = row.items.list.filterNot { it.metaPreview?.let(isCatalogItemWatched) == true }
++                if (dxKept.isEmpty() || dxKept.size == row.items.list.size) row.items.list else dxKept
++            } else {
++                row.items.list
++            }
+             LazyRow(
+                 state = rowListState,
+                 modifier = Modifier
+@@ -920,7 +930,7 @@ internal fun ModernRowSection(
+                 horizontalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.md)
+             ) {
+                 itemsIndexed(
+-                    items = row.items.list,
++                    items = dxRowItems,
+                     key = { index, item ->
+                         val pinned = pinnedItemKey.value
+                         when {
+@@ -1012,9 +1022,9 @@ internal fun ModernRowSection(
+                                 }
+                             }
+                             val placeholderFocusBlock = isPlaceholder && index > 0
+-                            Box(modifier = if (placeholderFocusBlock) {
++                            Box(modifier = (if (placeholderFocusBlock) {
+                                 Modifier.focusProperties { canFocus = false }
+-                            } else Modifier) {
++                            } else Modifier).dxWatchedDim(payload is ModernPayload.Catalog && metaPreview?.let(isCatalogItemWatched) == true)) {
+                             ModernCatalogRowItem(
+                                 item = item,
+                                 payload = payload,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/search/SearchDiscoverSection.kt b/app/src/main/java/com/nuvio/tv/ui/screens/search/SearchDiscoverSection.kt
+index aba7ae79b..fd8553816 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/search/SearchDiscoverSection.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/search/SearchDiscoverSection.kt
+@@ -76,6 +76,7 @@ import com.nuvio.tv.R
+ import com.nuvio.tv.domain.model.MetaPreview
+ import com.nuvio.tv.ui.components.EmptyScreenState
+ import com.nuvio.tv.ui.components.GridContentCard
++import com.nuvio.tv.ui.components.dxWatchedDim
+ import com.nuvio.tv.ui.components.LoadingIndicator
+ import com.nuvio.tv.ui.components.LocalCardDepthStyle
+ import com.nuvio.tv.ui.components.PosterCardStyle
+@@ -499,6 +500,16 @@ internal fun DiscoverGrid(
+     onItemLongPress: (MetaPreview) -> Unit = {},
+     filterKey: String = ""
+ ) {
++    val dxIsWatched: (MetaPreview) -> Boolean = { item ->
++        val isSeries = item.apiType.equals("series", ignoreCase = true) || item.apiType.equals("tv", ignoreCase = true)
++        if (isSeries) item.id in watchedSeriesIds else item.id in watchedMovieIds
++    }
++    @Suppress("NAME_SHADOWING")
++    val items = com.nuvio.tv.ui.components.DxWatchedTitles.filterItems(
++        items,
++        com.nuvio.tv.ui.components.rememberDxWatchedMode(),
++        dxIsWatched,
++    )
+     val restoreFocusRequester = remember { FocusRequester() }
+     val gridState = rememberLazyGridState()
+     var pendingFocusOnNewItemIndex by remember { mutableStateOf<Int?>(null) }
+@@ -677,7 +688,8 @@ internal fun DiscoverGrid(
+                 },
+                 modifier = Modifier
+                     .padding(top = 3.dp)
+-                    .width(adaptiveStyle.width),
++                    .width(adaptiveStyle.width)
++                    .dxWatchedDim(dxIsWatched(item)),
+                 focusRequester = focusReq,
+                 onFocused = {
+                     onItemFocused(index)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/search/SearchScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/search/SearchScreen.kt
+index 3e6e6009e..c7d69c55c 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/search/SearchScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/search/SearchScreen.kt
+@@ -833,6 +833,7 @@ fun SearchScreen(
+                                     val isSeries = item.apiType.equals("series", ignoreCase = true) || item.apiType.equals("tv", ignoreCase = true)
+                                     if (isSeries) item.id in watchedSeriesIds else item.id in watchedMovieIds
+                                 },
++                                applyWatchedMode = true,
+                                 focusedItemIndex = when {
+                                     restoringSearchFocus.value && catalogKey == viewModel.savedFocusRowKey ->
+                                         viewModel.savedFocusItemIndex
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/DxWatchedTitlesSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/DxWatchedTitlesSettings.kt
+new file mode 100644
+index 000000000..d6728e71d
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/DxWatchedTitlesSettings.kt
+@@ -0,0 +1,30 @@
++@file:OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
++
++package com.nuvio.tv.ui.screens.settings
++
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.platform.LocalContext
++import com.nuvio.tv.ui.components.DxWatchedMode
++import com.nuvio.tv.ui.components.DxWatchedTitles
++import com.nuvio.tv.ui.components.rememberDxWatchedMode
++
++/** Home layout settings row (dx.bi port): watched titles show, dim or hide in Home, Discover and Search. */
++@Composable
++internal fun DxWatchedTitlesSettingsRow() {
++    val context = LocalContext.current
++    val mode = rememberDxWatchedMode()
++    val label = when (mode) {
++        DxWatchedMode.Show -> "Show"
++        DxWatchedMode.Dim -> "Dim"
++        DxWatchedMode.Hide -> "Hide"
++    }
++    SettingsActionRow(
++        title = "Watched titles",
++        subtitle = "Show keeps watched titles as they are, Dim fades them, Hide removes them from Home rows, Discover and Search. Press to switch. Your Library is never changed.",
++        value = label,
++        onClick = {
++            val next = DxWatchedMode.values()[(mode.ordinal + 1) % DxWatchedMode.values().size]
++            DxWatchedTitles.setMode(context, next)
++        },
++    )
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutHomeSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutHomeSettings.kt
+index 32c30b228..714232998 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutHomeSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutHomeSettings.kt
+@@ -196,6 +196,7 @@ internal fun LayoutHomeContentSection(
+             onEvent(LayoutSettingsEvent.SetHomeImdbRatingsVisibility(visibility))
+         }
+     )
++    DxWatchedTitlesSettingsRow() // dx.bi watched titles hook
+ }
+ 
+ @Composable
