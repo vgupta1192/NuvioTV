@@ -1,0 +1,53 @@
+diff --git a/app/src/main/java/com/nuvio/tv/data/local/TrailerSettingsDataStore.kt b/app/src/main/java/com/nuvio/tv/data/local/TrailerSettingsDataStore.kt
+index c02a63f3f..7e9f64f5c 100644
+--- a/app/src/main/java/com/nuvio/tv/data/local/TrailerSettingsDataStore.kt
++++ b/app/src/main/java/com/nuvio/tv/data/local/TrailerSettingsDataStore.kt
+@@ -33,6 +33,9 @@ class TrailerSettingsDataStore @Inject constructor(
+     private val playInBackgroundKey = booleanPreferencesKey("trailer_play_in_background")
+     private val pauseOnScrollKey = booleanPreferencesKey("trailer_pause_on_scroll")
+     private val allow4kKey = booleanPreferencesKey("trailer_allow_4k")
++    private val netflixSavedKey = booleanPreferencesKey("netflix_saved")
++    private val netflixPrevEnabledKey = booleanPreferencesKey("netflix_prev_enabled")
++    private val netflixPrevDelayKey = intPreferencesKey("netflix_prev_delay_seconds")
+ 
+     val settings: Flow<TrailerSettings> = profileManager.activeProfileId.flatMapLatest { pid ->
+         factory.get(pid, FEATURE).data.map { prefs ->
+@@ -46,6 +49,26 @@ class TrailerSettingsDataStore @Inject constructor(
+         }
+     }
+ 
++    /** Netflix style master switch: trailer autoplay on the detail page with a short delay; OFF restores the snapshot. */
++    suspend fun applyNetflixStyle(on: Boolean) {
++        store().edit { prefs ->
++            val saved = prefs[netflixSavedKey] ?: false
++            if (on) {
++                if (!saved) {
++                    prefs[netflixPrevEnabledKey] = prefs[enabledKey] ?: true
++                    prefs[netflixPrevDelayKey] = prefs[delaySecondsKey] ?: 7
++                    prefs[netflixSavedKey] = true
++                }
++                prefs[enabledKey] = true
++                prefs[delaySecondsKey] = 2
++            } else if (saved) {
++                prefs[enabledKey] = prefs[netflixPrevEnabledKey] ?: true
++                prefs[delaySecondsKey] = prefs[netflixPrevDelayKey] ?: 7
++                prefs[netflixSavedKey] = false
++            }
++        }
++    }
++
+     suspend fun setEnabled(enabled: Boolean) {
+         store().edit { it[enabledKey] = enabled }
+     }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutSettingsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutSettingsViewModel.kt
+index ac987ff8c..23c3eaafa 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutSettingsViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutSettingsViewModel.kt
+@@ -501,6 +501,7 @@ class LayoutSettingsViewModel @Inject constructor(
+             is LayoutSettingsEvent.SetContinueWatchingSortMode -> setContinueWatchingSortMode(event.mode)
+             is LayoutSettingsEvent.SetNetflixStyleEnabled -> viewModelScope.launch {
+                 layoutPreferenceDataStore.setNetflixStyleEnabled(event.enabled)
++                trailerSettingsDataStore.applyNetflixStyle(event.enabled)
+             }
+             is LayoutSettingsEvent.SetContinueWatchingCardStyle -> setContinueWatchingCardStyle(event.style)
+             is LayoutSettingsEvent.SetAlwaysShowLandscapeClearlogo -> setAlwaysShowLandscapeClearlogo(event.enabled)
