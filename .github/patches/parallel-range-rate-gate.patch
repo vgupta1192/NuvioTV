@@ -1,0 +1,535 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
+index c00d91b..1a81159 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeDataSource.kt
+@@ -122,13 +122,9 @@ internal class ParallelRangeDataSource(
+         private const val ESCALATE_AFTER_MS = 2_000L
+         private const val ESCALATE_POLL_EXTENSION_MS = 3_000L
+ 
+-        private const val RATE_LIMIT_MAX_BACKOFF_RETRIES = 3
+-        private const val RATE_LIMIT_BACKOFF_BASE_MS = 500L
+-
+-        private const val RATE_LIMIT_BACKOFF_CYCLE_CAP_MS = 3_000L
+-
+-        private const val RATE_LIMIT_WAIT_HARD_CAP_MS = 15_000L
+-        private const val RATE_LIMIT_BACKOFF_JITTER_MS = 250L
++        // HTTP 429/503 is server-side rate-limiting, not a stalled socket. The
++        // session's rate gate holds every piece while the server refuses, and the
++        // prefetch depth adapts multiplicatively down / additively up (AIMD).
+         private const val RATE_LIMIT_SLEEP_SLICE_MS = 100L
+ 
+         private const val RATE_LIMIT_DEPTH_STEP_BASE_MS = 10_000L
+@@ -176,6 +172,7 @@ internal class ParallelRangeDataSource(
+             @Volatile var lastDepthStepAtMs: Long = 0L
+             @Volatile var depthStepIntervalMs: Long = RATE_LIMIT_DEPTH_STEP_BASE_MS
+             val rateLimitEscalation = AtomicInteger(0)
++            val rateGate = ParallelRangeRateGate({ SystemClock.uptimeMillis() })
+             val activeSources: MutableSet<DataSource> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+ 
+             val inFlight = ConcurrentHashMap<Long, InFlightChunk>()
+@@ -1000,7 +997,7 @@ internal class ParallelRangeDataSource(
+             Log.i(TAG, "RS_ESCALATE skip chunk=$chunkIndex reason=done")
+             return
+         }
+-        if (hudClampLatched) {
++        if (hudClampLatched || activeSession.rateGate.blocking) {
+             Log.i(TAG, "RS_ESCALATE skip chunk=$chunkIndex reason=clamp")
+             return
+         }
+@@ -1170,12 +1167,22 @@ internal class ParallelRangeDataSource(
+     }
+ 
+     private fun downloadChunk(activeSession: ChunkSession, chunkIndex: Long, future: CompletableFuture<*>): DownloadedChunk {
++        try {
++            return downloadChunkGated(activeSession, chunkIndex, future)
++        } finally {
++            activeSession.rateGate.finished(chunkIndex)
++        }
++    }
++
++    private fun downloadChunkGated(activeSession: ChunkSession, chunkIndex: Long, future: CompletableFuture<*>): DownloadedChunk {
+         var lastException: Exception? = null
+         for (attempt in 0..1) {
+ 
+             if (future.isDone || future.isCancelled || activeSession.abandoned.get()) throw IOException("Cancelled")
++            if (!awaitRateGate(activeSession, chunkIndex, future, lastException)) throw IOException("Cancelled")
++            val startedAtMs = activeSession.rateGate.now()
+             try {
+-                return downloadChunkOnce(activeSession, chunkIndex, future)
++                return downloadChunkOnce(activeSession, chunkIndex, future, startedAtMs = startedAtMs)
+             } catch (e: Exception) {
+ 
+                 if (activeSession.abandoned.get() || future.isCancelled) throw IOException("Session abandoned or cancelled")
+@@ -1186,7 +1193,7 @@ internal class ParallelRangeDataSource(
+                 }
+                 val rlError = e.findRateLimitException()
+                 if (rlError != null) {
+-                    return downloadChunkWithRateLimitBackoff(activeSession, chunkIndex, future, rlError)
++                    return downloadChunkWithRateLimitBackoff(activeSession, chunkIndex, future, rlError, startedAtMs)
+                 }
+                 if (attempt == 0) {
+                     if (e.isTransientInterruption()) {
+@@ -1204,7 +1211,13 @@ internal class ParallelRangeDataSource(
+         throw IOException("Failed to download chunk $chunkIndex after 2 attempts", lastException)
+     }
+ 
+-    private fun downloadChunkOnce(activeSession: ChunkSession, chunkIndex: Long, future: CompletableFuture<*>, allowStallRestart: Boolean = true): DownloadedChunk {
++    private fun downloadChunkOnce(
++        activeSession: ChunkSession,
++        chunkIndex: Long,
++        future: CompletableFuture<*>,
++        allowStallRestart: Boolean = true,
++        startedAtMs: Long = activeSession.rateGate.now()
++    ): DownloadedChunk {
+         val sessionLength = activeSession.totalLength
+         val start = chunkIndex * chunkSize
+         val end = if (sessionLength > 0L) {
+@@ -1227,6 +1240,9 @@ internal class ParallelRangeDataSource(
+             if (future.isCancelled || activeSession.abandoned.get()) throw IOException("Cancelled")
+             Log.d(TAG, "Starting chunk download: idx=$chunkIndex, range=$start-$end")
+             ds.open(spec)
++            if (activeSession.rateGate.answered(startedAtMs)) {
++                Log.i(TAG, "RATE_GATE open chunk=$chunkIndex: the server answers again")
++            }
+ 
+             val expectedBytes = if (sessionLength > 0L) end - start else -1L
+             val chunk = readIntoChunk(activeSession, chunkIndex, ds, future, expectedBytes, allowStallRestart)
+@@ -1294,72 +1310,88 @@ internal class ParallelRangeDataSource(
+         return null
+     }
+ 
++    /**
++     * A rate-limited piece waits for the session's [ParallelRangeRateGate] instead of retrying on its own: the
++     * pieces refused together count once, nothing is sent while the wait runs, then the piece nearest the player
++     * tries alone. The piece fails only after [ParallelRangeRateGate.GIVE_UP_MS] without any request answered.
++     */
+     private fun downloadChunkWithRateLimitBackoff(
+         activeSession: ChunkSession,
+         chunkIndex: Long,
+         future: CompletableFuture<*>,
+-        firstError: HttpDataSource.InvalidResponseCodeException
++        firstError: HttpDataSource.InvalidResponseCodeException,
++        firstStartedAtMs: Long
+     ): DownloadedChunk {
++        val gate = activeSession.rateGate
+         var rl: HttpDataSource.InvalidResponseCodeException = firstError
++        var startedAtMs = firstStartedAtMs
+         var lastException: Exception = firstError
+-        val escalation = activeSession.beginRateLimitEpisode(effectivePrefetchDepth)
+-        var attempt = 0
+-        while (attempt < RATE_LIMIT_MAX_BACKOFF_RETRIES) {
+-            val waitMs = rateLimitWaitMs(attempt, escalation, rl)
+-            Log.w(TAG, "Chunk $chunkIndex rate-limited (HTTP ${rl.responseCode}); backing off ${waitMs}ms " +
+-                "(attempt ${attempt + 1}/$RATE_LIMIT_MAX_BACKOFF_RETRIES, escalation $escalation)")
+-            if (!sleepInterruptibly(waitMs, future, activeSession)) throw IOException("Cancelled during rate-limit backoff")
+-            if (future.isCancelled || activeSession.abandoned.get()) throw IOException("Cancelled")
++        if (future.isDone || future.isCancelled || activeSession.abandoned.get()) throw IOException("Chunk already retired")
++        while (true) {
++            val refusal = gate.refused(chunkIndex, startedAtMs, retryAfterMs(rl))
++            if (refusal > 0) {
++                // Only the burst that opened the spell says too many ran at once; a lone try refused later does not.
++                if (refusal == 1) activeSession.beginRateLimitEpisode(effectivePrefetchDepth)
++                else activeSession.noteRateLimitHit()
++                Log.w(TAG, "RATE_GATE closed chunk=$chunkIndex HTTP ${rl.responseCode} refusals=$refusal " +
++                    "waitMs=${gate.waitLeftMs()} waiting=${gate.waitingCount()}")
++            } else {
++                activeSession.noteRateLimitHit()
++            }
++            if (!awaitRateGate(activeSession, chunkIndex, future, lastException)) {
++                throw IOException("Cancelled during rate-limit backoff")
++            }
++            startedAtMs = gate.now()
+             try {
+-                return downloadChunkOnce(activeSession, chunkIndex, future)
++                return downloadChunkOnce(activeSession, chunkIndex, future, startedAtMs = startedAtMs)
+             } catch (e: Exception) {
+                 if (activeSession.abandoned.get() || future.isCancelled) throw IOException("Session abandoned or cancelled")
+                 lastException = e
+ 
++                // A non-rate-limit error after a 429 is a different failure: surface it.
+                 rl = e.findRateLimitException() ?: throw e
+-                activeSession.noteRateLimitHit()
+-                attempt++
+             }
+         }
+-        throw IOException("Chunk $chunkIndex still rate-limited after $RATE_LIMIT_MAX_BACKOFF_RETRIES backoffs", lastException)
+     }
+ 
+-    private fun rateLimitWaitMs(
+-        attempt: Int,
+-        escalation: Int,
+-        rl: HttpDataSource.InvalidResponseCodeException
+-    ): Long {
+-        val jitter = (Math.random() * RATE_LIMIT_BACKOFF_JITTER_MS).toLong()
+-        val header = rl.headerFields.entries
+-            .firstOrNull { it.key?.equals("Retry-After", ignoreCase = true) == true }
+-            ?.value?.firstOrNull()?.trim()
+-        val headerMs = ParallelRangeRetryAfter.parseHeaderMs(header)
+-        if (headerMs != null) {
+-            return headerMs.coerceAtMost(RATE_LIMIT_WAIT_HARD_CAP_MS) + jitter
+-        }
+-        val cycleCapMs = (RATE_LIMIT_BACKOFF_CYCLE_CAP_MS shl escalation.coerceIn(0, RATE_LIMIT_ESCALATION_MAX))
+-            .coerceAtMost(RATE_LIMIT_WAIT_HARD_CAP_MS)
+-        val base = RATE_LIMIT_BACKOFF_BASE_MS shl (attempt + escalation).coerceIn(0, 6)
+-        return base.coerceIn(RATE_LIMIT_BACKOFF_BASE_MS, cycleCapMs) + jitter
+-    }
+-
+-    private fun sleepInterruptibly(
+-        totalMs: Long,
++    /**
++     * Waits until the session's rate gate lets piece [chunkIndex] send. False when the piece was retired meanwhile;
++     * throws once the server has refused everything for [ParallelRangeRateGate.GIVE_UP_MS].
++     */
++    private fun awaitRateGate(
++        activeSession: ChunkSession,
++        chunkIndex: Long,
+         future: CompletableFuture<*>,
+-        activeSession: ChunkSession
++        cause: Exception?
+     ): Boolean {
+-        var slept = 0L
+-        while (slept < totalMs) {
+-            if (future.isCancelled || activeSession.abandoned.get()) return false
+-            val slice = minOf(RATE_LIMIT_SLEEP_SLICE_MS, totalMs - slept)
+-            try {
+-                Thread.sleep(slice)
+-            } catch (_: InterruptedException) {
+-                return false
++        val gate = activeSession.rateGate
++        var started = false
++        try {
++            while (true) {
++                if (future.isDone || future.isCancelled || activeSession.abandoned.get()) return false
++                if (gate.tryStart(chunkIndex)) {
++                    started = true
++                    return true
++                }
++                if (gate.spellMs() >= ParallelRangeRateGate.GIVE_UP_MS) {
++                    throw IOException("Chunk $chunkIndex still rate-limited after ${gate.spellMs() / 1000} s", cause)
++                }
++                try {
++                    Thread.sleep(RATE_LIMIT_SLEEP_SLICE_MS)
++                } catch (_: InterruptedException) {
++                    return false
++                }
+             }
+-            slept += slice
++        } finally {
++            if (!started) gate.leave(chunkIndex)
+         }
+-        return !(future.isCancelled || activeSession.abandoned.get())
++    }
++
++    private fun retryAfterMs(rl: HttpDataSource.InvalidResponseCodeException): Long? {
++        val header = rl.headerFields.entries
++            .firstOrNull { it.key?.equals("Retry-After", ignoreCase = true) == true }
++            ?.value?.firstOrNull()?.trim()
++        return ParallelRangeRetryAfter.parseHeaderMs(header)
+     }
+ 
+     private fun readIntoChunk(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeRateGate.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeRateGate.kt
+new file mode 100644
+index 0000000..b191e67
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/ParallelRangeRateGate.kt
+@@ -0,0 +1,120 @@
++package com.nuvio.tv.ui.screens.player
++
++import java.util.TreeSet
++
++/**
++ * A chunk session's "too many requests" spell. While it lasts no piece request starts. When the wait is over one
++ * request, the piece nearest the player, tries alone; the others follow only once a request is answered again.
++ * Refusals of requests sent before the latest counted refusal belong to the same burst and count once.
++ */
++internal class ParallelRangeRateGate(
++    private val clock: () -> Long,
++    private val jitter: (Long) -> Long = { bound -> (Math.random() * bound).toLong() }
++) {
++    companion object {
++        const val FIRST_WAIT_MS = 2_000L
++        const val MAX_WAIT_MS = 15_000L
++        const val JITTER_MS = 250L
++        /** A spell this long with no request answered fails the waiting pieces, so the player can give up cleanly. */
++        const val GIVE_UP_MS = 120_000L
++        private const val NONE = Long.MIN_VALUE
++
++        /** The wait after the [refusals]th refusal in a row: the server's Retry-After, else 2 s doubling, at most 15 s. */
++        fun waitMs(refusals: Int, retryAfterMs: Long?): Long {
++            if (retryAfterMs != null) return retryAfterMs.coerceIn(0L, MAX_WAIT_MS)
++            val shift = (refusals - 1).coerceIn(0, 4)
++            return (FIRST_WAIT_MS shl shift).coerceAtMost(MAX_WAIT_MS)
++        }
++    }
++
++    private var spellStartMs = NONE
++    private var lastRefusalMs = NONE
++    private var blockedUntilMs = NONE
++    private var probe: Long? = null
++    private val waiting = TreeSet<Long>()
++
++    @Volatile
++    var refusals = 0
++        private set
++
++    fun now(): Long = clock()
++
++    @get:Synchronized
++    val blocking: Boolean get() = spellStartMs != NONE
++
++    /** Ms the spell has lasted, 0 when there is none. */
++    @Synchronized
++    fun spellMs(): Long = if (spellStartMs == NONE) 0L else (clock() - spellStartMs).coerceAtLeast(0L)
++
++    /** Ms until the next request may try, 0 when it may try now. */
++    @Synchronized
++    fun waitLeftMs(): Long = if (spellStartMs == NONE) 0L else (blockedUntilMs - clock()).coerceAtLeast(0L)
++
++    /**
++     * Piece [index]'s request sent at [startedAtMs] was refused. Returns the refusal's number in this spell when it is
++     * a new one (it starts or lengthens the wait), 0 when it belongs to a burst already counted.
++     */
++    @Synchronized
++    fun refused(index: Long, startedAtMs: Long, retryAfterMs: Long?): Int {
++        val now = clock()
++        if (probe == index) probe = null
++        val counted = spellStartMs == NONE || lastRefusalMs == NONE || startedAtMs > lastRefusalMs
++        if (counted) {
++            if (spellStartMs == NONE) spellStartMs = now
++            lastRefusalMs = now
++            refusals++
++            blockedUntilMs = maxOf(blockedUntilMs, now + waitMs(refusals, retryAfterMs) + jitter(JITTER_MS))
++        } else if (retryAfterMs != null) {
++            blockedUntilMs = maxOf(blockedUntilMs, now + retryAfterMs.coerceIn(0L, MAX_WAIT_MS))
++        }
++        return if (counted) refusals else 0
++    }
++
++    /** May piece [index] send its request now? While it may not, it is counted as waiting until [leave]. */
++    @Synchronized
++    fun tryStart(index: Long): Boolean {
++        if (spellStartMs == NONE) {
++            waiting.remove(index)
++            return true
++        }
++        waiting.add(index)
++        if (clock() < blockedUntilMs) return false
++        val current = probe
++        if (current != null && current != index) return false
++        if (waiting.first() != index) return false
++        probe = index
++        waiting.remove(index)
++        return true
++    }
++
++    @Synchronized
++    fun waitingCount(): Int = waiting.size
++
++    /** Piece [index] stopped waiting without sending. */
++    @Synchronized
++    fun leave(index: Long) {
++        waiting.remove(index)
++    }
++
++    /** Piece [index]'s request ended without a refusal; a probe that failed otherwise lets the next one try. */
++    @Synchronized
++    fun finished(index: Long) {
++        waiting.remove(index)
++        if (probe == index) probe = null
++    }
++
++    /**
++     * A request sent at [startedAtMs] was answered. One sent after the latest refusal ends the spell; returns true
++     * when it did.
++     */
++    @Synchronized
++    fun answered(startedAtMs: Long): Boolean {
++        if (spellStartMs == NONE || startedAtMs <= lastRefusalMs) return false
++        spellStartMs = NONE
++        blockedUntilMs = NONE
++        refusals = 0
++        probe = null
++        waiting.clear()
++        return true
++    }
++}
+diff --git a/app/src/test/java/com/nuvio/tv/ui/screens/player/ParallelRangeRateGateTest.kt b/app/src/test/java/com/nuvio/tv/ui/screens/player/ParallelRangeRateGateTest.kt
+new file mode 100644
+index 0000000..4c7c415
+--- /dev/null
++++ b/app/src/test/java/com/nuvio/tv/ui/screens/player/ParallelRangeRateGateTest.kt
+@@ -0,0 +1,173 @@
++package com.nuvio.tv.ui.screens.player
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class ParallelRangeRateGateTest {
++    private var now = 10_000L
++    private val gate = ParallelRangeRateGate(clock = { now }, jitter = { 0L })
++
++    @Test
++    fun `open gate lets every piece start`() {
++        assertFalse(gate.blocking)
++        assertTrue(gate.tryStart(1))
++        assertTrue(gate.tryStart(2))
++        assertEquals(0, gate.waitingCount())
++    }
++
++    @Test
++    fun `a burst refused together counts once and waits two seconds`() {
++        val sent = now
++        now += 300
++        assertEquals(1, gate.refused(1, sent, null))
++        assertEquals(0, gate.refused(2, sent, null))
++        assertEquals(0, gate.refused(3, sent, null))
++        assertEquals(1, gate.refusals)
++        assertTrue(gate.blocking)
++        assertEquals(ParallelRangeRateGate.FIRST_WAIT_MS, gate.waitLeftMs())
++    }
++
++    @Test
++    fun `nothing starts during the wait, then only the piece nearest the player tries`() {
++        val sent = now
++        gate.refused(3, sent, null)
++        gate.refused(1, sent, null)
++        gate.refused(2, sent, null)
++        assertFalse(gate.tryStart(3))
++        assertFalse(gate.tryStart(2))
++        assertFalse(gate.tryStart(1))
++        assertFalse(gate.tryStart(7))
++        assertEquals(4, gate.waitingCount())
++
++        now += ParallelRangeRateGate.FIRST_WAIT_MS
++        assertFalse(gate.tryStart(3))
++        assertFalse(gate.tryStart(7))
++        assertTrue(gate.tryStart(1))
++        assertFalse("one try at a time", gate.tryStart(2))
++
++        val probeSent = now
++        now += 400
++        assertTrue(gate.answered(probeSent))
++        assertFalse(gate.blocking)
++        assertTrue(gate.tryStart(2))
++        assertTrue(gate.tryStart(3))
++        assertTrue(gate.tryStart(7))
++        assertEquals(0, gate.refusals)
++    }
++
++    @Test
++    fun `a refused try doubles the wait up to fifteen seconds`() {
++        gate.refused(1, now, null)
++        val waits = mutableListOf(gate.waitLeftMs())
++        repeat(5) {
++            now += gate.waitLeftMs()
++            assertTrue(gate.tryStart(1))
++            val sent = now
++            now += 100
++            assertTrue(gate.refused(1, sent, null) > 0)
++            waits += gate.waitLeftMs()
++        }
++        assertEquals(listOf(2_000L, 4_000L, 8_000L, 15_000L, 15_000L, 15_000L), waits)
++    }
++
++    @Test
++    fun `retry after from the server is honoured up to fifteen seconds`() {
++        gate.refused(1, now, 5_000L)
++        assertEquals(5_000L, gate.waitLeftMs())
++        now += 5_000L
++        assertTrue(gate.tryStart(1))
++        val sent = now
++        now += 50
++        gate.refused(1, sent, 600_000L)
++        assertEquals(ParallelRangeRateGate.MAX_WAIT_MS, gate.waitLeftMs())
++    }
++
++    @Test
++    fun `retry after on a refusal already counted still lengthens the wait`() {
++        val sent = now
++        gate.refused(1, sent, null)
++        assertEquals(0, gate.refused(2, sent, 9_000L))
++        assertEquals(9_000L, gate.waitLeftMs())
++    }
++
++    @Test
++    fun `an answer to a request sent before the refusal does not end the spell`() {
++        val earlier = now
++        now += 1_000
++        gate.refused(1, earlier + 500, null)
++        assertFalse(gate.answered(earlier))
++        assertTrue(gate.blocking)
++    }
++
++    @Test
++    fun `a try that fails another way lets the next piece try`() {
++        gate.refused(1, now, null)
++        assertFalse(gate.tryStart(1))
++        assertFalse(gate.tryStart(2))
++        now += ParallelRangeRateGate.FIRST_WAIT_MS
++        assertTrue(gate.tryStart(1))
++        assertFalse(gate.tryStart(2))
++        gate.finished(1)
++        assertTrue(gate.tryStart(2))
++    }
++
++    @Test
++    fun `a piece that stops waiting does not hold the others back`() {
++        gate.refused(1, now, null)
++        assertFalse(gate.tryStart(1))
++        assertFalse(gate.tryStart(2))
++        gate.leave(1)
++        now += ParallelRangeRateGate.FIRST_WAIT_MS
++        assertTrue(gate.tryStart(2))
++    }
++
++    @Test
++    fun `a refused try frees the try for the piece nearest the player`() {
++        gate.refused(2, now, null)
++        now += ParallelRangeRateGate.FIRST_WAIT_MS
++        assertTrue(gate.tryStart(2))
++        val sent = now
++        assertFalse(gate.tryStart(1))
++        now += 100
++        gate.refused(2, sent, null)
++        assertEquals(2, gate.refusals)
++        now += gate.waitLeftMs()
++        assertFalse(gate.tryStart(2))
++        assertTrue(gate.tryStart(1))
++    }
++
++    @Test
++    fun `the spell length grows until a request is answered`() {
++        assertEquals(0L, gate.spellMs())
++        gate.refused(1, now, null)
++        now += 30_000
++        assertEquals(30_000L, gate.spellMs())
++        now += ParallelRangeRateGate.GIVE_UP_MS
++        assertTrue(gate.spellMs() >= ParallelRangeRateGate.GIVE_UP_MS)
++        assertTrue(gate.tryStart(1))
++        val sent = now
++        now += 10
++        gate.answered(sent)
++        assertEquals(0L, gate.spellMs())
++    }
++
++    @Test
++    fun `a later spell starts from the short wait again`() {
++        gate.refused(1, now, null)
++        now += 2_000
++        gate.tryStart(1)
++        val sent = now
++        now += 10
++        gate.refused(1, sent, null)
++        now += gate.waitLeftMs()
++        gate.tryStart(1)
++        val answeredSent = now
++        now += 10
++        assertTrue(gate.answered(answeredSent))
++        now += 60_000
++        gate.refused(4, now - 5, null)
++        assertEquals(ParallelRangeRateGate.FIRST_WAIT_MS, gate.waitLeftMs())
++    }
++}
