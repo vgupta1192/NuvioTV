@@ -1,0 +1,580 @@
+diff --git a/app/src/main/java/com/nuvio/tv/data/local/LayoutPreferenceDataStore.kt b/app/src/main/java/com/nuvio/tv/data/local/LayoutPreferenceDataStore.kt
+index 835d95704..242cedc84 100644
+--- a/app/src/main/java/com/nuvio/tv/data/local/LayoutPreferenceDataStore.kt
++++ b/app/src/main/java/com/nuvio/tv/data/local/LayoutPreferenceDataStore.kt
+@@ -120,6 +120,8 @@ class LayoutPreferenceDataStore @Inject constructor(
+     private val netflixPrevMutedKey = booleanPreferencesKey("netflix_prev_muted")
+     private val netflixPrevTargetKey = stringPreferencesKey("netflix_prev_target")
+     private val netflixPrevCwStyleKey = stringPreferencesKey("netflix_prev_cw_style")
++    private val liveTvNetflixStyleKey = booleanPreferencesKey("livetv_netflix_style_enabled")
++    private val netflixPrevLiveTvKey = booleanPreferencesKey("netflix_prev_livetv")
+     private val showUnairedNextUpKey = booleanPreferencesKey("show_unaired_next_up")
+     private val nextUpFromFurthestEpisodeKey = booleanPreferencesKey("next_up_from_furthest_episode")
+     private val blurContinueWatchingNextUpKey = booleanPreferencesKey("blur_continue_watching_next_up")
+@@ -288,6 +290,14 @@ class LayoutPreferenceDataStore @Inject constructor(
+         prefs[netflixStyleEnabledKey] ?: false
+     }
+ 
++    val liveTvNetflixStyleEnabled: Flow<Boolean> = profileFlow { prefs ->
++        prefs[liveTvNetflixStyleKey] ?: false
++    }
++
++    suspend fun setLiveTvNetflixStyleEnabled(enabled: Boolean) {
++        store().edit { prefs -> prefs[liveTvNetflixStyleKey] = enabled }
++    }
++
+     val classicFocusGradientEnabled: Flow<Boolean> = profileFlow { prefs ->
+         prefs[classicFocusGradientEnabledKey] ?: false
+     }
+@@ -651,6 +661,8 @@ class LayoutPreferenceDataStore @Inject constructor(
+                 prefs[focusedPosterBackdropTrailerPlaybackTargetKey] =
+                     FocusedPosterTrailerPlaybackTarget.EXPANDED_CARD.name
+                 prefs[continueWatchingCardStyleKey] = ContinueWatchingCardStyle.CARD.name
++                prefs[netflixPrevLiveTvKey] = prefs[liveTvNetflixStyleKey] ?: false
++                prefs[liveTvNetflixStyleKey] = true
+                 prefs[netflixStyleEnabledKey] = true
+             } else {
+                 prefs[focusedPosterBackdropExpandEnabledKey] = prefs[netflixPrevExpandKey] ?: true
+@@ -662,6 +674,7 @@ class LayoutPreferenceDataStore @Inject constructor(
+                     ?: FocusedPosterTrailerPlaybackTarget.HERO_MEDIA.name
+                 prefs[continueWatchingCardStyleKey] = prefs[netflixPrevCwStyleKey]
+                     ?: ContinueWatchingCardStyle.CARD.name
++                prefs[liveTvNetflixStyleKey] = prefs[netflixPrevLiveTvKey] ?: false
+                 prefs[netflixStyleEnabledKey] = false
+             }
+         }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvChannelsSettingsPane.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvChannelsSettingsPane.kt
+index e6f4b0ece..c34df61fa 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvChannelsSettingsPane.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvChannelsSettingsPane.kt
+@@ -135,6 +135,8 @@ internal fun TvChannelsSettingsPane(
+ 
+         item { TvIptvSettingsGroup() }
+ 
++        item { TvLiveNetflixSettingsGroup() }
++
+         // Grupo 2: Reprodução e Controle Parental
+         item {
+             SettingsGroupCard(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvLiveNetflixSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvLiveNetflixSettings.kt
+new file mode 100644
+index 000000000..16541e6f4
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvLiveNetflixSettings.kt
+@@ -0,0 +1,54 @@
++@file:OptIn(ExperimentalTvMaterial3Api::class)
++
++package com.nuvio.tv.ui.screens.settings
++
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.res.stringResource
++import androidx.hilt.navigation.compose.hiltViewModel
++import androidx.lifecycle.ViewModel
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import androidx.lifecycle.viewModelScope
++import androidx.tv.material3.ExperimentalTvMaterial3Api
++import com.nuvio.tv.R
++import com.nuvio.tv.data.local.LayoutPreferenceDataStore
++import dagger.hilt.android.lifecycle.HiltViewModel
++import kotlinx.coroutines.flow.SharingStarted
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.stateIn
++import kotlinx.coroutines.launch
++import javax.inject.Inject
++
++@HiltViewModel
++class TvLiveNetflixSettingsViewModel @Inject constructor(
++    private val layoutPreferenceDataStore: LayoutPreferenceDataStore
++) : ViewModel() {
++    val enabled: StateFlow<Boolean> = layoutPreferenceDataStore.liveTvNetflixStyleEnabled
++        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
++
++    fun set(value: Boolean) {
++        viewModelScope.launch { layoutPreferenceDataStore.setLiveTvNetflixStyleEnabled(value) }
++    }
++}
++
++/** Settings > Live TV: Netflix style for the Live TV screen (same preference as the chip on that screen). */
++@Composable
++internal fun TvLiveNetflixSettingsGroup(
++    viewModel: TvLiveNetflixSettingsViewModel = hiltViewModel()
++) {
++    val enabled by viewModel.enabled.collectAsStateWithLifecycle()
++    SettingsGroupCard(
++        modifier = Modifier.fillMaxWidth(),
++        title = stringResource(R.string.livetv_netflix_group_title),
++        subtitle = stringResource(R.string.livetv_netflix_group_sub)
++    ) {
++        SettingsToggleRow(
++            title = stringResource(R.string.livetv_netflix_toggle),
++            subtitle = stringResource(R.string.livetv_netflix_toggle_sub),
++            checked = enabled,
++            onToggle = { viewModel.set(!enabled) }
++        )
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
+index 9225d96cb..f18a13024 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
+@@ -116,6 +116,7 @@ import com.nuvio.tv.ui.components.LoadingIndicator
+ import com.nuvio.tv.ui.screens.tvchannels.components.TvAddonsSelectionDialog
+ import com.nuvio.tv.ui.screens.tvchannels.components.TvChannelFullscreenHud
+ import com.nuvio.tv.ui.screens.tvchannels.components.TvChannelListItem
++import com.nuvio.tv.ui.screens.tvchannels.components.TvChannelNetflixCard
+ import com.nuvio.tv.ui.screens.tvchannels.components.TvChannelPreviewPanel
+ import com.nuvio.tv.ui.screens.tvchannels.components.TvChannelScheduleDialog
+ import com.nuvio.tv.ui.screens.tvchannels.components.TvEpgGridGuide
+@@ -128,6 +129,7 @@ fun TvChannelsScreen(
+     modifier: Modifier = Modifier
+ ) {
+     val state by viewModel.uiState.collectAsStateWithLifecycle()
++    val netflixLive by viewModel.netflixStyle.collectAsStateWithLifecycle()
+     val listState = rememberLazyListState()
+     val context = LocalContext.current
+     val keyboardController = LocalSoftwareKeyboardController.current
+@@ -540,6 +542,26 @@ fun TvChannelsScreen(
+                         }
+                     }
+ 
++                    // Netflix style chip (same preference as Settings > Live TV)
++                    Button(
++                        onClick = { viewModel.setNetflixStyle(!netflixLive) },
++                        modifier = Modifier.focusProperties {
++                            down = searchInputFocusRequester
++                        },
++                        shape = ButtonDefaults.shape(shape = RoundedCornerShape(8.dp)),
++                        colors = ButtonDefaults.colors(
++                            containerColor = if (netflixLive) NuvioTheme.colors.Secondary else Color.White.copy(alpha = 0.10f),
++                            focusedContainerColor = Color.White,
++                            focusedContentColor = Color.Black
++                        )
++                    ) {
++                        Text(
++                            text = stringResource(R.string.livetv_netflix_chip),
++                            fontSize = 12.sp,
++                            fontWeight = FontWeight.SemiBold
++                        )
++                    }
++
+                     // Botão de Addons
+                     Button(
+                         onClick = { viewModel.setAddonsDialogVisible(true) },
+@@ -1134,38 +1156,54 @@ fun TvChannelsScreen(
+                                     val isPlaying = isSelected && state.isPreviewPlaybackActive && state.previewStreams.isNotEmpty()
+                                     val itemRequester = channelFocusRequesters.getOrPut(channelIndex) { FocusRequester() }
+ 
+-                                    TvChannelListItem(
+-                                        channel = channel,
+-                                        isSelected = isSelected,
+-                                        isPlaying = isPlaying,
+-                                        modifier = Modifier
+-                                            .focusRequester(itemRequester)
+-                                            .focusProperties {
+-                                                if (channelIndex == 0) {
+-                                                    up = categoriesContainerFocusRequester
+-                                                }
+-                                                right = previewPanelFocusRequester
++                                    val itemModifier = Modifier
++                                        .focusRequester(itemRequester)
++                                        .focusProperties {
++                                            if (channelIndex == 0) {
++                                                up = categoriesContainerFocusRequester
+                                             }
+-                                            .onPreviewKeyEvent { keyEvent ->
+-                                                if (keyEvent.nativeKeyEvent.action == KeyEvent.ACTION_DOWN &&
+-                                                    keyEvent.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_DPAD_RIGHT
+-                                                ) {
+-                                                    runCatching { previewPanelFocusRequester.requestFocus() }
+-                                                    return@onPreviewKeyEvent true
+-                                                }
+-                                                false
+-                                            },
+-                                        onFocused = {
+-                                            lastFocusedChannelIndex = channelIndex
+-                                            viewModel.onChannelFocused(channel)
+-                                        },
+-                                        onClick = {
+-                                            viewModel.onChannelClicked(channel, openFullscreen = true)
+-                                        },
+-                                        onLongClick = {
+-                                            viewModel.toggleFavorite(channel)
++                                            right = previewPanelFocusRequester
+                                         }
+-                                    )
++                                        .onPreviewKeyEvent { keyEvent ->
++                                            if (keyEvent.nativeKeyEvent.action == KeyEvent.ACTION_DOWN &&
++                                                keyEvent.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_DPAD_RIGHT
++                                            ) {
++                                                runCatching { previewPanelFocusRequester.requestFocus() }
++                                                return@onPreviewKeyEvent true
++                                            }
++                                            false
++                                        }
++                                    val onItemFocused = {
++                                        lastFocusedChannelIndex = channelIndex
++                                        viewModel.onChannelFocused(channel)
++                                    }
++                                    val onItemClick = {
++                                        viewModel.onChannelClicked(channel, openFullscreen = true)
++                                    }
++                                    val onItemLongClick = {
++                                        viewModel.toggleFavorite(channel)
++                                    }
++                                    if (netflixLive) {
++                                        TvChannelNetflixCard(
++                                            channel = channel,
++                                            isSelected = isSelected,
++                                            isPlaying = isPlaying,
++                                            modifier = itemModifier,
++                                            onFocused = onItemFocused,
++                                            onClick = onItemClick,
++                                            onLongClick = onItemLongClick
++                                        )
++                                    } else {
++                                        TvChannelListItem(
++                                            channel = channel,
++                                            isSelected = isSelected,
++                                            isPlaying = isPlaying,
++                                            modifier = itemModifier,
++                                            onFocused = onItemFocused,
++                                            onClick = onItemClick,
++                                            onLongClick = onItemLongClick
++                                        )
++                                    }
+                                 }
+                             }
+                         }
+@@ -1206,6 +1244,7 @@ fun TvChannelsScreen(
+                     onStreamSelected = { idx ->
+                         viewModel.selectStreamIndex(idx)
+                     },
++                    mutePreview = netflixLive,
+                     modifier = Modifier
+                         .weight(1.0f)
+                         .fillMaxHeight()
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsViewModel.kt
+index 2b5c26ab9..f2554b7af 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsViewModel.kt
+@@ -3,24 +3,36 @@ package com.nuvio.tv.ui.screens.tvchannels
+ import androidx.lifecycle.ViewModel
+ import androidx.lifecycle.viewModelScope
+ import com.nuvio.tv.core.player.TvChannelPreviewPlayerPool
++import com.nuvio.tv.data.local.LayoutPreferenceDataStore
+ import com.nuvio.tv.data.repository.TvChannelsRepository
+ import com.nuvio.tv.domain.model.TvChannelItem
+ import com.nuvio.tv.domain.model.TvChannelsUiState
+ import dagger.hilt.android.lifecycle.HiltViewModel
+ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.SharingStarted
+ import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.stateIn
+ import kotlinx.coroutines.launch
+ import javax.inject.Inject
+ 
+ @HiltViewModel
+ class TvChannelsViewModel @Inject constructor(
+     private val repository: TvChannelsRepository,
+-    val playerPool: TvChannelPreviewPlayerPool
++    val playerPool: TvChannelPreviewPlayerPool,
++    private val layoutPreferenceDataStore: LayoutPreferenceDataStore
+ ) : ViewModel() {
+ 
+     val uiState: StateFlow<TvChannelsUiState> = repository.uiState
+ 
++    /** Live TV "Netflix style": landscape cards and a muted preview that starts after a short focus delay. */
++    val netflixStyle: StateFlow<Boolean> = layoutPreferenceDataStore.liveTvNetflixStyleEnabled
++        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
++
++    fun setNetflixStyle(enabled: Boolean) {
++        viewModelScope.launch { layoutPreferenceDataStore.setLiveTvNetflixStyleEnabled(enabled) }
++    }
++
+     private var focusDebounceJob: Job? = null
+ 
+     init {
+@@ -36,13 +48,14 @@ class TvChannelsViewModel @Inject constructor(
+         if (uiState.value.previewChannel?.stableKey() == channel.stableKey()) return
+         focusDebounceJob?.cancel()
+ 
+-        val isAutoplay = uiState.value.channelAutoplay
++        val netflix = netflixStyle.value
++        val isAutoplay = uiState.value.channelAutoplay || netflix
+         if (!isAutoplay) {
+             repository.selectChannelMetadata(channel)
+             playerPool.stop()
+         } else {
+             focusDebounceJob = viewModelScope.launch {
+-                delay(450L)
++                delay(if (netflix) 900L else 450L)
+                 repository.selectChannelForPreview(channel, startPlayback = true)
+             }
+         }
+@@ -57,7 +70,7 @@ class TvChannelsViewModel @Inject constructor(
+         com.nuvio.tv.core.diagnostics.ForkStability.note("live tv channel click \"${channel.name}\" fullscreen=$openFullscreen")
+         focusDebounceJob?.cancel()
+         val currentUiState = uiState.value
+-        val isAutoplay = currentUiState.channelAutoplay
++        val isAutoplay = currentUiState.channelAutoplay || netflixStyle.value
+         val isSameChannel = currentUiState.previewChannel?.stableKey() == channel.stableKey()
+         val isCurrentlyPlaying = isSameChannel && currentUiState.isPreviewPlaybackActive && currentUiState.previewStreams.isNotEmpty()
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelNetflixCard.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelNetflixCard.kt
+new file mode 100644
+index 000000000..bf6271e82
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelNetflixCard.kt
+@@ -0,0 +1,214 @@
++package com.nuvio.tv.ui.screens.tvchannels.components
++
++import androidx.compose.foundation.BorderStroke
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxHeight
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.rounded.Star
++import androidx.compose.material.icons.rounded.Tv
++import androidx.compose.material3.Icon
++import androidx.compose.material3.LinearProgressIndicator
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.focus.onFocusChanged
++import androidx.compose.ui.graphics.Brush
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.layout.ContentScale
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import androidx.tv.material3.Border
++import androidx.tv.material3.ClickableSurfaceDefaults
++import androidx.tv.material3.ExperimentalTvMaterial3Api
++import androidx.tv.material3.MaterialTheme
++import androidx.tv.material3.Surface
++import androidx.tv.material3.Text
++import coil3.compose.AsyncImage
++import com.nuvio.tv.R
++import com.nuvio.tv.domain.model.TvChannelItem
++import com.nuvio.tv.ui.theme.NuvioTheme
++
++/**
++ * Live TV "Netflix style" channel entry: a landscape card led by the channel artwork, with the
++ * current programme title and a progress bar when guide data exists.
++ */
++@OptIn(ExperimentalTvMaterial3Api::class)
++@Composable
++fun TvChannelNetflixCard(
++    channel: TvChannelItem,
++    isSelected: Boolean,
++    isPlaying: Boolean = false,
++    onFocused: () -> Unit,
++    onClick: () -> Unit,
++    onLongClick: () -> Unit,
++    modifier: Modifier = Modifier
++) {
++    val shape = RoundedCornerShape(12.dp)
++
++    Surface(
++        onClick = onClick,
++        onLongClick = onLongClick,
++        modifier = modifier
++            .fillMaxWidth()
++            .height(96.dp)
++            .onFocusChanged { focusState ->
++                if (focusState.isFocused) onFocused()
++            },
++        shape = ClickableSurfaceDefaults.shape(shape),
++        scale = ClickableSurfaceDefaults.scale(focusedScale = 1.03f),
++        colors = ClickableSurfaceDefaults.colors(
++            containerColor = if (isSelected) {
++                NuvioTheme.colors.Secondary.copy(alpha = 0.18f)
++            } else {
++                NuvioTheme.colors.BackgroundElevated.copy(alpha = 0.65f)
++            },
++            focusedContainerColor = NuvioTheme.colors.Secondary.copy(alpha = 0.30f)
++        ),
++        border = ClickableSurfaceDefaults.border(
++            focusedBorder = Border(
++                border = BorderStroke(2.dp, Color.White),
++                shape = shape
++            ),
++            border = Border(
++                border = BorderStroke(
++                    1.dp,
++                    if (isSelected) NuvioTheme.colors.Secondary.copy(alpha = 0.6f) else Color.White.copy(alpha = 0.06f)
++                ),
++                shape = shape
++            )
++        )
++    ) {
++        Row(modifier = Modifier.fillMaxSize()) {
++            // Landscape artwork
++            Box(
++                modifier = Modifier
++                    .width(170.dp)
++                    .fillMaxHeight()
++                    .background(
++                        Brush.linearGradient(listOf(Color(0xFF2A2A33), Color(0xFF14141A)))
++                    ),
++                contentAlignment = Alignment.Center
++            ) {
++                val logoUrl = channel.displayLogo
++                if (!logoUrl.isNullOrBlank()) {
++                    AsyncImage(
++                        model = logoUrl,
++                        contentDescription = channel.name,
++                        modifier = Modifier
++                            .fillMaxSize()
++                            .padding(10.dp),
++                        contentScale = ContentScale.Fit
++                    )
++                } else {
++                    Icon(
++                        imageVector = Icons.Rounded.Tv,
++                        contentDescription = null,
++                        tint = Color.White.copy(alpha = 0.4f),
++                        modifier = Modifier.size(34.dp)
++                    )
++                }
++                Box(
++                    modifier = Modifier
++                        .align(Alignment.TopStart)
++                        .padding(6.dp)
++                        .clip(RoundedCornerShape(4.dp))
++                        .background(Color(0xFFE50914))
++                        .padding(horizontal = 5.dp, vertical = 1.dp)
++                ) {
++                    Text(
++                        text = if (isPlaying) stringResource(R.string.tv_channels_playing_badge)
++                        else stringResource(R.string.tv_channels_live_badge),
++                        color = Color.White,
++                        fontSize = 9.sp,
++                        fontWeight = FontWeight.ExtraBold
++                    )
++                }
++            }
++
++            Column(
++                modifier = Modifier
++                    .weight(1f)
++                    .fillMaxHeight()
++                    .padding(horizontal = 14.dp, vertical = 10.dp),
++                verticalArrangement = Arrangement.Center
++            ) {
++                Row(
++                    verticalAlignment = Alignment.CenterVertically,
++                    horizontalArrangement = Arrangement.spacedBy(6.dp)
++                ) {
++                    Text(
++                        text = channel.name,
++                        style = MaterialTheme.typography.titleSmall,
++                        fontWeight = FontWeight.Bold,
++                        color = Color.White,
++                        maxLines = 1,
++                        overflow = TextOverflow.Ellipsis,
++                        modifier = Modifier.weight(1f, fill = false)
++                    )
++                    if (channel.isFavorite) {
++                        Icon(
++                            imageVector = Icons.Rounded.Star,
++                            contentDescription = stringResource(R.string.tv_channels_favorited_button),
++                            tint = Color(0xFFFFD700),
++                            modifier = Modifier.size(14.dp)
++                        )
++                    }
++                }
++
++                Spacer(modifier = Modifier.height(4.dp))
++
++                val nowProgram = channel.epgInfo?.nowProgram
++                if (nowProgram != null) {
++                    Text(
++                        text = nowProgram.title,
++                        style = MaterialTheme.typography.bodySmall,
++                        color = Color.White.copy(alpha = 0.8f),
++                        maxLines = 2,
++                        overflow = TextOverflow.Ellipsis,
++                        fontSize = 12.sp
++                    )
++                    val now = System.currentTimeMillis()
++                    val prog = nowProgram.progress(now)
++                    if (prog > 0f) {
++                        Spacer(modifier = Modifier.height(6.dp))
++                        LinearProgressIndicator(
++                            progress = { prog },
++                            modifier = Modifier
++                                .fillMaxWidth()
++                                .height(3.dp)
++                                .clip(CircleShape),
++                            color = Color(0xFFE50914),
++                            trackColor = Color.White.copy(alpha = 0.15f)
++                        )
++                    }
++                } else {
++                    Text(
++                        text = channel.addonName,
++                        style = MaterialTheme.typography.bodySmall,
++                        color = Color.White.copy(alpha = 0.45f),
++                        maxLines = 1,
++                        overflow = TextOverflow.Ellipsis,
++                        fontSize = 11.sp
++                    )
++                }
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt
+index f1c9ba51a..e9819884d 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt
+@@ -84,6 +84,7 @@ fun TvChannelPreviewPanel(
+     onToggleFavorite: () -> Unit,
+     onOpenSchedule: () -> Unit,
+     onStreamSelected: (Int) -> Unit,
++    mutePreview: Boolean = false,
+     onRequestChannelListFocus: (() -> Unit)? = null,
+     panelFocusRequester: FocusRequester? = null,
+     modifier: Modifier = Modifier
+@@ -139,6 +140,7 @@ fun TvChannelPreviewPanel(
+                     streamUrl = playableUrl,
+                     playerPool = playerPool,
+                     isPlaying = playbackError == null,
++                    isMuted = mutePreview,
+                     headers = streamHeaders,
+                     wideBars = isWideBarsChannel(channel?.name),
+                     onError = { err ->
+diff --git a/app/src/main/res/values/strings_livetv_netflix.xml b/app/src/main/res/values/strings_livetv_netflix.xml
+new file mode 100644
+index 000000000..fe1cf9200
+--- /dev/null
++++ b/app/src/main/res/values/strings_livetv_netflix.xml
+@@ -0,0 +1,8 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="livetv_netflix_chip">Netflix style</string>
++    <string name="livetv_netflix_group_title">Netflix style</string>
++    <string name="livetv_netflix_group_sub">How the Live TV screen looks.</string>
++    <string name="livetv_netflix_toggle">Netflix style Live TV</string>
++    <string name="livetv_netflix_toggle_sub">Landscape channel cards with the current programme, and a muted preview that starts shortly after you focus a channel. Turn off for the original Live TV look.</string>
++</resources>
