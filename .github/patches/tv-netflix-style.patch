@@ -1,0 +1,145 @@
+diff --git a/app/src/main/java/com/nuvio/tv/data/local/LayoutPreferenceDataStore.kt b/app/src/main/java/com/nuvio/tv/data/local/LayoutPreferenceDataStore.kt
+index 3da446f87..e9d33c1e8 100644
+--- a/app/src/main/java/com/nuvio/tv/data/local/LayoutPreferenceDataStore.kt
++++ b/app/src/main/java/com/nuvio/tv/data/local/LayoutPreferenceDataStore.kt
+@@ -113,6 +113,13 @@ class LayoutPreferenceDataStore @Inject constructor(
+     private val useEpisodeThumbnailsInCwKey = booleanPreferencesKey("use_episode_thumbnails_in_cw")
+     private val continueWatchingEnabledKey = booleanPreferencesKey("continue_watching_enabled")
+     private val continueWatchingCardStyleKey = stringPreferencesKey("continue_watching_card_style")
++    private val netflixStyleEnabledKey = booleanPreferencesKey("netflix_style_enabled")
++    private val netflixPrevExpandKey = booleanPreferencesKey("netflix_prev_expand")
++    private val netflixPrevDelayKey = intPreferencesKey("netflix_prev_delay")
++    private val netflixPrevTrailerKey = booleanPreferencesKey("netflix_prev_trailer")
++    private val netflixPrevMutedKey = booleanPreferencesKey("netflix_prev_muted")
++    private val netflixPrevTargetKey = stringPreferencesKey("netflix_prev_target")
++    private val netflixPrevCwStyleKey = stringPreferencesKey("netflix_prev_cw_style")
+     private val showUnairedNextUpKey = booleanPreferencesKey("show_unaired_next_up")
+     private val nextUpFromFurthestEpisodeKey = booleanPreferencesKey("next_up_from_furthest_episode")
+     private val blurContinueWatchingNextUpKey = booleanPreferencesKey("blur_continue_watching_next_up")
+@@ -277,6 +284,10 @@ class LayoutPreferenceDataStore @Inject constructor(
+         prefs[catalogTypeSuffixEnabledKey] ?: true
+     }
+ 
++    val netflixStyleEnabled: Flow<Boolean> = profileFlow { prefs ->
++        prefs[netflixStyleEnabledKey] ?: false
++    }
++
+     val classicFocusGradientEnabled: Flow<Boolean> = profileFlow { prefs ->
+         prefs[classicFocusGradientEnabledKey] ?: false
+     }
+@@ -619,6 +630,43 @@ class LayoutPreferenceDataStore @Inject constructor(
+         }
+     }
+ 
++    suspend fun setNetflixStyleEnabled(enabled: Boolean) {
++        store().edit { prefs ->
++            val active = prefs[netflixStyleEnabledKey] ?: false
++            if (enabled == active) return@edit
++            if (enabled) {
++                prefs[netflixPrevExpandKey] = prefs[focusedPosterBackdropExpandEnabledKey] ?: true
++                prefs[netflixPrevDelayKey] = prefs[focusedPosterBackdropExpandDelaySecondsKey]
++                    ?: DEFAULT_FOCUSED_POSTER_BACKDROP_EXPAND_DELAY_SECONDS
++                prefs[netflixPrevTrailerKey] = prefs[focusedPosterBackdropTrailerEnabledKey] ?: false
++                prefs[netflixPrevMutedKey] = prefs[focusedPosterBackdropTrailerMutedKey] ?: true
++                prefs[netflixPrevTargetKey] = prefs[focusedPosterBackdropTrailerPlaybackTargetKey]
++                    ?: FocusedPosterTrailerPlaybackTarget.HERO_MEDIA.name
++                prefs[netflixPrevCwStyleKey] = prefs[continueWatchingCardStyleKey]
++                    ?: ContinueWatchingCardStyle.CARD.name
++                prefs[focusedPosterBackdropExpandEnabledKey] = true
++                prefs[focusedPosterBackdropExpandDelaySecondsKey] = 1
++                prefs[focusedPosterBackdropTrailerEnabledKey] = true
++                prefs[focusedPosterBackdropTrailerMutedKey] = true
++                prefs[focusedPosterBackdropTrailerPlaybackTargetKey] =
++                    FocusedPosterTrailerPlaybackTarget.EXPANDED_CARD.name
++                prefs[continueWatchingCardStyleKey] = ContinueWatchingCardStyle.WIDE.name
++                prefs[netflixStyleEnabledKey] = true
++            } else {
++                prefs[focusedPosterBackdropExpandEnabledKey] = prefs[netflixPrevExpandKey] ?: true
++                prefs[focusedPosterBackdropExpandDelaySecondsKey] = prefs[netflixPrevDelayKey]
++                    ?: DEFAULT_FOCUSED_POSTER_BACKDROP_EXPAND_DELAY_SECONDS
++                prefs[focusedPosterBackdropTrailerEnabledKey] = prefs[netflixPrevTrailerKey] ?: false
++                prefs[focusedPosterBackdropTrailerMutedKey] = prefs[netflixPrevMutedKey] ?: true
++                prefs[focusedPosterBackdropTrailerPlaybackTargetKey] = prefs[netflixPrevTargetKey]
++                    ?: FocusedPosterTrailerPlaybackTarget.HERO_MEDIA.name
++                prefs[continueWatchingCardStyleKey] = prefs[netflixPrevCwStyleKey]
++                    ?: ContinueWatchingCardStyle.CARD.name
++                prefs[netflixStyleEnabledKey] = false
++            }
++        }
++    }
++
+     suspend fun setClassicFocusGradientEnabled(enabled: Boolean) {
+         store().edit { prefs ->
+             prefs[classicFocusGradientEnabledKey] = enabled
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutHomeSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutHomeSettings.kt
+index c332d4949..70bff8e05 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutHomeSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutHomeSettings.kt
+@@ -52,6 +52,12 @@ internal fun LayoutHomeLayoutSection(
+     onEvent: (LayoutSettingsEvent) -> Unit
+ ) {
+     val firstHomeLayoutFocusRequester = remember { FocusRequester() }
++    SettingsToggleRow(
++        title = stringResource(R.string.layout_netflix_style),
++        subtitle = stringResource(R.string.layout_netflix_style_sub),
++        checked = uiState.netflixStyleEnabled,
++        onToggle = { onEvent(LayoutSettingsEvent.SetNetflixStyleEnabled(!uiState.netflixStyleEnabled)) }
++    )
+     Row(
+         modifier = Modifier
+             .fillMaxWidth()
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutSettingsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutSettingsViewModel.kt
+index 1360f717d..ac987ff8c 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutSettingsViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutSettingsViewModel.kt
+@@ -88,6 +88,7 @@ data class LayoutSettingsUiState(
+     val continueWatchingEnabled: Boolean = true,
+     val continueWatchingSortMode: ContinueWatchingSortMode = ContinueWatchingSortMode.DEFAULT,
+     val continueWatchingCardStyle: ContinueWatchingCardStyle = ContinueWatchingCardStyle.CARD,
++    val netflixStyleEnabled: Boolean = false,
+     val customPosterUrlPattern: String = "",
+     val customPosterEnabledScreens: Set<com.nuvio.tv.core.poster.CustomPosterScreen> =
+         com.nuvio.tv.core.poster.CustomPosterScreen.ALL,
+@@ -151,6 +152,7 @@ sealed class LayoutSettingsEvent {
+     data class SetShowUnairedNextUp(val enabled: Boolean) : LayoutSettingsEvent()
+     data class SetContinueWatchingEnabled(val enabled: Boolean) : LayoutSettingsEvent()
+     data class SetContinueWatchingSortMode(val mode: ContinueWatchingSortMode) : LayoutSettingsEvent()
++    data class SetNetflixStyleEnabled(val enabled: Boolean) : LayoutSettingsEvent()
+     data class SetContinueWatchingCardStyle(val style: ContinueWatchingCardStyle) : LayoutSettingsEvent()
+     data class SetAlwaysShowLandscapeClearlogo(val enabled: Boolean) : LayoutSettingsEvent()
+     data object ResetPosterCardStyle : LayoutSettingsEvent()
+@@ -410,6 +412,13 @@ class LayoutSettingsViewModel @Inject constructor(
+                     updateUiStateIfChanged { it.copy(continueWatchingSortMode = mode) }
+                 }
+         }
++        viewModelScope.launch {
++            layoutPreferenceDataStore.netflixStyleEnabled
++                .distinctUntilChanged()
++                .collect { enabled ->
++                    updateUiStateIfChanged { it.copy(netflixStyleEnabled = enabled) }
++                }
++        }
+         viewModelScope.launch {
+             layoutPreferenceDataStore.continueWatchingCardStyle
+                 .distinctUntilChanged()
+@@ -490,6 +499,9 @@ class LayoutSettingsViewModel @Inject constructor(
+             is LayoutSettingsEvent.SetShowUnairedNextUp -> setShowUnairedNextUp(event.enabled)
+             is LayoutSettingsEvent.SetContinueWatchingEnabled -> setContinueWatchingEnabled(event.enabled)
+             is LayoutSettingsEvent.SetContinueWatchingSortMode -> setContinueWatchingSortMode(event.mode)
++            is LayoutSettingsEvent.SetNetflixStyleEnabled -> viewModelScope.launch {
++                layoutPreferenceDataStore.setNetflixStyleEnabled(event.enabled)
++            }
+             is LayoutSettingsEvent.SetContinueWatchingCardStyle -> setContinueWatchingCardStyle(event.style)
+             is LayoutSettingsEvent.SetAlwaysShowLandscapeClearlogo -> setAlwaysShowLandscapeClearlogo(event.enabled)
+             LayoutSettingsEvent.ResetPosterCardStyle -> resetPosterCardStyle()
+diff --git a/app/src/main/res/values/strings_netflix_style.xml b/app/src/main/res/values/strings_netflix_style.xml
+new file mode 100644
+index 000000000..7feb892f1
+--- /dev/null
++++ b/app/src/main/res/values/strings_netflix_style.xml
+@@ -0,0 +1,5 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="layout_netflix_style">Netflix style</string>
++    <string name="layout_netflix_style_sub">Hover preview with trailer and wide Continue Watching cards. Turn off to restore your previous look.</string>
++</resources>
