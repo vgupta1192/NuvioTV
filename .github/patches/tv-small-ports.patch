@@ -11,6 +11,162 @@ index 0e7918d42..33eb69f4b 100644
          PluginRuntimeHooks.onApplicationCreate(this)
          com.nuvio.tv.reshaped.subtitlefont.SubtitleFontStore.warmUp(this) // Nuvio fork: custom subtitle font, loaded off the main thread
          com.nuvio.tv.ui.screens.player.PlayerEffects.ensureLoaded(this) // Nuvio fork: picture and sound effects, read by stream auto-play
+diff --git a/app/src/main/java/com/nuvio/tv/core/cloud/CloudLibraryCache.kt b/app/src/main/java/com/nuvio/tv/core/cloud/CloudLibraryCache.kt
+new file mode 100644
+index 000000000..86f8fa644
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/cloud/CloudLibraryCache.kt
+@@ -0,0 +1,79 @@
++package com.nuvio.tv.core.cloud
++
++import android.content.Context
++import org.json.JSONArray
++import org.json.JSONObject
++
++/** Last good cloud library listing per provider, so a failed refresh still shows the previous items. */
++internal object CloudLibraryCache {
++    private const val PREFS = "nuvio_cloud_library_cache"
++
++    fun save(context: Context, providerId: String, items: List<CloudLibraryItem>) {
++        val array = JSONArray()
++        items.forEach { item ->
++            val files = JSONArray()
++            item.files.forEach { file ->
++                files.put(
++                    JSONObject()
++                        .put("id", file.id ?: JSONObject.NULL)
++                        .put("name", file.name)
++                        .put("size", file.sizeBytes ?: JSONObject.NULL)
++                        .put("mime", file.mimeType ?: JSONObject.NULL)
++                        .put("playable", file.playable)
++                        .put("url", file.playbackUrl ?: JSONObject.NULL)
++                )
++            }
++            array.put(
++                JSONObject()
++                    .put("providerId", item.providerId)
++                    .put("providerName", item.providerName)
++                    .put("id", item.id)
++                    .put("type", item.type.name)
++                    .put("name", item.name)
++                    .put("status", item.status ?: JSONObject.NULL)
++                    .put("size", item.sizeBytes ?: JSONObject.NULL)
++                    .put("progress", item.progressFraction?.toDouble() ?: JSONObject.NULL)
++                    .put("files", files)
++            )
++        }
++        runCatching {
++            prefs(context).edit().putString(providerId, array.toString()).apply()
++        }
++    }
++
++    fun load(context: Context, providerId: String): List<CloudLibraryItem> = runCatching {
++        val raw = prefs(context).getString(providerId, null) ?: return emptyList()
++        val array = JSONArray(raw)
++        (0 until array.length()).mapNotNull { index ->
++            val o = array.optJSONObject(index) ?: return@mapNotNull null
++            val type = runCatching { CloudLibraryItemType.valueOf(o.optString("type")) }.getOrNull()
++                ?: return@mapNotNull null
++            val filesArray = o.optJSONArray("files")
++            val files = (0 until (filesArray?.length() ?: 0)).mapNotNull { fileIndex ->
++                val f = filesArray?.optJSONObject(fileIndex) ?: return@mapNotNull null
++                CloudLibraryFile(
++                    id = f.takeUnless { it.isNull("id") }?.optString("id"),
++                    name = f.optString("name"),
++                    sizeBytes = f.takeUnless { it.isNull("size") }?.optLong("size"),
++                    mimeType = f.takeUnless { it.isNull("mime") }?.optString("mime"),
++                    playable = f.optBoolean("playable", true),
++                    playbackUrl = f.takeUnless { it.isNull("url") }?.optString("url")
++                )
++            }
++            CloudLibraryItem(
++                providerId = o.optString("providerId"),
++                providerName = o.optString("providerName"),
++                id = o.optString("id"),
++                type = type,
++                name = o.optString("name"),
++                status = o.takeUnless { it.isNull("status") }?.optString("status"),
++                sizeBytes = o.takeUnless { it.isNull("size") }?.optLong("size"),
++                progressFraction = o.takeUnless { it.isNull("progress") }?.optDouble("progress")?.toFloat(),
++                files = files
++            )
++        }
++    }.getOrDefault(emptyList())
++
++    private fun prefs(context: Context) =
++        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/cloud/CloudLibraryRepository.kt b/app/src/main/java/com/nuvio/tv/core/cloud/CloudLibraryRepository.kt
+index d8c55a1d4..86e5c7244 100644
+--- a/app/src/main/java/com/nuvio/tv/core/cloud/CloudLibraryRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/core/cloud/CloudLibraryRepository.kt
+@@ -45,6 +45,7 @@ class CloudLibraryRepository @Inject constructor(
+             api.listItems(credential.apiKey)
+                 .fold(
+                     onSuccess = { items ->
++                        CloudLibraryCache.save(context, credential.provider.id, items)
+                         CloudLibraryProviderState(
+                             provider = credential.provider,
+                             items = items
+@@ -53,7 +54,8 @@ class CloudLibraryRepository @Inject constructor(
+                     onFailure = { error ->
+                         CloudLibraryProviderState(
+                             provider = credential.provider,
+-                            errorMessage = error.message
++                            errorMessage = error.message,
++                            items = CloudLibraryCache.load(context, credential.provider.id)
+                         )
+                     }
+                 )
+diff --git a/app/src/main/java/com/nuvio/tv/core/debrid/DirectDebridResolver.kt b/app/src/main/java/com/nuvio/tv/core/debrid/DirectDebridResolver.kt
+index 967a29416..6e9bb6a2a 100644
+--- a/app/src/main/java/com/nuvio/tv/core/debrid/DirectDebridResolver.kt
++++ b/app/src/main/java/com/nuvio/tv/core/debrid/DirectDebridResolver.kt
+@@ -30,6 +30,10 @@ class DirectDebridResolver @Inject constructor(
+     private val resolvedCache = mutableMapOf<String, CachedDirectDebridResolve>()
+     private val inFlightResolves = mutableMapOf<String, Deferred<DirectDebridResolveResult>>()
+ 
++    suspend fun hasTorboxKey(): Boolean = dataStore.settings.first().torboxApiKey.isNotBlank()
++
++    suspend fun addToTorbox(stream: Stream): Boolean = torboxResolver.addToCache(stream)
++
+     suspend fun resolve(
+         stream: Stream,
+         season: Int?,
+diff --git a/app/src/main/java/com/nuvio/tv/core/debrid/TorboxDirectDebridResolver.kt b/app/src/main/java/com/nuvio/tv/core/debrid/TorboxDirectDebridResolver.kt
+index 3001a5a14..83ae5092c 100644
+--- a/app/src/main/java/com/nuvio/tv/core/debrid/TorboxDirectDebridResolver.kt
++++ b/app/src/main/java/com/nuvio/tv/core/debrid/TorboxDirectDebridResolver.kt
+@@ -90,6 +90,29 @@ class TorboxDirectDebridResolver @Inject constructor(
+         }
+     }
+ 
++    suspend fun addToCache(stream: Stream): Boolean {
++        val resolve = stream.clientResolve
++        val apiKey = dataStore.settings.first().torboxApiKey.trim()
++        if (apiKey.isBlank()) return false
++        val magnet = resolve?.magnetUri?.takeIf { it.isNotBlank() }
++            ?: resolve?.let { buildMagnetUri(it) }
++            ?: stream.getEffectiveInfoHash()?.takeIf { it.isNotBlank() }?.let { "magnet:?xt=urn:btih:$it" }
++            ?: return false
++        return try {
++            val create = api.createTorrent(
++                authorization = "Bearer $apiKey",
++                magnet = magnet.toTextPart(),
++                addOnlyIfCached = "false".toTextPart(),
++                allowZip = "false".toTextPart()
++            )
++            create.isSuccessful && create.body()?.success != false
++        } catch (error: Exception) {
++            if (error is CancellationException) throw error
++            Log.w(TAG, "addToCache failed: ${error.message}")
++            false
++        }
++    }
++
+     private fun Response<com.nuvio.tv.data.remote.dto.TorboxEnvelopeDto<TorboxCreateTorrentDataDto>>.extractTorrentId(): Int? {
+         if (!isSuccessful) return null
+         val body = body()
 diff --git a/app/src/main/java/com/nuvio/tv/core/network/DohSetting.kt b/app/src/main/java/com/nuvio/tv/core/network/DohSetting.kt
 new file mode 100644
 index 000000000..a0641eced
@@ -118,6 +274,95 @@ index 8c87b55cb..626e679b6 100644
 +        val ANSWER_REGEX = Regex("\"type\"\\s*:\\s*(\\d+)[^}]*?\"data\"\\s*:\\s*\"([^\"]+)\"")
 +    }
  }
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
+new file mode 100644
+index 000000000..ed8d11d35
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
+@@ -0,0 +1,83 @@
++package com.nuvio.tv.data.repository
++
++import android.content.Context
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++
++class ForkTvBoolPref(private val key: String, private val default: Boolean) {
++    private val _value = MutableStateFlow(default)
++    val value: StateFlow<Boolean> = _value.asStateFlow()
++
++    @Volatile
++    private var loaded = false
++
++    fun ensureLoaded(context: Context) {
++        if (loaded) return
++        synchronized(this) {
++            if (loaded) return
++            _value.value = prefs(context).getBoolean(key, default)
++            loaded = true
++        }
++    }
++
++    fun current(context: Context): Boolean {
++        ensureLoaded(context)
++        return _value.value
++    }
++
++    fun set(context: Context, enabled: Boolean) {
++        _value.value = enabled
++        loaded = true
++        prefs(context).edit().putBoolean(key, enabled).apply()
++    }
++
++    private fun prefs(context: Context) =
++        context.applicationContext.getSharedPreferences("nuvio_fork_tv_settings", Context.MODE_PRIVATE)
++}
++
++object ForkTvPreferences {
++    val homeVideoRowsOnly = ForkTvBoolPref("home_video_rows_only", true)
++    val fillerGuide = ForkTvBoolPref("filler_guide", true)
++}
++
++object ForkTvPlayerButtons {
++    val buttons: List<Pair<String, String>> = listOf(
++        "next_episode" to "Next episode",
++        "subtitles" to "Subtitles",
++        "audio" to "Audio tracks",
++        "quality" to "Video quality",
++        "chapters" to "Chapters",
++        "sources" to "Sources",
++        "episodes" to "Episodes",
++        "speed" to "Playback speed",
++        "aspect" to "Aspect ratio",
++        "engine" to "Switch player engine",
++        "info" to "Stream info"
++    )
++
++    private val _hidden = MutableStateFlow<Set<String>>(emptySet())
++    val hidden: StateFlow<Set<String>> = _hidden.asStateFlow()
++
++    @Volatile
++    private var loaded = false
++
++    fun ensureLoaded(context: Context) {
++        if (loaded) return
++        synchronized(this) {
++            if (loaded) return
++            _hidden.value = prefs(context).getStringSet("hidden", emptySet()).orEmpty().toSet()
++            loaded = true
++        }
++    }
++
++    fun setVisible(context: Context, id: String, visible: Boolean) {
++        ensureLoaded(context)
++        val next = if (visible) _hidden.value - id else _hidden.value + id
++        _hidden.value = next
++        prefs(context).edit().putStringSet("hidden", next).apply()
++    }
++
++    private fun prefs(context: Context) =
++        context.applicationContext.getSharedPreferences("nuvio_fork_tv_settings", Context.MODE_PRIVATE)
++}
 diff --git a/app/src/main/java/com/nuvio/tv/data/repository/ImdbEpisodeRatingsRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/ImdbEpisodeRatingsRepository.kt
 index cfd52b4a7..a64df6c6a 100644
 --- a/app/src/main/java/com/nuvio/tv/data/repository/ImdbEpisodeRatingsRepository.kt
@@ -304,6 +549,197 @@ index 52cbd2950..50b9f7c5b 100644
      private suspend fun fetchFromAniSkip(malId: String, episode: Int): List<SkipInterval> {
          return try {
              val types = listOf("op", "ed", "recap", "mixed-op", "mixed-ed")
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/FillerGuideTv.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/FillerGuideTv.kt
+new file mode 100644
+index 000000000..38963ae88
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/FillerGuideTv.kt
+@@ -0,0 +1,147 @@
++@file:OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
++
++package com.nuvio.tv.ui.screens.detail
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import androidx.tv.material3.Text
++import com.nuvio.tv.ui.theme.NuvioTheme
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.withContext
++import org.json.JSONObject
++import java.net.HttpURLConnection
++import java.net.URL
++import java.net.URLEncoder
++
++private data class FillerResult(val filler: List<Int>, val recap: List<Int>)
++
++private val fillerCache = mutableMapOf<String, FillerResult?>()
++
++internal fun isFillerGuideCandidate(apiType: String, genres: List<String>): Boolean {
++    if (apiType.equals("movie", ignoreCase = true)) return false
++    return genres.any { it.equals("Anime", ignoreCase = true) || it.equals("Animation", ignoreCase = true) }
++}
++
++private fun jikanGet(url: String): String {
++    val connection = URL(url).openConnection() as HttpURLConnection
++    connection.connectTimeout = 10_000
++    connection.readTimeout = 15_000
++    return try {
++        connection.inputStream.bufferedReader().use { it.readText() }
++    } finally {
++        connection.disconnect()
++    }
++}
++
++private suspend fun loadFiller(title: String): FillerResult? {
++    synchronized(fillerCache) { if (fillerCache.containsKey(title)) return fillerCache[title] }
++    val result = withContext(Dispatchers.IO) {
++        try {
++            val query = URLEncoder.encode(title, "UTF-8")
++            val search = JSONObject(jikanGet("https://api.jikan.moe/v4/anime?q=$query&limit=1&type=tv"))
++                .optJSONArray("data")?.optJSONObject(0)
++            val malId = search?.optInt("mal_id", 0)?.takeIf { it > 0 }
++            if (malId == null) {
++                null
++            } else {
++                val filler = mutableListOf<Int>()
++                val recap = mutableListOf<Int>()
++                var page = 1
++                while (page <= 12) {
++                    if (page > 1) delay(400)
++                    val root = JSONObject(jikanGet("https://api.jikan.moe/v4/anime/$malId/episodes?page=$page"))
++                    val data = root.optJSONArray("data")
++                    if (data != null) {
++                        for (i in 0 until data.length()) {
++                            val ep = data.optJSONObject(i) ?: continue
++                            val number = ep.optInt("mal_id", 0).takeIf { it > 0 } ?: continue
++                            if (ep.optBoolean("filler", false)) filler += number
++                            if (ep.optBoolean("recap", false)) recap += number
++                        }
++                    }
++                    if (root.optJSONObject("pagination")?.optBoolean("has_next_page", false) != true) break
++                    page++
++                }
++                FillerResult(filler, recap)
++            }
++        } catch (cancelled: CancellationException) {
++            throw cancelled
++        } catch (_: Exception) {
++            null
++        }
++    }
++    synchronized(fillerCache) { fillerCache[title] = result }
++    return result
++}
++
++private fun List<Int>.asRanges(): String {
++    if (isEmpty()) return "none"
++    val sorted = distinct().sorted()
++    val parts = mutableListOf<String>()
++    var start = sorted.first()
++    var prev = start
++    for (n in sorted.drop(1)) {
++        if (n == prev + 1) {
++            prev = n
++            continue
++        }
++        parts += if (start == prev) "$start" else "$start-$prev"
++        start = n
++        prev = n
++    }
++    parts += if (start == prev) "$start" else "$start-$prev"
++    return parts.joinToString(", ")
++}
++
++@Composable
++internal fun FillerGuideTv(metaId: String, title: String, modifier: Modifier = Modifier) {
++    val enabled by com.nuvio.tv.data.repository.ForkTvPreferences.fillerGuide.value.collectAsStateWithLifecycle()
++    val context = androidx.compose.ui.platform.LocalContext.current
++    LaunchedEffect(Unit) { com.nuvio.tv.data.repository.ForkTvPreferences.fillerGuide.ensureLoaded(context) }
++    if (!enabled) return
++    var state by remember(metaId) { mutableStateOf<FillerResult?>(null) }
++    var done by remember(metaId) { mutableStateOf(false) }
++    LaunchedEffect(metaId) {
++        state = loadFiller(title)
++        done = true
++    }
++    val result = state
++    if (!done || result == null || (result.filler.isEmpty() && result.recap.isEmpty())) return
++    Column(
++        modifier = modifier.fillMaxWidth().padding(horizontal = 48.dp, vertical = 12.dp),
++        verticalArrangement = Arrangement.spacedBy(6.dp),
++    ) {
++        Text(text = "Filler guide", fontSize = 18.sp, color = NuvioTheme.colors.TextPrimary)
++        Text(
++            text = "Filler episodes: ${result.filler.asRanges()}",
++            fontSize = 14.sp,
++            color = NuvioTheme.colors.TextPrimary,
++        )
++        if (result.recap.isNotEmpty()) {
++            Text(
++                text = "Recap episodes: ${result.recap.asRanges()}",
++                fontSize = 14.sp,
++                color = NuvioTheme.colors.TextSecondary,
++            )
++        }
++        Text(
++            text = "Numbers follow MyAnimeList and count from the first episode of the show.",
++            fontSize = 12.sp,
++            color = NuvioTheme.colors.TextSecondary,
++        )
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
+index 1f54d0be8..2097973ed 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
+@@ -2683,6 +2683,11 @@ private fun MetaDetailsContent(
+                             windowResetKey = meta.id
+                         )
+                     }
++                    if (isFillerGuideCandidate(meta.apiType, meta.genres)) {
++                        item(key = "filler_guide", contentType = "filler_guide") {
++                            FillerGuideTv(metaId = meta.id, title = meta.name)
++                        }
++                    }
+             }
+         }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogPipeline.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogPipeline.kt
+index cd5d9ecae..50e83f490 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogPipeline.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogPipeline.kt
+@@ -224,7 +224,7 @@ internal suspend fun HomeViewModel.loadAllCatalogsPipeline(
+         val catalogsToLoad = addons.flatMap { addon ->
+             addon.catalogs
+                 .filterNot {
+-                    !it.shouldShowOnHome() || isCatalogDisabled(
++                    !it.shouldShowOnHome() || hiddenByVideoRowsOnly(it.apiType) || isCatalogDisabled(
+                         addonBaseUrl = addon.baseUrl,
+                         addonId = addon.id,
+                         type = it.apiType,
+@@ -1199,3 +1199,8 @@ internal fun HomeViewModel.refreshVisibleCatalogsPipeline(requestedByUser: Boole
+         loadCatalogPipeline(addon, catalog, generation, isRefresh = true, requestedByUser = requestedByUser, forceReplace = forceReplace)
+     }
+ }
++
++private fun HomeViewModel.hiddenByVideoRowsOnly(apiType: String): Boolean =
++    com.nuvio.tv.data.repository.ForkTvPreferences.homeVideoRowsOnly.current(appContext) &&
++        apiType.isNotBlank() &&
++        apiType.lowercase() !in setOf("movie", "series", "anime", "collections", "tv")
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
 index 81c3afb0c..1c226275c 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
@@ -348,6 +784,119 @@ index 35dafddf3..924642ef1 100644
      if (isUserExplicitSubtitleSelection) {
          Log.d(PlayerRuntimeController.TAG, "AUTO_SUB stop: user explicitly selected current subtitle")
          return
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+index b497c96e6..c9e2df1c3 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+@@ -2988,6 +2988,9 @@ private fun PlayerControlsOverlay(
+                     verticalAlignment = Alignment.CenterVertically
+                 ) {
+                     val hasEpisodeContext = uiState.currentSeason != null && uiState.currentEpisode != null
++                    val hiddenBtns by com.nuvio.tv.data.repository.ForkTvPlayerButtons.hidden.collectAsState()
++                    val btnContext = androidx.compose.ui.platform.LocalContext.current
++                    androidx.compose.runtime.LaunchedEffect(Unit) { com.nuvio.tv.data.repository.ForkTvPlayerButtons.ensureLoaded(btnContext) }
+                     // Nuvio fork: the generated-subtitle entries (online + on-device) must keep
+                     // the CC button reachable even when this stream has no subtitle tracks and
+                     // no add-on subtitles were found.
+@@ -3010,7 +3013,7 @@ private fun PlayerControlsOverlay(
+                         onFocused = onResetHideTimer
+                     )
+ 
+-                    if (showNextEpisodeButton) {
++                    if (showNextEpisodeButton && "next_episode" !in hiddenBtns) {
+                         ControlButton(
+                             icon = Icons.Default.SkipNext,
+                             contentDescription = stringResource(R.string.next_episode_label),
+@@ -3021,7 +3024,7 @@ private fun PlayerControlsOverlay(
+                         )
+                     }
+ 
+-                    if (hasSubtitleControl) {
++                    if (hasSubtitleControl && "subtitles" !in hiddenBtns) {
+                         ControlButton(
+                             icon = Icons.Default.ClosedCaption,
+                             iconPainter = customSubtitlePainter,
+@@ -3033,7 +3036,7 @@ private fun PlayerControlsOverlay(
+                         )
+                     }
+ 
+-                    if (hasAudioControl) {
++                    if (hasAudioControl && "audio" !in hiddenBtns) {
+                         ControlButton(
+                             icon = Icons.AutoMirrored.Filled.VolumeUp,
+                             iconPainter = customAudioPainter,
+@@ -3047,7 +3050,7 @@ private fun PlayerControlsOverlay(
+ 
+                     val qualityPlayer = viewModel.exoPlayer
+                     var showQualityDialog by remember { mutableStateOf(false) }
+-                    if (!isLivePlayback && qualityPlayer != null && qualityPlayer.extractVideoQualities().size > 1) {
++                    if ("quality" !in hiddenBtns && !isLivePlayback && qualityPlayer != null && qualityPlayer.extractVideoQualities().size > 1) {
+                         ControlButton(
+                             icon = Icons.Default.HighQuality,
+                             contentDescription = stringResource(R.string.player_video_quality),
+@@ -3064,7 +3067,7 @@ private fun PlayerControlsOverlay(
+                         )
+                     }
+ 
+-                    if (uiState.chapters.isNotEmpty() && !isLivePlayback) {
++                    if ("chapters" !in hiddenBtns && uiState.chapters.isNotEmpty() && !isLivePlayback) {
+                         ControlButton(
+                             icon = Icons.AutoMirrored.Filled.Toc,
+                             contentDescription = stringResource(R.string.player_chapters),
+@@ -3075,7 +3078,7 @@ private fun PlayerControlsOverlay(
+                         )
+                     }
+ 
+-                    ControlButton(
++                    if ("sources" !in hiddenBtns) ControlButton(
+                         icon = Icons.Default.SwapHoriz,
+                         iconPainter = customSourcePainter,
+                         contentDescription = stringResource(R.string.cd_sources),
+@@ -3085,7 +3088,7 @@ private fun PlayerControlsOverlay(
+                         onFocused = onResetHideTimer
+                     )
+ 
+-                    if (hasEpisodeContext) {
++                    if (hasEpisodeContext && "episodes" !in hiddenBtns) {
+                         ControlButton(
+                             icon = Icons.AutoMirrored.Filled.List,
+                             iconPainter = customEpisodesPainter,
+@@ -3124,7 +3127,7 @@ private fun PlayerControlsOverlay(
+                             horizontalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.xs),
+                             verticalAlignment = Alignment.CenterVertically
+                         ) {
+-                            ControlButton(
++                            if ("speed" !in hiddenBtns) ControlButton(
+                                 icon = Icons.Default.Speed,
+                                 contentDescription = stringResource(R.string.cd_playback_speed),
+                                 onClick = {
+@@ -3134,7 +3137,7 @@ private fun PlayerControlsOverlay(
+                                 onDownKey = onHideControls,
+                                 onFocused = onResetHideTimer
+                             )
+-                            ControlButton(
++                            if ("aspect" !in hiddenBtns) ControlButton(
+                                 icon = Icons.Default.AspectRatio,
+                                 iconPainter = customAspectPainter,
+                                 contentDescription = stringResource(R.string.cd_aspect_ratio),
+@@ -3145,7 +3148,7 @@ private fun PlayerControlsOverlay(
+                                 onDownKey = onHideControls,
+                                 onFocused = onResetHideTimer
+                             )
+-                            ControlButton(
++                            if ("engine" !in hiddenBtns) ControlButton(
+                                 icon = Icons.Default.SwapHoriz,
+                                 contentDescription = stringResource(R.string.cd_switch_player_engine),
+                                 onClick = { showEngineSwitchConfirm = true },
+@@ -3163,7 +3166,7 @@ private fun PlayerControlsOverlay(
+                                     onFocused = onResetHideTimer
+                                 )
+                             }
+-                            ControlButton(
++                            if ("info" !in hiddenBtns) ControlButton(
+                                 icon = Icons.Default.Info,
+                                 contentDescription = stringResource(R.string.cd_stream_info),
+                                 onClick = {
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/TvForkPlayerPrefs.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/TvForkPlayerPrefs.kt
 new file mode 100644
 index 000000000..2b362d830
@@ -443,18 +992,117 @@ index 000000000..46ce3c1b2
 +        )
 +    }
 +}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
+new file mode 100644
+index 000000000..17f604b6f
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
+@@ -0,0 +1,79 @@
++package com.nuvio.tv.ui.screens.settings
++
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.lazy.items
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.unit.dp
++import androidx.compose.runtime.getValue
++import androidx.compose.ui.platform.LocalContext
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import com.nuvio.tv.data.repository.ForkTvBoolPref
++import com.nuvio.tv.data.repository.ForkTvPreferences
++
++@Composable
++private fun forkTvToggleRow(title: String, subtitle: String, pref: ForkTvBoolPref) {
++    val context = LocalContext.current
++    pref.ensureLoaded(context)
++    val checked by pref.value.collectAsStateWithLifecycle()
++    SettingsToggleRow(
++        title = title,
++        subtitle = subtitle,
++        checked = checked,
++        onToggle = { pref.set(context, !checked) }
++    )
++}
++
++@Composable
++internal fun forkHomeVideoOnlyRow() = forkTvToggleRow(
++    title = "Only movie, series and anime rows",
++    subtitle = "Hide Home rows from addons that list other things, like debrid downloads or YouTube channels. They stay in Discover.",
++    pref = ForkTvPreferences.homeVideoRowsOnly
++)
++
++@Composable
++internal fun forkFillerGuideRow() = forkTvToggleRow(
++    title = "Anime filler guide",
++    subtitle = "Mark filler and recap episodes on anime pages (Jikan).",
++    pref = ForkTvPreferences.fillerGuide
++)
++
++@Composable
++internal fun forkPlayerButtonsRow() {
++    val context = LocalContext.current
++    com.nuvio.tv.data.repository.ForkTvPlayerButtons.ensureLoaded(context)
++    val hidden by com.nuvio.tv.data.repository.ForkTvPlayerButtons.hidden.collectAsStateWithLifecycle()
++    var open by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
++    SettingsActionRow(
++        title = "Player buttons",
++        subtitle = "Choose which buttons show in the player controls.",
++        value = "${com.nuvio.tv.data.repository.ForkTvPlayerButtons.buttons.size - hidden.size} shown",
++        onClick = { open = true }
++    )
++    if (open) {
++        com.nuvio.tv.ui.components.NuvioDialog(
++            onDismiss = { open = false },
++            title = "Player buttons",
++            subtitle = "Buttons also stay hidden when the player has nothing for them.",
++            suppressFirstKeyUp = false
++        ) {
++            androidx.compose.foundation.lazy.LazyColumn(
++                modifier = androidx.compose.ui.Modifier
++                    .fillMaxWidth()
++                    .heightIn(max = 380.dp),
++                verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(8.dp)
++            ) {
++                items(com.nuvio.tv.data.repository.ForkTvPlayerButtons.buttons, key = { it.first }) { (id, label) ->
++                    SettingsToggleRow(
++                        title = label,
++                        subtitle = null,
++                        checked = id !in hidden,
++                        onToggle = {
++                            com.nuvio.tv.data.repository.ForkTvPlayerButtons.setVisible(context, id, id in hidden)
++                        }
++                    )
++                }
++            }
++        }
++    }
++}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutDetailSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutDetailSettings.kt
-index 10b052424..f8cb60953 100644
+index 10b052424..969df4013 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutDetailSettings.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutDetailSettings.kt
-@@ -50,6 +50,7 @@ internal fun LayoutDetailPageSection(
+@@ -50,6 +50,9 @@ internal fun LayoutDetailPageSection(
          value = episodeRatingsVisibilityLabel(uiState.detailImdbRatingsVisibility),
          onClick = { showRatingsDialog = true }
      )
 +    omdbKeySettingsRow()
++    forkFillerGuideRow()
++    forkPlayerButtonsRow()
  
      SettingsSectionLabel(text = stringResource(R.string.layout_detail_group_trailers))
      if (AppFeaturePolicy.inAppTrailerPlaybackEnabled) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutHomeSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutHomeSettings.kt
+index 9aae7c94c..70e1c6597 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutHomeSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutHomeSettings.kt
+@@ -168,6 +168,7 @@ internal fun LayoutHomeContentSection(
+             onToggle = { onEvent(LayoutSettingsEvent.SetCatalogAddonNameEnabled(!uiState.catalogAddonNameEnabled)) }
+         )
+     }
++    forkHomeVideoOnlyRow()
+     SettingsToggleRow(
+         title = stringResource(R.string.layout_catalog_type),
+         subtitle = stringResource(R.string.layout_catalog_type_sub),
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
 index 7de677fbe..fe4778a33 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
@@ -695,3 +1343,90 @@ index 000000000..756a99d52
 +        )
 +    }
 +}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreen.kt
+index a09fc1412..15308a5f3 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreen.kt
+@@ -323,6 +323,26 @@ fun StreamScreen(
+         }
+     }
+ 
++    if (uiState.addToTorboxOffer != null) {
++        com.nuvio.tv.ui.components.NuvioDialog(
++            onDismiss = { viewModel.dismissAddToTorboxOffer() },
++            title = "Not cached on TorBox",
++            subtitle = "Add this torrent to TorBox so it downloads there?",
++            suppressFirstKeyUp = false
++        ) {
++            com.nuvio.tv.ui.screens.settings.SettingsActionRow(
++                title = "Add to TorBox",
++                subtitle = null,
++                onClick = { viewModel.confirmAddToTorbox() }
++            )
++            com.nuvio.tv.ui.screens.settings.SettingsActionRow(
++                title = "Cancel",
++                subtitle = null,
++                onClick = { viewModel.dismissAddToTorboxOffer() }
++            )
++        }
++    }
++
+     LaunchedEffect(uiState.playbackErrorMessage) {
+         val message = uiState.playbackErrorMessage ?: return@LaunchedEffect
+         Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenUiState.kt b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenUiState.kt
+index 547aec2e6..f4aeb0d4d 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenUiState.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenUiState.kt
+@@ -36,7 +36,8 @@ data class StreamScreenUiState(
+     val autoPlayStream: Stream? = null,
+     val autoPlayPlaybackInfo: StreamPlaybackInfo? = null,
+     val error: String? = null,
+-    val playbackErrorMessage: String? = null
++    val playbackErrorMessage: String? = null,
++    val addToTorboxOffer: Stream? = null
+ ) {
+     val isEpisode: Boolean get() = season != null && episode != null
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
+index 505d5c193..16abba2ce 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
+@@ -1384,6 +1384,9 @@ class StreamScreenViewModel @Inject constructor(
+             }
+             DirectDebridResolveResult.NotCached -> {
+                 showDirectDebridPlaybackError(context.getString(R.string.debrid_not_cached), refreshStreams = false)
++                if (directDebridResolver.hasTorboxKey()) {
++                    updateUiStateIfChanged { it.copy(addToTorboxOffer = stream) }
++                }
+                 null
+             }
+             DirectDebridResolveResult.Stale -> {
+@@ -1456,6 +1459,27 @@ class StreamScreenViewModel @Inject constructor(
+         return getStreamForPlayback(resolved, saveLastLink = false)
+     }
+ 
++    fun dismissAddToTorboxOffer() {
++        updateUiStateIfChanged { it.copy(addToTorboxOffer = null) }
++    }
++
++    fun confirmAddToTorbox() {
++        val stream = _uiState.value.addToTorboxOffer ?: return
++        updateUiStateIfChanged { it.copy(addToTorboxOffer = null) }
++        viewModelScope.launch {
++            val ok = directDebridResolver.addToTorbox(stream)
++            updateUiStateIfChanged {
++                it.copy(
++                    playbackErrorMessage = if (ok) {
++                        "Added to TorBox. Try again when it finishes caching."
++                    } else {
++                        "Could not add to TorBox."
++                    }
++                )
++            }
++        }
++    }
++
+     fun onPlaybackErrorShown() {
+         updateUiStateIfChanged { it.copy(playbackErrorMessage = null) }
+     }
