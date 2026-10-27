@@ -1,12 +1,13 @@
 diff --git a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
-index 0e7918d42..f69395afe 100644
+index 0e7918d42..33eb69f4b 100644
 --- a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
 +++ b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
-@@ -84,6 +84,7 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+@@ -84,6 +84,8 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
          SentryInitializer.start(this, sentrySettingsDataStore)
          com.nuvio.tv.core.diagnostics.ForkCrashReporter.install(this) // Nuvio fork: local crash reports, shown in Debug logs to phone
          com.nuvio.tv.core.diagnostics.ForkStability.install(this) // Nuvio fork: breadcrumbs and main thread freeze watchdog
 +        com.nuvio.tv.core.network.DohSetting.init(this) // Nuvio fork: DNS over HTTPS choice
++        com.nuvio.tv.ui.screens.player.TvForkPlayerPrefs.load(this) // Nuvio fork: player extras
          PluginRuntimeHooks.onApplicationCreate(this)
          com.nuvio.tv.reshaped.subtitlefont.SubtitleFontStore.warmUp(this) // Nuvio fork: custom subtitle font, loaded off the main thread
          com.nuvio.tv.ui.screens.player.PlayerEffects.ensureLoaded(this) // Nuvio fork: picture and sound effects, read by stream auto-play
@@ -117,6 +118,107 @@ index 8c87b55cb..626e679b6 100644
 +        val ANSWER_REGEX = Regex("\"type\"\\s*:\\s*(\\d+)[^}]*?\"data\"\\s*:\\s*\"([^\"]+)\"")
 +    }
  }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
+index 81c3afb0c..1c226275c 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
+@@ -542,6 +542,7 @@ class PlayerRuntimeController(
+     internal val autoSkippedIntervalKeys: MutableSet<String> = mutableSetOf()
+     internal var lastActiveSkipType: String? = null
+     internal var autoSubtitleSelected: Boolean = false
++    internal var forkSleepWatcherStarted: Boolean = false
+     internal var isUserExplicitSubtitleSelection: Boolean = false
+     internal var lastSubtitlePreferredLanguage: String? = null
+     internal var lastSubtitleSecondaryLanguage: String? = null
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+index 0df4b3a2d..8997884a2 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+@@ -160,6 +160,15 @@ internal fun PlayerRuntimeController.initializePlayer(
+         _uiState.update { it.copy(error = context.getString(R.string.player_error_no_stream_url), showLoadingOverlay = false) }
+         return
+     }
++    if (!forkSleepWatcherStarted) {
++        forkSleepWatcherStarted = true
++        scope.launch {
++            while (true) {
++                delay(5_000)
++                if (TvForkPlayerPrefs.consumeExpired()) setPlaybackPaused(true)
++            }
++        }
++    }
+     mpvMediaLoadPrepared = false
+     val afrPreflightToken = afrPreflightGate.token()
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt
+index 35dafddf3..924642ef1 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt
+@@ -1638,6 +1638,7 @@ private fun audioMatchesSubtitleTargetForForced(audioTrack: TrackInfo, target: S
+ }
+ 
+ internal fun PlayerRuntimeController.tryAutoSelectPreferredSubtitleFromAvailableTracks() {
++    if (TvForkPlayerPrefs.subtitlesStartOff) return
+     if (isUserExplicitSubtitleSelection) {
+         Log.d(PlayerRuntimeController.TAG, "AUTO_SUB stop: user explicitly selected current subtitle")
+         return
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/TvForkPlayerPrefs.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/TvForkPlayerPrefs.kt
+new file mode 100644
+index 000000000..2b362d830
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/TvForkPlayerPrefs.kt
+@@ -0,0 +1,51 @@
++package com.nuvio.tv.ui.screens.player
++
++import android.content.Context
++import android.os.SystemClock
++
++/** Fork player prefs: subtitles start off, and a one-shot sleep timer. */
++object TvForkPlayerPrefs {
++    private const val FILE = "tv_fork_player_prefs"
++    private const val KEY_SUBS_OFF = "subtitles_start_off"
++
++    @Volatile var subtitlesStartOff: Boolean = false
++        private set
++
++    @Volatile var sleepDeadlineMs: Long = 0L
++        private set
++
++    val sleepOptionsMin = listOf(0, 15, 30, 45, 60, 90)
++
++    fun load(context: Context) {
++        subtitlesStartOff = context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
++            .getBoolean(KEY_SUBS_OFF, false)
++    }
++
++    fun setSubtitlesStartOff(context: Context, value: Boolean) {
++        subtitlesStartOff = value
++        context.getSharedPreferences(FILE, Context.MODE_PRIVATE).edit().putBoolean(KEY_SUBS_OFF, value).apply()
++    }
++
++    fun sleepMinutesLeft(): Int {
++        if (sleepDeadlineMs == 0L) return 0
++        val left = sleepDeadlineMs - SystemClock.elapsedRealtime()
++        return if (left <= 0) 0 else ((left + 59_999) / 60_000).toInt()
++    }
++
++    fun setSleepMinutes(minutes: Int) {
++        sleepDeadlineMs = if (minutes <= 0) 0L else SystemClock.elapsedRealtime() + minutes * 60_000L
++    }
++
++    fun nextSleepMinutes(): Int {
++        val left = sleepMinutesLeft()
++        val idx = sleepOptionsMin.indexOfFirst { it > left }
++        return if (idx < 0) 0 else sleepOptionsMin[idx]
++    }
++
++    /** True once when the deadline has passed; clears it. */
++    fun consumeExpired(): Boolean {
++        if (sleepDeadlineMs == 0L || SystemClock.elapsedRealtime() < sleepDeadlineMs) return false
++        sleepDeadlineMs = 0L
++        return true
++    }
++}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/DohSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/DohSettings.kt
 new file mode 100644
 index 000000000..46ce3c1b2
@@ -156,14 +258,61 @@ index 000000000..46ce3c1b2
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
-index 7de677fbe..eb50ad74f 100644
+index 7de677fbe..fe4778a33 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
-@@ -479,6 +479,7 @@ fun AdvancedSettingsContent(
+@@ -479,6 +479,8 @@ fun AdvancedSettingsContent(
          }
  
          item(key = "dx_sounds") { DxSoundsSettingsCard() } // dx.bi sounds hook
 +        item(key = "doh_dns") { DohSettingsCard() } // DNS over HTTPS hook
++        item(key = "fork_player_extras") { TvForkPlayerSettingsCard() }
  
          item(key = "startup_settings") {
              SettingsGroupCard(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvForkPlayerSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvForkPlayerSettings.kt
+new file mode 100644
+index 000000000..756a99d52
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvForkPlayerSettings.kt
+@@ -0,0 +1,40 @@
++@file:OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
++
++package com.nuvio.tv.ui.screens.settings
++
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalContext
++import com.nuvio.tv.ui.screens.player.TvForkPlayerPrefs
++
++@Composable
++internal fun TvForkPlayerSettingsCard() {
++    val context = LocalContext.current
++    var subsOff by remember { mutableStateOf(TvForkPlayerPrefs.subtitlesStartOff) }
++    var sleepLeft by remember { mutableStateOf(TvForkPlayerPrefs.sleepMinutesLeft()) }
++    SettingsGroupCard(modifier = Modifier.fillMaxWidth(), title = "Player extras") {
++        SettingsToggleRow(
++            title = "Subtitles start off",
++            subtitle = "Do not auto-select a subtitle track. Pick one by hand when needed.",
++            checked = subsOff,
++            onToggle = {
++                subsOff = !subsOff
++                TvForkPlayerPrefs.setSubtitlesStartOff(context, subsOff)
++            },
++        )
++        SettingsActionRow(
++            title = "Sleep timer",
++            subtitle = "Pause playback after the chosen time. Click to cycle 15, 30, 45, 60, 90 minutes, then off.",
++            value = if (sleepLeft == 0) "Off" else "$sleepLeft min",
++            onClick = {
++                TvForkPlayerPrefs.setSleepMinutes(TvForkPlayerPrefs.nextSleepMinutes())
++                sleepLeft = TvForkPlayerPrefs.sleepMinutesLeft()
++            },
++        )
++    }
++}
