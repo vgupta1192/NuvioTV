@@ -118,6 +118,68 @@ index 8c87b55cb..626e679b6 100644
 +        val ANSWER_REGEX = Regex("\"type\"\\s*:\\s*(\\d+)[^}]*?\"data\"\\s*:\\s*\"([^\"]+)\"")
 +    }
  }
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/SkipIntroRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/SkipIntroRepository.kt
+index 52cbd2950..50b9f7c5b 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/SkipIntroRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/SkipIntroRepository.kt
+@@ -61,7 +61,7 @@ class SkipIntroRepository @Inject constructor(
+ ) {
+     private val cache = ConcurrentHashMap<String, List<SkipInterval>>()
+     private val animeSkipShowIdCache = ConcurrentHashMap<String, String>()
+-    private val introDbConfigured = BuildConfig.INTRODB_API_URL.isNotEmpty()
++    private val introDbConfigured = true
+ 
+     suspend fun getMovieSkipIntervals(contentId: String?, videoId: String? = null): List<SkipInterval> {
+         if (!introDbConfigured) return emptyList()
+@@ -251,6 +251,7 @@ class SkipIntroRepository @Inject constructor(
+         episode: Int? = null,
+         isMovie: Boolean = false
+     ): List<SkipInterval> {
++        if (BuildConfig.INTRODB_API_URL.isEmpty()) return fetchFromTheIntroDb(imdbId, season, episode)
+         return try {
+             val response = introDbApi.getSegments(imdbId, season, episode, true.takeIf { isMovie })
+             if (response.isSuccessful && response.body() != null) {
+@@ -264,6 +265,40 @@ class SkipIntroRepository @Inject constructor(
+         }
+     }
+ 
++    private suspend fun fetchFromTheIntroDb(imdbId: String, season: Int?, episode: Int?): List<SkipInterval> =
++        kotlinx.coroutines.withContext<List<SkipInterval>>(kotlinx.coroutines.Dispatchers.IO) {
++            try {
++                val url = buildString {
++                    append("https://api.theintrodb.org/v2/media?imdb_id=").append(imdbId)
++                    if (season != null && episode != null) append("&season=").append(season).append("&episode=").append(episode)
++                }
++                val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
++                conn.connectTimeout = 8000
++                conn.readTimeout = 8000
++                val text = try {
++                    if (conn.responseCode != 200) return@withContext emptyList()
++                    conn.inputStream.bufferedReader().use { it.readText() }
++                } finally {
++                    conn.disconnect()
++                }
++                val root = org.json.JSONObject(text)
++                fun first(key: String, type: String): SkipInterval? {
++                    val arr = root.optJSONArray(key) ?: return null
++                    val seg = arr.optJSONObject(0) ?: return null
++                    if (seg.isNull("end_ms")) return null
++                    val start = seg.optLong("start_ms", 0L)
++                    val end = seg.optLong("end_ms", 0L)
++                    if (end <= start) return null
++                    return SkipInterval(startTime = start / 1000.0, endTime = end / 1000.0, type = type, provider = "theintrodb")
++                }
++                listOfNotNull(first("intro", "intro"), first("recap", "recap"), first("credits", "outro"))
++            } catch (e: CancellationException) {
++                throw e
++            } catch (e: Exception) {
++                emptyList()
++            }
++        }
++
+     private suspend fun fetchFromAniSkip(malId: String, episode: Int): List<SkipInterval> {
+         return try {
+             val types = listOf("op", "ed", "recap", "mixed-op", "mixed-ed")
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
 index 81c3afb0c..1c226275c 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
