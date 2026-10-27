@@ -1,0 +1,41 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/DxAutoMpvFailover.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/DxAutoMpvFailover.kt
+new file mode 100644
+index 000000000..4a53726ef
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/DxAutoMpvFailover.kt
+@@ -0,0 +1,18 @@
++package com.nuvio.tv.ui.screens.player
++
++/**
++ * Nuvio fork: loop guard for the automatic switch to mpv on a fatal ExoPlayer decoder or format error.
++ * Each stream URL gets one automatic switch; if mpv fails too (or the user switches back), the normal error
++ * screen with the manual "Switch to mpv" action is shown instead.
++ */
++internal object DxAutoMpvFailover {
++    private val tried = LinkedHashSet<String>()
++
++    @Synchronized
++    fun shouldTry(streamUrl: String): Boolean {
++        if (streamUrl.isBlank()) return false
++        if (!tried.add(streamUrl)) return false
++        while (tried.size > 50) tried.remove(tried.first())
++        return true
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+index e1d6bdc4d..0df4b3a2d 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+@@ -1671,6 +1671,12 @@ internal fun PlayerRuntimeController.initializePlayer(
+                              error.errorCode == PlaybackException.ERROR_CODE_DECODING_FORMAT_EXCEEDS_CAPABILITIES ||
+                              error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED ||
+                              error.errorCode == PlaybackException.ERROR_CODE_PARSING_MANIFEST_UNSUPPORTED)
++                        // Nuvio fork: one automatic switch to mpv on a fatal decoder/format error (once per stream)
++                        if (canSwitchToMpvOnFatal && DxAutoMpvFailover.shouldTry(currentStreamUrl)) {
++                            android.util.Log.w(PlayerRuntimeController.TAG, "Fatal ExoPlayer error; auto-switching to mpv: $detailedError")
++                            switchToInternalPlayerEngine(InternalPlayerEngine.MVP_PLAYER, reason = "auto-fatal-failover")
++                            return
++                        }
+                         _uiState.update {
+                             it.copy(
+                                 error = detailedError,

@@ -1,0 +1,138 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/components/DxHeroRotation.kt b/app/src/main/java/com/nuvio/tv/ui/components/DxHeroRotation.kt
+new file mode 100644
+index 000000000..d6c8b40bb
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/components/DxHeroRotation.kt
+@@ -0,0 +1,77 @@
++@file:OptIn(ExperimentalTvMaterial3Api::class)
++
++package com.nuvio.tv.ui.components
++
++import android.content.Context
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.platform.LocalContext
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import androidx.tv.material3.ExperimentalTvMaterial3Api
++import com.nuvio.tv.ui.screens.settings.SettingsActionRow
++import com.nuvio.tv.ui.screens.settings.SettingsPickerOption
++import com.nuvio.tv.ui.screens.settings.SettingsSingleChoiceDialog
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++
++/** Nuvio fork: how fast the Home hero carousel rotates. 0 = off (no automatic rotation). Kept in SharedPreferences. */
++internal object DxHeroRotation {
++    private const val PREFS = "nuvio_tv_dx_hero_rotation"
++    private const val KEY = "interval_ms"
++    const val DEFAULT_MS = 10_000L
++    val choices: List<Pair<Long, String>> = listOf(
++        0L to "Off",
++        5_000L to "5 seconds",
++        8_000L to "8 seconds",
++        10_000L to "10 seconds (default)",
++        15_000L to "15 seconds",
++    )
++    private val _intervalMs = MutableStateFlow(DEFAULT_MS)
++    val intervalMs: StateFlow<Long> = _intervalMs.asStateFlow()
++    private var loaded = false
++
++    fun ensureLoaded(context: Context) {
++        if (loaded) return
++        loaded = true
++        _intervalMs.value = context.applicationContext
++            .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++            .getLong(KEY, DEFAULT_MS)
++    }
++
++    fun set(context: Context, ms: Long) {
++        _intervalMs.value = ms
++        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putLong(KEY, ms).apply()
++    }
++}
++
++/** Layout > Home row under "Show hero": pick the rotation speed. */
++@Composable
++internal fun DxHeroRotationSettingsRow() {
++    val context = LocalContext.current
++    DxHeroRotation.ensureLoaded(context)
++    val current by DxHeroRotation.intervalMs.collectAsStateWithLifecycle()
++    var show by remember { mutableStateOf(false) }
++    val label = DxHeroRotation.choices.firstOrNull { it.first == current }?.second ?: "${current / 1000} seconds"
++    SettingsActionRow(
++        title = "Hero rotation speed",
++        subtitle = "How often the Home hero moves to the next title. It pauses while the hero is focused.",
++        value = label,
++        onClick = { show = true },
++    )
++    if (show) {
++        SettingsSingleChoiceDialog(
++            title = "Hero rotation speed",
++            options = DxHeroRotation.choices.map { SettingsPickerOption(it.first, it.second) },
++            selectedValue = current,
++            onOptionSelected = {
++                DxHeroRotation.set(context, it)
++                show = false
++            },
++            onDismiss = { show = false },
++        )
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/components/HeroCarousel.kt b/app/src/main/java/com/nuvio/tv/ui/components/HeroCarousel.kt
+index 219bbcdf4..1716c5ede 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/components/HeroCarousel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/components/HeroCarousel.kt
+@@ -31,6 +31,7 @@ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.rememberUpdatedState
+ import androidx.compose.runtime.getValue
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
+ import androidx.compose.runtime.mutableIntStateOf
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+@@ -82,7 +83,6 @@ import com.nuvio.tv.ui.util.localizedContentType
+ import com.nuvio.tv.ui.util.localizedGenreLabel
+ import kotlinx.coroutines.delay
+ 
+-private const val AUTO_ADVANCE_INTERVAL_MS = 10000L
+ private val YEAR_REGEX = Regex("""\b\d{4}\b""")
+ 
+ @OptIn(ExperimentalTvMaterial3Api::class)
+@@ -119,12 +119,15 @@ fun HeroCarousel(
+         items.getOrNull(activeIndex)?.let { currentOnActiveItemChanged(it) }
+     }
+ 
+-    // Auto-advance when not focused — delay first advance to 20s so initial GPU load settles
+-    LaunchedEffect(isFocused, items.size) {
+-        if (items.size <= 1) return@LaunchedEffect
+-        delay(AUTO_ADVANCE_INTERVAL_MS * 2) // 20s before first advance
++    // Auto-advance when not focused. The speed is a setting (Layout > Home); 0 = off.
++    val heroContext = androidx.compose.ui.platform.LocalContext.current
++    DxHeroRotation.ensureLoaded(heroContext)
++    val rotationMs by DxHeroRotation.intervalMs.collectAsStateWithLifecycle()
++    LaunchedEffect(isFocused, items.size, rotationMs) {
++        if (items.size <= 1 || rotationMs <= 0L) return@LaunchedEffect
++        delay(rotationMs + 5000L) // first advance waits a little longer so the initial GPU load settles
+         while (true) {
+-            delay(AUTO_ADVANCE_INTERVAL_MS)
++            delay(rotationMs)
+             if (!isFocused) {
+                 activeIndex = (activeIndex + 1) % items.size
+             }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutHomeSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutHomeSettings.kt
+index 714232998..9aae7c94c 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutHomeSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutHomeSettings.kt
+@@ -109,6 +109,9 @@ internal fun LayoutHomeLayoutSection(
+             checked = uiState.heroSectionEnabled,
+             onToggle = { onEvent(LayoutSettingsEvent.SetHeroSectionEnabled(!uiState.heroSectionEnabled)) }
+         )
++        if (uiState.heroSectionEnabled) {
++            com.nuvio.tv.ui.components.DxHeroRotationSettingsRow() // Nuvio fork: hero rotation speed
++        }
+         if (uiState.heroSectionEnabled && uiState.availableCatalogs.isNotEmpty()) {
+             Text(
+                 text = stringResource(R.string.layout_hero_catalogs),
