@@ -118,6 +118,130 @@ index 8c87b55cb..626e679b6 100644
 +        val ANSWER_REGEX = Regex("\"type\"\\s*:\\s*(\\d+)[^}]*?\"data\"\\s*:\\s*\"([^\"]+)\"")
 +    }
  }
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/ImdbEpisodeRatingsRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/ImdbEpisodeRatingsRepository.kt
+index cfd52b4a7..a64df6c6a 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/ImdbEpisodeRatingsRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/ImdbEpisodeRatingsRepository.kt
+@@ -16,7 +16,8 @@ import javax.inject.Singleton
+ @Singleton
+ class ImdbEpisodeRatingsRepository @Inject constructor(
+     private val imdbTapframeApi: ImdbTapframeApi,
+-    private val seriesGraphApi: SeriesGraphApi
++    private val seriesGraphApi: SeriesGraphApi,
++    @dagger.hilt.android.qualifiers.ApplicationContext private val appContext: android.content.Context
+ ) {
+     private data class CacheEntry(
+         val ratings: Map<Pair<Int, Int>, Double>,
+@@ -88,7 +89,14 @@ class ImdbEpisodeRatingsRepository @Inject constructor(
+         }
+ 
+         if (tmdbId != null && tmdbId > 0) {
+-            return fetchFromSeriesGraph(tmdbId)
++            val graph = fetchFromSeriesGraph(tmdbId)
++            if (graph.isNotEmpty()) return graph
++        }
++
++        OmdbKeyPreferences.ensureLoaded(appContext)
++        val omdbKey = OmdbKeyPreferences.key.value
++        if (!imdbId.isNullOrBlank() && omdbKey.isNotBlank()) {
++            return OmdbEpisodeRatingsClient.fetch(imdbId, omdbKey)
+         }
+ 
+         return emptyMap()
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/OmdbEpisodeRatingsClient.kt b/app/src/main/java/com/nuvio/tv/data/repository/OmdbEpisodeRatingsClient.kt
+new file mode 100644
+index 000000000..d008fa249
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/repository/OmdbEpisodeRatingsClient.kt
+@@ -0,0 +1,45 @@
++package com.nuvio.tv.data.repository
++
++import android.util.Log
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++import org.json.JSONObject
++import java.net.HttpURLConnection
++import java.net.URL
++
++internal object OmdbEpisodeRatingsClient {
++    private const val TAG = "OmdbEpisodeRatings"
++
++    suspend fun fetch(imdbId: String, apiKey: String): Map<Pair<Int, Int>, Double> = withContext(Dispatchers.IO) {
++        if (apiKey.isBlank()) return@withContext emptyMap()
++        val out = mutableMapOf<Pair<Int, Int>, Double>()
++        try {
++            val head = JSONObject(get("https://www.omdbapi.com/?i=$imdbId&apikey=$apiKey"))
++            val totalSeasons = head.optString("totalSeasons").toIntOrNull() ?: return@withContext emptyMap()
++            for (season in 1..minOf(totalSeasons, 40)) {
++                val root = JSONObject(get("https://www.omdbapi.com/?i=$imdbId&Season=$season&apikey=$apiKey"))
++                val episodes = root.optJSONArray("Episodes") ?: continue
++                for (i in 0 until episodes.length()) {
++                    val ep = episodes.getJSONObject(i)
++                    val number = ep.optString("Episode").toIntOrNull() ?: continue
++                    val rating = ep.optString("imdbRating").toDoubleOrNull() ?: continue
++                    if (rating > 0.0) out[season to number] = rating
++                }
++            }
++        } catch (e: Exception) {
++            Log.w(TAG, "OMDb episode ratings failed for $imdbId", e)
++        }
++        out
++    }
++
++    private fun get(url: String): String {
++        val connection = URL(url).openConnection() as HttpURLConnection
++        connection.connectTimeout = 10_000
++        connection.readTimeout = 15_000
++        return try {
++            connection.inputStream.bufferedReader().use { it.readText() }
++        } finally {
++            connection.disconnect()
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/OmdbKeyPreferences.kt b/app/src/main/java/com/nuvio/tv/data/repository/OmdbKeyPreferences.kt
+new file mode 100644
+index 000000000..e61bc1e2a
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/repository/OmdbKeyPreferences.kt
+@@ -0,0 +1,37 @@
++package com.nuvio.tv.data.repository
++
++import android.content.Context
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++
++/** The user's own OMDb API key, used only as a fallback source for episode ratings. */
++object OmdbKeyPreferences {
++    private const val PREFS = "nuvio_omdb_settings"
++    private const val KEY_API_KEY = "api_key"
++
++    private val _key = MutableStateFlow("")
++    val key: StateFlow<String> = _key.asStateFlow()
++
++    @Volatile
++    private var loaded = false
++
++    fun ensureLoaded(context: Context) {
++        if (loaded) return
++        synchronized(this) {
++            if (loaded) return
++            _key.value = prefs(context).getString(KEY_API_KEY, null).orEmpty()
++            loaded = true
++        }
++    }
++
++    fun setKey(context: Context, value: String) {
++        val trimmed = value.trim()
++        _key.value = trimmed
++        loaded = true
++        prefs(context).edit().putString(KEY_API_KEY, trimmed).apply()
++    }
++
++    private fun prefs(context: Context) =
++        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++}
 diff --git a/app/src/main/java/com/nuvio/tv/data/repository/SkipIntroRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/SkipIntroRepository.kt
 index 52cbd2950..50b9f7c5b 100644
 --- a/app/src/main/java/com/nuvio/tv/data/repository/SkipIntroRepository.kt
@@ -319,6 +443,18 @@ index 000000000..46ce3c1b2
 +        )
 +    }
 +}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutDetailSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutDetailSettings.kt
+index 10b052424..f8cb60953 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutDetailSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutDetailSettings.kt
+@@ -50,6 +50,7 @@ internal fun LayoutDetailPageSection(
+         value = episodeRatingsVisibilityLabel(uiState.detailImdbRatingsVisibility),
+         onClick = { showRatingsDialog = true }
+     )
++    omdbKeySettingsRow()
+ 
+     SettingsSectionLabel(text = stringResource(R.string.layout_detail_group_trailers))
+     if (AppFeaturePolicy.inAppTrailerPlaybackEnabled) {
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
 index 7de677fbe..fe4778a33 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
@@ -332,6 +468,187 @@ index 7de677fbe..fe4778a33 100644
  
          item(key = "startup_settings") {
              SettingsGroupCard(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/OmdbKeySettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/OmdbKeySettingsItems.kt
+new file mode 100644
+index 000000000..1a5962ed7
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/OmdbKeySettingsItems.kt
+@@ -0,0 +1,175 @@
++@file:OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
++
++package com.nuvio.tv.ui.screens.settings
++
++import android.view.KeyEvent
++import androidx.compose.foundation.BorderStroke
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.foundation.text.BasicTextField
++import androidx.compose.foundation.text.KeyboardActions
++import androidx.compose.foundation.text.KeyboardOptions
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.focus.onFocusChanged
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.SolidColor
++import androidx.compose.ui.input.key.onKeyEvent
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.platform.LocalSoftwareKeyboardController
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.text.input.ImeAction
++import androidx.compose.ui.unit.dp
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import androidx.tv.material3.Border
++import androidx.tv.material3.Button
++import androidx.tv.material3.ButtonDefaults
++import androidx.tv.material3.Card
++import androidx.tv.material3.CardDefaults
++import androidx.tv.material3.MaterialTheme
++import androidx.tv.material3.Text
++import com.nuvio.tv.R
++import com.nuvio.tv.data.repository.OmdbKeyPreferences
++import com.nuvio.tv.ui.components.NuvioDialog
++import com.nuvio.tv.ui.theme.NuvioTheme
++
++@Composable
++internal fun omdbKeySettingsRow() {
++    val context = LocalContext.current
++    OmdbKeyPreferences.ensureLoaded(context)
++    val key by OmdbKeyPreferences.key.collectAsStateWithLifecycle()
++    var showDialog by remember { mutableStateOf(false) }
++
++    SettingsActionRow(
++        title = "OMDb API key",
++        subtitle = "Optional. Fills in episode ratings when the default sources have none.",
++        value = if (key.isBlank()) "Not set" else "Set",
++        onClick = { showDialog = true }
++    )
++
++    if (showDialog) {
++        OmdbKeyDialog(currentValue = key, onDismiss = { showDialog = false })
++    }
++}
++
++@Composable
++private fun OmdbKeyDialog(currentValue: String, onDismiss: () -> Unit) {
++    val context = LocalContext.current
++    var value by remember(currentValue) { mutableStateOf(currentValue) }
++    var isInputFocused by remember { mutableStateOf(false) }
++    val inputFocusRequester = remember { FocusRequester() }
++    val keyboardController = LocalSoftwareKeyboardController.current
++
++    NuvioDialog(
++        onDismiss = onDismiss,
++        title = "OMDb API key",
++        subtitle = "Get a free key at omdbapi.com and enter it here.",
++        width = 700.dp,
++        usePlatformDefaultWidth = false,
++    ) {
++        Column(verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.lg)) {
++            Card(
++                onClick = { inputFocusRequester.requestFocus() },
++                modifier = Modifier
++                    .fillMaxWidth()
++                    .onFocusChanged { isInputFocused = it.isFocused || it.hasFocus },
++                colors = CardDefaults.colors(
++                    containerColor = NuvioTheme.colors.BackgroundElevated,
++                    focusedContainerColor = NuvioTheme.colors.BackgroundElevated
++                ),
++                border = CardDefaults.border(
++                    border = Border(
++                        border = BorderStroke(NuvioTheme.spacing.hairline, NuvioTheme.colors.Border),
++                        shape = RoundedCornerShape(10.dp)
++                    ),
++                    focusedBorder = Border(
++                        border = NuvioTheme.focusRing.border(NuvioTheme.spacing.xxs),
++                        shape = RoundedCornerShape(10.dp)
++                    )
++                ),
++                shape = CardDefaults.shape(RoundedCornerShape(10.dp)),
++                scale = CardDefaults.scale(focusedScale = 1f)
++            ) {
++                Box(modifier = Modifier.padding(horizontal = 14.dp, vertical = NuvioTheme.spacing.md)) {
++                    BasicTextField(
++                        value = value,
++                        onValueChange = { value = it },
++                        modifier = Modifier
++                            .fillMaxWidth()
++                            .focusRequester(inputFocusRequester)
++                            .onKeyEvent { event ->
++                                event.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_DPAD_CENTER &&
++                                    event.nativeKeyEvent.action == KeyEvent.ACTION_DOWN
++                            },
++                        singleLine = true,
++                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
++                        keyboardActions = KeyboardActions(onDone = { keyboardController?.hide() }),
++                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = NuvioTheme.colors.TextPrimary),
++                        cursorBrush = SolidColor(if (isInputFocused) NuvioTheme.colors.Primary else Color.Transparent),
++                        decorationBox = { innerTextField ->
++                            if (value.isBlank()) {
++                                Text(
++                                    text = "OMDb API key",
++                                    style = MaterialTheme.typography.bodyMedium,
++                                    color = NuvioTheme.colors.TextTertiary
++                                )
++                            }
++                            innerTextField()
++                        }
++                    )
++                }
++            }
++
++            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
++                Button(
++                    onClick = onDismiss,
++                    colors = ButtonDefaults.colors(
++                        containerColor = NuvioTheme.colors.BackgroundElevated,
++                        contentColor = NuvioTheme.colors.TextPrimary
++                    )
++                ) {
++                    Text(stringResource(R.string.action_cancel))
++                }
++                Spacer(modifier = Modifier.width(NuvioTheme.spacing.sm))
++                Button(
++                    onClick = {
++                        OmdbKeyPreferences.setKey(context, "")
++                        onDismiss()
++                    },
++                    colors = ButtonDefaults.colors(
++                        containerColor = NuvioTheme.colors.BackgroundElevated,
++                        contentColor = NuvioTheme.colors.TextPrimary
++                    )
++                ) {
++                    Text(stringResource(R.string.action_clear))
++                }
++                Spacer(modifier = Modifier.width(NuvioTheme.spacing.sm))
++                Button(
++                    onClick = {
++                        OmdbKeyPreferences.setKey(context, value)
++                        onDismiss()
++                    },
++                    colors = ButtonDefaults.colors(
++                        containerColor = NuvioTheme.colors.BackgroundCard,
++                        contentColor = NuvioTheme.colors.TextPrimary
++                    )
++                ) {
++                    Text(stringResource(R.string.action_save))
++                }
++            }
++        }
++    }
++}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvForkPlayerSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvForkPlayerSettings.kt
 new file mode 100644
 index 000000000..756a99d52
