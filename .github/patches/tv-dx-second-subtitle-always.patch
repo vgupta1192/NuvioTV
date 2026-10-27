@@ -1,0 +1,136 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/DxSecondSubtitle.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/DxSecondSubtitle.kt
+index 874748f3f..8b83b8244 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/DxSecondSubtitle.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/DxSecondSubtitle.kt
+@@ -4,7 +4,9 @@ package com.nuvio.tv.ui.screens.player
+ 
+ import android.content.Context
+ import androidx.compose.foundation.BorderStroke
++import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.padding
+@@ -37,6 +39,9 @@ import androidx.tv.material3.ExperimentalTvMaterial3Api
+ import androidx.tv.material3.MaterialTheme
+ import androidx.tv.material3.Text
+ import com.nuvio.tv.domain.model.Subtitle
++import com.nuvio.tv.ui.screens.settings.SettingsActionRow
++import com.nuvio.tv.ui.screens.settings.SettingsPickerOption
++import com.nuvio.tv.ui.screens.settings.SettingsSingleChoiceDialog
+ import com.nuvio.tv.ui.screens.settings.SettingsToggleRow
+ import com.nuvio.tv.ui.theme.NuvioTheme
+ import com.nuvio.tv.ui.util.languageCodeToName
+@@ -160,14 +165,14 @@ internal fun DxSecondSubtitleOverlay(
+     }
+ }
+ 
+-/** D-pad card at the end of the Subtitles menu's style column. Press to step through Off and the available languages. */
++/** D-pad card near the top of the Subtitles menu's style column. Always shown while the feature is on. Press to step through Off and the available languages. */
+ @Composable
+ internal fun DxSecondSubtitleStyleItem(onMoveLeft: () -> Unit) {
+     DxSecondSubtitle.ensureLoaded(LocalContext.current)
+     val enabled by DxSecondSubtitle.enabled.collectAsStateWithLifecycle()
+     val chosen by DxSecondSubtitle.language.collectAsStateWithLifecycle()
+     val available by DxSecondSubtitle.available.collectAsStateWithLifecycle()
+-    if (!enabled || (available.isEmpty() && chosen == null)) return
++    if (!enabled) return
+     val isRtl = LocalLayoutDirection.current == LayoutDirection.Rtl
+     val moveLeftKey = if (isRtl) android.view.KeyEvent.KEYCODE_DPAD_RIGHT else android.view.KeyEvent.KEYCODE_DPAD_LEFT
+     Card(
+@@ -197,24 +202,65 @@ internal fun DxSecondSubtitleStyleItem(onMoveLeft: () -> Unit) {
+                     event.nativeKeyEvent.action == android.view.KeyEvent.ACTION_UP
+             },
+     ) {
+-        Text(
+-            text = "Second subtitle on top: " + (chosen?.let { languageCodeToName(it) } ?: "Off"),
+-            style = MaterialTheme.typography.bodyMedium,
+-            color = Color.White,
+-            modifier = Modifier.padding(horizontal = NuvioTheme.spacing.md, vertical = 10.dp),
+-        )
++        Row(
++            modifier = Modifier
++                .fillMaxWidth()
++                .padding(horizontal = NuvioTheme.spacing.md, vertical = 10.dp),
++            horizontalArrangement = Arrangement.SpaceBetween,
++            verticalAlignment = Alignment.CenterVertically,
++        ) {
++            Text(
++                text = "Second subtitle",
++                style = MaterialTheme.typography.bodyMedium,
++                color = Color.White,
++            )
++            Text(
++                text = chosen?.let { languageCodeToName(it) }
++                    ?: if (available.isEmpty()) "No subtitles loaded yet" else "Off",
++                style = MaterialTheme.typography.bodySmall,
++                color = Color.White.copy(alpha = 0.7f),
++                textAlign = TextAlign.End,
++                modifier = Modifier.padding(start = 8.dp).weight(1f, fill = false),
++            )
++        }
+     }
+ }
+ 
+-/** Settings row in Playback > Subtitles. */
++/** Settings rows in Playback > Subtitles: the on/off switch and a language chooser that works without addon subtitles. */
+ @Composable
+ internal fun DxSecondSubtitleSettingsRows() {
+     DxSecondSubtitle.ensureLoaded(LocalContext.current)
+     val enabled by DxSecondSubtitle.enabled.collectAsStateWithLifecycle()
++    val chosen by DxSecondSubtitle.language.collectAsStateWithLifecycle()
++    val available by DxSecondSubtitle.available.collectAsStateWithLifecycle()
++    var showPicker by remember { mutableStateOf(false) }
+     SettingsToggleRow(
+-        title = "Second subtitle language",
+-        subtitle = "Shows a second subtitle language at the top of the picture. Pick the language in the player's Subtitles menu. Off hides the picker and the extra line.",
++        title = "Second subtitle",
++        subtitle = "Shows a second subtitle language at the top of the picture. Off hides the line and the player entry.",
+         checked = enabled,
+         onToggle = { DxSecondSubtitle.setEnabled(!enabled) },
+     )
++    SettingsActionRow(
++        title = "Second subtitle language",
++        subtitle = "Used when a video offers subtitles in this language. You can also change it in the player's Subtitles menu.",
++        value = chosen?.let { languageCodeToName(it) } ?: "Off",
++        onClick = { showPicker = true },
++        enabled = enabled,
++    )
++    if (showPicker) {
++        val codes = (listOfNotNull(chosen) + available + DxSecondSubtitleCommonLanguages).distinct()
++        val options = listOf(SettingsPickerOption<String?>(null, "Off")) +
++            codes.map { SettingsPickerOption<String?>(it, languageCodeToName(it)) }
++        SettingsSingleChoiceDialog(
++            title = "Second subtitle language",
++            options = options,
++            selectedValue = chosen,
++            onOptionSelected = { code ->
++                DxSecondSubtitle.setLanguage(code)
++                showPicker = false
++            },
++            onDismiss = { showPicker = false },
++            maxHeight = 480.dp,
++        )
++    }
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/SubtitleSelectionOverlay.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/SubtitleSelectionOverlay.kt
+index 2c31be9c2..c7c786466 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/SubtitleSelectionOverlay.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/SubtitleSelectionOverlay.kt
+@@ -897,6 +897,7 @@ private fun SubtitleStyleRail(
+                     }
+                 }
+             }
++            item { DxSecondSubtitleStyleItem(onMoveLeft = onMoveLeft) } // Nuvio fork: second subtitle language
+             item {
+                 OverlaySectionCard(
+                     title = stringResource(R.string.subtitle_style_font_size),
+@@ -1092,7 +1093,6 @@ private fun SubtitleStyleRail(
+                     )
+                 }
+             }
+-            item { DxSecondSubtitleStyleItem(onMoveLeft = onMoveLeft) } // Nuvio fork: second subtitle language
+         }
+     }
+ }
