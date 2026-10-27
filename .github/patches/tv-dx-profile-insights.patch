@@ -1,0 +1,1217 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
+index db0d56781..70969a36f 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
+@@ -1327,6 +1327,9 @@ private fun PlaybackNavHost(
+                 onNavigateToPlugins = { navController.navigate(Screen.Plugins.route) },
+                 onNavigateToAuthQrSignIn = { navController.navigate(Screen.AuthQrSignIn.route) },
+                 onNavigateToManageProfiles = { navController.navigate(Screen.ManageProfiles.route) },
++                onOpenDetail = { id, type, addon ->
++                    navController.navigate(Screen.Detail.createRoute(id, type, addon))
++                },
+                 onNavigateToSupportersContributors = {
+                     navController.navigate(Screen.SupportersContributors.route)
+                 },
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/DxProfileInsights.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/DxProfileInsights.kt
+new file mode 100644
+index 000000000..3564131b1
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/DxProfileInsights.kt
+@@ -0,0 +1,486 @@
++package com.nuvio.tv.ui.screens.settings
++
++import android.content.Context
++import com.nuvio.tv.core.network.NetworkResult
++import com.nuvio.tv.core.profile.ProfileManager
++import com.nuvio.tv.data.remote.supabase.AvatarRepository
++import com.nuvio.tv.domain.model.LibraryEntry
++import com.nuvio.tv.domain.model.WatchProgress
++import com.nuvio.tv.domain.model.WatchedItem
++import com.nuvio.tv.domain.repository.LibraryRepository
++import com.nuvio.tv.domain.repository.MetaRepository
++import com.nuvio.tv.domain.repository.WatchProgressRepository
++import dagger.hilt.EntryPoint
++import dagger.hilt.InstallIn
++import dagger.hilt.components.SingletonComponent
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.async
++import kotlinx.coroutines.awaitAll
++import kotlinx.coroutines.coroutineScope
++import kotlinx.coroutines.flow.Flow
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.sync.Semaphore
++import kotlinx.coroutines.sync.withPermit
++import kotlinx.coroutines.withContext
++import kotlinx.coroutines.withTimeoutOrNull
++import org.json.JSONArray
++import org.json.JSONObject
++import java.time.Instant
++import java.time.LocalDate
++import java.time.OffsetDateTime
++import java.time.ZoneId
++import java.time.format.DateTimeFormatter
++import java.util.Locale
++import kotlin.math.roundToInt
++
++/*
++ * Nuvio fork: data layer of the Profile page (modelled on NuvioMobile-Enhanced's profile insights).
++ * Counts come from the watch progress, watched and library repositories; genres, runtimes, episode
++ * totals and upcoming release dates come from the title details, which are fetched a few at a time
++ * and kept on the device ("facts"), so the page is instant after the first visit.
++ */
++
++@EntryPoint
++@InstallIn(SingletonComponent::class)
++internal interface DxInsightsEntryPoint {
++    fun metaRepository(): MetaRepository
++    fun watchProgressRepository(): WatchProgressRepository
++    fun libraryRepository(): LibraryRepository
++    fun profileManager(): ProfileManager
++    fun avatarRepository(): AvatarRepository
++    fun profileLockStateDataStore(): com.nuvio.tv.data.local.ProfileLockStateDataStore
++}
++
++internal data class DxUpcomingRef(val date: String, val season: Int?, val episode: Int?)
++
++internal data class DxTitleFacts(
++    val genres: List<String>,
++    val runtimeMin: Int,
++    val episodeRuntimeMin: Int,
++    val episodes: Int,
++    val upcoming: List<DxUpcomingRef>,
++    val fetchedAt: Long,
++)
++
++internal data class DxInsightItem(
++    val id: String,
++    val type: String,
++    val title: String,
++    val subtitle: String?,
++    val poster: String?,
++    val addonBaseUrl: String? = null,
++)
++
++internal data class DxGenreSlice(val name: String, val fraction: Float)
++
++internal data class DxInsights(
++    val watching: List<DxInsightItem>,
++    val saved: List<DxInsightItem>,
++    val upcoming: List<DxInsightItem>,
++    val completed: List<DxInsightItem>,
++    val ongoing: List<DxInsightItem>,
++    val watchedMovies: List<DxInsightItem>,
++    val episodes: List<DxInsightItem>,
++    val episodeCount: Int,
++    val watchTimeMs: Long,
++    val movieShare: Float,
++    val genres: List<DxGenreSlice>,
++    val genreTitles: Int,
++    val totalTitles: Int,
++    val chips: List<String>,
++)
++
++internal object DxInsightsFactsStore {
++    private const val PREFS = "nuvio_tv_dx_insight_facts"
++    private val map = HashMap<String, DxTitleFacts>()
++    private var loaded = false
++
++    private fun prefs(context: Context) =
++        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++
++    @Synchronized
++    fun ensureLoaded(context: Context) {
++        if (loaded) return
++        loaded = true
++        runCatching {
++            val root = JSONObject(prefs(context).getString("facts", null) ?: return@runCatching)
++            root.keys().forEach { key ->
++                val o = root.optJSONObject(key) ?: return@forEach
++                val genres = o.optJSONArray("g")?.let { a -> (0 until a.length()).map { a.optString(it) } }.orEmpty()
++                val ups = o.optJSONArray("u")?.let { a ->
++                    (0 until a.length()).mapNotNull { i ->
++                        val u = a.optJSONObject(i) ?: return@mapNotNull null
++                        DxUpcomingRef(
++                            u.optString("d"),
++                            if (u.has("s")) u.optInt("s") else null,
++                            if (u.has("e")) u.optInt("e") else null,
++                        )
++                    }
++                }.orEmpty()
++                map[key] = DxTitleFacts(
++                    genres = genres,
++                    runtimeMin = o.optInt("r"),
++                    episodeRuntimeMin = o.optInt("er"),
++                    episodes = o.optInt("n"),
++                    upcoming = ups,
++                    fetchedAt = o.optLong("t"),
++                )
++            }
++        }
++    }
++
++    @Synchronized
++    fun get(key: String): DxTitleFacts? = map[key]
++
++    @Synchronized
++    fun put(key: String, facts: DxTitleFacts) {
++        map[key] = facts
++    }
++
++    @Synchronized
++    fun snapshot(): Map<String, DxTitleFacts> = HashMap(map)
++
++    @Synchronized
++    fun save(context: Context) {
++        val root = JSONObject()
++        map.entries.sortedByDescending { it.value.fetchedAt }.take(600).forEach { (key, f) ->
++            val o = JSONObject()
++            o.put("g", JSONArray(f.genres))
++            o.put("r", f.runtimeMin)
++            o.put("er", f.episodeRuntimeMin)
++            o.put("n", f.episodes)
++            o.put("t", f.fetchedAt)
++            o.put("u", JSONArray().also { a ->
++                f.upcoming.forEach { u ->
++                    a.put(JSONObject().also { j ->
++                        j.put("d", u.date)
++                        u.season?.let { j.put("s", it) }
++                        u.episode?.let { j.put("e", it) }
++                    })
++                }
++            })
++            root.put(key, o)
++        }
++        prefs(context).edit().putString("facts", root.toString()).apply()
++    }
++
++    fun lastUpdated(context: Context, profileId: Int): Long = prefs(context).getLong("updated_$profileId", 0L)
++
++    fun markUpdated(context: Context, profileId: Int) {
++        prefs(context).edit().putLong("updated_$profileId", System.currentTimeMillis()).apply()
++    }
++}
++
++private fun isMovieType(type: String?): Boolean = type.equals("movie", ignoreCase = true)
++
++internal fun dxFactsKey(type: String?, id: String): String = (if (isMovieType(type)) "movie:" else "series:") + id
++
++private fun parseDate(value: String?): LocalDate? {
++    val text = value?.trim()?.takeIf { it.isNotEmpty() } ?: return null
++    return runCatching { OffsetDateTime.parse(text).toLocalDate() }.getOrNull()
++        ?: runCatching { LocalDate.parse(text.take(10)) }.getOrNull()
++}
++
++private fun parseRuntimeMinutes(value: String?): Int {
++    val text = value?.lowercase(Locale.US) ?: return 0
++    val hours = Regex("""(\d+)\s*h""").find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 0
++    val minutes = Regex("""(\d+)\s*m""").find(text)?.groupValues?.get(1)?.toIntOrNull()
++    if (hours > 0 || minutes != null) return hours * 60 + (minutes ?: 0)
++    return Regex("""(\d+)""").find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 0
++}
++
++private suspend fun fetchFacts(repository: MetaRepository, type: String, id: String, addon: String?): DxTitleFacts? {
++    val meta = withTimeoutOrNull(12_000L) {
++        repository.getMetaFromAllAddons(type, id, addon).first { it !is NetworkResult.Loading }
++    }.let { (it as? NetworkResult.Success)?.data } ?: return null
++    val today = LocalDate.now()
++    val movie = isMovieType(type)
++    val watchable = if (movie) emptyList() else meta.watchableEpisodes()
++    val episodeRuntimes = meta.videos.mapNotNull { v -> v.runtime?.takeIf { it in 5..300 } }
++    val episodeRuntime = when {
++        movie -> 0
++        episodeRuntimes.isNotEmpty() -> episodeRuntimes.average().roundToInt()
++        else -> parseRuntimeMinutes(meta.runtime)
++    }
++    val upcoming: List<DxUpcomingRef> = if (movie) {
++        parseDate(meta.released ?: meta.releaseInfo)?.takeIf { !it.isBefore(today) }
++            ?.let { listOf(DxUpcomingRef(it.toString(), null, null)) }.orEmpty()
++    } else {
++        meta.videos.mapNotNull { v ->
++            if ((v.season ?: 1) <= 0) return@mapNotNull null
++            val date = parseDate(v.released)?.takeIf { !it.isBefore(today) } ?: return@mapNotNull null
++            DxUpcomingRef(date.toString(), v.season, v.episode)
++        }.sortedBy { it.date }.take(3)
++    }
++    return DxTitleFacts(
++        genres = meta.genres.map { it.trim() }.filter { it.isNotEmpty() },
++        runtimeMin = if (movie) parseRuntimeMinutes(meta.runtime) else 0,
++        episodeRuntimeMin = episodeRuntime,
++        episodes = watchable.size,
++        upcoming = upcoming,
++        fetchedAt = System.currentTimeMillis(),
++    )
++}
++
++private suspend fun <T> Flow<List<T>>.firstOrEmpty(): List<T> =
++    withTimeoutOrNull(8_000L) { first() }.orEmpty()
++
++private const val FACTS_MAX_AGE_MS = 24L * 60L * 60L * 1000L
++private const val HYDRATE_CAP = 100
++
++/**
++ * Builds the insights from the repositories, then fetches the title details that are missing or
++ * stale (all of them when [force]) and rebuilds as they arrive. [onUpdate] gets every new result;
++ * [onProgress] gets "done of total" while details load and (0, 0) at the end.
++ */
++internal suspend fun loadDxInsights(
++    context: Context,
++    entry: DxInsightsEntryPoint,
++    force: Boolean,
++    onUpdate: (DxInsights) -> Unit,
++    onProgress: (Int, Int) -> Unit,
++) {
++    DxInsightsFactsStore.ensureLoaded(context)
++    val progress = entry.watchProgressRepository().allProgress.firstOrEmpty()
++    val continueWatching = entry.watchProgressRepository().continueWatching.firstOrEmpty()
++    val watched = entry.watchProgressRepository().watchedItems.firstOrEmpty()
++    val library = entry.libraryRepository().libraryItems.firstOrEmpty()
++    val weekSeconds = com.nuvio.tv.ui.screens.player.DxWatchStats.summary(context).week
++
++    fun rebuild() = onUpdate(
++        buildDxInsights(
++            progress, continueWatching, watched, library,
++            DxInsightsFactsStore.snapshot(), LocalDate.now(), weekSeconds,
++        )
++    )
++    rebuild()
++
++    // Titles to look up, library first (upcoming dates), then what is being watched, newest first.
++    class Target(val key: String, val type: String, val id: String, val addon: String?)
++    val targets = LinkedHashMap<String, Target>()
++    library.forEach { targets.putIfAbsent(dxFactsKey(it.type, it.id), Target(dxFactsKey(it.type, it.id), it.type, it.id, it.addonBaseUrl)) }
++    continueWatching.forEach { targets.putIfAbsent(dxFactsKey(it.contentType, it.contentId), Target(dxFactsKey(it.contentType, it.contentId), it.contentType, it.contentId, it.addonBaseUrl)) }
++    watched.sortedByDescending { it.watchedAt }.forEach {
++        targets.putIfAbsent(dxFactsKey(it.contentType, it.contentId), Target(dxFactsKey(it.contentType, it.contentId), it.contentType, it.contentId, null))
++    }
++    progress.sortedByDescending { it.lastWatched }.forEach {
++        targets.putIfAbsent(dxFactsKey(it.contentType, it.contentId), Target(dxFactsKey(it.contentType, it.contentId), it.contentType, it.contentId, it.addonBaseUrl))
++    }
++    val now = System.currentTimeMillis()
++    val todo = targets.values.take(HYDRATE_CAP).filter { t ->
++        val facts = DxInsightsFactsStore.get(t.key)
++        force || facts == null || now - facts.fetchedAt > FACTS_MAX_AGE_MS ||
++            facts.upcoming.any { (parseDate(it.date) ?: LocalDate.MAX).isBefore(LocalDate.now()) }
++    }
++    if (todo.isEmpty()) {
++        onProgress(0, 0)
++        return
++    }
++    val gate = Semaphore(4)
++    var done = 0
++    onProgress(0, todo.size)
++    withContext(Dispatchers.IO) {
++        coroutineScope {
++            todo.map { t ->
++                async {
++                    gate.withPermit {
++                        val facts = runCatching { fetchFacts(entry.metaRepository(), t.type, t.id, t.addon) }.getOrNull()
++                        if (facts != null) DxInsightsFactsStore.put(t.key, facts)
++                        val finished = synchronized(todo) { ++done }
++                        withContext(Dispatchers.Main) {
++                            onProgress(finished, todo.size)
++                            if (finished % 6 == 0) rebuild()
++                        }
++                    }
++                }
++            }.awaitAll()
++        }
++    }
++    DxInsightsFactsStore.save(context)
++    DxInsightsFactsStore.markUpdated(context, entry.profileManager().activeProfileId.value)
++    rebuild()
++    onProgress(0, 0)
++}
++
++private class Rec(
++    val id: String,
++    val type: String,
++    val title: String,
++    val poster: String?,
++    val season: Int?,
++    val episode: Int?,
++    val at: Long,
++)
++
++private fun episodeLine(season: Int?, episode: Int?): String? =
++    if (season != null && episode != null) "S${season}E$episode" else null
++
++private val monthDay: DateTimeFormatter get() = DateTimeFormatter.ofPattern("MMM d", Locale.getDefault())
++
++private fun dayOf(epochMs: Long): LocalDate = Instant.ofEpochMilli(epochMs).atZone(ZoneId.systemDefault()).toLocalDate()
++
++internal fun buildDxInsights(
++    progress: List<WatchProgress>,
++    continueWatching: List<WatchProgress>,
++    watched: List<WatchedItem>,
++    library: List<LibraryEntry>,
++    facts: Map<String, DxTitleFacts>,
++    today: LocalDate,
++    weekSeconds: Double,
++): DxInsights {
++    val recs = LinkedHashMap<String, Rec>()
++    fun add(rec: Rec) {
++        val key = if (rec.season != null && rec.episode != null) "${rec.id}|${rec.season}|${rec.episode}" else rec.id
++        val old = recs[key]
++        if (old == null || rec.at > old.at) recs[key] = rec
++    }
++    watched.forEach { add(Rec(it.contentId, it.contentType, it.title, it.poster, it.season, it.episode, it.watchedAt)) }
++    progress.filter { it.isCompleted() }.forEach {
++        add(Rec(it.contentId, it.contentType, it.name, it.poster, it.season, it.episode, it.lastWatched))
++    }
++    val movieRecs = recs.values.filter { it.season == null && isMovieType(it.type) }
++    val episodeRecs = recs.values.filter { it.season != null && it.episode != null }
++    val bySeries = episodeRecs.groupBy { it.id }
++
++    // Continue watching, one row per title.
++    val watching = continueWatching.sortedByDescending { it.lastWatched }.distinctBy { it.contentId }.map {
++        val pct = (it.progressPercentage * 100f).roundToInt()
++        DxInsightItem(
++            id = it.contentId, type = it.contentType, title = it.name,
++            subtitle = listOfNotNull(episodeLine(it.season, it.episode), "$pct%").joinToString(" • "),
++            poster = it.poster, addonBaseUrl = it.addonBaseUrl,
++        )
++    }
++    val saved = library.sortedByDescending { it.listedAt }.distinctBy { "${it.type}:${it.id}" }.map {
++        DxInsightItem(it.id, it.type, it.name, it.releaseInfo, it.poster, it.addonBaseUrl)
++    }
++    val upcoming = library.distinctBy { "${it.type}:${it.id}" }.mapNotNull { e ->
++        val ref = facts[dxFactsKey(e.type, e.id)]?.upcoming
++            ?.firstOrNull { (parseDate(it.date) ?: LocalDate.MIN) >= today } ?: return@mapNotNull null
++        val date = parseDate(ref.date) ?: return@mapNotNull null
++        date to DxInsightItem(
++            e.id, e.type, e.name,
++            listOfNotNull(date.format(monthDay), episodeLine(ref.season, ref.episode) ?: "Release").joinToString(" • "),
++            e.poster, e.addonBaseUrl,
++        )
++    }.sortedBy { it.first }.map { it.second }
++
++    val completed = ArrayList<Pair<Long, DxInsightItem>>()
++    val ongoing = ArrayList<Pair<Long, DxInsightItem>>()
++    bySeries.forEach { (id, list) ->
++        val latest = list.maxByOrNull { it.at } ?: return@forEach
++        val count = list.filter { (it.season ?: 0) > 0 }.map { it.season to it.episode }.distinct().size
++        val total = facts[dxFactsKey("series", id)]?.episodes ?: 0
++        val poster = list.sortedByDescending { it.at }.firstNotNullOfOrNull { it.poster }
++        val item = DxInsightItem(
++            id, latest.type, latest.title,
++            if (total > 0) "${minOf(count, total)} of $total episodes" else "$count episodes watched",
++            poster,
++        )
++        if (total > 0 && count >= total) completed.add(latest.at to item) else ongoing.add(latest.at to item)
++    }
++    continueWatching.filter { !isMovieType(it.contentType) && !bySeries.containsKey(it.contentId) }
++        .distinctBy { it.contentId }.forEach {
++            ongoing.add(it.lastWatched to DxInsightItem(it.contentId, it.contentType, it.name, "Just started", it.poster, it.addonBaseUrl))
++        }
++
++    val watchedMovies = movieRecs.sortedByDescending { it.at }.map {
++        DxInsightItem(it.id, it.type, it.title, "Watched " + dayOf(it.at).format(monthDay), it.poster)
++    }
++    val episodeItems = episodeRecs.sortedByDescending { it.at }.take(120).map {
++        DxInsightItem(it.id, it.type, it.title, listOfNotNull(episodeLine(it.season, it.episode), dayOf(it.at).format(monthDay)).joinToString(" • "), it.poster)
++    }
++
++    // Watch time from runtimes, plus the part of the unfinished items already watched.
++    val weights = HashMap<String, Long>()
++    var movieMs = 0L
++    var seriesMs = 0L
++    movieRecs.forEach {
++        val minutes = facts[dxFactsKey("movie", it.id)]?.runtimeMin?.takeIf { m -> m > 0 } ?: 110
++        val ms = minutes * 60_000L
++        movieMs += ms
++        weights.merge(dxFactsKey("movie", it.id), ms, Long::plus)
++    }
++    episodeRecs.forEach {
++        val minutes = facts[dxFactsKey("series", it.id)]?.episodeRuntimeMin?.takeIf { m -> m > 0 } ?: 42
++        val ms = minutes * 60_000L
++        seriesMs += ms
++        weights.merge(dxFactsKey("series", it.id), ms, Long::plus)
++    }
++    progress.filter { !it.isCompleted() && it.position > 0 }.forEach {
++        val ms = it.position
++        if (isMovieType(it.contentType)) movieMs += ms else seriesMs += ms
++        weights.merge(dxFactsKey(it.contentType, it.contentId), ms, Long::plus)
++    }
++    val total = movieMs + seriesMs
++    val movieShare = if (total > 0) movieMs.toFloat() / total.toFloat() else 0.5f
++
++    // Taste DNA: genres weighted by watch time.
++    val libraryGenres = library.associate { dxFactsKey(it.type, it.id) to it.genres }
++    val genreMs = HashMap<String, Long>()
++    var withGenres = 0
++    weights.forEach { (key, ms) ->
++        val genres = (facts[key]?.genres?.takeIf { it.isNotEmpty() } ?: libraryGenres[key].orEmpty())
++            .map { it.trim() }.filter { it.isNotEmpty() }.distinct()
++        if (genres.isEmpty()) return@forEach
++        withGenres++
++        genres.forEach { genreMs.merge(it, ms, Long::plus) }
++    }
++    val genreTotal = genreMs.values.sum().toFloat()
++    val sorted = genreMs.entries.sortedByDescending { it.value }
++    val top = sorted.take(5).map { DxGenreSlice(it.key, it.value / genreTotal) }
++    val otherFraction = sorted.drop(5).sumOf { it.value }.toFloat() / genreTotal
++    val genres = if (genreTotal <= 0f) emptyList() else if (otherFraction > 0.01f) top + DxGenreSlice("Others", otherFraction) else top
++
++    val titles = weights.size
++    val chips = ArrayList<String>()
++    if (titles < 3) {
++        chips.add("Learning")
++    } else {
++        chips.add(if (movieShare >= 0.6f) "Movie fan" else if (movieShare <= 0.4f) "Series fan" else "Balanced viewer")
++        if (episodeRecs.size >= 100) chips.add("Binge ready")
++        if (weekSeconds >= 10 * 3600) chips.add("Highly active")
++        if (saved.size >= 20) chips.add("Collector")
++        if (upcoming.size >= 3) chips.add("Release radar")
++        if (completed.size >= 5) chips.add("Completionist")
++    }
++
++    return DxInsights(
++        watching = watching,
++        saved = saved,
++        upcoming = upcoming,
++        completed = completed.sortedByDescending { it.first }.map { it.second },
++        ongoing = ongoing.sortedByDescending { it.first }.map { it.second },
++        watchedMovies = watchedMovies,
++        episodes = episodeItems,
++        episodeCount = episodeRecs.size,
++        watchTimeMs = total,
++        movieShare = movieShare,
++        genres = genres,
++        genreTitles = withGenres,
++        totalTitles = titles,
++        chips = chips,
++    )
++}
++
++internal fun dxDurationLabel(ms: Long): String {
++    val minutes = ms / 60_000L
++    val days = minutes / (24 * 60)
++    val hours = (minutes / 60) % 24
++    return when {
++        days > 0 -> "~${days}d ${hours}h"
++        minutes >= 60 -> "~${minutes / 60}h ${minutes % 60}m"
++        else -> "~${minutes}m"
++    }
++}
++
++internal fun dxUpdatedLabel(updatedAt: Long): String {
++    if (updatedAt <= 0L) return "Not refreshed yet"
++    val minutes = ((System.currentTimeMillis() - updatedAt) / 60_000L).coerceAtLeast(0L)
++    return when {
++        minutes < 1 -> "Updated just now"
++        minutes < 60 -> "Updated $minutes min ago"
++        minutes < 24 * 60 -> "Updated ${minutes / 60} h ago"
++        else -> "Updated ${minutes / (24 * 60)} d ago"
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/DxProfileInsightsPage.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/DxProfileInsightsPage.kt
+new file mode 100644
+index 000000000..d06dc918a
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/DxProfileInsightsPage.kt
+@@ -0,0 +1,606 @@
++@file:OptIn(ExperimentalTvMaterial3Api::class, ExperimentalLayoutApi::class)
++
++package com.nuvio.tv.ui.screens.settings
++
++import android.widget.Toast
++import androidx.compose.foundation.BorderStroke
++import androidx.compose.foundation.Canvas
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.ExperimentalLayoutApi
++import androidx.compose.foundation.layout.FlowRow
++import androidx.compose.foundation.layout.PaddingValues
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.aspectRatio
++import androidx.compose.foundation.layout.fillMaxHeight
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.grid.GridCells
++import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
++import androidx.compose.foundation.lazy.grid.items
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.geometry.Size
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.drawscope.Stroke
++import androidx.compose.ui.layout.ContentScale
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.style.TextAlign
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import androidx.compose.ui.window.Dialog
++import androidx.compose.ui.window.DialogProperties
++import androidx.tv.material3.Border
++import androidx.tv.material3.Card
++import androidx.tv.material3.CardDefaults
++import androidx.tv.material3.ExperimentalTvMaterial3Api
++import androidx.tv.material3.MaterialTheme
++import androidx.tv.material3.Text
++import coil3.compose.AsyncImage
++import com.nuvio.tv.ui.components.NuvioDialog
++import com.nuvio.tv.ui.components.ProfileAvatarCircle
++import com.nuvio.tv.ui.screens.player.DxWatchStats
++import com.nuvio.tv.ui.theme.NuvioTheme
++import dagger.hilt.android.EntryPointAccessors
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withTimeoutOrNull
++
++/*
++ * Nuvio fork: the Profile page of Settings, modelled on NuvioMobile-Enhanced's profile insights and
++ * built for the D-pad. Avatar and name with Switch profile / Edit profile, rounded stat tiles that
++ * open a poster sheet, the Watch Time card and the Taste DNA section.
++ */
++
++private class DxSheet(val title: String, val items: List<DxInsightItem>)
++
++private val DxPalette = listOf(
++    Color(0xFF6C8CFF), Color(0xFFFF7A90), Color(0xFF4CD6A5),
++    Color(0xFFFFC857), Color(0xFFB07CFF), Color(0xFF8A8FA3),
++)
++
++@Composable
++private fun DxCard(
++    onClick: () -> Unit,
++    modifier: Modifier = Modifier,
++    radius: Int = 20,
++    container: Color = NuvioTheme.colors.BackgroundCard,
++    content: @Composable androidx.compose.foundation.layout.ColumnScope.() -> Unit,
++) {
++    val shape = RoundedCornerShape(radius.dp)
++    Card(
++        onClick = onClick,
++        modifier = modifier,
++        shape = CardDefaults.shape(shape = shape),
++        colors = CardDefaults.colors(
++            containerColor = container,
++            focusedContainerColor = NuvioTheme.colors.FocusBackground,
++        ),
++        border = CardDefaults.border(
++            border = Border(BorderStroke(1.dp, NuvioTheme.colors.Border), shape),
++            focusedBorder = Border(NuvioTheme.focusRing.border(NuvioTheme.spacing.xxs), shape),
++        ),
++        scale = CardDefaults.scale(focusedScale = 1.03f),
++        content = content,
++    )
++}
++
++@Composable
++private fun DxPill(text: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
++    DxCard(onClick = onClick, modifier = modifier, radius = 40) {
++        Text(
++            text = text,
++            style = MaterialTheme.typography.titleMedium,
++            color = NuvioTheme.colors.TextPrimary,
++            modifier = Modifier.padding(horizontal = 28.dp, vertical = 14.dp),
++        )
++    }
++}
++
++@Composable
++private fun DxStatTile(value: String, label: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
++    DxCard(onClick = onClick, modifier = modifier) {
++        Column(
++            modifier = Modifier.fillMaxWidth().padding(vertical = 18.dp, horizontal = 12.dp),
++            horizontalAlignment = Alignment.CenterHorizontally,
++        ) {
++            Text(
++                text = value,
++                style = MaterialTheme.typography.headlineMedium,
++                fontWeight = FontWeight.Bold,
++                color = NuvioTheme.colors.TextPrimary,
++            )
++            Text(
++                text = label,
++                style = MaterialTheme.typography.bodyLarge,
++                color = NuvioTheme.colors.TextSecondary,
++                maxLines = 1,
++                overflow = TextOverflow.Ellipsis,
++            )
++        }
++    }
++}
++
++@Composable
++internal fun DxProfileInsightsPage(
++    onManageProfiles: () -> Unit,
++    onOpenDetail: (id: String, type: String, addonBaseUrl: String?) -> Unit,
++    initialFocusRequester: FocusRequester? = null,
++) {
++    val context = LocalContext.current
++    val entry = remember(context) {
++        EntryPointAccessors.fromApplication(context.applicationContext, DxInsightsEntryPoint::class.java)
++    }
++    val scope = androidx.compose.runtime.rememberCoroutineScope()
++    val profiles by entry.profileManager().profiles.collectAsState()
++    val activeId by entry.profileManager().activeProfileId.collectAsState()
++    val profile = profiles.firstOrNull { it.id == activeId }
++
++    var avatarUrl by remember { mutableStateOf<String?>(null) }
++    LaunchedEffect(profile?.id, profile?.avatarId, profile?.avatarUrl) {
++        avatarUrl = profile?.avatarUrl ?: profile?.avatarId?.let { id ->
++            runCatching {
++                withTimeoutOrNull(6_000L) {
++                    val repo = entry.avatarRepository()
++                    repo.getAvatarImageUrl(id, repo.getAvatarCatalog())
++                }
++            }.getOrNull()
++        }
++    }
++
++    var insights by remember { mutableStateOf<DxInsights?>(null) }
++    var loading by remember { mutableStateOf<Pair<Int, Int>?>(null) }
++    var updatedAt by remember { mutableStateOf(0L) }
++    var refreshTick by remember { mutableIntStateOf(0) }
++    LaunchedEffect(activeId, refreshTick) {
++        if (refreshTick == 0) insights = null
++        delay(400)
++        updatedAt = DxInsightsFactsStore.lastUpdated(context, activeId)
++        runCatching {
++            loadDxInsights(
++                context = context,
++                entry = entry,
++                force = refreshTick > 0,
++                onUpdate = { insights = it },
++                onProgress = { done, total -> loading = if (total > 0) done to total else null },
++            )
++        }
++        loading = null
++        updatedAt = DxInsightsFactsStore.lastUpdated(context, activeId)
++    }
++
++    var sheet by remember { mutableStateOf<DxSheet?>(null) }
++    var showSwitch by remember { mutableStateOf(false) }
++    val data = insights
++    val stats = remember(insights) { DxWatchStats.summary(context) }
++
++    LazyColumn(
++        modifier = Modifier.fillMaxSize(),
++        contentPadding = PaddingValues(bottom = 48.dp),
++        verticalArrangement = Arrangement.spacedBy(20.dp),
++    ) {
++        item(key = "header") {
++            Column(
++                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
++                horizontalAlignment = Alignment.CenterHorizontally,
++                verticalArrangement = Arrangement.spacedBy(10.dp),
++            ) {
++                ProfileAvatarCircle(
++                    name = profile?.name ?: "?",
++                    colorHex = profile?.avatarColorHex ?: "#1E88E5",
++                    size = 132.dp,
++                    avatarImageUrl = avatarUrl,
++                )
++                Text(
++                    text = profile?.name ?: "Profile",
++                    style = MaterialTheme.typography.headlineLarge,
++                    fontWeight = FontWeight.Bold,
++                    color = NuvioTheme.colors.TextPrimary,
++                )
++                Text(
++                    text = "Activity, library and taste insights",
++                    style = MaterialTheme.typography.bodyLarge,
++                    color = NuvioTheme.colors.TextSecondary,
++                )
++                Row(horizontalArrangement = Arrangement.spacedBy(20.dp)) {
++                    DxPill(
++                        text = "Switch profile",
++                        onClick = { showSwitch = true },
++                        modifier = if (initialFocusRequester != null) Modifier.focusRequester(initialFocusRequester) else Modifier,
++                    )
++                    DxPill(text = "Edit profile", onClick = onManageProfiles)
++                }
++            }
++        }
++
++        item(key = "updated") {
++            Row(
++                modifier = Modifier.fillMaxWidth(),
++                horizontalArrangement = Arrangement.SpaceBetween,
++                verticalAlignment = Alignment.CenterVertically,
++            ) {
++                Column {
++                    Text(
++                        text = dxUpdatedLabel(updatedAt),
++                        style = MaterialTheme.typography.titleMedium,
++                        color = NuvioTheme.colors.TextPrimary,
++                    )
++                    val progressLine = loading?.let { "Loading title details · ${it.first} of ${it.second}" }
++                    if (progressLine != null) {
++                        Text(
++                            text = progressLine,
++                            style = MaterialTheme.typography.bodyLarge,
++                            color = NuvioTheme.colors.TextSecondary,
++                        )
++                    }
++                }
++                DxPill(
++                    text = if (loading != null) "Refreshing…" else "Refresh",
++                    onClick = { if (loading == null) refreshTick++ },
++                )
++            }
++        }
++
++        item(key = "tiles") {
++            val i = data
++            fun open(title: String, list: List<DxInsightItem>?) {
++                sheet = DxSheet(title, list.orEmpty())
++            }
++            Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
++                Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
++                    DxStatTile((i?.watching?.size ?: 0).toString(), "Watching", { open("Continue Watching", i?.watching) }, Modifier.weight(1f))
++                    DxStatTile((i?.saved?.size ?: 0).toString(), "Saved", { open("Saved in Library", i?.saved) }, Modifier.weight(1f))
++                    DxStatTile((i?.upcoming?.size ?: 0).toString(), "Upcoming", { open("Upcoming", i?.upcoming) }, Modifier.weight(1f))
++                    DxStatTile((i?.completed?.size ?: 0).toString(), "Completed", { open("Completed series", i?.completed) }, Modifier.weight(1f))
++                }
++                Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
++                    DxStatTile((i?.ongoing?.size ?: 0).toString(), "Ongoing", { open("Ongoing series", i?.ongoing) }, Modifier.weight(1f))
++                    DxStatTile((i?.episodeCount ?: 0).toString(), "Episodes", { open("Watched episodes", i?.episodes) }, Modifier.weight(1f))
++                    DxStatTile((i?.watchedMovies?.size ?: 0).toString(), "Watched", { open("Watched movies", i?.watchedMovies) }, Modifier.weight(1f))
++                }
++            }
++        }
++
++        item(key = "watchtime") {
++            DxCard(onClick = {}, modifier = Modifier.fillMaxWidth(), radius = 24) {
++                Column(
++                    modifier = Modifier.fillMaxWidth().padding(28.dp),
++                    verticalArrangement = Arrangement.spacedBy(6.dp),
++                ) {
++                    Text("Watch Time", style = MaterialTheme.typography.titleLarge, color = NuvioTheme.colors.TextSecondary)
++                    Text(
++                        text = data?.let { dxDurationLabel(it.watchTimeMs) } ?: "—",
++                        fontSize = 56.sp,
++                        fontWeight = FontWeight.Bold,
++                        color = NuvioTheme.colors.TextPrimary,
++                    )
++                    Text(
++                        text = "Approximate time from title runtimes",
++                        style = MaterialTheme.typography.bodyLarge,
++                        color = NuvioTheme.colors.TextTertiary,
++                    )
++                    if (stats.total > 0.0) {
++                        Spacer(Modifier.height(6.dp))
++                        Text(
++                            text = "Tracked on this device: today ${dxShortHours(stats.today)}, 7 days ${dxShortHours(stats.week)}, streak ${stats.currentStreak} d",
++                            style = MaterialTheme.typography.bodyLarge,
++                            color = NuvioTheme.colors.TextSecondary,
++                        )
++                    }
++                }
++            }
++        }
++
++        item(key = "taste") {
++            DxCard(onClick = {}, modifier = Modifier.fillMaxWidth(), radius = 24) {
++                Column(
++                    modifier = Modifier.fillMaxWidth().padding(28.dp),
++                    verticalArrangement = Arrangement.spacedBy(18.dp),
++                ) {
++                    Text("Taste DNA", style = MaterialTheme.typography.titleLarge, color = NuvioTheme.colors.TextPrimary)
++                    val genres = data?.genres.orEmpty()
++                    if (genres.isEmpty()) {
++                        Text(
++                            text = if (loading != null) "Learning your taste…" else "Watch a few titles and your genres show up here",
++                            style = MaterialTheme.typography.bodyLarge,
++                            color = NuvioTheme.colors.TextSecondary,
++                        )
++                    } else {
++                        Row(
++                            modifier = Modifier.fillMaxWidth(),
++                            horizontalArrangement = Arrangement.spacedBy(36.dp),
++                            verticalAlignment = Alignment.CenterVertically,
++                        ) {
++                            Canvas(modifier = Modifier.size(200.dp)) {
++                                val stroke = 34.dp.toPx()
++                                var start = -90f
++                                genres.forEachIndexed { index, slice ->
++                                    val sweep = slice.fraction * 360f
++                                    drawArc(
++                                        color = DxPalette[index % DxPalette.size],
++                                        startAngle = start,
++                                        sweepAngle = (sweep - 2f).coerceAtLeast(1f),
++                                        useCenter = false,
++                                        topLeft = Offset(stroke / 2, stroke / 2),
++                                        size = Size(size.width - stroke, size.height - stroke),
++                                        style = Stroke(width = stroke),
++                                    )
++                                    start += sweep
++                                }
++                            }
++                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                                genres.forEachIndexed { index, slice ->
++                                    Row(verticalAlignment = Alignment.CenterVertically) {
++                                        Box(
++                                            Modifier.size(16.dp).clip(CircleShape)
++                                                .background(DxPalette[index % DxPalette.size])
++                                        )
++                                        Spacer(Modifier.width(12.dp))
++                                        Text(
++                                            text = "${slice.name}  ${(slice.fraction * 100f).toInt()}%",
++                                            style = MaterialTheme.typography.titleMedium,
++                                            color = NuvioTheme.colors.TextPrimary,
++                                        )
++                                    }
++                                }
++                            }
++                        }
++                        Text(
++                            text = "Based on ${data?.genreTitles ?: 0} of ${data?.totalTitles ?: 0} titles",
++                            style = MaterialTheme.typography.bodyLarge,
++                            color = NuvioTheme.colors.TextTertiary,
++                        )
++                    }
++
++                    if (data != null && data.watchTimeMs > 0L) {
++                        val movie = data.movieShare.coerceIn(0.03f, 0.97f)
++                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
++                                Text(
++                                    "Movies ${(data.movieShare * 100f).toInt()}%",
++                                    style = MaterialTheme.typography.bodyLarge,
++                                    color = NuvioTheme.colors.TextSecondary,
++                                )
++                                Text(
++                                    "Series ${100 - (data.movieShare * 100f).toInt()}%",
++                                    style = MaterialTheme.typography.bodyLarge,
++                                    color = NuvioTheme.colors.TextSecondary,
++                                )
++                            }
++                            Row(Modifier.fillMaxWidth().height(14.dp).clip(RoundedCornerShape(7.dp))) {
++                                Box(Modifier.weight(movie).fillMaxHeight().background(DxPalette[0]))
++                                Box(Modifier.weight(1f - movie).fillMaxHeight().background(DxPalette[1]))
++                            }
++                        }
++                    }
++
++                    val chips = data?.chips.orEmpty()
++                    if (chips.isNotEmpty()) {
++                        FlowRow(
++                            horizontalArrangement = Arrangement.spacedBy(12.dp),
++                            verticalArrangement = Arrangement.spacedBy(12.dp),
++                        ) {
++                            chips.forEach { chip ->
++                                Text(
++                                    text = chip,
++                                    style = MaterialTheme.typography.titleMedium,
++                                    color = NuvioTheme.colors.TextPrimary,
++                                    modifier = Modifier
++                                        .clip(RoundedCornerShape(30.dp))
++                                        .background(NuvioTheme.colors.BackgroundElevated)
++                                        .padding(horizontal = 20.dp, vertical = 10.dp),
++                                )
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    sheet?.let { current ->
++        DxPosterSheet(
++            sheet = current,
++            onDismiss = { sheet = null },
++            onPick = { item ->
++                sheet = null
++                onOpenDetail(item.id, item.type, item.addonBaseUrl)
++            },
++        )
++    }
++
++    if (showSwitch) {
++        val locked by remember(entry) { entry.profileLockStateDataStore().pinEnabled }
++            .collectAsState(initial = emptyMap())
++        NuvioDialog(
++            onDismiss = { showSwitch = false },
++            title = "Switch profile",
++            subtitle = "Choose who is watching",
++            width = 560.dp,
++        ) {
++            val firstFocus = remember { FocusRequester() }
++            LaunchedEffect(Unit) {
++                delay(120)
++                runCatching { firstFocus.requestFocus() }
++            }
++            profiles.forEachIndexed { index, p ->
++                val isActive = p.id == activeId
++                val isLocked = !isActive && locked[p.id] == true
++                DxCard(
++                    onClick = {
++                        when {
++                            isActive -> showSwitch = false
++                            isLocked -> Toast.makeText(
++                                context,
++                                "This profile has a PIN. Use Edit profile to open it.",
++                                Toast.LENGTH_LONG,
++                            ).show()
++                            else -> {
++                                showSwitch = false
++                                scope.launch { entry.profileManager().setActiveProfile(p.id) }
++                            }
++                        }
++                    },
++                    modifier = Modifier.fillMaxWidth().let { if (index == 0) it.focusRequester(firstFocus) else it },
++                    radius = 18,
++                ) {
++                    Row(
++                        modifier = Modifier.fillMaxWidth().padding(16.dp),
++                        verticalAlignment = Alignment.CenterVertically,
++                        horizontalArrangement = Arrangement.spacedBy(16.dp),
++                    ) {
++                        ProfileAvatarCircle(
++                            name = p.name,
++                            colorHex = p.avatarColorHex,
++                            size = 52.dp,
++                            avatarImageUrl = p.avatarUrl,
++                        )
++                        Text(
++                            text = p.name,
++                            style = MaterialTheme.typography.titleLarge,
++                            color = NuvioTheme.colors.TextPrimary,
++                            modifier = Modifier.weight(1f),
++                        )
++                        if (isActive || isLocked) {
++                            Text(
++                                text = if (isActive) "Active" else "PIN protected",
++                                style = MaterialTheme.typography.bodyLarge,
++                                color = NuvioTheme.colors.TextSecondary,
++                            )
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
++
++private fun dxShortHours(seconds: Double): String {
++    val minutes = (seconds / 60.0).toLong()
++    return if (minutes >= 60) "${minutes / 60}h ${minutes % 60}m" else "${minutes}m"
++}
++
++@Composable
++private fun DxPosterSheet(sheet: DxSheet, onDismiss: () -> Unit, onPick: (DxInsightItem) -> Unit) {
++    Dialog(
++        onDismissRequest = onDismiss,
++        properties = DialogProperties(usePlatformDefaultWidth = false),
++    ) {
++        Box(
++            modifier = Modifier.fillMaxSize().background(Color(0x99000000)),
++            contentAlignment = Alignment.CenterEnd,
++        ) {
++            Column(
++                modifier = Modifier
++                    .width(760.dp)
++                    .fillMaxHeight()
++                    .clip(RoundedCornerShape(topStart = 28.dp, bottomStart = 28.dp))
++                    .background(NuvioTheme.colors.BackgroundElevated)
++                    .padding(32.dp),
++                verticalArrangement = Arrangement.spacedBy(18.dp),
++            ) {
++                Text(
++                    text = sheet.title,
++                    style = MaterialTheme.typography.headlineMedium,
++                    fontWeight = FontWeight.Bold,
++                    color = NuvioTheme.colors.TextPrimary,
++                )
++                if (sheet.items.isEmpty()) {
++                    val empty = remember { FocusRequester() }
++                    LaunchedEffect(Unit) {
++                        delay(120)
++                        runCatching { empty.requestFocus() }
++                    }
++                    DxCard(onClick = onDismiss, modifier = Modifier.focusRequester(empty), radius = 30) {
++                        Text(
++                            text = "Nothing here yet. Press to close.",
++                            style = MaterialTheme.typography.titleMedium,
++                            color = NuvioTheme.colors.TextSecondary,
++                            modifier = Modifier.padding(horizontal = 28.dp, vertical = 16.dp),
++                        )
++                    }
++                } else {
++                    val first = remember { FocusRequester() }
++                    LaunchedEffect(Unit) {
++                        delay(120)
++                        runCatching { first.requestFocus() }
++                    }
++                    LazyVerticalGrid(
++                        columns = GridCells.Fixed(3),
++                        modifier = Modifier.fillMaxSize(),
++                        contentPadding = PaddingValues(8.dp),
++                        horizontalArrangement = Arrangement.spacedBy(18.dp),
++                        verticalArrangement = Arrangement.spacedBy(18.dp),
++                    ) {
++                        items(sheet.items, key = { "${it.type}:${it.id}:${it.subtitle}" }) { item ->
++                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
++                                DxCard(
++                                    onClick = { onPick(item) },
++                                    modifier = Modifier
++                                        .fillMaxWidth()
++                                        .let { if (item === sheet.items.first()) it.focusRequester(first) else it },
++                                    radius = 14,
++                                ) {
++                                    Box(
++                                        modifier = Modifier.fillMaxWidth().aspectRatio(2f / 3f)
++                                            .background(NuvioTheme.colors.Surface)
++                                    ) {
++                                        if (!item.poster.isNullOrBlank()) {
++                                            AsyncImage(
++                                                model = item.poster,
++                                                contentDescription = item.title,
++                                                modifier = Modifier.fillMaxSize(),
++                                                contentScale = ContentScale.Crop,
++                                            )
++                                        }
++                                    }
++                                }
++                                Text(
++                                    text = item.title,
++                                    style = MaterialTheme.typography.titleMedium,
++                                    color = NuvioTheme.colors.TextPrimary,
++                                    maxLines = 1,
++                                    overflow = TextOverflow.Ellipsis,
++                                    textAlign = TextAlign.Start,
++                                )
++                                if (!item.subtitle.isNullOrBlank()) {
++                                    Text(
++                                        text = item.subtitle,
++                                        style = MaterialTheme.typography.bodyMedium,
++                                        color = NuvioTheme.colors.TextSecondary,
++                                        maxLines = 1,
++                                        overflow = TextOverflow.Ellipsis,
++                                    )
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ProfileSettingsContent.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ProfileSettingsContent.kt
+index 9903499f3..d6702a85f 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ProfileSettingsContent.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ProfileSettingsContent.kt
+@@ -2,44 +2,19 @@
+ 
+ package com.nuvio.tv.ui.screens.settings
+ 
+-import com.nuvio.tv.ui.theme.NuvioTheme
+-
+-import androidx.compose.foundation.layout.Arrangement
+-import androidx.compose.foundation.layout.Column
+-import androidx.compose.foundation.layout.fillMaxSize
+-import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.runtime.Composable
+-import androidx.compose.ui.Modifier
+ import androidx.compose.ui.focus.FocusRequester
+-import androidx.compose.ui.focus.focusRequester
+-import androidx.compose.ui.res.stringResource
+ import androidx.tv.material3.ExperimentalTvMaterial3Api
+-import com.nuvio.tv.R
+ 
+ @Composable
+ internal fun ProfileSettingsContent(
+     onManageProfiles: () -> Unit,
++    onOpenDetail: (String, String, String?) -> Unit = { _, _, _ -> },
+     initialFocusRequester: FocusRequester? = null
+ ) {
+-    Column(
+-        modifier = Modifier.fillMaxSize(),
+-        verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.md)
+-    ) {
+-        SettingsDetailHeader(
+-            title = stringResource(R.string.profile_title),
+-            subtitle = stringResource(R.string.profile_subtitle)
+-        )
+-        SettingsGroupCard(modifier = Modifier.fillMaxWidth()) {
+-            SettingsActionRow(
+-                title = stringResource(R.string.profile_manage_button),
+-                subtitle = null,
+-                onClick = onManageProfiles,
+-                modifier = if (initialFocusRequester != null) {
+-                    Modifier.focusRequester(initialFocusRequester)
+-                } else {
+-                    Modifier
+-                }
+-            )
+-        }
+-    }
++    DxProfileInsightsPage(
++        onManageProfiles = onManageProfiles,
++        onOpenDetail = onOpenDetail,
++        initialFocusRequester = initialFocusRequester
++    )
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt
+index 8dfba7169..f3c059066 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt
+@@ -180,6 +180,7 @@ fun SettingsScreen(
+     onNavigateToPlugins: () -> Unit = {},
+     onNavigateToAuthQrSignIn: () -> Unit = {},
+     onNavigateToManageProfiles: () -> Unit = {},
++    onOpenDetail: (String, String, String?) -> Unit = { _, _, _ -> },
+     onNavigateToSupportersContributors: () -> Unit = {},
+     onNavigateToLicensesAttributions: () -> Unit = {},
+     onNavigateToWatchParty: () -> Unit = {},
+@@ -662,6 +663,7 @@ fun SettingsScreen(
+                                 integrationMdbListFocusRequester = integrationMdbListFocusRequester,
+                                 integrationAnimeSkipFocusRequester = integrationAnimeSkipFocusRequester,
+                                 onNavigateToManageProfiles = onNavigateToManageProfiles,
++                                onOpenDetail = onOpenDetail,
+                                 onNavigateToAddons = onNavigateToAddons,
+                                 onNavigateToPlugins = onNavigateToPlugins,
+                                 onNavigateToAuthQrSignIn = onNavigateToAuthQrSignIn,
+@@ -822,6 +824,7 @@ fun SettingsScreen(
+                         integrationMdbListFocusRequester = integrationMdbListFocusRequester,
+                         integrationAnimeSkipFocusRequester = integrationAnimeSkipFocusRequester,
+                         onNavigateToManageProfiles = onNavigateToManageProfiles,
++                        onOpenDetail = onOpenDetail,
+                         onNavigateToAddons = onNavigateToAddons,
+                         onNavigateToPlugins = onNavigateToPlugins,
+                         onNavigateToAuthQrSignIn = onNavigateToAuthQrSignIn,
+@@ -852,6 +855,7 @@ private fun SettingsDetailPane(
+     integrationMdbListFocusRequester: FocusRequester,
+     integrationAnimeSkipFocusRequester: FocusRequester,
+     onNavigateToManageProfiles: () -> Unit,
++    onOpenDetail: (String, String, String?) -> Unit,
+     onNavigateToAddons: () -> Unit,
+     onNavigateToPlugins: () -> Unit,
+     onNavigateToAuthQrSignIn: () -> Unit,
+@@ -870,6 +874,7 @@ private fun SettingsDetailPane(
+         )
+         SettingsCategory.PROFILES -> ProfileSettingsContent(
+             onManageProfiles = onNavigateToManageProfiles,
++            onOpenDetail = onOpenDetail,
+             initialFocusRequester = if (allowDetailAutofocus) {
+                 contentFocusRequesters[SettingsCategory.PROFILES]
+             } else {
