@@ -1,0 +1,169 @@
+diff --git a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
+index 0e7918d42..f69395afe 100644
+--- a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
++++ b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
+@@ -84,6 +84,7 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+         SentryInitializer.start(this, sentrySettingsDataStore)
+         com.nuvio.tv.core.diagnostics.ForkCrashReporter.install(this) // Nuvio fork: local crash reports, shown in Debug logs to phone
+         com.nuvio.tv.core.diagnostics.ForkStability.install(this) // Nuvio fork: breadcrumbs and main thread freeze watchdog
++        com.nuvio.tv.core.network.DohSetting.init(this) // Nuvio fork: DNS over HTTPS choice
+         PluginRuntimeHooks.onApplicationCreate(this)
+         com.nuvio.tv.reshaped.subtitlefont.SubtitleFontStore.warmUp(this) // Nuvio fork: custom subtitle font, loaded off the main thread
+         com.nuvio.tv.ui.screens.player.PlayerEffects.ensureLoaded(this) // Nuvio fork: picture and sound effects, read by stream auto-play
+diff --git a/app/src/main/java/com/nuvio/tv/core/network/DohSetting.kt b/app/src/main/java/com/nuvio/tv/core/network/DohSetting.kt
+new file mode 100644
+index 000000000..a0641eced
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/network/DohSetting.kt
+@@ -0,0 +1,33 @@
++package com.nuvio.tv.core.network
++
++import android.content.Context
++
++/** Fork feature: resolve host names through DNS over HTTPS instead of the system resolver. */
++enum class DohProvider(val id: String, val label: String, val endpoint: String?) {
++    OFF("off", "System DNS", null),
++    CLOUDFLARE("cloudflare", "Cloudflare (1.1.1.1)", "https://1.1.1.1/dns-query"),
++    GOOGLE("google", "Google (8.8.8.8)", "https://8.8.8.8/resolve"),
++}
++
++object DohSetting {
++    private const val PREFS = "nuvio_tv_doh"
++
++    @Volatile
++    var provider: DohProvider = DohProvider.OFF
++        private set
++
++    fun init(context: Context) {
++        val id = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("provider", null)
++        provider = DohProvider.values().firstOrNull { it.id == id } ?: DohProvider.OFF
++    }
++
++    fun set(context: Context, value: DohProvider) {
++        provider = value
++        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("provider", value.id).apply()
++    }
++
++    fun next(current: DohProvider): DohProvider {
++        val all = DohProvider.values()
++        return all[(all.indexOf(current) + 1) % all.size]
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/network/IPv4FirstDns.kt b/app/src/main/java/com/nuvio/tv/core/network/IPv4FirstDns.kt
+index 8c87b55cb..626e679b6 100644
+--- a/app/src/main/java/com/nuvio/tv/core/network/IPv4FirstDns.kt
++++ b/app/src/main/java/com/nuvio/tv/core/network/IPv4FirstDns.kt
+@@ -1,17 +1,61 @@
+ package com.nuvio.tv.core.network
+ 
+ import okhttp3.Dns
++import java.net.HttpURLConnection
+ import java.net.Inet4Address
+ import java.net.InetAddress
++import java.net.URL
++import java.net.URLEncoder
++import java.util.concurrent.ConcurrentHashMap
+ 
+ /**
+  * Custom DNS that reorders resolved addresses to place IPv4 (Inet4Address)
+  * before IPv6 (Inet6Address). This avoids 60s timeout delays on networks
+- * with broken IPv6 routing (issue #651).
++ * with broken IPv6 routing (issue #651). When a DNS over HTTPS provider is
++ * chosen in settings, names are resolved there first and fall back to the system.
+  */
+ class IPv4FirstDns(private val delegate: Dns = Dns.SYSTEM) : Dns {
+     override fun lookup(hostname: String): List<InetAddress> {
+-        val addresses = delegate.lookup(hostname)
++        val addresses = resolveWithDoh(hostname) ?: delegate.lookup(hostname)
+         return addresses.sortedBy { if (it is Inet4Address) 0 else 1 }
+     }
++
++    private fun resolveWithDoh(hostname: String): List<InetAddress>? {
++        val provider = DohSetting.provider
++        val endpoint = provider.endpoint ?: return null
++        if (hostname == "localhost" || hostname.all { it.isDigit() || it == '.' || it == ':' }) return null
++        val key = provider.id + "|" + hostname
++        val now = System.currentTimeMillis()
++        cache[key]?.let { (expires, list) -> if (expires > now) return list }
++        val result = runCatching { query(endpoint, hostname) }.getOrNull()
++        if (result.isNullOrEmpty()) return null
++        cache[key] = (now + CACHE_MS) to result
++        return result
++    }
++
++    private fun query(endpoint: String, hostname: String): List<InetAddress> {
++        val url = URL("$endpoint?name=${URLEncoder.encode(hostname, "UTF-8")}&type=A")
++        val connection = (url.openConnection() as HttpURLConnection).apply {
++            connectTimeout = 3_000
++            readTimeout = 3_000
++            setRequestProperty("accept", "application/dns-json")
++        }
++        try {
++            if (connection.responseCode != 200) return emptyList()
++            val body = connection.inputStream.bufferedReader().use { it.readText() }
++            val out = ArrayList<InetAddress>()
++            ANSWER_REGEX.findAll(body).forEach { match ->
++                if (match.groupValues[1].toInt() == 1) out += InetAddress.getByName(match.groupValues[2])
++            }
++            return out
++        } finally {
++            connection.disconnect()
++        }
++    }
++
++    private companion object {
++        const val CACHE_MS = 5 * 60_000L
++        val cache = ConcurrentHashMap<String, Pair<Long, List<InetAddress>>>()
++        val ANSWER_REGEX = Regex("\"type\"\\s*:\\s*(\\d+)[^}]*?\"data\"\\s*:\\s*\"([^\"]+)\"")
++    }
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/DohSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/DohSettings.kt
+new file mode 100644
+index 000000000..46ce3c1b2
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/DohSettings.kt
+@@ -0,0 +1,32 @@
++@file:OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
++
++package com.nuvio.tv.ui.screens.settings
++
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalContext
++import com.nuvio.tv.core.network.DohSetting
++
++/** Advanced settings card: pick a DNS over HTTPS provider. Click cycles System, Cloudflare, Google. */
++@Composable
++internal fun DohSettingsCard() {
++    val context = LocalContext.current
++    var provider by remember { mutableStateOf(DohSetting.provider) }
++    SettingsGroupCard(modifier = Modifier.fillMaxWidth(), title = "Network") {
++        SettingsActionRow(
++            title = "DNS over HTTPS",
++            subtitle = "Resolve host names through a secure DNS server. Applies to new connections. Click to switch.",
++            value = provider.label,
++            onClick = {
++                val next = DohSetting.next(provider)
++                DohSetting.set(context, next)
++                provider = next
++            },
++        )
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
+index 7de677fbe..eb50ad74f 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
+@@ -479,6 +479,7 @@ fun AdvancedSettingsContent(
+         }
+ 
+         item(key = "dx_sounds") { DxSoundsSettingsCard() } // dx.bi sounds hook
++        item(key = "doh_dns") { DohSettingsCard() } // DNS over HTTPS hook
+ 
+         item(key = "startup_settings") {
+             SettingsGroupCard(
