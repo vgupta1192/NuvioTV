@@ -1,0 +1,200 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/sound/DxSounds.kt b/app/src/main/java/com/nuvio/tv/core/sound/DxSounds.kt
+index 3a4f28212..3ad1a2118 100644
+--- a/app/src/main/java/com/nuvio/tv/core/sound/DxSounds.kt
++++ b/app/src/main/java/com/nuvio/tv/core/sound/DxSounds.kt
+@@ -109,6 +109,9 @@ object DxSounds {
+         )
+     }
+ 
++    @Volatile
++    var dialogDepth = 0
++
+     /** Called first in MainActivity.dispatchKeyEvent. Returns true when the key is used up. */
+     fun onKey(activity: Activity, event: KeyEvent): Boolean {
+         if (introActive) {
+@@ -126,7 +129,7 @@ object DxSounds {
+             else -> return false
+         }
+         ensureLoaded(activity)
+-        if (!_uiSoundsEnabled.value || TvRecommendationManager.isPlaybackActive.value) return false
++        if (!_uiSoundsEnabled.value || dialogDepth > 0 || TvRecommendationManager.isPlaybackActive.value) return false
+         val now = System.currentTimeMillis()
+         if (now - lastClickMs < 60L) return false
+         lastClickMs = now
+diff --git a/app/src/main/java/com/nuvio/tv/ui/components/NuvioDialog.kt b/app/src/main/java/com/nuvio/tv/ui/components/NuvioDialog.kt
+index 9e85795a0..f67cc9a74 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/components/NuvioDialog.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/components/NuvioDialog.kt
+@@ -72,6 +72,10 @@ fun NuvioDialog(
+         properties = DialogProperties(usePlatformDefaultWidth = usePlatformDefaultWidth)
+     ) {
+         AmbientDialogEffect(onDismiss)
++        androidx.compose.runtime.DisposableEffect(Unit) { // dx.bi sounds hook: no tick while a dialog is open
++            com.nuvio.tv.core.sound.DxSounds.dialogDepth++
++            onDispose { com.nuvio.tv.core.sound.DxSounds.dialogDepth = (com.nuvio.tv.core.sound.DxSounds.dialogDepth - 1).coerceAtLeast(0) }
++        }
+         Box(
+             modifier = Modifier
+                 .width(width)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/DxEnhance.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/DxEnhance.kt
+index f154b8d5e..d6545699b 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/DxEnhance.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/DxEnhance.kt
+@@ -49,6 +49,8 @@ internal object DxEnhance {
+     private val _enabled = MutableStateFlow(true)
+     val enabled: StateFlow<Boolean> = _enabled.asStateFlow()
+     private val _anime = MutableStateFlow(false)
++    private var animeById = false
++    private var animeByMeta = false
+     private val _kind = MutableStateFlow(DxEnhanceKind.NONE)
+     val kind: StateFlow<DxEnhanceKind> = _kind.asStateFlow()
+     private var loaded = false
+@@ -93,7 +95,19 @@ internal object DxEnhance {
+     /** Auto looks at the content id: kitsu, mal, anilist and anidb ids are anime. */
+     fun setTitle(contentId: String?) {
+         val id = contentId.orEmpty()
+-        _anime.value = listOf("kitsu:", "mal:", "anilist:", "anidb:").any { id.startsWith(it, ignoreCase = true) }
++        animeById = listOf("kitsu:", "mal:", "anilist:", "anidb:").any { id.startsWith(it, ignoreCase = true) }
++        animeByMeta = false
++        _anime.value = animeById
++        recompute()
++    }
++
++    /** Title details arrive after the player opens: an anime genre, or animation from Japan, also counts as anime. */
++    fun setAnimeMeta(genres: List<String>, country: String?) {
++        val byMeta = genres.any { it.equals("anime", ignoreCase = true) } ||
++            (genres.any { it.equals("animation", ignoreCase = true) } && country?.contains("Japan", ignoreCase = true) == true)
++        if (byMeta == animeByMeta) return
++        animeByMeta = byMeta
++        _anime.value = animeById || animeByMeta
+         recompute()
+     }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
+index d03f5ce53..aba001b91 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
+@@ -445,7 +445,12 @@ internal fun SmartEnhanceBanner(modifier: Modifier = Modifier) {
+  * Smart Enhance banner. The panels themselves live in the audio overlay (see [PictureSoundBlock]).
+  */
+ @Composable
+-internal fun PlayerEffectsHost(exoPlayer: ExoPlayer?, mpvView: NuvioMpvSurfaceView?, contentId: String?) {
++internal fun PlayerEffectsHost(
++    exoPlayer: ExoPlayer?,
++    mpvView: NuvioMpvSurfaceView?,
++    contentId: String?,
++    animeMeta: () -> Pair<List<String>, String?> = { emptyList<String>() to null },
++) {
+     val context = LocalContext.current
+     PlayerEffects.ensureLoaded(context)
+     LaunchedEffect(contentId) { PlayerEffects.enterTitle(contentId) }
+@@ -461,7 +466,14 @@ internal fun PlayerEffectsHost(exoPlayer: ExoPlayer?, mpvView: NuvioMpvSurfaceVi
+         }
+     }
+     DxEnhance.ensureLoaded(context) // dx.bi picture enhance hook
+-    LaunchedEffect(contentId) { DxEnhance.setTitle(contentId) } // dx.bi picture enhance hook
++    LaunchedEffect(contentId) { // dx.bi picture enhance hook
++        DxEnhance.setTitle(contentId)
++        repeat(20) {
++            val (genres, country) = animeMeta()
++            DxEnhance.setAnimeMeta(genres, country)
++            kotlinx.coroutines.delay(1500)
++        }
++    }
+     val dxKind by DxEnhance.kind.collectAsStateWithLifecycle() // dx.bi picture enhance hook
+     LaunchedEffect(exoPicture, mpvView, picture, smartEnhance, dxKind) {
+         val state = picture.copy(smartEnhance = smartEnhance)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+index e6c323974..b497c96e6 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+@@ -2041,6 +2041,7 @@ fun PlayerScreen(
+             exoPlayer = viewModel.exoPlayer,
+             mpvView = viewModel.controller.mpvView,
+             contentId = viewModel.controller.contentId,
++            animeMeta = { viewModel.controller.metaGenres to viewModel.controller.metaCountry },
+         )
+ 
+         // Nuvio fork: second subtitle language drawn at the top
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/DxWatchStatsSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/DxWatchStatsSettings.kt
+index 9116a3951..b4d16ca9a 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/DxWatchStatsSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/DxWatchStatsSettings.kt
+@@ -28,28 +28,28 @@ private fun dxHours(seconds: Double): String {
+     return if (minutes < 60) "${minutes} min" else "${minutes / 60} h ${minutes % 60} min"
+ }
+ 
+-/** Advanced settings card (dx.bi port): opens the "Your stats" page, with the Count watch time switch. */
++/** Advanced settings card (dx.bi port): the stats themselves live on the Profiles page; this keeps the switch and reset. */
+ @Composable
+ internal fun DxWatchStatsSettingsCard() {
+     val context = LocalContext.current
+     val enabled by DxWatchStats.enabled.collectAsStateWithLifecycle()
+-    var showStats by remember { mutableStateOf(false) }
++    var resetDone by remember { mutableStateOf(false) }
+     LaunchedEffectEnsureLoaded()
+     SettingsGroupCard(modifier = Modifier.fillMaxWidth(), title = "Your stats") {
+-        SettingsActionRow(
+-            title = "Your stats",
+-            subtitle = "Hours watched, streaks and your most watched titles. Kept on this device only.",
+-            onClick = { showStats = true },
+-        )
+         SettingsToggleRow(
+             title = "Count watch time",
+-            subtitle = "Count the time a video is really playing. Turn it off to stop collecting stats.",
++            subtitle = "See your stats in Settings > Profiles. Turn this off to stop collecting watch time.",
+             checked = enabled,
+             onToggle = { DxWatchStats.setEnabled(context, !enabled) },
+         )
+-    }
+-    if (showStats) {
+-        DxWatchStatsDialog(onDismiss = { showStats = false })
++        SettingsActionRow(
++            title = "Reset stats",
++            subtitle = if (resetDone) "Stats were reset." else "Clear the watch time, streaks and top titles kept on this device.",
++            onClick = {
++                DxWatchStats.reset(context)
++                resetDone = true
++            },
++        )
+     }
+ }
+ 
+@@ -58,37 +58,3 @@ private fun LaunchedEffectEnsureLoaded() {
+     val context = LocalContext.current
+     remember { DxWatchStats.ensureLoaded(context); true }
+ }
+-
+-@Composable
+-private fun DxWatchStatsDialog(onDismiss: () -> Unit) {
+-    val context = LocalContext.current
+-    var summary by remember { mutableStateOf<DxStatSummary>(DxWatchStats.summary(context)) }
+-    NuvioDialog(
+-        onDismiss = onDismiss,
+-        title = "Your stats",
+-        subtitle = "Counting since ${summary.since}",
+-        width = 640.dp,
+-        contentSpacing = 8.dp,
+-    ) {
+-        val style = MaterialTheme.typography.bodyMedium
+-        val color = NuvioTheme.colors.TextPrimary
+-        Text("Today: ${dxHours(summary.today)}   Last 7 days: ${dxHours(summary.week)}", style = style, color = color)
+-        Text("Last 30 days: ${dxHours(summary.month)}   All time: ${dxHours(summary.total)}", style = style, color = color)
+-        Text("Streak: ${summary.currentStreak} days   Best streak: ${summary.bestStreak} days", style = style, color = color)
+-        if (summary.topTitles.isEmpty()) {
+-            Text("Nothing counted yet. Watch something and come back.", style = style, color = NuvioTheme.colors.TextSecondary)
+-        } else {
+-            Text("Most watched", style = MaterialTheme.typography.titleSmall, color = color)
+-            summary.topTitles.forEachIndexed { i, row ->
+-                Text("${i + 1}. ${row.name.ifBlank { "Untitled" }}  -  ${dxHours(row.seconds)}", style = style, color = color, maxLines = 1)
+-            }
+-        }
+-        Row(modifier = Modifier.padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+-            Button(onClick = onDismiss) { Text("Close") }
+-            Button(onClick = {
+-                DxWatchStats.reset(context)
+-                summary = DxWatchStats.summary(context)
+-            }) { Text("Reset stats") }
+-        }
+-    }
+-}
