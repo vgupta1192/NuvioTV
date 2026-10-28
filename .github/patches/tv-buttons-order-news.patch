@@ -1,5 +1,5 @@
 diff --git a/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
-index 10047e4d3..4b30a3d2d 100644
+index 10047e4d3..b8782aabd 100644
 --- a/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
 @@ -42,6 +42,7 @@ object ForkTvPreferences {
@@ -10,33 +10,44 @@ index 10047e4d3..4b30a3d2d 100644
  }
  
  object ForkTvPlayerButtons {
-@@ -70,10 +71,33 @@ object ForkTvPlayerButtons {
+@@ -70,10 +71,44 @@ object ForkTvPlayerButtons {
          synchronized(this) {
              if (loaded) return
              _hidden.value = prefs(context).getStringSet("hidden", emptySet()).orEmpty().toSet()
-+            val saved = prefs(context).getString("order", null)?.split(",").orEmpty().filter { it in mainIds }
-+            _order.value = saved + mainIds.filter { it !in saved }
++            val saved = prefs(context).getString("order", null)?.split(",").orEmpty().filter { it in allIds }
++            val savedMain = saved.filter { it in mainIds }
++            val savedMore = saved.filter { it in moreIds }
++            _order.value = savedMain + mainIds.filter { it !in savedMain } + savedMore + moreIds.filter { it !in savedMore }
              loaded = true
          }
      }
  
 +    private val mainIds = listOf("next_episode", "subtitles", "audio", "quality", "chapters", "sources", "episodes")
 +
-+    private val _order = MutableStateFlow<List<String>>(mainIds)
++    private val moreIds = listOf("speed", "aspect", "engine", "info")
++    private val allIds = mainIds + moreIds
++
++    private val _order = MutableStateFlow<List<String>>(allIds)
 +    val order: StateFlow<List<String>> = _order.asStateFlow()
 +
 +    /** Ids of the main control row in the saved order (ids added later are appended). */
-+    fun mainOrder(@Suppress("UNUSED_PARAMETER") hidden: Set<String>): List<String> = _order.value
++    fun mainOrder(@Suppress("UNUSED_PARAMETER") hidden: Set<String>): List<String> = _order.value.filter { it in mainIds }
 +
-+    fun isMain(id: String) = id in mainIds
++    /** Ids of the expanded "more" row in the saved order. */
++    fun moreOrder(): List<String> = _order.value.filter { it in moreIds }
++
++    fun isMain(id: String) = id in allIds
 +
 +    fun move(context: Context, id: String, delta: Int) {
 +        ensureLoaded(context)
-+        val list = _order.value.toMutableList()
-+        val from = list.indexOf(id)
++        val group = if (id in mainIds) mainIds else moreIds
++        val sub = _order.value.filter { it in group }.toMutableList()
++        val from = sub.indexOf(id)
 +        val to = from + delta
-+        if (from < 0 || to < 0 || to >= list.size) return
-+        list.add(to, list.removeAt(from))
++        if (from < 0 || to < 0 || to >= sub.size) return
++        sub.add(to, sub.removeAt(from))
++        val other = _order.value.filter { it !in group }
++        val list = if (group === mainIds) sub + other else other + sub
 +        _order.value = list
 +        prefs(context).edit().putString("order", list.joinToString(",")).apply()
 +    }
@@ -256,7 +267,7 @@ index ed5e9324f..b153c5fc8 100644
                          meta = meta,
                          hideImdbRating = hideMetaInfoImdb,
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
-index 7a0dd36e2..e126a2dd8 100644
+index 7a0dd36e2..bf5b58fc8 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
 @@ -3099,6 +3099,8 @@ private fun PlayerControlsOverlay(
@@ -337,13 +348,65 @@ index 7a0dd36e2..e126a2dd8 100644
  
 +                    }
 +                    val forkBtnOrder by com.nuvio.tv.data.repository.ForkTvPlayerButtons.order.collectAsState()
-+                    forkBtnOrder.forEach { forkBtns[it]?.invoke() }
++                    forkBtnOrder.filter { com.nuvio.tv.data.repository.ForkTvPlayerButtons.mainOrder(hiddenBtns).contains(it) }.forEach { forkBtns[it]?.invoke() }
 +
                      if (onShowPartyPanel != null) {
                          ControlButton(
                              icon = Icons.Rounded.Groups,
+@@ -3213,6 +3231,8 @@ private fun PlayerControlsOverlay(
+                             horizontalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.xs),
+                             verticalAlignment = Alignment.CenterVertically
+                         ) {
++                            val moreBtns = mutableMapOf<String, @Composable () -> Unit>()
++                            moreBtns["speed"] = {
+                             if ("speed" !in hiddenBtns) ControlButton(
+                                 icon = Icons.Default.Speed,
+                                 contentDescription = stringResource(R.string.cd_playback_speed),
+@@ -3223,6 +3243,8 @@ private fun PlayerControlsOverlay(
+                                 onDownKey = onHideControls,
+                                 onFocused = onResetHideTimer
+                             )
++                            }
++                            moreBtns["aspect"] = {
+                             if ("aspect" !in hiddenBtns) ControlButton(
+                                 icon = Icons.Default.AspectRatio,
+                                 iconPainter = customAspectPainter,
+@@ -3234,6 +3256,8 @@ private fun PlayerControlsOverlay(
+                                 onDownKey = onHideControls,
+                                 onFocused = onResetHideTimer
+                             )
++                            }
++                            moreBtns["engine"] = {
+                             if ("engine" !in hiddenBtns) ControlButton(
+                                 icon = Icons.Default.SwapHoriz,
+                                 contentDescription = stringResource(R.string.cd_switch_player_engine),
+@@ -3242,6 +3266,7 @@ private fun PlayerControlsOverlay(
+                                 onDownKey = onHideControls,
+                                 onFocused = onResetHideTimer
+                             )
++                            }
+                             onOpenInExternalPlayer?.let { openInExternalPlayer ->
+                                 ControlButton(
+                                     icon = Icons.AutoMirrored.Filled.OpenInNew,
+@@ -3252,6 +3277,7 @@ private fun PlayerControlsOverlay(
+                                     onFocused = onResetHideTimer
+                                 )
+                             }
++                            moreBtns["info"] = {
+                             if ("info" !in hiddenBtns) ControlButton(
+                                 icon = Icons.Default.Info,
+                                 contentDescription = stringResource(R.string.cd_stream_info),
+@@ -3263,6 +3289,8 @@ private fun PlayerControlsOverlay(
+                                 onDownKey = onHideControls,
+                                 onFocused = onResetHideTimer
+                             )
++                            }
++                            com.nuvio.tv.data.repository.ForkTvPlayerButtons.moreOrder().forEach { moreBtns[it]?.invoke() }
+                             com.nuvio.tv.ui.screens.player.seekpreview.seekPreviewSyncAction(viewModel)?.let { openSync -> // Nuvio fork: seek previews
+                                 ControlButton(
+                                     icon = forkSeekPreviewSyncIcon,
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
-index 9b60208ff..175afb7bd 100644
+index 9b60208ff..5aeee6fbe 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
 @@ -2,6 +2,7 @@ package com.nuvio.tv.ui.screens.settings
@@ -359,7 +422,7 @@ index 9b60208ff..175afb7bd 100644
              onDismiss = { open = false },
              title = "Player buttons",
 -            subtitle = "Buttons also stay hidden when the player has nothing for them.",
-+            subtitle = "Up and Down reorder the main control row. Buttons also stay hidden when the player has nothing for them.",
++            subtitle = "Up and Down reorder buttons within the main row and the expanded row. Buttons also stay hidden when the player has nothing for them.",
              suppressFirstKeyUp = false
          ) {
 +            val btns = com.nuvio.tv.data.repository.ForkTvPlayerButtons
