@@ -1,0 +1,147 @@
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
+index b8782aabd..4f5677a22 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
+@@ -42,6 +42,7 @@ object ForkTvPreferences {
+     val autoAddTorbox = ForkTvBoolPref("auto_add_torbox", false)
+     val homeUpNextTonight = ForkTvBoolPref("home_up_next_tonight", true)
+     val homeAiringWeek = ForkTvBoolPref("home_airing_week", true)
++    val homeFinishSeries = ForkTvBoolPref("home_finish_series", true)
+     val nuvioRead = ForkTvBoolPref("nuvio_read", false)
+ }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/ForkTvFinishSeriesRow.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/ForkTvFinishSeriesRow.kt
+new file mode 100644
+index 000000000..f8d1fe7c2
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/ForkTvFinishSeriesRow.kt
+@@ -0,0 +1,90 @@
++package com.nuvio.tv.ui.screens.home
++
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.platform.LocalContext
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import com.nuvio.tv.core.network.NetworkResult
++import com.nuvio.tv.core.util.isEpisodeReleaseAired
++import com.nuvio.tv.data.repository.ForkTvPreferences
++import com.nuvio.tv.domain.model.CatalogRow
++import com.nuvio.tv.domain.model.ContentType
++import com.nuvio.tv.domain.model.MetaPreview
++import com.nuvio.tv.domain.model.WatchProgress
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.withTimeoutOrNull
++
++/**
++ * Nuvio fork: "Finish a series" Home row. Shows shows where at least 3 episodes are watched and
++ * 60% or more, but not all, of the aired episodes are done.
++ */
++@Composable
++internal fun rememberForkFinishSeriesRows(viewModel: HomeViewModel): List<CatalogRow> {
++    val context = LocalContext.current
++    ForkTvPreferences.homeFinishSeries.ensureLoaded(context)
++    val enabled by ForkTvPreferences.homeFinishSeries.value.collectAsStateWithLifecycle()
++    val progress by viewModel.watchProgressRepository.allProgress.collectAsStateWithLifecycle(initialValue = emptyList())
++    var items by remember { mutableStateOf<List<MetaPreview>>(emptyList()) }
++    val watchedKey = progress.count { it.isCompleted() && it.season != null }
++
++    LaunchedEffect(watchedKey, enabled) {
++        if (!enabled) {
++            items = emptyList()
++            return@LaunchedEffect
++        }
++        val series = progress.filter { it.contentType.equals("series", true) && !viewModel.watchProgressRepository.isDroppedShow(it.contentId) }
++        val watched: Map<String, Int> = series
++            .filter { it.isCompleted() && (it.season ?: 0) > 0 && (it.episode ?: 0) > 0 }
++            .groupBy { it.contentId }
++            .mapValues { (_, list) -> list.map { it.season to it.episode }.toSet().size }
++        val lastTouch: Map<String, Long> = series.groupBy { it.contentId }.mapValues { (_, list) -> list.maxOf(WatchProgress::lastWatched) }
++        val candidates = watched.entries.filter { it.value >= 3 }.sortedByDescending { lastTouch[it.key] ?: 0L }.take(12)
++        val result = mutableListOf<MetaPreview>()
++        for ((seriesId, watchedCount) in candidates) {
++            val meta = withTimeoutOrNull(15_000L) {
++                (viewModel.metaRepository.getMetaFromPrimaryAddon("series", seriesId)
++                    .first { it !is NetworkResult.Loading } as? NetworkResult.Success)?.data
++            } ?: continue
++            val aired = meta.videos.count { (it.season ?: 0) > 0 && (it.episode ?: 0) > 0 && isEpisodeReleaseAired(it.released) == true }
++            if (aired == 0) continue
++            val ratio = watchedCount.toFloat() / aired
++            if (ratio >= 0.6f && ratio < 1f) {
++                result += MetaPreview(
++                    id = meta.id,
++                    type = ContentType.SERIES,
++                    rawType = "series",
++                    name = meta.name,
++                    poster = meta.poster,
++                    posterShape = meta.posterShape,
++                    background = meta.background,
++                    logo = meta.logo,
++                    description = meta.description,
++                    releaseInfo = meta.releaseInfo,
++                    imdbRating = meta.imdbRating,
++                    genres = meta.genres,
++                )
++                items = result.toList()
++            }
++        }
++        items = result.toList()
++    }
++    if (!enabled || items.isEmpty()) return emptyList()
++    return listOf(
++        CatalogRow(
++            addonId = "fork.library",
++            addonName = "Library",
++            addonBaseUrl = "fork://library",
++            catalogId = "finish_series",
++            catalogName = "Finish a series",
++            type = ContentType.SERIES,
++            rawType = "series",
++            items = items,
++            isLoading = false,
++            hasMore = false,
++        ),
++    )
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/ForkTvHomeRows.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/ForkTvHomeRows.kt
+index 8712970d9..504de2f6e 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/ForkTvHomeRows.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/ForkTvHomeRows.kt
+@@ -56,7 +56,8 @@ internal fun rememberForkLibraryHomeRows(viewModel: HomeViewModel): List<Catalog
+             if (showWeek && week.isNotEmpty()) add(forkRow("airing_this_week", "Airing this week", week))
+         }
+     }
+-    return if (showTonight || showWeek) rows else emptyList()
++    val finishRows = rememberForkFinishSeriesRows(viewModel)
++    return (if (showTonight || showWeek) rows else emptyList()) + finishRows
+ }
+ 
+ internal fun HomeUiState.withForkRows(extra: List<CatalogRow>): HomeUiState {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
+index 5aeee6fbe..c15d54af3 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
+@@ -113,6 +113,11 @@ internal fun forkHomeLibraryRowsRows() {
+         subtitle = "Saved series with an episode releasing in the next 7 days.",
+         pref = ForkTvPreferences.homeAiringWeek
+     )
++    forkTvToggleRow(
++        title = "Home row: Finish a series",
++        subtitle = "Shows you have mostly watched but not finished.",
++        pref = ForkTvPreferences.homeFinishSeries
++    )
+     forkTvToggleRow(
+         title = "Nuvio Read card",
+         subtitle = "Show credits, ratings and synopsis in a card on the detail page.",
+@@ -147,7 +152,7 @@ internal fun forkClearImageCacheRow() {
+ private val forkTvChanges = listOf(
+     "Add uncached streams to TorBox from the player",
+     "Player buttons: hide and reorder the main control row",
+-    "Home rows: Up next tonight, Airing this week",
++    "Home rows: Up next tonight, Airing this week, Finish a series",
+     "Filler guide and OMDb ratings",
+     "Sleep timer and subtitles-off option",
+     "Native seek-bar thumbnails",
