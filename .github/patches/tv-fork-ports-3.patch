@@ -1,3 +1,453 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/di/TrackingModule.kt b/app/src/main/java/com/nuvio/tv/core/di/TrackingModule.kt
+index 7acf32468..b5e9679f1 100644
+--- a/app/src/main/java/com/nuvio/tv/core/di/TrackingModule.kt
++++ b/app/src/main/java/com/nuvio/tv/core/di/TrackingModule.kt
+@@ -32,6 +32,14 @@ import javax.inject.Singleton
+ @Module
+ @InstallIn(SingletonComponent::class)
+ abstract class TrackingModule {
++    @Binds
++    @IntoSet
++    abstract fun bindPublicMetaDbLibrary(provider: com.nuvio.tv.data.tracking.PublicMetaDbTrackingLibraryProvider): TrackingLibraryProvider
++
++    @Binds
++    @IntoSet
++    abstract fun bindWeTrakrLibrary(provider: com.nuvio.tv.data.tracking.WeTrakrTrackingLibraryProvider): TrackingLibraryProvider
++
+     @Binds
+     @IntoSet
+     abstract fun bindMdbListLibrary(provider: com.nuvio.tv.data.mdblist.MdbListTrackingLibraryProvider): TrackingLibraryProvider
+diff --git a/app/src/main/java/com/nuvio/tv/core/tmdb/TmdbMetadataService.kt b/app/src/main/java/com/nuvio/tv/core/tmdb/TmdbMetadataService.kt
+index 6fd32cccb..85e55a294 100644
+--- a/app/src/main/java/com/nuvio/tv/core/tmdb/TmdbMetadataService.kt
++++ b/app/src/main/java/com/nuvio/tv/core/tmdb/TmdbMetadataService.kt
+@@ -70,6 +70,26 @@ class TmdbMetadataService(
+         return enrichmentCache.entries.firstOrNull { it.key.startsWith(prefix) }?.value?.originalTitle
+     }
+ 
++    /** TMDB community rating per (season, episode); entries without votes are left out. */
++    suspend fun fetchEpisodeVoteAverages(tmdbId: Int, seasonNumbers: List<Int>): Map<Pair<Int, Int>, Double> =
++        withContext(Dispatchers.IO) {
++            val out = HashMap<Pair<Int, Int>, Double>()
++            seasonNumbers.distinct().forEach { season ->
++                try {
++                    tmdbApi.getTvSeasonDetails(tmdbId, season, TMDB_API_KEY, null).body()?.episodes.orEmpty().forEach { ep ->
++                        val number = ep.episodeNumber ?: return@forEach
++                        val vote = ep.voteAverage ?: return@forEach
++                        if (vote > 0.0 && (ep.voteCount ?: 0) > 0) out[season to number] = vote
++                    }
++                } catch (e: CancellationException) {
++                    throw e
++                } catch (e: Exception) {
++                    Log.w(TAG, "Failed TMDB episode votes season $season: ${e.message}")
++                }
++            }
++            out
++        }
++
+     suspend fun fetchEnrichment(
+         tmdbId: String,
+         contentType: ContentType,
+diff --git a/app/src/main/java/com/nuvio/tv/core/tracking/TrackingSources.kt b/app/src/main/java/com/nuvio/tv/core/tracking/TrackingSources.kt
+index 20890ab39..0772c0054 100644
+--- a/app/src/main/java/com/nuvio/tv/core/tracking/TrackingSources.kt
++++ b/app/src/main/java/com/nuvio/tv/core/tracking/TrackingSources.kt
+@@ -17,6 +17,8 @@ val LibrarySourceMode.providerId: TrackingProviderId?
+         LibrarySourceMode.TRAKT -> TrackingProviderId.TRAKT
+         LibrarySourceMode.SIMKL -> TrackingProviderId.SIMKL
+         LibrarySourceMode.MDBLIST -> TrackingProviderId.MDBLIST
++        LibrarySourceMode.WETRAKR -> TrackingProviderId.WETRAKR
++        LibrarySourceMode.PUBLICMETADB -> TrackingProviderId.PUBLICMETADB
+     }
+ 
+ fun effectiveWatchProgressSource(
+@@ -70,4 +72,9 @@ fun availableLibrarySourceModes(
+     if (TrackingProviderId.TRAKT in connectedProviderIds) add(LibrarySourceMode.TRAKT)
+     if (TrackingProviderId.SIMKL in connectedProviderIds) add(LibrarySourceMode.SIMKL)
+     if (TrackingProviderId.MDBLIST in connectedProviderIds) add(LibrarySourceMode.MDBLIST)
++    if (TrackingProviderId.WETRAKR in connectedProviderIds && TrackingProviderId.WETRAKR in forkLibraryProviders) add(LibrarySourceMode.WETRAKR)
++    if (TrackingProviderId.PUBLICMETADB in connectedProviderIds) add(LibrarySourceMode.PUBLICMETADB)
+ }
++
++/** Providers whose [com.nuvio.tv.core.tracking.TrackingLibraryProvider] is registered in this fork. */
++private val forkLibraryProviders = setOf(TrackingProviderId.WETRAKR, TrackingProviderId.PUBLICMETADB)
+diff --git a/app/src/main/java/com/nuvio/tv/data/publicmetadb/PublicMetaDbService.kt b/app/src/main/java/com/nuvio/tv/data/publicmetadb/PublicMetaDbService.kt
+index db3b3b8af..b279acd59 100644
+--- a/app/src/main/java/com/nuvio/tv/data/publicmetadb/PublicMetaDbService.kt
++++ b/app/src/main/java/com/nuvio/tv/data/publicmetadb/PublicMetaDbService.kt
+@@ -286,6 +286,25 @@ class PublicMetaDbService @Inject constructor(
+         return null
+     }
+ 
++    /** Pages through a read-only list endpoint; null when no key is stored. */
++    suspend fun getPaged(path: String, perPage: Int = 100, maxPages: Int = 30): List<JSONObject>? {
++        val results = mutableListOf<JSONObject>()
++        for (page in 1..maxPages) {
++            val response = call(
++                "GET",
++                path,
++                listOf("page" to page.toString(), "perPage" to perPage.toString()),
++                null,
++                allowStatuses = setOf(404)
++            ) ?: return null
++            if (response.status == 404) break
++            val array = response.items()
++            for (i in 0 until array.length()) array.optJSONObject(i)?.let(results::add)
++            if (array.length() < perPage) break
++        }
++        return results
++    }
++
+     // --- http ---
+ 
+     private data class Response(val status: Int, val body: String) {
+diff --git a/app/src/main/java/com/nuvio/tv/data/remote/api/TmdbApi.kt b/app/src/main/java/com/nuvio/tv/data/remote/api/TmdbApi.kt
+index 29d6f5838..c057d17d3 100644
+--- a/app/src/main/java/com/nuvio/tv/data/remote/api/TmdbApi.kt
++++ b/app/src/main/java/com/nuvio/tv/data/remote/api/TmdbApi.kt
+@@ -504,7 +504,9 @@ data class TmdbEpisode(
+     @Json(name = "overview") val overview: String? = null,
+     @Json(name = "still_path") val stillPath: String? = null,
+     @Json(name = "air_date") val airDate: String? = null,
+-    @Json(name = "runtime") val runtime: Int? = null
++    @Json(name = "runtime") val runtime: Int? = null,
++    @Json(name = "vote_average") val voteAverage: Double? = null,
++    @Json(name = "vote_count") val voteCount: Int? = null
+ )
+ 
+ @JsonClass(generateAdapter = true)
+diff --git a/app/src/main/java/com/nuvio/tv/data/tracking/ForkTvAccountLibraries.kt b/app/src/main/java/com/nuvio/tv/data/tracking/ForkTvAccountLibraries.kt
+new file mode 100644
+index 000000000..de0bde96d
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/tracking/ForkTvAccountLibraries.kt
+@@ -0,0 +1,154 @@
++package com.nuvio.tv.data.tracking
++
++import com.nuvio.tv.core.tracking.TrackingLibraryProvider
++import com.nuvio.tv.core.tracking.TrackingProviderId
++import com.nuvio.tv.data.publicmetadb.PublicMetaDbService
++import com.nuvio.tv.data.wetrakr.WeTrakrService
++import com.nuvio.tv.domain.model.LibraryEntry
++import com.nuvio.tv.domain.model.LibraryListTab
++import javax.inject.Inject
++import javax.inject.Singleton
++import kotlinx.coroutines.flow.map
++import org.json.JSONObject
++
++private const val TMDB_IMAGE = "https://image.tmdb.org/t/p/w500"
++
++private fun JSONObject.str(vararg keys: String): String? =
++    keys.firstNotNullOfOrNull { key -> optString(key, "").takeIf { it.isNotBlank() && it != "null" } }
++
++private fun JSONObject.long(vararg keys: String): Long? =
++    keys.firstNotNullOfOrNull { key -> if (has(key) && !isNull(key)) optLong(key, -1L).takeIf { it > 0L } else null }
++
++private fun tmdbPoster(path: String?): String? =
++    path?.takeIf { it.isNotBlank() }?.let { if (it.startsWith("http")) it else "$TMDB_IMAGE${if (it.startsWith("/")) it else "/$it"}" }
++
++private fun parseTimeMs(raw: String?): Long = raw?.let { runCatching { java.time.Instant.parse(it).toEpochMilli() }.getOrNull() } ?: 0L
++
++private fun entry(
++    id: String, type: String, name: String, year: Int?, poster: String?, background: String?,
++    genres: List<String>, imdb: String?, tmdb: Long?, listKey: String, listedAt: Long, providerId: TrackingProviderId
++) = LibraryEntry(
++    id = id,
++    type = type,
++    name = name,
++    poster = poster,
++    background = background,
++    logo = null,
++    description = null,
++    releaseInfo = year?.toString(),
++    imdbRating = null,
++    genres = genres,
++    addonBaseUrl = null,
++    listKeys = setOf(listKey),
++    listedAt = listedAt,
++    imdbId = imdb,
++    tmdbId = tmdb?.toInt(),
++    trackingProviderId = providerId.storageId,
++    trackingProviderItemId = id
++)
++
++private fun List<LibraryEntry>.mergeByTitle(): List<LibraryEntry> =
++    groupBy { "${it.type}:${it.id}" }.map { (_, group) ->
++        group.first().copy(listKeys = group.flatMapTo(linkedSetOf()) { it.listKeys }, listedAt = group.maxOf { it.listedAt })
++    }
++
++@Singleton
++class PublicMetaDbTrackingLibraryProvider @Inject constructor(
++    private val service: PublicMetaDbService
++) : TrackingLibraryProvider by ForkTvReadOnlyLibrary(
++    providerId = TrackingProviderId.PUBLICMETADB,
++    isAuthenticated = service.state.map { it.isConnected },
++    listKeyPrefix = "publicmetadb:",
++    load = {
++        val lists = service.getPaged("/api/external/lists")
++        if (lists == null) null else {
++            val tabs = mutableListOf<LibraryListTab>()
++            val items = mutableListOf<LibraryEntry>()
++            for (list in lists) {
++                val id = list.str("id") ?: continue
++                val key = "publicmetadb:list:$id"
++                val type = list.str("type")?.lowercase()
++                tabs += LibraryListTab(
++                    key = key,
++                    title = list.str("name", "title") ?: "Watchlist",
++                    type = if (type == "watchlist") LibraryListTab.Type.WATCHLIST else LibraryListTab.Type.PERSONAL,
++                    trackingProviderId = TrackingProviderId.PUBLICMETADB.storageId,
++                    isMembershipDestination = false
++                )
++                val rows = service.getPaged("/api/external/lists/${java.net.URLEncoder.encode(id, "UTF-8")}/items").orEmpty()
++                for (row in rows) {
++                    val media = row.optJSONObject("media")
++                    val rawType = (row.str("media_type", "mediaType") ?: media?.str("media_type", "type"))?.lowercase()
++                    val isMovie = rawType != "tv" && rawType != "series" && rawType != "show"
++                    val tmdb = row.long("tmdb_id", "tmdbId") ?: media?.long("tmdb_id", "tmdbId", "id") ?: row.long("id") ?: continue
++                    val name = row.str("title", "name") ?: media?.str("title", "name") ?: continue
++                    val year = row.optInt("year", 0).takeIf { it > 0 }
++                        ?: (row.str("release_date", "first_air_date") ?: media?.str("release_date", "first_air_date"))
++                            ?.take(4)?.toIntOrNull()
++                    items += entry(
++                        id = "tmdb:$tmdb", type = if (isMovie) "movie" else "series", name = name, year = year,
++                        poster = tmdbPoster(row.str("poster", "poster_path") ?: media?.str("poster", "poster_path")),
++                        background = null, genres = emptyList(), imdb = null, tmdb = tmdb, listKey = key,
++                        listedAt = parseTimeMs(row.str("added_at", "created", "created_at", "updated")),
++                        providerId = TrackingProviderId.PUBLICMETADB
++                    )
++                }
++            }
++            ForkTvLibrarySnapshot(tabs, items.mergeByTitle())
++        }
++    }
++)
++
++@Singleton
++class WeTrakrTrackingLibraryProvider @Inject constructor(
++    private val service: WeTrakrService
++) : TrackingLibraryProvider by ForkTvReadOnlyLibrary(
++    providerId = TrackingProviderId.WETRAKR,
++    isAuthenticated = service.state.map { it.isConnected },
++    listKeyPrefix = "wetrakr:",
++    load = {
++        val statuses = listOf(
++            "planning" to "Planning", "watching" to "Watching", "waiting" to "Waiting",
++            "watched" to "Watched", "paused" to "Paused", "dropped" to "Dropped"
++        )
++        val tabs = mutableListOf<LibraryListTab>()
++        val items = mutableListOf<LibraryEntry>()
++        var connected = true
++        for ((status, title) in statuses) {
++            val key = "wetrakr:status:$status"
++            var any = false
++            for ((kind, entryType, extended) in listOf(
++                Triple("movies", "movie", "movie_level_1"),
++                Triple("shows", "series", "show_level_1")
++            )) {
++                if (kind == "movies" && status !in setOf("planning", "watched", "dropped")) continue
++                val rows = service.getPaged("/sync/tracking/$status/$kind", "&extended=$extended")
++                if (rows == null) { connected = false; break }
++                for (row in rows) {
++                    val node = row.optJSONObject(if (kind == "movies") "movie" else "show") ?: row
++                    val ids = node.optJSONObject("ids")
++                    val imdb = ids?.str("imdb")?.takeIf { it.startsWith("tt") }
++                    val tmdb = ids?.long("tmdb")
++                    val id = imdb ?: tmdb?.let { "tmdb:$it" } ?: continue
++                    val name = node.str("title", "name", "original_title") ?: continue
++                    val year = node.optInt("year", 0).takeIf { it > 0 }
++                        ?: node.str("release_date", "first_air_date")?.take(4)?.toIntOrNull()
++                    any = true
++                    items += entry(
++                        id = id, type = entryType, name = name, year = year,
++                        poster = tmdbPoster(node.str("poster_path")), background = tmdbPoster(node.str("backdrop_path")),
++                        genres = emptyList(), imdb = imdb, tmdb = tmdb, listKey = key,
++                        listedAt = parseTimeMs(row.str("tracked_at", "added_at", "listed_at", "updated_at")),
++                        providerId = TrackingProviderId.WETRAKR
++                    )
++                }
++            }
++            if (!connected) break
++            if (any) tabs += LibraryListTab(
++                key = key, title = title, type = LibraryListTab.Type.STATUS,
++                trackingProviderId = TrackingProviderId.WETRAKR.storageId, isMembershipDestination = false
++            )
++        }
++        if (!connected) null else ForkTvLibrarySnapshot(tabs, items.mergeByTitle())
++    }
++)
+diff --git a/app/src/main/java/com/nuvio/tv/data/tracking/ForkTvReadOnlyLibrary.kt b/app/src/main/java/com/nuvio/tv/data/tracking/ForkTvReadOnlyLibrary.kt
+new file mode 100644
+index 000000000..83689766a
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/tracking/ForkTvReadOnlyLibrary.kt
+@@ -0,0 +1,113 @@
++package com.nuvio.tv.data.tracking
++
++import com.nuvio.tv.core.tracking.TrackingLibraryProvider
++import com.nuvio.tv.core.tracking.TrackingProviderId
++import com.nuvio.tv.core.tracking.TrackingRefreshIntent
++import com.nuvio.tv.domain.model.LibraryEntry
++import com.nuvio.tv.domain.model.LibraryEntryInput
++import com.nuvio.tv.domain.model.LibraryListTab
++import com.nuvio.tv.domain.model.ListMembershipChanges
++import com.nuvio.tv.domain.model.ListMembershipSnapshot
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.flow.Flow
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.distinctUntilChanged
++import kotlinx.coroutines.flow.map
++import kotlinx.coroutines.flow.onStart
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
++
++/** Lists and their items as loaded from a tracking account. */
++data class ForkTvLibrarySnapshot(
++    val tabs: List<LibraryListTab>,
++    val items: List<LibraryEntry>
++)
++
++/**
++ * Read-only library for a tracking account: the account's lists show as tabs, adding or removing
++ * from the app is not supported. [load] returns null when the account is not connected.
++ */
++class ForkTvReadOnlyLibrary(
++    override val providerId: TrackingProviderId,
++    override val isAuthenticated: Flow<Boolean>,
++    private val listKeyPrefix: String,
++    private val load: suspend () -> ForkTvLibrarySnapshot?
++) : TrackingLibraryProvider {
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++    private val mutex = Mutex()
++    private val refreshing = MutableStateFlow(false)
++    private val snapshot = MutableStateFlow(ForkTvLibrarySnapshot(emptyList(), emptyList()))
++    @Volatile private var loadedAt = 0L
++
++    override val isRefreshing: Flow<Boolean> = refreshing
++    override val items: Flow<List<LibraryEntry>> =
++        snapshot.map { it.items }.onStart { refreshAsync() }.distinctUntilChanged()
++    override val tabs: Flow<List<LibraryListTab>> =
++        snapshot.map { it.tabs }.onStart { refreshAsync() }.distinctUntilChanged()
++
++    override fun recognizesListKey(key: String): Boolean = key.startsWith(listKeyPrefix)
++
++    override fun observeMembership(itemId: String, itemType: String): Flow<Set<String>> =
++        snapshot.map { membership(itemId, null) }.distinctUntilChanged()
++
++    override fun toggledDefaultMembership(currentMembership: Map<String, Boolean>): Map<String, Boolean> =
++        currentMembership
++
++    override suspend fun getMembershipSnapshot(item: LibraryEntryInput): ListMembershipSnapshot {
++        refresh(TrackingRefreshIntent.AUTOMATIC)
++        val keys = membership(item.itemId, item.tmdbId)
++        return ListMembershipSnapshot(snapshot.value.tabs.associate { it.key to (it.key in keys) })
++    }
++
++    override suspend fun applyMembershipChanges(
++        item: LibraryEntryInput,
++        changes: ListMembershipChanges,
++        destructiveRemovalConfirmed: Boolean
++    ) {
++        throw UnsupportedOperationException("This account library is read-only here")
++    }
++
++    override suspend fun refresh(intent: TrackingRefreshIntent) {
++        val now = System.currentTimeMillis()
++        if (intent == TrackingRefreshIntent.AUTOMATIC && now - loadedAt in 0 until AUTOMATIC_INTERVAL_MS) return
++        mutex.withLock {
++            if (intent == TrackingRefreshIntent.AUTOMATIC && System.currentTimeMillis() - loadedAt in 0 until AUTOMATIC_INTERVAL_MS) return
++            refreshing.value = true
++            try {
++                val loaded = load()
++                if (loaded != null) {
++                    snapshot.value = loaded
++                    loadedAt = System.currentTimeMillis()
++                } else {
++                    snapshot.value = ForkTvLibrarySnapshot(emptyList(), emptyList())
++                }
++            } catch (error: CancellationException) {
++                throw error
++            } catch (error: Exception) {
++                if (intent != TrackingRefreshIntent.AUTOMATIC) throw error
++            } finally {
++                refreshing.value = false
++            }
++        }
++    }
++
++    private fun refreshAsync() {
++        scope.launch { runCatching { refresh(TrackingRefreshIntent.AUTOMATIC) } }
++    }
++
++    private fun membership(itemId: String, tmdbId: Int?): Set<String> {
++        val tmdbAlias = "tmdb:$tmdbId"
++        return snapshot.value.items
++            .filter { it.id == itemId || (tmdbId != null && (it.tmdbId == tmdbId || it.id == tmdbAlias)) ||
++                it.imdbId == itemId || "tmdb:${it.tmdbId}" == itemId }
++            .flatMapTo(linkedSetOf()) { it.listKeys }
++    }
++
++    private companion object {
++        const val AUTOMATIC_INTERVAL_MS = 5 * 60 * 1000L
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/data/wetrakr/WeTrakrService.kt b/app/src/main/java/com/nuvio/tv/data/wetrakr/WeTrakrService.kt
+index ac3ca7c66..43a01baae 100644
+--- a/app/src/main/java/com/nuvio/tv/data/wetrakr/WeTrakrService.kt
++++ b/app/src/main/java/com/nuvio/tv/data/wetrakr/WeTrakrService.kt
+@@ -352,6 +352,33 @@ class WeTrakrService @Inject constructor(
+         }
+     }
+ 
++    /** Pages through a read-only list endpoint; null when not connected. */
++    suspend fun getPaged(path: String, extra: String = "", limit: Int = 100, maxPages: Int = 30): List<JSONObject>? {
++        val profileId = activeProfile
++        val results = mutableListOf<JSONObject>()
++        for (page in 1..maxPages) {
++            val query = "?page=$page&limit=$limit$extra"
++            var token = accessToken(profileId, forceRefresh = false) ?: return null
++            var response = send("GET", path + query, null, token)
++            if (response.status == 401) {
++                token = accessToken(profileId, forceRefresh = true) ?: return null
++                response = send("GET", path + query, null, token)
++            }
++            if (response.status == 404) break
++            if (response.status !in 200..299) throw IllegalStateException("WeTrakr $path failed (${response.status})")
++            val array = runCatching {
++                val trimmed = response.body.trim()
++                if (trimmed.startsWith("[")) JSONArray(trimmed)
++                else JSONObject(trimmed).let { root ->
++                    listOf("items", "results", "data").firstNotNullOfOrNull { root.optJSONArray(it) } ?: JSONArray()
++                }
++            }.getOrDefault(JSONArray())
++            for (i in 0 until array.length()) array.optJSONObject(i)?.let(results::add)
++            if (array.length() < limit) break
++        }
++        return results
++    }
++
+     private suspend fun authorizedPost(path: String, body: JSONObject): Response? {
+         val profileId = activeProfile
+         var token = accessToken(profileId, forceRefresh = false) ?: return null
+diff --git a/app/src/main/java/com/nuvio/tv/domain/model/LibraryModels.kt b/app/src/main/java/com/nuvio/tv/domain/model/LibraryModels.kt
+index 7e675b777..ef5581dd4 100644
+--- a/app/src/main/java/com/nuvio/tv/domain/model/LibraryModels.kt
++++ b/app/src/main/java/com/nuvio/tv/domain/model/LibraryModels.kt
+@@ -60,7 +60,9 @@ enum class LibrarySourceMode {
+     LOCAL,
+     TRAKT,
+     SIMKL,
+-    MDBLIST
++    MDBLIST,
++    WETRAKR,
++    PUBLICMETADB
+ }
+ 
+ enum class LibraryListPrivacy(val apiValue: String) {
 diff --git a/app/src/main/java/com/nuvio/tv/ui/components/GridContentCard.kt b/app/src/main/java/com/nuvio/tv/ui/components/GridContentCard.kt
 index 3433e6ddf..edaa95106 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/components/GridContentCard.kt
@@ -153,3 +603,179 @@ index 000000000..1bed4bef0
 +
 +internal fun Map<String, String>.ownedLabelFor(item: MetaPreview): String? =
 +    ownedKeys(item.id, item.name).firstNotNullOfOrNull { this[it] }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt
+index 820f5226e..ba2399fb4 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt
+@@ -613,6 +613,7 @@ fun EpisodesRow(
+             val seasonEp = remember(episode.season, episode.episode) { episode.season?.let { s -> episode.episode?.let { e -> s to e } } }
+             val progress = remember(seasonEp, episodeProgressMap) { seasonEp?.let { episodeProgressMap[it] } }
+             val imdbRating = remember(seasonEp, episodeRatings) { seasonEp?.let { episodeRatings[it] } }
++            val tmdbRating = seasonEp?.let { LocalForkTmdbEpisodeRatings.current[it] }
+             val isMarkedWatched = remember(seasonEp, watchedEpisodes) { seasonEp?.let { watchedEpisodes.contains(it) } ?: false }
+             val episodeFocusRequester = remember(episode.id) { episodeFocusRequesters.getOrPut(episode.id) { FocusRequester() } }
+             val episodeOnClick = remember(episode, onEpisodeClick) { { onEpisodeClick(episode) } }
+@@ -626,6 +627,7 @@ fun EpisodesRow(
+                 episode = episode,
+                 watchProgress = progress,
+                 imdbRating = imdbRating,
++                forkTmdbRating = tmdbRating,
+                 isMarkedWatched = isMarkedWatched,
+                 blurUnwatched = blurUnwatchedEpisodes,
+                 suppressMarquee = isOverlayOpen,
+@@ -725,6 +727,7 @@ private fun EpisodeCard(
+     episode: Video,
+     watchProgress: com.nuvio.tv.domain.model.WatchProgress? = null,
+     imdbRating: Double? = null,
++    forkTmdbRating: Double? = null,
+     isMarkedWatched: Boolean = false,
+     blurUnwatched: Boolean = false,
+     suppressMarquee: Boolean = false,
+@@ -1068,7 +1071,7 @@ private fun EpisodeCard(
+                     )
+                 }
+ 
+-                if (runtimeLabel != null || ratingLabel != null || formattedDate.isNotBlank()) {
++                if (runtimeLabel != null || ratingLabel != null || forkTmdbRating != null || formattedDate.isNotBlank()) {
+                     Row(
+                         modifier = Modifier.fillMaxWidth(),
+                         horizontalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.md),
+@@ -1113,6 +1116,14 @@ private fun EpisodeCard(
+                             }
+                         }
+ 
++                        forkTmdbRating?.takeIf { it > 0.0 }?.let { tmdb ->
++                            Text(
++                                text = "TMDB " + String.format(Locale.US, "%.1f", tmdb),
++                                style = ratingStyle,
++                                maxLines = 1
++                            )
++                        }
++
+                         if (formattedDate.isNotBlank()) {
+                             Text(
+                                 text = formattedDate,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/ForkTvTmdbEpisodeRatings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/ForkTvTmdbEpisodeRatings.kt
+new file mode 100644
+index 000000000..0ac430370
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/ForkTvTmdbEpisodeRatings.kt
+@@ -0,0 +1,6 @@
++package com.nuvio.tv.ui.screens.detail
++
++import androidx.compose.runtime.compositionLocalOf
++
++/** TMDB community rating per (season, episode), shown beside the IMDb rating on episode cards. */
++internal val LocalForkTmdbEpisodeRatings = compositionLocalOf<Map<Pair<Int, Int>, Double>> { emptyMap() }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
+index 711b60616..52eec32d8 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
+@@ -888,6 +888,7 @@ fun MetaDetailsScreen(
+                     collectionName = uiState.collectionName,
+                     relatedWatchedStatus = uiState.relatedWatchedStatus,
+                     episodeImdbRatings = uiState.episodeImdbRatings,
++                    episodeTmdbRatings = uiState.episodeTmdbRatings,
+                     isEpisodeRatingsLoading = uiState.isEpisodeRatingsLoading,
+                     episodeRatingsError = uiState.episodeRatingsError,
+                     mdbListRatings = uiState.mdbListRatings,
+@@ -1231,6 +1232,7 @@ private fun MetaDetailsContent(
+     collectionName: String?,
+     relatedWatchedStatus: Map<String, Boolean> = emptyMap(),
+     episodeImdbRatings: Map<Pair<Int, Int>, Double>,
++    episodeTmdbRatings: Map<Pair<Int, Int>, Double> = emptyMap(),
+     isEpisodeRatingsLoading: Boolean,
+     episodeRatingsError: String?,
+     mdbListRatings: MDBListRatings?,
+@@ -2334,6 +2336,7 @@ private fun MetaDetailsContent(
+ 
+         // Single scrollable column with hero + content
+         CompositionLocalProvider(
++            LocalForkTmdbEpisodeRatings provides episodeTmdbRatings,
+             // The hero grows to full height during a trailer; keep the list from
+             // scrolling to follow the focused hero while it resizes.
+             LocalBringIntoViewSpec provides if (suppressRestoreBringIntoView || isTrailerPlaying) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsUiState.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsUiState.kt
+index 8af9e348b..a08fe94da 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsUiState.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsUiState.kt
+@@ -78,6 +78,7 @@ data class MetaDetailsUiState(
+     val collectionName: String? = null,
+     val relatedWatchedStatus: Map<String, Boolean> = emptyMap(),
+     val episodeImdbRatings: Map<Pair<Int, Int>, Double> = emptyMap(),
++    val episodeTmdbRatings: Map<Pair<Int, Int>, Double> = emptyMap(),
+     val isEpisodeRatingsLoading: Boolean = false,
+     val episodeRatingsError: String? = null,
+     val mdbListRatings: MDBListRatings? = null,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt
+index 3914eba15..40a90573e 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt
+@@ -1462,6 +1462,7 @@ class MetaDetailsViewModel @Inject constructor(
+             _uiState.update {
+                 it.copy(
+                     episodeImdbRatings = emptyMap(),
++                    episodeTmdbRatings = emptyMap(),
+                     isEpisodeRatingsLoading = true,
+                     episodeRatingsError = null
+                 )
+@@ -1530,6 +1531,16 @@ class MetaDetailsViewModel @Inject constructor(
+                         )
+                     }
+                 }
++                if (tmdbId != null) {
++                    val seasons = meta.videos.mapNotNull { it.season }.filter { it > 0 }
++                    val votes = tmdbMetadataService.fetchEpisodeVoteAverages(tmdbId, seasons)
++                    if (votes.isNotEmpty()) {
++                        _uiState.update { state ->
++                            if (state.meta == null || state.meta.id != meta.id) state
++                            else state.copy(episodeTmdbRatings = votes)
++                        }
++                    }
++                }
+             } catch (cancelled: CancellationException) {
+                 throw cancelled
+             } catch (error: Exception) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryScreen.kt
+index db91162b7..ed95612d2 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryScreen.kt
+@@ -372,6 +372,8 @@ fun LibraryScreen(
+                         uiState.sourceMode == LibrarySourceMode.TRAKT -> "TRAKT"
+                         uiState.sourceMode == LibrarySourceMode.SIMKL -> "SIMKL"
+                         uiState.sourceMode == LibrarySourceMode.MDBLIST -> "MDBLIST"
++                        uiState.sourceMode == LibrarySourceMode.WETRAKR -> "WETRAKR"
++                        uiState.sourceMode == LibrarySourceMode.PUBLICMETADB -> "PUBLICMETADB"
+                         uiState.isNuvioAccount -> "NUVIO"
+                         else -> stringResource(R.string.library_source_local)
+                     },
+@@ -497,14 +499,14 @@ fun LibraryScreen(
+                     val title = when {
+                         uiState.sourceMode == LibrarySourceMode.TRAKT && !uiState.isTrackingAuthenticated -> stringResource(R.string.library_empty_trakt_not_auth_title)
+                         uiState.sourceMode == LibrarySourceMode.SIMKL && !uiState.isTrackingAuthenticated -> stringResource(R.string.library_empty_simkl_not_auth_title)
+-                        uiState.sourceMode == LibrarySourceMode.TRAKT || uiState.sourceMode == LibrarySourceMode.MDBLIST -> stringResource(R.string.library_empty_trakt_title, selectedTypeLabel)
++                        uiState.sourceMode == LibrarySourceMode.TRAKT || uiState.sourceMode == LibrarySourceMode.MDBLIST || uiState.sourceMode == LibrarySourceMode.WETRAKR || uiState.sourceMode == LibrarySourceMode.PUBLICMETADB -> stringResource(R.string.library_empty_trakt_title, selectedTypeLabel)
+                         uiState.sourceMode == LibrarySourceMode.SIMKL -> stringResource(R.string.library_empty_simkl_title, selectedTypeLabel)
+                         else -> stringResource(R.string.library_empty_local_title, selectedTypeLabel)
+                     }
+                     val subtitle = when {
+                         uiState.sourceMode == LibrarySourceMode.TRAKT && !uiState.isTrackingAuthenticated -> stringResource(R.string.library_empty_trakt_not_auth_subtitle)
+                         uiState.sourceMode == LibrarySourceMode.SIMKL && !uiState.isTrackingAuthenticated -> stringResource(R.string.library_empty_simkl_not_auth_subtitle)
+-                        uiState.sourceMode == LibrarySourceMode.TRAKT || uiState.sourceMode == LibrarySourceMode.MDBLIST -> stringResource(R.string.library_empty_trakt_subtitle)
++                        uiState.sourceMode == LibrarySourceMode.TRAKT || uiState.sourceMode == LibrarySourceMode.MDBLIST || uiState.sourceMode == LibrarySourceMode.WETRAKR || uiState.sourceMode == LibrarySourceMode.PUBLICMETADB -> stringResource(R.string.library_empty_trakt_subtitle)
+                         uiState.sourceMode == LibrarySourceMode.SIMKL -> stringResource(R.string.library_empty_simkl_subtitle)
+                         else -> stringResource(R.string.library_empty_local_subtitle)
+                     }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TrackingSettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TrackingSettingsScreen.kt
+index f5996d26e..2c2f4e7e0 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TrackingSettingsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TrackingSettingsScreen.kt
+@@ -792,6 +792,8 @@ private fun librarySourceLabel(mode: LibrarySourceMode): String = when (mode) {
+     LibrarySourceMode.TRAKT -> stringResource(R.string.trakt_name)
+     LibrarySourceMode.SIMKL -> stringResource(R.string.simkl_name)
+     LibrarySourceMode.MDBLIST -> stringResource(R.string.mdblist_name)
++    LibrarySourceMode.WETRAKR -> stringResource(R.string.wetrakr_name)
++    LibrarySourceMode.PUBLICMETADB -> stringResource(R.string.publicmetadb_name)
+     LibrarySourceMode.LOCAL -> stringResource(R.string.trakt_library_source_nuvio)
+ }
+ 
