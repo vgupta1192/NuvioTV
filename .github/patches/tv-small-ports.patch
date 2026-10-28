@@ -276,10 +276,10 @@ index 8c87b55cb..626e679b6 100644
  }
 diff --git a/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
 new file mode 100644
-index 000000000..051bd606f
+index 000000000..10047e4d3
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,86 @@
 +package com.nuvio.tv.data.repository
 +
 +import android.content.Context
@@ -321,6 +321,7 @@ index 000000000..051bd606f
 +object ForkTvPreferences {
 +    val homeVideoRowsOnly = ForkTvBoolPref("home_video_rows_only", true)
 +    val fillerGuide = ForkTvBoolPref("filler_guide", true)
++    val autoAddTorbox = ForkTvBoolPref("auto_add_torbox", false)
 +    val homeUpNextTonight = ForkTvBoolPref("home_up_next_tonight", true)
 +    val homeAiringWeek = ForkTvBoolPref("home_airing_week", true)
 +}
@@ -876,6 +877,43 @@ index 0df4b3a2d..8997884a2 100644
      mpvMediaLoadPrepared = false
      val afrPreflightToken = afrPreflightGate.token()
  
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
+index b360b27ca..f51d423be 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
+@@ -1801,8 +1801,31 @@ internal suspend fun PlayerRuntimeController.resolveDirectDebridStreamIfNeeded(
+             )
+             result.stream
+         }
++        DirectDebridPlayableResult.NotCached -> {
++            recordLoadingDiagnosticEvent(
++                phase = "resolving_debrid_failed",
++                message = context.getString(com.nuvio.tv.R.string.player_loading_preparing),
++                detail = result.javaClass.simpleName
++            )
++            // Nuvio fork: optionally send the uncached torrent to TorBox so it caches for next time.
++            val autoAdd = com.nuvio.tv.data.repository.ForkTvPreferences.autoAddTorbox.let {
++                it.ensureLoaded(context)
++                it.current(context)
++            }
++            if (autoAdd && directDebridResolver.hasTorboxKey()) {
++                val added = runCatching { directDebridResolver.addToTorbox(stream) }.getOrDefault(false)
++                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
++                    android.widget.Toast.makeText(
++                        context,
++                        if (added) "Not cached. Added to TorBox, try again when it finishes caching."
++                        else "Not cached on TorBox.",
++                        android.widget.Toast.LENGTH_LONG
++                    ).show()
++                }
++            }
++            null
++        }
+         DirectDebridPlayableResult.MissingApiKey,
+-        DirectDebridPlayableResult.NotCached,
+         DirectDebridPlayableResult.Stale,
+         DirectDebridPlayableResult.Error -> {
+             recordLoadingDiagnosticEvent(
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt
 index 35dafddf3..924642ef1 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt
@@ -1098,10 +1136,10 @@ index 000000000..46ce3c1b2
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
 new file mode 100644
-index 000000000..a93554dbd
+index 000000000..9b60208ff
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,118 @@
 +package com.nuvio.tv.ui.screens.settings
 +
 +import androidx.compose.foundation.layout.fillMaxWidth
@@ -1196,17 +1234,43 @@ index 000000000..a93554dbd
 +        pref = ForkTvPreferences.homeAiringWeek
 +    )
 +}
++
++@Composable
++internal fun forkAutoAddTorboxRow() = forkTvToggleRow(
++    title = "Add uncached streams to TorBox from the player",
++    subtitle = "When a TorBox stream is not cached, send it to TorBox so it caches for next time.",
++    pref = ForkTvPreferences.autoAddTorbox
++)
++
++@Composable
++internal fun forkClearImageCacheRow() {
++    val context = LocalContext.current
++    var cleared by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
++    SettingsActionRow(
++        title = "Clear image cache",
++        subtitle = "Remove cached posters and backdrops. They download again when needed.",
++        value = if (cleared) "Cleared" else null,
++        onClick = {
++            val loader = coil3.SingletonImageLoader.get(context)
++            loader.memoryCache?.clear()
++            loader.diskCache?.clear()
++            cleared = true
++        }
++    )
++}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutDetailSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutDetailSettings.kt
-index 10b052424..969df4013 100644
+index 10b052424..9cc772fe3 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutDetailSettings.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutDetailSettings.kt
-@@ -50,6 +50,9 @@ internal fun LayoutDetailPageSection(
+@@ -50,6 +50,11 @@ internal fun LayoutDetailPageSection(
          value = episodeRatingsVisibilityLabel(uiState.detailImdbRatingsVisibility),
          onClick = { showRatingsDialog = true }
      )
 +    omdbKeySettingsRow()
 +    forkFillerGuideRow()
++    forkAutoAddTorboxRow()
 +    forkPlayerButtonsRow()
++    forkClearImageCacheRow()
  
      SettingsSectionLabel(text = stringResource(R.string.layout_detail_group_trailers))
      if (AppFeaturePolicy.inAppTrailerPlaybackEnabled) {
