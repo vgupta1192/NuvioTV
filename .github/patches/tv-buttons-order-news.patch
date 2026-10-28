@@ -1,0 +1,237 @@
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
+index 10047e4d3..fc3a9111c 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
+@@ -70,10 +70,33 @@ object ForkTvPlayerButtons {
+         synchronized(this) {
+             if (loaded) return
+             _hidden.value = prefs(context).getStringSet("hidden", emptySet()).orEmpty().toSet()
++            val saved = prefs(context).getString("order", null)?.split(",").orEmpty().filter { it in mainIds }
++            _order.value = saved + mainIds.filter { it !in saved }
+             loaded = true
+         }
+     }
+ 
++    private val mainIds = listOf("next_episode", "subtitles", "audio", "quality", "chapters", "sources", "episodes")
++
++    private val _order = MutableStateFlow<List<String>>(mainIds)
++    val order: StateFlow<List<String>> = _order.asStateFlow()
++
++    /** Ids of the main control row in the saved order (ids added later are appended). */
++    fun mainOrder(@Suppress("UNUSED_PARAMETER") hidden: Set<String>): List<String> = _order.value
++
++    fun isMain(id: String) = id in mainIds
++
++    fun move(context: Context, id: String, delta: Int) {
++        ensureLoaded(context)
++        val list = _order.value.toMutableList()
++        val from = list.indexOf(id)
++        val to = from + delta
++        if (from < 0 || to < 0 || to >= list.size) return
++        list.add(to, list.removeAt(from))
++        _order.value = list
++        prefs(context).edit().putString("order", list.joinToString(",")).apply()
++    }
++
+     fun setVisible(context: Context, id: String, visible: Boolean) {
+         ensureLoaded(context)
+         val next = if (visible) _hidden.value - id else _hidden.value + id
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+index 7a0dd36e2..e126a2dd8 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+@@ -3099,6 +3099,8 @@ private fun PlayerControlsOverlay(
+                         onFocused = onResetHideTimer
+                     )
+ 
++                    val forkBtns = mutableMapOf<String, @Composable () -> Unit>()
++                    forkBtns["next_episode"] = {
+                     if (showNextEpisodeButton && "next_episode" !in hiddenBtns) {
+                         ControlButton(
+                             icon = Icons.Default.SkipNext,
+@@ -3110,6 +3112,8 @@ private fun PlayerControlsOverlay(
+                         )
+                     }
+ 
++                    }
++                    forkBtns["subtitles"] = {
+                     if (hasSubtitleControl && "subtitles" !in hiddenBtns) {
+                         ControlButton(
+                             icon = Icons.Default.ClosedCaption,
+@@ -3122,6 +3126,8 @@ private fun PlayerControlsOverlay(
+                         )
+                     }
+ 
++                    }
++                    forkBtns["audio"] = {
+                     if (hasAudioControl && "audio" !in hiddenBtns) {
+                         ControlButton(
+                             icon = Icons.AutoMirrored.Filled.VolumeUp,
+@@ -3134,8 +3140,10 @@ private fun PlayerControlsOverlay(
+                         )
+                     }
+ 
++                    }
+                     val qualityPlayer = viewModel.exoPlayer
+                     var showQualityDialog by remember { mutableStateOf(false) }
++                    forkBtns["quality"] = {
+                     if ("quality" !in hiddenBtns && !isLivePlayback && qualityPlayer != null && qualityPlayer.extractVideoQualities().size > 1) {
+                         ControlButton(
+                             icon = Icons.Default.HighQuality,
+@@ -3146,6 +3154,7 @@ private fun PlayerControlsOverlay(
+                             onFocused = onResetHideTimer
+                         )
+                     }
++                    }
+                     if (showQualityDialog && qualityPlayer != null) {
+                         VideoQualityDialog(
+                             exoPlayer = qualityPlayer,
+@@ -3153,6 +3162,7 @@ private fun PlayerControlsOverlay(
+                         )
+                     }
+ 
++                    forkBtns["chapters"] = {
+                     if ("chapters" !in hiddenBtns && uiState.chapters.isNotEmpty() && !isLivePlayback) {
+                         ControlButton(
+                             icon = Icons.AutoMirrored.Filled.Toc,
+@@ -3164,6 +3174,8 @@ private fun PlayerControlsOverlay(
+                         )
+                     }
+ 
++                    }
++                    forkBtns["sources"] = {
+                     if ("sources" !in hiddenBtns) ControlButton(
+                         icon = Icons.Default.SwapHoriz,
+                         iconPainter = customSourcePainter,
+@@ -3174,6 +3186,8 @@ private fun PlayerControlsOverlay(
+                         onFocused = onResetHideTimer
+                     )
+ 
++                    }
++                    forkBtns["episodes"] = {
+                     if (hasEpisodeContext && "episodes" !in hiddenBtns) {
+                         ControlButton(
+                             icon = Icons.AutoMirrored.Filled.List,
+@@ -3186,6 +3200,10 @@ private fun PlayerControlsOverlay(
+                         )
+                     }
+ 
++                    }
++                    val forkBtnOrder by com.nuvio.tv.data.repository.ForkTvPlayerButtons.order.collectAsState()
++                    forkBtnOrder.forEach { forkBtns[it]?.invoke() }
++
+                     if (onShowPartyPanel != null) {
+                         ControlButton(
+                             icon = Icons.Rounded.Groups,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
+index 9b60208ff..39498f675 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
+@@ -2,6 +2,7 @@ package com.nuvio.tv.ui.screens.settings
+ 
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.width
+ import androidx.compose.foundation.lazy.items
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.setValue
+@@ -55,7 +56,7 @@ internal fun forkPlayerButtonsRow() {
+         com.nuvio.tv.ui.components.NuvioDialog(
+             onDismiss = { open = false },
+             title = "Player buttons",
+-            subtitle = "Buttons also stay hidden when the player has nothing for them.",
++            subtitle = "Up and Down reorder the main control row. Buttons also stay hidden when the player has nothing for them.",
+             suppressFirstKeyUp = false
+         ) {
+             androidx.compose.foundation.lazy.LazyColumn(
+@@ -64,15 +65,36 @@ internal fun forkPlayerButtonsRow() {
+                     .heightIn(max = 380.dp),
+                 verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(8.dp)
+             ) {
+-                items(com.nuvio.tv.data.repository.ForkTvPlayerButtons.buttons, key = { it.first }) { (id, label) ->
+-                    SettingsToggleRow(
+-                        title = label,
+-                        subtitle = null,
+-                        checked = id !in hidden,
+-                        onToggle = {
+-                            com.nuvio.tv.data.repository.ForkTvPlayerButtons.setVisible(context, id, id in hidden)
++                val btns = com.nuvio.tv.data.repository.ForkTvPlayerButtons
++                val order by btns.order.collectAsStateWithLifecycle()
++                val labels = btns.buttons.toMap()
++                val rows = order + btns.buttons.map { it.first }.filter { !btns.isMain(it) }
++                items(rows, key = { it }) { id ->
++                    androidx.compose.foundation.layout.Row(
++                        horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(8.dp)
++                    ) {
++                        SettingsToggleRow(
++                            title = labels[id] ?: id,
++                            subtitle = null,
++                            checked = id !in hidden,
++                            onToggle = { btns.setVisible(context, id, id in hidden) },
++                            modifier = androidx.compose.ui.Modifier.weight(1f)
++                        )
++                        if (btns.isMain(id)) {
++                            SettingsActionRow(
++                                title = "Up",
++                                subtitle = null,
++                                onClick = { btns.move(context, id, -1) },
++                                modifier = androidx.compose.ui.Modifier.width(110.dp)
++                            )
++                            SettingsActionRow(
++                                title = "Down",
++                                subtitle = null,
++                                onClick = { btns.move(context, id, 1) },
++                                modifier = androidx.compose.ui.Modifier.width(120.dp)
++                            )
+                         }
+-                    )
++                    }
+                 }
+             }
+         }
+@@ -116,3 +138,33 @@ internal fun forkClearImageCacheRow() {
+         }
+     )
+ }
++
++private val forkTvChanges = listOf(
++    "Add uncached streams to TorBox from the player",
++    "Player buttons: hide and reorder the main control row",
++    "Home rows: Up next tonight, Airing this week",
++    "Filler guide and OMDb ratings",
++    "Sleep timer and subtitles-off option",
++    "Native seek-bar thumbnails",
++    "Netflix style, Live TV Custom Stretch, second subtitle",
++)
++
++@Composable
++internal fun forkWhatsNewRow() {
++    var open by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(false) }
++    SettingsActionRow(
++        title = "What's new in this build",
++        subtitle = "Features added by this fork.",
++        onClick = { open = true }
++    )
++    if (open) {
++        com.nuvio.tv.ui.components.NuvioDialog(
++            onDismiss = { open = false },
++            title = "What's new",
++            subtitle = forkTvChanges.joinToString("\n") { "- $it" },
++            suppressFirstKeyUp = false
++        ) {
++            SettingsActionRow(title = "Close", subtitle = null, onClick = { open = false })
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutDetailSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutDetailSettings.kt
+index 9cc772fe3..572047542 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutDetailSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutDetailSettings.kt
+@@ -55,6 +55,7 @@ internal fun LayoutDetailPageSection(
+     forkAutoAddTorboxRow()
+     forkPlayerButtonsRow()
+     forkClearImageCacheRow()
++    forkWhatsNewRow()
+ 
+     SettingsSectionLabel(text = stringResource(R.string.layout_detail_group_trailers))
+     if (AppFeaturePolicy.inAppTrailerPlaybackEnabled) {
