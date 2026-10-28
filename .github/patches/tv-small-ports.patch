@@ -276,10 +276,10 @@ index 8c87b55cb..626e679b6 100644
  }
 diff --git a/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
 new file mode 100644
-index 000000000..ed8d11d35
+index 000000000..051bd606f
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,85 @@
 +package com.nuvio.tv.data.repository
 +
 +import android.content.Context
@@ -321,6 +321,8 @@ index 000000000..ed8d11d35
 +object ForkTvPreferences {
 +    val homeVideoRowsOnly = ForkTvBoolPref("home_video_rows_only", true)
 +    val fillerGuide = ForkTvBoolPref("filler_guide", true)
++    val homeUpNextTonight = ForkTvBoolPref("home_up_next_tonight", true)
++    val homeAiringWeek = ForkTvBoolPref("home_airing_week", true)
 +}
 +
 +object ForkTvPlayerButtons {
@@ -718,6 +720,95 @@ index 1f54d0be8..711b60616 100644
  
          // Cast / More like this section
          if (hasVisiblePeopleSection) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/ForkTvHomeRows.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/ForkTvHomeRows.kt
+new file mode 100644
+index 000000000..8712970d9
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/ForkTvHomeRows.kt
+@@ -0,0 +1,68 @@
++package com.nuvio.tv.ui.screens.home
++
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.platform.LocalContext
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import com.nuvio.tv.data.repository.ForkTvPreferences
++import com.nuvio.tv.domain.model.CatalogRow
++import com.nuvio.tv.domain.model.ContentType
++import com.nuvio.tv.domain.model.LibraryEntry
++import com.nuvio.tv.ui.screens.library.loadLibraryCalendar
++import java.time.LocalDate
++
++private fun forkRow(id: String, name: String, entries: List<LibraryEntry>) = CatalogRow(
++    addonId = "fork.library",
++    addonName = "Library",
++    addonBaseUrl = "fork://library",
++    catalogId = id,
++    catalogName = name,
++    type = ContentType.SERIES,
++    rawType = "series",
++    items = entries.map { it.toMetaPreview() },
++    isLoading = false,
++    hasMore = false
++)
++
++/** Extra Home rows from the saved library: up next tonight and airing this week. */
++@Composable
++internal fun rememberForkLibraryHomeRows(viewModel: HomeViewModel): List<CatalogRow> {
++    val context = LocalContext.current
++    ForkTvPreferences.homeUpNextTonight.ensureLoaded(context)
++    ForkTvPreferences.homeAiringWeek.ensureLoaded(context)
++    val showTonight by ForkTvPreferences.homeUpNextTonight.value.collectAsStateWithLifecycle()
++    val showWeek by ForkTvPreferences.homeAiringWeek.value.collectAsStateWithLifecycle()
++    val library by viewModel.libraryRepository.libraryItems.collectAsStateWithLifecycle(initialValue = emptyList())
++    var rows by remember { mutableStateOf<List<CatalogRow>>(emptyList()) }
++
++    val series = library.filter { it.type.trim().lowercase() in setOf("series", "show", "tv") }
++    LaunchedEffect(series.map { it.id }, showTonight, showWeek) {
++        if ((!showTonight && !showWeek) || series.isEmpty()) {
++            rows = emptyList()
++            return@LaunchedEffect
++        }
++        val events = runCatching { loadLibraryCalendar(context, series) }.getOrDefault(emptyList())
++            .filter { it.entry.type.trim().lowercase() in setOf("series", "show", "tv") }
++        val today = LocalDate.now()
++        val tonight = events.filter { it.date == today }.map { it.entry }.distinctBy { it.id }
++        val week = events.filter { it.date.isAfter(today) && !it.date.isAfter(today.plusDays(7)) }
++            .sortedBy { it.date }.map { it.entry }.distinctBy { it.id }
++        rows = buildList {
++            if (showTonight && tonight.isNotEmpty()) add(forkRow("up_next_tonight", "Up next tonight", tonight))
++            if (showWeek && week.isNotEmpty()) add(forkRow("airing_this_week", "Airing this week", week))
++        }
++    }
++    return if (showTonight || showWeek) rows else emptyList()
++}
++
++internal fun HomeUiState.withForkRows(extra: List<CatalogRow>): HomeUiState {
++    if (extra.isEmpty()) return this
++    return copy(
++        catalogRows = extra + catalogRows,
++        homeRows = if (homeRows.isNotEmpty()) extra.map { HomeRow.Catalog(it) } + homeRows else homeRows
++    )
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeScreen.kt
+index d44615064..77556df3a 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeScreen.kt
+@@ -97,7 +97,9 @@ fun HomeScreen(
+     onNavigateToCatalogSeeAll: (String, String, String) -> Unit = { _, _, _ -> },
+     onNavigateToFolderDetail: (String, String) -> Unit = { _, _ -> }
+ ) {
+-    val uiState by viewModel.uiState.collectAsStateWithLifecycle()
++    val baseUiState by viewModel.uiState.collectAsStateWithLifecycle()
++    val forkLibraryRows = rememberForkLibraryHomeRows(viewModel)
++    val uiState = remember(baseUiState, forkLibraryRows) { baseUiState.withForkRows(forkLibraryRows) }
+ 
+     // Home was the only major screen without a lifecycle observer, so nothing ever told it to
+     // look at its catalogs again.
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogPipeline.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogPipeline.kt
 index cd5d9ecae..50e83f490 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogPipeline.kt
@@ -740,6 +831,19 @@ index cd5d9ecae..50e83f490 100644
 +    com.nuvio.tv.data.repository.ForkTvPreferences.homeVideoRowsOnly.current(appContext) &&
 +        apiType.isNotBlank() &&
 +        apiType.lowercase() !in setOf("movie", "series", "anime", "collections", "tv")
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryCalendarTv.kt b/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryCalendarTv.kt
+index 522edc3a0..9c37508bb 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryCalendarTv.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryCalendarTv.kt
+@@ -82,7 +82,7 @@ private fun parseReleaseDate(value: String?): LocalDate? {
+         ?: runCatching { LocalDate.parse(text.take(10)) }.getOrNull()
+ }
+ 
+-private suspend fun loadLibraryCalendar(context: Context, items: List<LibraryEntry>): List<LibraryCalendarEvent> {
++internal suspend fun loadLibraryCalendar(context: Context, items: List<LibraryEntry>): List<LibraryCalendarEvent> {
+     val key = items.map { "${it.type}:${it.id}" }.toSet()
+     LibraryCalendarCache.events?.takeIf { LibraryCalendarCache.key == key }?.let { return it }
+     val repository = EntryPointAccessors.fromApplication(context.applicationContext, LibraryCalendarEntryPoint::class.java)
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
 index 81c3afb0c..1c226275c 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
@@ -994,10 +1098,10 @@ index 000000000..46ce3c1b2
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
 new file mode 100644
-index 000000000..121dac8ba
+index 000000000..a93554dbd
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,94 @@
 +package com.nuvio.tv.ui.screens.settings
 +
 +import androidx.compose.foundation.layout.fillMaxWidth
@@ -1078,6 +1182,20 @@ index 000000000..121dac8ba
 +        }
 +    }
 +}
++
++@Composable
++internal fun forkHomeLibraryRowsRows() {
++    forkTvToggleRow(
++        title = "Home row: Up next tonight",
++        subtitle = "Saved series with an episode releasing today.",
++        pref = ForkTvPreferences.homeUpNextTonight
++    )
++    forkTvToggleRow(
++        title = "Home row: Airing this week",
++        subtitle = "Saved series with an episode releasing in the next 7 days.",
++        pref = ForkTvPreferences.homeAiringWeek
++    )
++}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutDetailSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutDetailSettings.kt
 index 10b052424..969df4013 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutDetailSettings.kt
@@ -1093,14 +1211,15 @@ index 10b052424..969df4013 100644
      SettingsSectionLabel(text = stringResource(R.string.layout_detail_group_trailers))
      if (AppFeaturePolicy.inAppTrailerPlaybackEnabled) {
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutHomeSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutHomeSettings.kt
-index 9aae7c94c..70e1c6597 100644
+index 9aae7c94c..29071464c 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutHomeSettings.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutHomeSettings.kt
-@@ -168,6 +168,7 @@ internal fun LayoutHomeContentSection(
+@@ -168,6 +168,8 @@ internal fun LayoutHomeContentSection(
              onToggle = { onEvent(LayoutSettingsEvent.SetCatalogAddonNameEnabled(!uiState.catalogAddonNameEnabled)) }
          )
      }
 +    forkHomeVideoOnlyRow()
++    forkHomeLibraryRowsRows()
      SettingsToggleRow(
          title = stringResource(R.string.layout_catalog_type),
          subtitle = stringResource(R.string.layout_catalog_type_sub),
