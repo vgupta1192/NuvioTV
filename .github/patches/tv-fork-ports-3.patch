@@ -1,0 +1,155 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/components/GridContentCard.kt b/app/src/main/java/com/nuvio/tv/ui/components/GridContentCard.kt
+index 3433e6ddf..edaa95106 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/components/GridContentCard.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/components/GridContentCard.kt
+@@ -72,6 +72,7 @@ fun GridContentCard(
+     showLogo: Boolean = false,
+     imageCrossfade: Boolean = true,
+     isWatched: Boolean = false,
++    ownedLabel: String? = null,
+     focusRequester: FocusRequester? = null,
+     upFocusRequester: FocusRequester? = null,
+     downFocusRequester: FocusRequester? = null,
+@@ -346,6 +347,21 @@ fun GridContentCard(
+                     )
+                 }
+ 
++                if (ownedLabel != null) {
++                    Text(
++                        text = ownedLabel,
++                        style = MaterialTheme.typography.labelSmall,
++                        color = Color.White,
++                        modifier = Modifier
++                            .align(Alignment.BottomStart)
++                            .padding(start = NuvioTheme.spacing.sm, bottom = NuvioTheme.spacing.sm)
++                            .zIndex(2f)
++                            .clip(RoundedCornerShape(4.dp))
++                            .background(Color.Black.copy(alpha = 0.72f))
++                            .padding(horizontal = 6.dp, vertical = 2.dp)
++                    )
++                }
++
+                 if (isWatched) {
+                     WatchedMarker(
+                         modifier = Modifier
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/cast/CastDetailScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/cast/CastDetailScreen.kt
+index 99f0a3d71..fbcacfc98 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/cast/CastDetailScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/cast/CastDetailScreen.kt
+@@ -111,6 +111,7 @@ fun CastDetailScreen(
+     val uiState by viewModel.uiState.collectAsState()
+     val watchedMovieIds by viewModel.watchedMovieIds.collectAsState()
+     val watchedSeriesIds by viewModel.watchedSeriesIds.collectAsState()
++    val ownedLabels by viewModel.ownedLabels.collectAsState()
+     var isBiographyExpanded by rememberSaveable(viewModel.personId) { mutableStateOf(false) }
+ 
+     BackHandler {
+@@ -148,6 +149,7 @@ fun CastDetailScreen(
+                         onNavigateToDetail = onNavigateToDetail,
+                         posterOptions = viewModel.posterOptions,
+                         posterCardCornerRadiusDp = viewModel.posterCardCornerRadiusDp.collectAsState().value,
++                        ownedLabel = { item -> ownedLabels.ownedLabelFor(item) },
+                         isItemWatched = { item ->
+                             if (item.apiType == "movie") item.id in watchedMovieIds
+                             else item.id in watchedSeriesIds
+@@ -177,7 +179,8 @@ private fun CastDetailContent(
+     onNavigateToDetail: (itemId: String, itemType: String, addonBaseUrl: String?) -> Unit,
+     posterOptions: com.nuvio.tv.ui.components.posteroptions.PosterOptionsController,
+     posterCardCornerRadiusDp: Int = 12,
+-    isItemWatched: (MetaPreview) -> Boolean = { false }
++    isItemWatched: (MetaPreview) -> Boolean = { false },
++    ownedLabel: (MetaPreview) -> String? = { null }
+ ) {
+     val backgroundColor = NuvioTheme.colors.Background
+     val accentColor = NuvioTheme.colors.Secondary
+@@ -296,7 +299,8 @@ private fun CastDetailContent(
+                             onItemLongPress = { item ->
+                                 posterOptions.show(item, null)
+                             },
+-                            isItemWatched = isItemWatched
++                            isItemWatched = isItemWatched,
++                            ownedLabel = ownedLabel
+                         )
+                     }
+                 }
+@@ -578,7 +582,8 @@ private fun FilmographyRow(
+     onRestoreFocusHandled: () -> Unit = {},
+     onItemClick: (MetaPreview) -> Unit,
+     onItemLongPress: (MetaPreview) -> Unit = {},
+-    isItemWatched: (MetaPreview) -> Boolean = { false }
++    isItemWatched: (MetaPreview) -> Boolean = { false },
++    ownedLabel: (MetaPreview) -> String? = { null }
+ ) {
+     val hasRequestedInitialFocus = remember(credits) { mutableStateOf(false) }
+     val restoreFocusRequester = remember { FocusRequester() }
+@@ -624,6 +629,7 @@ private fun FilmographyRow(
+                 onClick = { onItemClick(item) },
+                 onLongPress = { onItemLongPress(item) },
+                 isWatched = isItemWatched(item),
++                ownedLabel = ownedLabel(item),
+                 modifier = if (isFirstItem) {
+                     Modifier.onGloballyPositioned {
+                         if (!hasRequestedInitialFocus.value) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/cast/CastDetailViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/cast/CastDetailViewModel.kt
+index e58d0c33c..f8c40dbf8 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/cast/CastDetailViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/cast/CastDetailViewModel.kt
+@@ -11,6 +11,8 @@ import com.nuvio.tv.data.local.TmdbSettingsDataStore
+ import dagger.hilt.android.qualifiers.ApplicationContext
+ import dagger.hilt.android.lifecycle.HiltViewModel
+ import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.SharingStarted
++import kotlinx.coroutines.flow.stateIn
+ import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.flow.asStateFlow
+ import kotlinx.coroutines.flow.first
+@@ -25,6 +27,7 @@ class CastDetailViewModel @Inject constructor(
+     private val watchProgressRepository: com.nuvio.tv.domain.repository.WatchProgressRepository,
+     private val watchedSeriesStateHolder: com.nuvio.tv.data.local.WatchedSeriesStateHolder,
+     private val layoutPreferenceDataStore: com.nuvio.tv.data.local.LayoutPreferenceDataStore,
++    private val libraryRepository: com.nuvio.tv.domain.repository.LibraryRepository,
+     val posterOptions: com.nuvio.tv.ui.components.posteroptions.PosterOptionsController,
+     savedStateHandle: SavedStateHandle
+ ) : ViewModel() {
+@@ -42,6 +45,12 @@ class CastDetailViewModel @Inject constructor(
+     val watchedMovieIds: StateFlow<Set<String>> = _watchedMovieIds.asStateFlow()
+     val watchedSeriesIds: StateFlow<Set<String>> = watchedSeriesStateHolder.fullyWatchedSeriesIds
+ 
++    val ownedLabels: StateFlow<Map<String, String>> = kotlinx.coroutines.flow.combine(
++        libraryRepository.libraryItems,
++        watchProgressRepository.allProgress
++    ) { library, progress -> buildOwnedLabels(library, progress) }
++        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyMap())
++
+     private val _posterCardCornerRadiusDp = MutableStateFlow(12)
+     val posterCardCornerRadiusDp: StateFlow<Int> = _posterCardCornerRadiusDp.asStateFlow()
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/cast/ForkTvOwnedTitles.kt b/app/src/main/java/com/nuvio/tv/ui/screens/cast/ForkTvOwnedTitles.kt
+new file mode 100644
+index 000000000..1bed4bef0
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/cast/ForkTvOwnedTitles.kt
+@@ -0,0 +1,23 @@
++package com.nuvio.tv.ui.screens.cast
++
++import com.nuvio.tv.domain.model.LibraryEntry
++import com.nuvio.tv.domain.model.MetaPreview
++import com.nuvio.tv.domain.model.WatchProgress
++
++/**
++ * What the user already has, keyed by id and by folded title (TMDB credits use TMDB ids while library
++ * and progress use IMDb ids, so the title is the practical match). Watching wins over In library.
++ */
++internal fun ownedKeys(id: String, title: String): List<String> =
++    listOf(id, title.lowercase().filter { it.isLetterOrDigit() }).filter { it.isNotBlank() }
++
++internal fun buildOwnedLabels(library: List<LibraryEntry>, progress: List<WatchProgress>): Map<String, String> {
++    val labels = HashMap<String, String>()
++    library.forEach { entry -> ownedKeys(entry.id, entry.name).forEach { labels[it] = "In library" } }
++    progress.filterNot { it.isCompleted() }
++        .forEach { entry -> ownedKeys(entry.contentId, entry.name).forEach { labels[it] = "Watching" } }
++    return labels
++}
++
++internal fun Map<String, String>.ownedLabelFor(item: MetaPreview): String? =
++    ownedKeys(item.id, item.name).firstNotNullOfOrNull { this[it] }
