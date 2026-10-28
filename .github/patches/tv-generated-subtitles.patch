@@ -1,8 +1,8 @@
 diff --git a/app/build.gradle.kts b/app/build.gradle.kts
-index 71784b3ed..58f85037e 100644
+index 18a263131..2cde5c636 100644
 --- a/app/build.gradle.kts
 +++ b/app/build.gradle.kts
-@@ -610,3 +610,4 @@ dependencies {
+@@ -622,3 +622,4 @@ dependencies {
  
  apply(from = "autosync.gradle") // AutoSync: audio subtitle sync fallback (sherpa-onnx)
  apply(from = "seekpreview.gradle") // Nuvio fork: seek previews (Seekr client)
@@ -100,7 +100,7 @@ index 000000000..0836fb25d
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/GeneratedSubtitles.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/GeneratedSubtitles.kt
 new file mode 100644
-index 000000000..0091f49b3
+index 000000000..299607890
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/GeneratedSubtitles.kt
 @@ -0,0 +1,230 @@
@@ -508,8 +508,158 @@ index 000000000..e0cfc3d76
 +
 +private const val AUTO_PICK_POLL_MS = 1_000L
 +private const val AUTO_PICK_SETTLE_MS = 4_000L
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/GeneratedUsage.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/GeneratedUsage.kt
+new file mode 100644
+index 000000000..7ce590c50
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/GeneratedUsage.kt
+@@ -0,0 +1,144 @@
++package com.nuvio.tv.ui.screens.player
++
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.flow.update
++
++/**
++ * What the online generation services have been used for, shown in Settings so the choice between
++ * Groq, DeepL and the on-device model can be made with the numbers in view.
++ *
++ * Groq publishes no balance. The calls and the minutes of audio sent are counted here per UTC day
++ * (the way its daily limits count), and the "requests left" Groq reports in its response headers
++ * is shown once a call has been made. DeepL reports its own character usage when asked.
++ */
++object GeneratedUsage {
++    private data class State(
++        val day: Long = 0L,
++        val calls: Int = 0,
++        val audioSeconds: Long = 0L,
++        val requestsLeft: Int? = null,
++        val requestsLimit: Int? = null,
++        val deeplUsed: Long? = null,
++        val deeplLimit: Long? = null,
++        val deeplProblem: String? = null,
++    )
++
++    private val state = MutableStateFlow(State())
++    private val _groqText = MutableStateFlow(groqLine(State()))
++    private val _deeplText = MutableStateFlow(deeplLine(State()))
++
++    /** One or two sentences about today's Groq use. */
++    val groqText: StateFlow<String> = _groqText.asStateFlow()
++
++    /** One sentence about the DeepL characters used and left. */
++    val deeplText: StateFlow<String> = _deeplText.asStateFlow()
++
++    /** Registered by the platform: asks DeepL for the key's usage and calls [publishDeepl]. */
++    var deeplFetcher: ((key: String) -> Unit)? = null
++
++    private var save: ((key: String, value: String) -> Unit)? = null
++
++    /** Restores today's Groq counters; [nowMs] drops counters of an earlier day. */
++    fun install(nowMs: Long, load: (key: String) -> String?, save: (key: String, value: String) -> Unit) {
++        this.save = save
++        val today = nowMs / DAY_MS
++        val storedDay = load(KEY_DAY)?.toLongOrNull()
++        if (storedDay == today) {
++            state.update {
++                it.copy(
++                    day = today,
++                    calls = load(KEY_CALLS)?.toIntOrNull() ?: 0,
++                    audioSeconds = load(KEY_AUDIO)?.toLongOrNull() ?: 0L,
++                )
++            }
++        } else {
++            state.update { it.copy(day = today) }
++        }
++        publish()
++    }
++
++    /**
++     * One Groq answer: [audioSeconds] of speech were uploaded; the two header values are what Groq
++     * reported as requests left and allowed per day (null when absent). Only a successful call counts.
++     */
++    fun recordGroq(nowMs: Long, audioSeconds: Double, requestsLeft: Int?, requestsLimit: Int?, success: Boolean) {
++        val today = nowMs / DAY_MS
++        state.update { current ->
++            val base = if (current.day == today) current else current.copy(day = today, calls = 0, audioSeconds = 0L)
++            base.copy(
++                calls = base.calls + if (success) 1 else 0,
++                audioSeconds = base.audioSeconds + if (success) audioSeconds.toLong() else 0L,
++                requestsLeft = requestsLeft ?: base.requestsLeft,
++                requestsLimit = requestsLimit ?: base.requestsLimit,
++            )
++        }
++        val now = state.value
++        save?.invoke(KEY_DAY, now.day.toString())
++        save?.invoke(KEY_CALLS, now.calls.toString())
++        save?.invoke(KEY_AUDIO, now.audioSeconds.toString())
++        publish()
++    }
++
++    fun publishDeepl(used: Long, limit: Long) {
++        state.update { it.copy(deeplUsed = used, deeplLimit = limit, deeplProblem = null) }
++        publish()
++    }
++
++    fun publishDeeplProblem(problem: String) {
++        state.update { it.copy(deeplProblem = problem) }
++        publish()
++    }
++
++    /** Asks DeepL for the usage of [key] (the platform fetcher limits how often). */
++    fun refreshDeepl(key: String) {
++        if (key.isNotBlank()) deeplFetcher?.invoke(key)
++    }
++
++    private fun publish() {
++        val now = state.value
++        _groqText.value = groqLine(now)
++        _deeplText.value = deeplLine(now)
++    }
++
++    private fun groqLine(now: State): String {
++        val used = if (now.calls == 0) {
++            "Groq today (UTC): no calls yet."
++        } else {
++            "Groq today (UTC): ${now.calls} calls, ${now.audioSeconds / 60} min of audio sent."
++        }
++        val left = if (now.requestsLeft != null && now.requestsLimit != null) {
++            " Groq reports ${grouped(now.requestsLeft.toLong())} of ${grouped(now.requestsLimit.toLong())} requests left today."
++        } else {
++            ""
++        }
++        return used + left + " Groq publishes no balance; its free plan allows about 2,000 requests and 480 min of audio a day."
++    }
++
++    private fun deeplLine(now: State): String {
++        val used = now.deeplUsed
++        val limit = now.deeplLimit
++        return when {
++            used != null && limit != null ->
++                "DeepL: ${grouped(used)} of ${grouped(limit)} characters used this period, ${grouped((limit - used).coerceAtLeast(0L))} left."
++            now.deeplProblem != null -> "DeepL usage unavailable (${now.deeplProblem})."
++            else -> "DeepL usage: checking…"
++        }
++    }
++
++    private fun grouped(value: Long): String {
++        val digits = value.toString()
++        val out = StringBuilder()
++        digits.forEachIndexed { index, char ->
++            if (index > 0 && (digits.length - index) % 3 == 0) out.append(',')
++            out.append(char)
++        }
++        return out.toString()
++    }
++
++    private const val DAY_MS = 86_400_000L
++    private const val KEY_DAY = "usage_groq_day"
++    private const val KEY_CALLS = "usage_groq_calls"
++    private const val KEY_AUDIO = "usage_groq_audio_seconds"
++}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerLifecycle.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerLifecycle.kt
-index 21a3e8e27..b44e5e603 100644
+index faac33069..182b75e48 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerLifecycle.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerLifecycle.kt
 @@ -16,6 +16,7 @@ internal fun PlayerRuntimeController.releasePlayer(
@@ -517,14 +667,14 @@ index 21a3e8e27..b44e5e603 100644
      logScrobbleDiagnostic("release_player", "flushPlaybackState=$flushPlaybackState")
      com.nuvio.tv.core.connection.PlaybackThroughput.finish() // Nuvio fork: connection-speed learning
 +    stopGeneratedSubtitles() // Nuvio fork: generated subtitles
-     isReleasingPlayer = true
-     com.nuvio.tv.core.recommendations.TvRecommendationManager.isPlaybackActive.value = false
-     if (flushPlaybackState) {
+ 
+     // Preserve current subtitle selection across any rebuild. When the user explicitly
+     // selected a track, persistedTrackPreference was nulled and the choice lives only
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
-index cfc4cd5ee..a0b83580a 100644
+index f06624472..0b9f39465 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
-@@ -1479,6 +1479,11 @@ fun PlayerRuntimeController.onEvent(event: PlayerEvent) {
+@@ -1595,6 +1595,11 @@ fun PlayerRuntimeController.onEvent(event: PlayerEvent) {
              }
          }
          is PlayerEvent.OnSelectAddonSubtitle -> {
@@ -537,10 +687,10 @@ index cfc4cd5ee..a0b83580a 100644
                  stage = "event-select-subtitle-addon",
                  message = "addonId=${event.subtitle.id} addonLang=${event.subtitle.lang} addonName=${event.subtitle.addonName}"
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
-index a78e56568..8c9ecba6b 100644
+index 93ca98b27..77a6ab35e 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
-@@ -2020,7 +2020,7 @@ fun PlayerScreen(
+@@ -2061,7 +2061,7 @@ fun PlayerScreen(
              } else {
                  uiState.serverSubtitleTracks.firstOrNull { it.isSelected }?.index ?: -1
              },
@@ -550,7 +700,7 @@ index a78e56568..8c9ecba6b 100644
              subtitleStyle = uiState.editableSubtitleStyle,
              isEditingHdrStyle = uiState.isEditingHdrSubtitleStyle,
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerViewModel.kt
-index d6106653b..db4e5b551 100644
+index 3725d1d60..88d3f1d12 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerViewModel.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerViewModel.kt
 @@ -206,6 +206,10 @@ class PlayerViewModel @Inject constructor(
@@ -566,7 +716,7 @@ index d6106653b..db4e5b551 100644
  
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/generated/DeepLTranslator.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/generated/DeepLTranslator.kt
 new file mode 100644
-index 000000000..8467b9628
+index 000000000..338b0a794
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/generated/DeepLTranslator.kt
 @@ -0,0 +1,146 @@
@@ -1042,7 +1192,7 @@ index 000000000..d6821e2cb
 +private const val FILE_TOKENS = "tokens.txt"
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/generated/GeneratedSubtitleSession.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/generated/GeneratedSubtitleSession.kt
 new file mode 100644
-index 000000000..35efd1929
+index 000000000..a2cb390e8
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/generated/GeneratedSubtitleSession.kt
 @@ -0,0 +1,1264 @@
@@ -2395,7 +2545,7 @@ index 000000000..c4dbd4873
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/generated/GroqWhisperClient.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/generated/GroqWhisperClient.kt
 new file mode 100644
-index 000000000..aa4e54de4
+index 000000000..996004fdb
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/generated/GroqWhisperClient.kt
 @@ -0,0 +1,124 @@
@@ -2525,7 +2675,7 @@ index 000000000..aa4e54de4
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/GeneratedSubtitleSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/GeneratedSubtitleSettingsItems.kt
 new file mode 100644
-index 000000000..36ff02fe9
+index 000000000..545f0cf4f
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/GeneratedSubtitleSettingsItems.kt
 @@ -0,0 +1,305 @@
@@ -2835,10 +2985,10 @@ index 000000000..36ff02fe9
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSubtitleSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSubtitleSettings.kt
-index ece1a9df2..4f24204c9 100644
+index 2af018806..7d919bae9 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSubtitleSettings.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSubtitleSettings.kt
-@@ -80,6 +80,7 @@ internal fun PlaybackSubtitlesSection(
+@@ -81,6 +81,7 @@ internal fun PlaybackSubtitlesSection(
      )
      autoSyncSettingsItems(enabled = enabled) // AutoSync hook
      subtitleFontSettingsRow(enabled = enabled) // Nuvio fork: custom subtitle font
@@ -2875,153 +3025,3 @@ index 000000000..bab1b8c35
 +    <string name="generated_subs_phone_sent">Sent. The TV saved the key.</string>
 +    <string name="generated_subs_phone_failed">Could not reach the TV. Is the key screen still open?</string>
 +</resources>
-diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/GeneratedUsage.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/GeneratedUsage.kt
-new file mode 100644
-index 0000000..1111111
---- /dev/null
-+++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/GeneratedUsage.kt
-@@ -0,0 +1,144 @@
-+package com.nuvio.tv.ui.screens.player
-+
-+import kotlinx.coroutines.flow.MutableStateFlow
-+import kotlinx.coroutines.flow.StateFlow
-+import kotlinx.coroutines.flow.asStateFlow
-+import kotlinx.coroutines.flow.update
-+
-+/**
-+ * What the online generation services have been used for, shown in Settings so the choice between
-+ * Groq, DeepL and the on-device model can be made with the numbers in view.
-+ *
-+ * Groq publishes no balance. The calls and the minutes of audio sent are counted here per UTC day
-+ * (the way its daily limits count), and the "requests left" Groq reports in its response headers
-+ * is shown once a call has been made. DeepL reports its own character usage when asked.
-+ */
-+object GeneratedUsage {
-+    private data class State(
-+        val day: Long = 0L,
-+        val calls: Int = 0,
-+        val audioSeconds: Long = 0L,
-+        val requestsLeft: Int? = null,
-+        val requestsLimit: Int? = null,
-+        val deeplUsed: Long? = null,
-+        val deeplLimit: Long? = null,
-+        val deeplProblem: String? = null,
-+    )
-+
-+    private val state = MutableStateFlow(State())
-+    private val _groqText = MutableStateFlow(groqLine(State()))
-+    private val _deeplText = MutableStateFlow(deeplLine(State()))
-+
-+    /** One or two sentences about today's Groq use. */
-+    val groqText: StateFlow<String> = _groqText.asStateFlow()
-+
-+    /** One sentence about the DeepL characters used and left. */
-+    val deeplText: StateFlow<String> = _deeplText.asStateFlow()
-+
-+    /** Registered by the platform: asks DeepL for the key's usage and calls [publishDeepl]. */
-+    var deeplFetcher: ((key: String) -> Unit)? = null
-+
-+    private var save: ((key: String, value: String) -> Unit)? = null
-+
-+    /** Restores today's Groq counters; [nowMs] drops counters of an earlier day. */
-+    fun install(nowMs: Long, load: (key: String) -> String?, save: (key: String, value: String) -> Unit) {
-+        this.save = save
-+        val today = nowMs / DAY_MS
-+        val storedDay = load(KEY_DAY)?.toLongOrNull()
-+        if (storedDay == today) {
-+            state.update {
-+                it.copy(
-+                    day = today,
-+                    calls = load(KEY_CALLS)?.toIntOrNull() ?: 0,
-+                    audioSeconds = load(KEY_AUDIO)?.toLongOrNull() ?: 0L,
-+                )
-+            }
-+        } else {
-+            state.update { it.copy(day = today) }
-+        }
-+        publish()
-+    }
-+
-+    /**
-+     * One Groq answer: [audioSeconds] of speech were uploaded; the two header values are what Groq
-+     * reported as requests left and allowed per day (null when absent). Only a successful call counts.
-+     */
-+    fun recordGroq(nowMs: Long, audioSeconds: Double, requestsLeft: Int?, requestsLimit: Int?, success: Boolean) {
-+        val today = nowMs / DAY_MS
-+        state.update { current ->
-+            val base = if (current.day == today) current else current.copy(day = today, calls = 0, audioSeconds = 0L)
-+            base.copy(
-+                calls = base.calls + if (success) 1 else 0,
-+                audioSeconds = base.audioSeconds + if (success) audioSeconds.toLong() else 0L,
-+                requestsLeft = requestsLeft ?: base.requestsLeft,
-+                requestsLimit = requestsLimit ?: base.requestsLimit,
-+            )
-+        }
-+        val now = state.value
-+        save?.invoke(KEY_DAY, now.day.toString())
-+        save?.invoke(KEY_CALLS, now.calls.toString())
-+        save?.invoke(KEY_AUDIO, now.audioSeconds.toString())
-+        publish()
-+    }
-+
-+    fun publishDeepl(used: Long, limit: Long) {
-+        state.update { it.copy(deeplUsed = used, deeplLimit = limit, deeplProblem = null) }
-+        publish()
-+    }
-+
-+    fun publishDeeplProblem(problem: String) {
-+        state.update { it.copy(deeplProblem = problem) }
-+        publish()
-+    }
-+
-+    /** Asks DeepL for the usage of [key] (the platform fetcher limits how often). */
-+    fun refreshDeepl(key: String) {
-+        if (key.isNotBlank()) deeplFetcher?.invoke(key)
-+    }
-+
-+    private fun publish() {
-+        val now = state.value
-+        _groqText.value = groqLine(now)
-+        _deeplText.value = deeplLine(now)
-+    }
-+
-+    private fun groqLine(now: State): String {
-+        val used = if (now.calls == 0) {
-+            "Groq today (UTC): no calls yet."
-+        } else {
-+            "Groq today (UTC): ${now.calls} calls, ${now.audioSeconds / 60} min of audio sent."
-+        }
-+        val left = if (now.requestsLeft != null && now.requestsLimit != null) {
-+            " Groq reports ${grouped(now.requestsLeft.toLong())} of ${grouped(now.requestsLimit.toLong())} requests left today."
-+        } else {
-+            ""
-+        }
-+        return used + left + " Groq publishes no balance; its free plan allows about 2,000 requests and 480 min of audio a day."
-+    }
-+
-+    private fun deeplLine(now: State): String {
-+        val used = now.deeplUsed
-+        val limit = now.deeplLimit
-+        return when {
-+            used != null && limit != null ->
-+                "DeepL: ${grouped(used)} of ${grouped(limit)} characters used this period, ${grouped((limit - used).coerceAtLeast(0L))} left."
-+            now.deeplProblem != null -> "DeepL usage unavailable (${now.deeplProblem})."
-+            else -> "DeepL usage: checking…"
-+        }
-+    }
-+
-+    private fun grouped(value: Long): String {
-+        val digits = value.toString()
-+        val out = StringBuilder()
-+        digits.forEachIndexed { index, char ->
-+            if (index > 0 && (digits.length - index) % 3 == 0) out.append(',')
-+            out.append(char)
-+        }
-+        return out.toString()
-+    }
-+
-+    private const val DAY_MS = 86_400_000L
-+    private const val KEY_DAY = "usage_groq_day"
-+    private const val KEY_CALLS = "usage_groq_calls"
-+    private const val KEY_AUDIO = "usage_groq_audio_seconds"
-+}
