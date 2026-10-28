@@ -1,0 +1,525 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/diagnostics/ForkCrashReporter.kt b/app/src/main/java/com/nuvio/tv/core/diagnostics/ForkCrashReporter.kt
+index db86d44e3..688dbf14c 100644
+--- a/app/src/main/java/com/nuvio/tv/core/diagnostics/ForkCrashReporter.kt
++++ b/app/src/main/java/com/nuvio/tv/core/diagnostics/ForkCrashReporter.kt
+@@ -80,6 +80,23 @@ object ForkCrashReporter {
+         }.onFailure { Log.w(TAG, "exit report failed: ${it.message}") }
+     }
+ 
++    private fun crashFiles(app: Context): List<File> =
++        File(app.cacheDir, "autosync-debug")
++            .listFiles { f -> f.name.startsWith("autosync-crash-") }
++            .orEmpty()
++            .sortedByDescending(File::lastModified)
++
++    /** One line for Settings: kind and time of the newest saved report, or null when none. */
++    fun latestSummary(app: Context): String? {
++        val file = crashFiles(app.applicationContext).firstOrNull() ?: return null
++        val kind = runCatching { file.useLines { it.firstOrNull() } }.getOrNull().orEmpty().ifBlank { "Crash report" }
++        return "$kind, ${stamp(file.lastModified())}"
++    }
++
++    fun clearReports(app: Context) {
++        crashFiles(app.applicationContext).forEach(File::delete)
++    }
++
+     private fun save(app: Context, prefix: String, text: String) {
+         val directory = File(app.cacheDir, "autosync-debug").apply { mkdirs() }
+         File(directory, "$prefix-${System.currentTimeMillis()}.txt").writeText(text)
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
+index 4f5677a22..998426356 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
+@@ -44,6 +44,8 @@ object ForkTvPreferences {
+     val homeAiringWeek = ForkTvBoolPref("home_airing_week", true)
+     val homeFinishSeries = ForkTvBoolPref("home_finish_series", true)
+     val nuvioRead = ForkTvBoolPref("nuvio_read", false)
++    val catalogAccentUnderline = ForkTvBoolPref("catalog_accent_underline", false)
++    val skipFeedbackPrompt = ForkTvBoolPref("skip_feedback_prompt", true)
+ }
+ 
+ object ForkTvPlayerButtons {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/components/CatalogRowSection.kt b/app/src/main/java/com/nuvio/tv/ui/components/CatalogRowSection.kt
+index 0ad11bd16..b467a0018 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/components/CatalogRowSection.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/components/CatalogRowSection.kt
+@@ -31,6 +31,7 @@ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.derivedStateOf
+ import androidx.compose.runtime.getValue
++import androidx.compose.runtime.collectAsState
+ import androidx.compose.runtime.mutableIntStateOf
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+@@ -333,6 +334,19 @@ fun CatalogRowSection(
+                         )
+                     }
+                 }
++                val forkAppContext = androidx.compose.ui.platform.LocalContext.current
++                com.nuvio.tv.data.repository.ForkTvPreferences.catalogAccentUnderline.ensureLoaded(forkAppContext)
++                val forkUnderline by com.nuvio.tv.data.repository.ForkTvPreferences.catalogAccentUnderline.value
++                    .collectAsState()
++                if (forkUnderline && catalogTitle.isNotBlank()) {
++                    Box(
++                        modifier = Modifier
++                            .width(48.dp)
++                            .height(3.dp)
++                            .clip(RoundedCornerShape(2.dp))
++                            .background(NuvioTheme.colors.Secondary)
++                    )
++                }
+                 if (showAddonName) {
+                     val addonText = if (catalogTitle.isBlank()) " " else stringResource(R.string.catalog_from_addon, catalogRow.addonName)
+                     Text(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/ForkTvSkipFeedbackPrompt.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/ForkTvSkipFeedbackPrompt.kt
+new file mode 100644
+index 000000000..1f6b35f2e
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/ForkTvSkipFeedbackPrompt.kt
+@@ -0,0 +1,156 @@
++@file:OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
++
++package com.nuvio.tv.ui.screens.player
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.widthIn
++import androidx.compose.foundation.background
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import androidx.tv.material3.Card
++import androidx.tv.material3.CardDefaults
++import androidx.tv.material3.Text
++import com.nuvio.tv.data.repository.SkipInterval
++import com.nuvio.tv.ui.theme.NuvioTheme
++import kotlinx.coroutines.delay
++
++private const val PROMPT_VISIBLE_MS = 8_000L
++
++private fun segmentLabel(type: String): String = when (type.trim().lowercase()) {
++    "intro", "op", "mixed-op", "opening" -> "intro"
++    "recap" -> "recap"
++    "outro", "ed", "mixed-ed", "credits", "ending", "movie-credits" -> "credits"
++    "preview" -> "preview"
++    else -> "segment"
++}
++
++private fun formatSeconds(sec: Double): String {
++    val total = sec.toLong().coerceAtLeast(0L)
++    val h = total / 3600
++    val m = (total % 3600) / 60
++    val s = total % 60
++    return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%d:%02d".format(m, s)
++}
++
++/**
++ * Small prompt about 4 s after a manual skip lands: "Skipped the intro right?" with Good / Wrong and
++ * close, gone after 8 seconds. Wrong opens a nudge panel to move the start and end before saving.
++ * Never pauses playback.
++ */
++@Composable
++fun ForkTvSkipFeedbackPrompt(
++    interval: SkipInterval,
++    nudging: Boolean,
++    durationSec: Double,
++    onGood: () -> Unit,
++    onWrong: () -> Unit,
++    onRewind: () -> Unit,
++    onSave: (Double, Double) -> Unit,
++    onDismiss: () -> Unit,
++    modifier: Modifier = Modifier,
++) {
++    val firstFocus = remember(nudging) { FocusRequester() }
++    LaunchedEffect(interval, nudging) {
++        runCatching { firstFocus.requestFocus() }
++    }
++    if (!nudging) {
++        LaunchedEffect(interval) {
++            delay(PROMPT_VISIBLE_MS)
++            onDismiss()
++        }
++    }
++    val panel = modifier
++        .clip(RoundedCornerShape(NuvioTheme.radii.md))
++        .background(Color.Black.copy(alpha = 0.78f))
++    val label = segmentLabel(interval.type)
++    if (!nudging) {
++        Row(
++            modifier = panel.padding(horizontal = 14.dp, vertical = 10.dp),
++            verticalAlignment = Alignment.CenterVertically,
++            horizontalArrangement = Arrangement.spacedBy(10.dp),
++        ) {
++            Text("Skipped the $label right?", color = Color.White, fontSize = 14.sp)
++            PromptChip("Good", onGood, Modifier.focusRequester(firstFocus))
++            PromptChip("Wrong", onWrong)
++            PromptChip("Close", onDismiss)
++        }
++        return
++    }
++    var start by remember(interval) { mutableStateOf(interval.startTime.coerceAtLeast(0.0)) }
++    var end by remember(interval) { mutableStateOf(interval.endTime) }
++    val maxSec = if (durationSec > 0) durationSec else Double.MAX_VALUE
++    Column(
++        modifier = panel.widthIn(max = 460.dp).padding(14.dp),
++        verticalArrangement = Arrangement.spacedBy(10.dp),
++    ) {
++        Text("Fix the $label", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
++        NudgeRow("Start", start, Modifier.focusRequester(firstFocus)) { delta ->
++            start = (start + delta).coerceIn(0.0, (end - 1.0).coerceAtLeast(0.0))
++        }
++        NudgeRow("End", end, Modifier) { delta ->
++            end = (end + delta).coerceIn(start + 1.0, maxSec)
++        }
++        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
++            PromptChip("Rewind 5s", onRewind)
++            PromptChip("Cancel", onDismiss)
++            PromptChip("Save", { if (end > start) onSave(start, end) })
++        }
++    }
++}
++
++@Composable
++private fun NudgeRow(label: String, valueSec: Double, firstChipModifier: Modifier, onNudge: (Double) -> Unit) {
++    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++        Text(
++            "$label ${formatSeconds(valueSec)}",
++            color = Color.White,
++            fontSize = 14.sp,
++            modifier = Modifier.widthIn(min = 100.dp),
++        )
++        listOf(-5.0, -1.0, 1.0, 5.0).forEachIndexed { index, delta ->
++            PromptChip(
++                text = if (delta > 0) "+${delta.toInt()}s" else "${delta.toInt()}s",
++                onClick = { onNudge(delta) },
++                modifier = if (index == 0) firstChipModifier else Modifier,
++            )
++        }
++    }
++}
++
++@Composable
++private fun PromptChip(text: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
++    Card(
++        onClick = onClick,
++        modifier = modifier,
++        colors = CardDefaults.colors(
++            containerColor = Color.White.copy(alpha = 0.16f),
++            focusedContainerColor = NuvioTheme.colors.Secondary,
++        ),
++        shape = CardDefaults.shape(shape = RoundedCornerShape(10.dp)),
++    ) {
++        Text(
++            text = text,
++            color = Color.White,
++            fontSize = 14.sp,
++            fontWeight = FontWeight.SemiBold,
++            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
++        )
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
+index a1b65aa2f..020ac0ff0 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
+@@ -23,6 +23,7 @@ import com.nuvio.tv.data.repository.SkipInterval
+ import com.nuvio.tv.domain.model.WatchProgress
+ import java.io.IOException
+ import kotlinx.coroutines.delay
++import com.nuvio.tv.data.repository.ForkTvPreferences
+ import kotlinx.coroutines.flow.update
+ import kotlinx.coroutines.isActive
+ import kotlinx.coroutines.launch
+@@ -200,7 +201,26 @@ internal fun PlayerRuntimeController.mpvSubtitleDelayMs(userDelayMs: Int): Int =
+     userDelayMs + (streamSubtitleDelayUs.get() / 1000L).toInt()
+ 
+ internal fun PlayerRuntimeController.skipActiveInterval(): Boolean {
+-    return skipInterval(_uiState.value.activeSkipInterval ?: return false)
++    val interval = _uiState.value.activeSkipInterval ?: return false
++    val skipped = skipInterval(interval)
++    if (skipped && ForkTvPreferences.skipFeedbackPrompt.current(context)) {
++        _uiState.update { it.copy(skipFeedbackInterval = interval, skipFeedbackNudging = false) }
++    }
++    return skipped
++}
++
++internal fun PlayerRuntimeController.clearSkipFeedback() {
++    _uiState.update { it.copy(skipFeedbackInterval = null, skipFeedbackNudging = false) }
++}
++
++internal fun PlayerRuntimeController.saveSkipFeedback(startSec: Double, endSec: Double) {
++    val old = _uiState.value.skipFeedbackInterval
++    if (old != null) {
++        skipIntervals = skipIntervals.map {
++            if (it == old) it.copy(startTime = startSec, endTime = endSec) else it
++        }
++    }
++    clearSkipFeedback()
+ }
+ 
+ internal fun PlayerRuntimeController.skipInterval(interval: SkipInterval): Boolean {
+@@ -1922,6 +1942,13 @@ fun PlayerRuntimeController.onEvent(event: PlayerEvent) {
+         PlayerEvent.OnDismissSkipIntro -> {
+             _uiState.update { it.copy(skipIntervalDismissed = true) }
+         }
++        PlayerEvent.OnSkipFeedbackGood -> clearSkipFeedback()
++        PlayerEvent.OnSkipFeedbackWrong -> _uiState.update { it.copy(skipFeedbackNudging = true) }
++        PlayerEvent.OnSkipFeedbackRewind -> {
++            val pos = currentPlaybackPositionMs() ?: 0L
++            seekPlaybackTo((pos - 5_000L).coerceAtLeast(0L))
++        }
++        is PlayerEvent.OnSkipFeedbackSave -> saveSkipFeedback(event.startSec, event.endSec)
+         PlayerEvent.OnPlayNextEpisode -> {
+             playNextEpisode(userInitiated = true)
+         }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+index 648df55c9..4efa5c3fd 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+@@ -1515,6 +1515,30 @@ fun PlayerScreen(
+                 .zIndex(2.1f)
+                 .reportSubtitleClearance(subtitleClearanceGapPx) { skipClearancePx = it }
+         )
++        val skipFeedbackInterval = uiState.skipFeedbackInterval
++        if (skipFeedbackInterval != null && !uiState.showControls) {
++            var skipFeedbackReady by remember(skipFeedbackInterval) { mutableStateOf(false) }
++            LaunchedEffect(skipFeedbackInterval) {
++                delay(4_000L)
++                skipFeedbackReady = true
++            }
++            if (skipFeedbackReady) {
++                ForkTvSkipFeedbackPrompt(
++                    interval = skipFeedbackInterval,
++                    nudging = uiState.skipFeedbackNudging,
++                    durationSec = uiState.duration / 1000.0,
++                    onGood = { viewModel.onEvent(PlayerEvent.OnSkipFeedbackGood) },
++                    onWrong = { viewModel.onEvent(PlayerEvent.OnSkipFeedbackWrong) },
++                    onRewind = { viewModel.onEvent(PlayerEvent.OnSkipFeedbackRewind) },
++                    onSave = { s, e -> viewModel.onEvent(PlayerEvent.OnSkipFeedbackSave(s, e)) },
++                    onDismiss = { viewModel.onEvent(PlayerEvent.OnSkipFeedbackGood) },
++                    modifier = Modifier
++                        .align(Alignment.BottomStart)
++                        .padding(start = NuvioTheme.spacing.xxl, bottom = 90.dp)
++                        .zIndex(2.2f)
++                )
++            }
++        }
+         PostPlayOverlay(
+             mode = postPlayOverlayMode,
+             controlsVisible = uiState.showControls,
+@@ -2672,11 +2696,21 @@ private fun PlayerView.applySubtitleStyleIfNeeded(
+             android.graphics.Typeface.DEFAULT
+         }
+ 
++        val forkShadow = if (subtitleStyle.outlineEnabled) 0 else TvForkPlayerPrefs.subtitleShadow
+         val edgeType = if (subtitleStyle.outlineEnabled) {
+             androidx.media3.ui.CaptionStyleCompat.EDGE_TYPE_OUTLINE
++        } else if (forkShadow > 0) {
++            androidx.media3.ui.CaptionStyleCompat.EDGE_TYPE_DROP_SHADOW
+         } else {
+             androidx.media3.ui.CaptionStyleCompat.EDGE_TYPE_NONE
+         }
++        val edgeColor = if (forkShadow == 1) {
++            android.graphics.Color.argb(140, 0, 0, 0)
++        } else if (forkShadow == 2) {
++            android.graphics.Color.BLACK
++        } else {
++            subtitleStyle.outlineColor
++        }
+ 
+         setStyle(
+             androidx.media3.ui.CaptionStyleCompat(
+@@ -2684,7 +2718,7 @@ private fun PlayerView.applySubtitleStyleIfNeeded(
+                 subtitleStyle.backgroundColor,
+                 android.graphics.Color.TRANSPARENT,
+                 edgeType,
+-                subtitleStyle.outlineColor,
++                edgeColor,
+                 typeface
+             )
+         )
+@@ -4476,6 +4510,16 @@ private fun SpeedSelectionDialog(
+                     modifier = Modifier.padding(bottom = NuvioTheme.spacing.lg)
+                 )
+ 
++                var sleepLeft by remember { mutableStateOf(TvForkPlayerPrefs.sleepMinutesLeft()) }
++                MoreActionItem(
++                    text = if (sleepLeft == 0) "Sleep timer: off" else "Sleep timer: $sleepLeft min",
++                    onClick = {
++                        TvForkPlayerPrefs.setSleepMinutes(TvForkPlayerPrefs.nextSleepMinutes())
++                        sleepLeft = TvForkPlayerPrefs.sleepMinutesLeft()
++                    }
++                )
++                Spacer(modifier = Modifier.height(NuvioTheme.spacing.sm))
++
+                 LazyColumn(
+                     state = listState,
+                     verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.sm),
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt
+index 013ca6aef..eaf361a63 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt
+@@ -194,6 +194,8 @@ data class PlayerUiState(
+     val activeSkipInterval: SkipInterval? = null,
+     val activeSkipTargetsPostCredits: Boolean = false,
+     val skipIntervalDismissed: Boolean = false,
++    val skipFeedbackInterval: SkipInterval? = null,
++    val skipFeedbackNudging: Boolean = false,
+     // Next episode card
+     val nextEpisode: NextEpisodeInfo? = null,
+     val isNextEpisodeMetadataResolved: Boolean = false,
+@@ -369,6 +371,10 @@ sealed class PlayerEvent {
+     data object OnDismissPauseOverlay : PlayerEvent()
+     data object OnSkipIntro : PlayerEvent()
+     data object OnDismissSkipIntro : PlayerEvent()
++    data object OnSkipFeedbackGood : PlayerEvent()
++    data object OnSkipFeedbackWrong : PlayerEvent()
++    data object OnSkipFeedbackRewind : PlayerEvent()
++    data class OnSkipFeedbackSave(val startSec: Double, val endSec: Double) : PlayerEvent()
+     data object OnPlayNextEpisode : PlayerEvent()
+     data object OnDismissNextEpisodeCard : PlayerEvent()
+     data object OnStillWatchingContinue : PlayerEvent()
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/TvForkPlayerPrefs.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/TvForkPlayerPrefs.kt
+index 2b362d830..f5507e72d 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/TvForkPlayerPrefs.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/TvForkPlayerPrefs.kt
+@@ -7,18 +7,29 @@ import android.os.SystemClock
+ object TvForkPlayerPrefs {
+     private const val FILE = "tv_fork_player_prefs"
+     private const val KEY_SUBS_OFF = "subtitles_start_off"
++    private const val KEY_SHADOW = "subtitle_shadow"
+ 
+     @Volatile var subtitlesStartOff: Boolean = false
+         private set
+ 
++    /** Subtitle shadow when outline is off: 0 off, 1 soft, 2 strong. */
++    @Volatile var subtitleShadow: Int = 0
++        private set
++
+     @Volatile var sleepDeadlineMs: Long = 0L
+         private set
+ 
+     val sleepOptionsMin = listOf(0, 15, 30, 45, 60, 90)
+ 
+     fun load(context: Context) {
+-        subtitlesStartOff = context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+-            .getBoolean(KEY_SUBS_OFF, false)
++        val prefs = context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
++        subtitlesStartOff = prefs.getBoolean(KEY_SUBS_OFF, false)
++        subtitleShadow = prefs.getInt(KEY_SHADOW, 0).coerceIn(0, 2)
++    }
++
++    fun setSubtitleShadow(context: Context, value: Int) {
++        subtitleShadow = value.coerceIn(0, 2)
++        context.getSharedPreferences(FILE, Context.MODE_PRIVATE).edit().putInt(KEY_SHADOW, subtitleShadow).apply()
+     }
+ 
+     fun setSubtitlesStartOff(context: Context, value: Boolean) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt
+index 5b47c3158..ef372ad84 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt
+@@ -35,6 +35,7 @@ internal fun ForkFeaturesPane(
+             SettingsGroupCard(title = "Home") {
+                 forkHomeVideoOnlyRow()
+                 forkHomeLibraryRowsRows()
++                forkCatalogUnderlineRow()
+             }
+         }
+         item {
+@@ -52,6 +53,7 @@ internal fun ForkFeaturesPane(
+             SettingsGroupCard(title = "Maintenance") {
+                 forkClearImageCacheRow()
+                 forkWhatsNewRow()
++                forkCrashLogRow()
+             }
+         }
+     }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
+index c15d54af3..8e4716227 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
+@@ -125,6 +125,39 @@ internal fun forkHomeLibraryRowsRows() {
+     )
+ }
+ 
++@Composable
++internal fun forkCatalogUnderlineRow() = forkTvToggleRow(
++    title = "Accent underline on row titles",
++    subtitle = "Draw a short accent-colour line under each home row title.",
++    pref = ForkTvPreferences.catalogAccentUnderline
++)
++
++@Composable
++internal fun forkSkipFeedbackRow() = forkTvToggleRow(
++    title = "Skip feedback prompt",
++    subtitle = "After you skip an intro, recap or credits, ask if it landed right and let you fix the times.",
++    pref = ForkTvPreferences.skipFeedbackPrompt
++)
++
++@Composable
++internal fun forkCrashLogRow() {
++    val context = androidx.compose.ui.platform.LocalContext.current
++    var summary by androidx.compose.runtime.remember {
++        androidx.compose.runtime.mutableStateOf(com.nuvio.tv.core.diagnostics.ForkCrashReporter.latestSummary(context))
++    }
++    SettingsActionRow(
++        title = "Last crash report",
++        subtitle = if (summary == null) "No crash or abnormal exit saved." else "$summary. Click to clear saved reports.",
++        value = if (summary == null) "None" else "Clear",
++        onClick = {
++            if (summary != null) {
++                com.nuvio.tv.core.diagnostics.ForkCrashReporter.clearReports(context)
++                summary = null
++            }
++        }
++    )
++}
++
+ @Composable
+ internal fun forkAutoAddTorboxRow() = forkTvToggleRow(
+     title = "Add uncached streams to TorBox from the player",
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvForkPlayerSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvForkPlayerSettings.kt
+index 756a99d52..ccbb22b67 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvForkPlayerSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvForkPlayerSettings.kt
+@@ -16,6 +16,7 @@ import com.nuvio.tv.ui.screens.player.TvForkPlayerPrefs
+ internal fun TvForkPlayerSettingsCard() {
+     val context = LocalContext.current
+     var subsOff by remember { mutableStateOf(TvForkPlayerPrefs.subtitlesStartOff) }
++    var shadow by remember { mutableStateOf(TvForkPlayerPrefs.subtitleShadow) }
+     var sleepLeft by remember { mutableStateOf(TvForkPlayerPrefs.sleepMinutesLeft()) }
+     SettingsGroupCard(modifier = Modifier.fillMaxWidth(), title = "Player extras") {
+         SettingsToggleRow(
+@@ -27,6 +28,16 @@ internal fun TvForkPlayerSettingsCard() {
+                 TvForkPlayerPrefs.setSubtitlesStartOff(context, subsOff)
+             },
+         )
++        forkSkipFeedbackRow()
++        SettingsActionRow(
++            title = "Subtitle shadow",
++            subtitle = "Drop shadow behind subtitles when the outline is off. Click to cycle off, soft, strong.",
++            value = listOf("Off", "Soft", "Strong")[shadow],
++            onClick = {
++                TvForkPlayerPrefs.setSubtitleShadow(context, (shadow + 1) % 3)
++                shadow = TvForkPlayerPrefs.subtitleShadow
++            },
++        )
+         SettingsActionRow(
+             title = "Sleep timer",
+             subtitle = "Pause playback after the chosen time. Click to cycle 15, 30, 45, 60, 90 minutes, then off.",
