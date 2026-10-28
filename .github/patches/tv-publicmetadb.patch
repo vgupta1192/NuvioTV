@@ -1,0 +1,787 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/di/TrackingModule.kt b/app/src/main/java/com/nuvio/tv/core/di/TrackingModule.kt
+index 26ea2a2b4..7acf32468 100644
+--- a/app/src/main/java/com/nuvio/tv/core/di/TrackingModule.kt
++++ b/app/src/main/java/com/nuvio/tv/core/di/TrackingModule.kt
+@@ -125,4 +125,16 @@ abstract class TrackingModule {
+     abstract fun bindWeTrakrTrackingHistoryWriter(
+         writer: com.nuvio.tv.data.wetrakr.WeTrakrTrackingHistoryWriter
+     ): TrackingHistoryWriter
++
++    @Binds
++    @IntoSet
++    abstract fun bindPublicMetaDbTrackingProvider(
++        provider: com.nuvio.tv.data.publicmetadb.PublicMetaDbTrackingProvider
++    ): TrackingProvider
++
++    @Binds
++    @IntoSet
++    abstract fun bindPublicMetaDbTrackingHistoryWriter(
++        writer: com.nuvio.tv.data.publicmetadb.PublicMetaDbTrackingHistoryWriter
++    ): TrackingHistoryWriter
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/core/tracking/TrackingProvider.kt b/app/src/main/java/com/nuvio/tv/core/tracking/TrackingProvider.kt
+index 4385a75f0..567a13c54 100644
+--- a/app/src/main/java/com/nuvio/tv/core/tracking/TrackingProvider.kt
++++ b/app/src/main/java/com/nuvio/tv/core/tracking/TrackingProvider.kt
+@@ -8,7 +8,8 @@ enum class TrackingProviderId(val storageId: String) {
+     TRAKT("trakt"),
+     SIMKL("simkl"),
+     MDBLIST("mdblist"),
+-    WETRAKR("wetrakr");
++    WETRAKR("wetrakr"),
++    PUBLICMETADB("publicmetadb");
+ 
+     companion object {
+         fun fromStorage(value: String?): TrackingProviderId? {
+diff --git a/app/src/main/java/com/nuvio/tv/data/publicmetadb/PublicMetaDbService.kt b/app/src/main/java/com/nuvio/tv/data/publicmetadb/PublicMetaDbService.kt
+new file mode 100644
+index 000000000..db3b3b8af
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/publicmetadb/PublicMetaDbService.kt
+@@ -0,0 +1,374 @@
++package com.nuvio.tv.data.publicmetadb
++
++import android.content.Context
++import com.nuvio.tv.core.profile.ProfileManager
++import com.nuvio.tv.core.profile.ProtectedProfilePreferences
++import com.nuvio.tv.core.tracking.TrackingHistoryItem
++import com.nuvio.tv.core.tracking.TrackingMediaKind
++import com.nuvio.tv.core.tracking.TrackingMediaReference
++import com.nuvio.tv.core.tracking.TrackingMutationResult
++import com.nuvio.tv.core.tracking.TrackingScrobbleAction
++import com.nuvio.tv.core.tracking.TrackingScrobbleEvent
++import dagger.hilt.android.qualifiers.ApplicationContext
++import java.net.URLEncoder
++import java.text.SimpleDateFormat
++import java.util.Date
++import java.util.Locale
++import java.util.TimeZone
++import java.util.concurrent.ConcurrentHashMap
++import javax.inject.Inject
++import javax.inject.Singleton
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
++import kotlinx.coroutines.withContext
++import okhttp3.MediaType.Companion.toMediaType
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.RequestBody.Companion.toRequestBody
++import org.json.JSONArray
++import org.json.JSONObject
++
++data class PublicMetaDbUiState(
++    val isConnected: Boolean = false,
++    val busy: Boolean = false,
++    val error: String? = null
++)
++
++/**
++ * PublicMetaDB account for the fork (compact port of the NuvioMobile PublicMetaDB tracker): API-key sign in,
++ * live resume points while playing and watched-history writes. Library, list and rating reads stay Mobile-only.
++ */
++@Singleton
++class PublicMetaDbService @Inject constructor(
++    @ApplicationContext context: Context,
++    private val http: OkHttpClient,
++    private val profiles: ProfileManager
++) {
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++    private val store = ProtectedProfilePreferences(context, "publicmetadb_auth", "com.nuvio.tv.publicmetadb.credentials.v1")
++    private val writeMutex = Mutex()
++    private val resolved = ConcurrentHashMap<String, Long>()
++    private var activeProfile = profiles.activeProfileId.value
++    @Volatile private var lastRequestAt = 0L
++
++    private val mutableState = MutableStateFlow(PublicMetaDbUiState(isConnected = readKey(activeProfile) != null))
++    val state: StateFlow<PublicMetaDbUiState> = mutableState.asStateFlow()
++
++    init {
++        scope.launch {
++            profiles.activeProfileId.collect { profileId ->
++                if (profileId == activeProfile) return@collect
++                activeProfile = profileId
++                mutableState.value = PublicMetaDbUiState(isConnected = readKey(profileId) != null)
++            }
++        }
++    }
++
++    /** Checks the key against the API and stores it when valid. */
++    fun connect(apiKey: String) {
++        val key = apiKey.trim()
++        if (key.isEmpty() || mutableState.value.busy) return
++        val profileId = activeProfile
++        mutableState.value = mutableState.value.copy(busy = true, error = null)
++        scope.launch {
++            val error = try {
++                val response = send("GET", "/api/external/lists", listOf("page" to "1", "perPage" to "1"), null, key)
++                when {
++                    response.status in 200..299 -> null
++                    response.status == 401 || response.status == 403 -> "PublicMetaDB rejected this API key."
++                    response.status == 429 -> "PublicMetaDB is rate limiting requests, try again shortly."
++                    else -> "PublicMetaDB is unavailable (${response.status})."
++                }
++            } catch (error: CancellationException) {
++                throw error
++            } catch (error: Exception) {
++                error.message ?: "PublicMetaDB request failed"
++            }
++            if (error == null) {
++                store.write(profileId, key)
++                if (profileId == activeProfile) mutableState.value = PublicMetaDbUiState(isConnected = true)
++            } else if (profileId == activeProfile) {
++                mutableState.value = PublicMetaDbUiState(error = error)
++            }
++        }
++    }
++
++    fun disconnect() {
++        store.write(activeProfile, null)
++        mutableState.value = PublicMetaDbUiState()
++    }
++
++    fun clearError() {
++        mutableState.value = mutableState.value.copy(error = null)
++    }
++
++    /** Playing a title is not reported; pausing or stopping saves a resume point, or marks it watched past 80%. */
++    suspend fun scrobble(action: TrackingScrobbleAction, event: TrackingScrobbleEvent) {
++        if (action == TrackingScrobbleAction.START) return
++        if (!mutableState.value.isConnected || !event.progressPercent.isFinite()) return
++        val media = event.media
++        val target = resolveTarget(media) ?: return
++        val percent = event.progressPercent.coerceIn(0.0, 100.0)
++        writeMutex.withLock {
++            when {
++                percent >= COMPLETE_PERCENT -> {
++                    postWatched(target, media, null)
++                    deleteResume(target)
++                }
++                percent >= MIN_RESUME_PERCENT -> {
++                    val runtime = if (target.isMovie) DEFAULT_MOVIE_RUNTIME_MS else DEFAULT_EPISODE_RUNTIME_MS
++                    saveResume(target, (runtime * percent / 100.0).toLong(), runtime)
++                }
++            }
++        }
++    }
++
++    suspend fun addToHistory(items: Collection<TrackingHistoryItem>): TrackingMutationResult {
++        if (!mutableState.value.isConnected) return TrackingMutationResult(0)
++        var notFound = 0
++        writeMutex.withLock {
++            items.forEach { item ->
++                if (item.isWholeSeriesMark) {
++                    notFound++
++                    return@forEach
++                }
++                val target = resolveTarget(item.media)
++                if (target == null) {
++                    notFound++
++                } else {
++                    postWatched(target, item.media, item.watchedAtEpochMs)
++                    deleteResume(target)
++                }
++            }
++        }
++        return TrackingMutationResult(items.size, notFound)
++    }
++
++    suspend fun removeFromHistory(items: Collection<TrackingMediaReference>): TrackingMutationResult {
++        if (!mutableState.value.isConnected) return TrackingMutationResult(0)
++        var notFound = 0
++        writeMutex.withLock {
++            items.forEach { media ->
++                val target = if (media.kind != TrackingMediaKind.MOVIE && media.episode == null) null else resolveTarget(media)
++                if (target == null) {
++                    notFound++
++                    return@forEach
++                }
++                val query = mutableListOf("tmdb_id" to target.tmdbId.toString(), "media_type" to target.mediaType)
++                if (!target.isMovie) {
++                    query += "season" to target.season.toString()
++                    query += "episode" to target.episode.toString()
++                }
++                call("DELETE", "/api/external/watched", query, null, allowStatuses = setOf(404))
++            }
++        }
++        return TrackingMutationResult(items.size, notFound)
++    }
++
++    // --- writes ---
++
++    private data class Target(val tmdbId: Long, val isMovie: Boolean, val season: Int, val episode: Int) {
++        val mediaType: String get() = if (isMovie) "movie" else "tv"
++    }
++
++    private suspend fun postWatched(target: Target, media: TrackingMediaReference, watchedAt: Long?) {
++        val body = JSONObject()
++            .put("tmdb_id", target.tmdbId)
++            .put("media_type", target.mediaType)
++            .put("watched_at", isoTimestamp(watchedAt ?: System.currentTimeMillis()))
++        if (!target.isMovie) body.put("season", target.season).put("episode", target.episode)
++        media.ids.imdb?.takeIf(String::isNotBlank)?.let { body.put("id_type", "imdb").put("id_value", it) }
++        call("POST", "/api/external/watched", listOf("dedupe" to "true"), body, allowStatuses = setOf(409))
++    }
++
++    private suspend fun saveResume(target: Target, positionMs: Long, runtimeMs: Long) {
++        val body = JSONObject()
++            .put("tmdb_id", target.tmdbId)
++            .put("media_type", target.mediaType)
++            .put("season", if (target.isMovie) 0 else target.season)
++            .put("episode", if (target.isMovie) 0 else target.episode)
++            .put("position_ms", positionMs)
++            .put("runtime_ms", runtimeMs)
++        val first = call("POST", "/api/external/resume", emptyList(), body, allowStatuses = setOf(409))
++        if (first?.status == 409) {
++            findResumeId(target)?.let { call("DELETE", "/api/external/resume/${encode(it)}", emptyList(), null, allowStatuses = setOf(404)) }
++            call("POST", "/api/external/resume", emptyList(), body, allowStatuses = setOf(409))
++        }
++    }
++
++    private suspend fun deleteResume(target: Target) {
++        val id = findResumeId(target) ?: return
++        call("DELETE", "/api/external/resume/${encode(id)}", emptyList(), null, allowStatuses = setOf(404))
++    }
++
++    private suspend fun findResumeId(target: Target): String? {
++        for (page in 1..RESUME_LOOKUP_MAX_PAGES) {
++            val response = call(
++                "GET", "/api/external/resume",
++                listOf("page" to page.toString(), "perPage" to RESUME_LOOKUP_PAGE_SIZE.toString()),
++                null, allowStatuses = setOf(404)
++            ) ?: return null
++            if (response.status == 404) return null
++            val rows = response.items()
++            for (i in 0 until rows.length()) {
++                val row = rows.optJSONObject(i) ?: continue
++                val type = row.optString("media_type").ifBlank { row.optString("mediaType") }
++                val isMovie = if (type.isBlank()) target.isMovie else type.equals("movie", ignoreCase = true)
++                val tmdb = row.optLong("tmdb_id", row.optLong("tmdbId", -1L))
++                val sameEpisode = target.isMovie ||
++                    (row.optInt("season", row.optInt("season_number", -1)) == target.season &&
++                        row.optInt("episode", row.optInt("episode_number", -1)) == target.episode)
++                if (isMovie == target.isMovie && tmdb == target.tmdbId && sameEpisode) {
++                    row.optString("id").takeIf(String::isNotBlank)?.let { return it }
++                }
++            }
++            val totalPages = runCatching { JSONObject(response.body).let { it.optInt("totalPages", it.optInt("total_pages", 1)) } }.getOrDefault(1)
++            if (rows.length() == 0 || page >= totalPages) return null
++        }
++        return null
++    }
++
++    // --- id resolution ---
++
++    private suspend fun resolveTarget(media: TrackingMediaReference): Target? {
++        val isMovie = media.kind == TrackingMediaKind.MOVIE
++        val episode = media.episode
++        if (!isMovie && episode == null) return null
++        val tmdbId = media.ids.tmdb ?: lookupTmdb(media, isMovie) ?: return null
++        return Target(tmdbId, isMovie, episode?.season ?: 1, episode?.number ?: 1)
++    }
++
++    private suspend fun lookupTmdb(media: TrackingMediaReference, isMovie: Boolean): Long? {
++        val candidates = listOfNotNull(
++            media.ids.imdb?.takeIf(String::isNotBlank)?.let { "imdb" to it },
++            media.ids.tvdb?.takeIf(String::isNotBlank)?.let { "tvdb" to it },
++            media.ids.anilist?.let { "anilist" to it.toString() },
++            media.ids.mal?.let { "mal" to it.toString() },
++            media.ids.anidb?.let { "anidb" to it.toString() },
++            media.ids.trakt?.let { "trakt" to it.toString() }
++        )
++        val mediaType = if (isMovie) "movie" else "tv"
++        for ((type, value) in candidates) {
++            val cacheKey = "$mediaType:$type:$value"
++            resolved[cacheKey]?.let { return it }
++            val response = call(
++                "GET", "/api/external/mappings/lookup",
++                listOf("id_type" to type, "id_value" to value, "media_type" to mediaType),
++                null, allowStatuses = setOf(404)
++            ) ?: continue
++            if (response.status == 404) continue
++            val rows = response.items()
++            var best: Long? = null
++            var bestVotes = -1
++            for (i in 0 until rows.length()) {
++                val row = rows.optJSONObject(i) ?: continue
++                val tmdb = row.optLong("tmdb_id", row.optLong("tmdbId", -1L)).takeIf { it > 0L } ?: continue
++                val votes = row.optInt("votes", 0)
++                if (votes > bestVotes) {
++                    best = tmdb
++                    bestVotes = votes
++                }
++            }
++            if (best != null) {
++                resolved[cacheKey] = best
++                return best
++            }
++        }
++        return null
++    }
++
++    // --- http ---
++
++    private data class Response(val status: Int, val body: String) {
++        fun items(): JSONArray = runCatching {
++            val trimmed = body.trim()
++            if (trimmed.startsWith("[")) return JSONArray(trimmed)
++            val root = JSONObject(trimmed)
++            listOf("items", "results", "data", "watched_history", "lists", "ratings")
++                .firstNotNullOfOrNull { root.optJSONArray(it) } ?: JSONArray()
++        }.getOrDefault(JSONArray())
++    }
++
++    /** Authorized call with 429 back-off; null when no key is stored. Statuses in [allowStatuses] are returned, other failures throw. */
++    private suspend fun call(
++        method: String,
++        path: String,
++        query: List<Pair<String, String>>,
++        body: JSONObject?,
++        allowStatuses: Set<Int> = emptySet()
++    ): Response? {
++        val profileId = activeProfile
++        val key = readKey(profileId) ?: return null
++        var attempt = 0
++        while (true) {
++            val response = send(method, path, query, body, key)
++            when {
++                response.status in 200..299 || response.status in allowStatuses -> return response
++                response.status == 401 -> {
++                    store.write(profileId, null)
++                    if (profileId == activeProfile) mutableState.value = PublicMetaDbUiState(error = "PublicMetaDB rejected the API key. Enter it again.")
++                    return null
++                }
++                response.status == 429 && ++attempt < MAX_ATTEMPTS -> delay(RETRY_AFTER_MS * attempt)
++                else -> throw IllegalStateException("PublicMetaDB $path failed (${response.status})")
++            }
++        }
++    }
++
++    private suspend fun send(
++        method: String,
++        path: String,
++        query: List<Pair<String, String>>,
++        body: JSONObject?,
++        key: String
++    ): Response = withContext(Dispatchers.IO) {
++        val wait = MIN_SPACING_MS - (System.currentTimeMillis() - lastRequestAt)
++        if (wait > 0) delay(wait)
++        lastRequestAt = System.currentTimeMillis()
++        val url = buildString {
++            append(BASE_URL).append(path)
++            if (query.isNotEmpty()) append('?').append(query.joinToString("&") { (k, v) -> "${encode(k)}=${encode(v)}" })
++        }
++        val request = Request.Builder()
++            .url(url)
++            .header("Accept", "application/json")
++            .header("User-Agent", USER_AGENT)
++            .header("Authorization", "Bearer $key")
++            .method(method, if (method == "GET" || method == "DELETE") null else (body?.toString() ?: "{}").toRequestBody(JSON))
++            .build()
++        http.newCall(request).execute().use { Response(it.code, it.body?.string().orEmpty()) }
++    }
++
++    private fun readKey(profileId: Int): String? = store.read(profileId)?.takeIf(String::isNotBlank)
++
++    private fun encode(value: String): String = URLEncoder.encode(value, "UTF-8").replace("+", "%20")
++
++    private fun isoTimestamp(epochMs: Long): String =
++        SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
++            .apply { timeZone = TimeZone.getTimeZone("UTC") }
++            .format(Date(epochMs))
++
++    private companion object {
++        const val BASE_URL = "https://publicmetadb.com"
++        const val USER_AGENT = "NuvioTV"
++        const val COMPLETE_PERCENT = 80.0
++        const val MIN_RESUME_PERCENT = 1.0
++        const val DEFAULT_MOVIE_RUNTIME_MS = 7_200_000L
++        const val DEFAULT_EPISODE_RUNTIME_MS = 2_700_000L
++        const val RESUME_LOOKUP_PAGE_SIZE = 100
++        const val RESUME_LOOKUP_MAX_PAGES = 5
++        const val MIN_SPACING_MS = 60L
++        const val RETRY_AFTER_MS = 2_000L
++        const val MAX_ATTEMPTS = 3
++        val JSON = "application/json".toMediaType()
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/data/publicmetadb/PublicMetaDbTrackingProvider.kt b/app/src/main/java/com/nuvio/tv/data/publicmetadb/PublicMetaDbTrackingProvider.kt
+new file mode 100644
+index 000000000..2fa851504
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/publicmetadb/PublicMetaDbTrackingProvider.kt
+@@ -0,0 +1,65 @@
++package com.nuvio.tv.data.publicmetadb
++
++import com.nuvio.tv.core.tracking.TrackingCapability
++import com.nuvio.tv.core.tracking.TrackingHistoryItem
++import com.nuvio.tv.core.tracking.TrackingHistoryWriter
++import com.nuvio.tv.core.tracking.TrackingMediaReference
++import com.nuvio.tv.core.tracking.TrackingMutationResult
++import com.nuvio.tv.core.tracking.TrackingProvider
++import com.nuvio.tv.core.tracking.TrackingProviderDescriptor
++import com.nuvio.tv.core.tracking.TrackingProviderId
++import com.nuvio.tv.core.tracking.TrackingScrobbleAction
++import com.nuvio.tv.core.tracking.TrackingScrobbleEvent
++import com.nuvio.tv.core.tracking.TrackingScrobbler
++import javax.inject.Inject
++import javax.inject.Singleton
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.flow.SharingStarted
++import kotlinx.coroutines.flow.map
++import kotlinx.coroutines.flow.stateIn
++
++@Singleton
++class PublicMetaDbTrackingScrobbler @Inject constructor(
++    private val service: PublicMetaDbService
++) : TrackingScrobbler {
++    override val providerId = TrackingProviderId.PUBLICMETADB
++
++    override suspend fun scrobble(action: TrackingScrobbleAction, event: TrackingScrobbleEvent) {
++        service.scrobble(action, event)
++    }
++}
++
++@Singleton
++class PublicMetaDbTrackingHistoryWriter @Inject constructor(
++    private val service: PublicMetaDbService
++) : TrackingHistoryWriter {
++    override val providerId = TrackingProviderId.PUBLICMETADB
++
++    override suspend fun addToHistory(profileId: Int, items: Collection<TrackingHistoryItem>): TrackingMutationResult =
++        service.addToHistory(items)
++
++    override suspend fun removeFromHistory(profileId: Int, items: Collection<TrackingMediaReference>): TrackingMutationResult =
++        service.removeFromHistory(items)
++}
++
++@Singleton
++class PublicMetaDbTrackingProvider @Inject constructor(
++    service: PublicMetaDbService,
++    override val scrobbler: PublicMetaDbTrackingScrobbler
++) : TrackingProvider {
++    override val descriptor = TrackingProviderDescriptor(
++        TrackingProviderId.PUBLICMETADB,
++        "PublicMetaDB",
++        setOf(
++            TrackingCapability.AUTHENTICATION,
++            TrackingCapability.WATCHED_WRITE,
++            TrackingCapability.PROGRESS_WRITE,
++            TrackingCapability.SCROBBLE
++        )
++    )
++    override val isAuthenticated = service.state
++        .map { it.isConnected }
++        .stateIn(CoroutineScope(SupervisorJob() + Dispatchers.IO), SharingStarted.Eagerly, service.state.value.isConnected)
++}
+diff --git a/app/src/main/java/com/nuvio/tv/domain/model/LibraryListTabLocalization.kt b/app/src/main/java/com/nuvio/tv/domain/model/LibraryListTabLocalization.kt
+index ebe93a77c..af2febb8c 100644
+--- a/app/src/main/java/com/nuvio/tv/domain/model/LibraryListTabLocalization.kt
++++ b/app/src/main/java/com/nuvio/tv/domain/model/LibraryListTabLocalization.kt
+@@ -13,6 +13,7 @@ fun LibraryListTab.localizedMembershipTitle(): String {
+         TrackingProviderId.SIMKL -> stringResource(R.string.simkl_name)
+         TrackingProviderId.MDBLIST -> stringResource(R.string.mdblist_name)
+         TrackingProviderId.WETRAKR -> stringResource(R.string.wetrakr_name)
++        TrackingProviderId.PUBLICMETADB -> stringResource(R.string.publicmetadb_name)
+         null -> null
+     }
+     return provider?.let { "$it · ${localizedTitle()}" } ?: localizedTitle()
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PublicMetaDbSettingsRow.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PublicMetaDbSettingsRow.kt
+new file mode 100644
+index 000000000..47ce44efd
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PublicMetaDbSettingsRow.kt
+@@ -0,0 +1,200 @@
++@file:OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
++
++package com.nuvio.tv.ui.screens.settings
++
++import android.view.KeyEvent
++import androidx.compose.foundation.BorderStroke
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.foundation.text.BasicTextField
++import androidx.compose.foundation.text.KeyboardActions
++import androidx.compose.foundation.text.KeyboardOptions
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.focus.onFocusChanged
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.SolidColor
++import androidx.compose.ui.input.key.onKeyEvent
++import androidx.compose.ui.platform.LocalSoftwareKeyboardController
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.text.input.ImeAction
++import androidx.compose.ui.unit.dp
++import androidx.hilt.navigation.compose.hiltViewModel
++import androidx.lifecycle.ViewModel
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import androidx.tv.material3.Border
++import androidx.tv.material3.Card
++import androidx.tv.material3.CardDefaults
++import androidx.tv.material3.MaterialTheme
++import androidx.tv.material3.Text
++import com.nuvio.tv.R
++import com.nuvio.tv.data.publicmetadb.PublicMetaDbService
++import com.nuvio.tv.data.publicmetadb.PublicMetaDbUiState
++import com.nuvio.tv.ui.components.NuvioDialog
++import com.nuvio.tv.ui.theme.NuvioTheme
++import dagger.hilt.android.lifecycle.HiltViewModel
++import javax.inject.Inject
++import kotlinx.coroutines.flow.StateFlow
++
++@HiltViewModel
++class PublicMetaDbSettingsViewModel @Inject constructor(
++    private val service: PublicMetaDbService
++) : ViewModel() {
++    val state: StateFlow<PublicMetaDbUiState> = service.state
++
++    fun connect(apiKey: String) = service.connect(apiKey)
++    fun disconnect() = service.disconnect()
++    fun clearError() = service.clearError()
++}
++
++/** PublicMetaDB entry in Tracking settings (fork): API key, watched history and resume points. */
++@Composable
++internal fun PublicMetaDbSettingsRow(viewModel: PublicMetaDbSettingsViewModel = hiltViewModel()) {
++    val state by viewModel.state.collectAsStateWithLifecycle()
++    var showDialog by remember { mutableStateOf(false) }
++
++    SettingsActionRow(
++        title = stringResource(R.string.publicmetadb_name),
++        subtitle = state.error ?: stringResource(R.string.publicmetadb_description),
++        value = when {
++            state.isConnected -> stringResource(R.string.tracking_status_connected)
++            state.busy -> stringResource(R.string.tracking_status_connecting)
++            else -> stringResource(R.string.tracking_status_disconnected)
++        },
++        valueColor = when {
++            state.isConnected -> NuvioTheme.colors.Success
++            state.busy -> NuvioTheme.colors.Warning
++            else -> NuvioTheme.colors.TextSecondary
++        },
++        onClick = { showDialog = true }
++    )
++
++    if (showDialog) {
++        val dismiss = {
++            viewModel.clearError()
++            showDialog = false
++        }
++        PublicMetaDbDialog(
++            state = state,
++            onConnect = viewModel::connect,
++            onDisconnect = {
++                viewModel.disconnect()
++                showDialog = false
++            },
++            onDismiss = dismiss
++        )
++    }
++}
++
++@Composable
++private fun PublicMetaDbDialog(
++    state: PublicMetaDbUiState,
++    onConnect: (String) -> Unit,
++    onDisconnect: () -> Unit,
++    onDismiss: () -> Unit
++) {
++    var value by remember { mutableStateOf("") }
++    var isInputFocused by remember { mutableStateOf(false) }
++    val inputFocusRequester = remember { FocusRequester() }
++    val keyboardController = LocalSoftwareKeyboardController.current
++
++    NuvioDialog(
++        onDismiss = onDismiss,
++        title = stringResource(R.string.publicmetadb_name),
++        subtitle = stringResource(
++            if (state.isConnected) R.string.publicmetadb_connected_dialog else R.string.publicmetadb_dialog_subtitle
++        ),
++        width = 700.dp,
++        usePlatformDefaultWidth = false,
++        suppressFirstKeyUp = false
++    ) {
++        if (!state.isConnected) {
++            Card(
++                onClick = { inputFocusRequester.requestFocus() },
++                modifier = Modifier
++                    .fillMaxWidth()
++                    .onFocusChanged { isInputFocused = it.isFocused || it.hasFocus },
++                colors = CardDefaults.colors(
++                    containerColor = NuvioTheme.colors.BackgroundElevated,
++                    focusedContainerColor = NuvioTheme.colors.BackgroundElevated
++                ),
++                border = CardDefaults.border(
++                    border = Border(
++                        border = BorderStroke(NuvioTheme.spacing.hairline, NuvioTheme.colors.Border),
++                        shape = RoundedCornerShape(10.dp)
++                    ),
++                    focusedBorder = Border(
++                        border = NuvioTheme.focusRing.border(NuvioTheme.spacing.xxs),
++                        shape = RoundedCornerShape(10.dp)
++                    )
++                ),
++                shape = CardDefaults.shape(RoundedCornerShape(10.dp)),
++                scale = CardDefaults.scale(focusedScale = 1f)
++            ) {
++                Box(modifier = Modifier.padding(horizontal = 14.dp, vertical = NuvioTheme.spacing.md)) {
++                    BasicTextField(
++                        value = value,
++                        onValueChange = { value = it },
++                        modifier = Modifier
++                            .fillMaxWidth()
++                            .focusRequester(inputFocusRequester)
++                            .onKeyEvent { event ->
++                                event.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_DPAD_CENTER &&
++                                    event.nativeKeyEvent.action == KeyEvent.ACTION_DOWN
++                            },
++                        singleLine = true,
++                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
++                        keyboardActions = KeyboardActions(onDone = { keyboardController?.hide() }),
++                        textStyle = MaterialTheme.typography.bodyMedium.copy(color = NuvioTheme.colors.TextPrimary),
++                        cursorBrush = SolidColor(if (isInputFocused) NuvioTheme.colors.Primary else Color.Transparent),
++                        decorationBox = { innerTextField ->
++                            if (value.isBlank()) {
++                                Text(
++                                    text = stringResource(R.string.publicmetadb_key_hint),
++                                    style = MaterialTheme.typography.bodyMedium,
++                                    color = NuvioTheme.colors.TextTertiary
++                                )
++                            }
++                            innerTextField()
++                        }
++                    )
++                }
++            }
++            state.error?.let {
++                Text(
++                    text = it,
++                    style = MaterialTheme.typography.bodyMedium,
++                    color = NuvioTheme.colors.Warning,
++                    modifier = Modifier.padding(top = 12.dp)
++                )
++            }
++        }
++        SettingsDialogActionRow {
++            SettingsDialogActionButton(
++                text = stringResource(R.string.action_cancel),
++                onClick = onDismiss
++            )
++            if (state.isConnected) {
++                SettingsDialogActionButton(
++                    text = stringResource(R.string.trakt_disconnect),
++                    onClick = onDisconnect,
++                    primary = true
++                )
++            } else if (!state.busy) {
++                SettingsDialogActionButton(
++                    text = stringResource(R.string.publicmetadb_save_key),
++                    onClick = { onConnect(value) },
++                    primary = true
++                )
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TrackingSettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TrackingSettingsScreen.kt
+index 3ac05ab48..f5996d26e 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TrackingSettingsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TrackingSettingsScreen.kt
+@@ -117,6 +117,7 @@ fun TrackingSettingsContent(
+             TrackingProviderId.SIMKL -> simklState.mode == SimklConnectionMode.CONNECTED
+             TrackingProviderId.MDBLIST -> mdbListState.isConnected
+             TrackingProviderId.WETRAKR -> false
++            TrackingProviderId.PUBLICMETADB -> false
+             null -> false
+         }
+         if (activeProvider == dismissOnConnected && connected) {
+@@ -149,6 +150,7 @@ fun TrackingSettingsContent(
+             TrackingProviderId.SIMKL -> TrackingFocusTarget.SIMKL
+             TrackingProviderId.MDBLIST -> TrackingFocusTarget.MDBLIST
+             TrackingProviderId.WETRAKR -> TrackingFocusTarget.TRAKT
++            TrackingProviderId.PUBLICMETADB -> TrackingFocusTarget.TRAKT
+         }
+         activeProvider = provider
+         disconnectProvider = null
+@@ -183,6 +185,7 @@ fun TrackingSettingsContent(
+                 }
+             }
+             TrackingProviderId.WETRAKR -> Unit
++            TrackingProviderId.PUBLICMETADB -> Unit
+         }
+     }
+ 
+@@ -287,6 +290,7 @@ fun TrackingSettingsContent(
+             )
+         }
+         TrackingProviderId.WETRAKR -> Unit
++        TrackingProviderId.PUBLICMETADB -> Unit
+         null -> Unit
+     }
+ 
+@@ -302,6 +306,7 @@ fun TrackingSettingsContent(
+                     TrackingProviderId.SIMKL -> R.string.simkl_disconnect_title
+                     TrackingProviderId.MDBLIST -> R.string.mdblist_disconnect_title
+                     TrackingProviderId.WETRAKR -> R.string.wetrakr_name
++                    TrackingProviderId.PUBLICMETADB -> R.string.publicmetadb_name
+                 }
+             ),
+             subtitle = stringResource(
+@@ -310,6 +315,7 @@ fun TrackingSettingsContent(
+                     TrackingProviderId.SIMKL -> R.string.simkl_disconnect_subtitle
+                     TrackingProviderId.MDBLIST -> R.string.mdblist_disconnect_subtitle
+                     TrackingProviderId.WETRAKR -> R.string.wetrakr_dialog_subtitle
++                    TrackingProviderId.PUBLICMETADB -> R.string.publicmetadb_dialog_subtitle
+                 }
+             ),
+             width = 520.dp,
+@@ -332,6 +338,7 @@ fun TrackingSettingsContent(
+                             TrackingProviderId.SIMKL -> simklViewModel.onDisconnect()
+                             TrackingProviderId.MDBLIST -> mdbListViewModel.onDisconnect()
+                             TrackingProviderId.WETRAKR -> Unit
++                            TrackingProviderId.PUBLICMETADB -> Unit
+                         }
+                     },
+                     primary = true
+@@ -573,6 +580,7 @@ internal fun TrackingSettingsOverview(
+                                 .testTag(TrackingSettingsTestTags.MDBLIST_PROVIDER)
+                         )
+                         WeTrakrSettingsRow()
++                        PublicMetaDbSettingsRow()
+                     }
+                 }
+                 item(key = "tracking_sources") {
+diff --git a/app/src/main/res/values/strings_publicmetadb.xml b/app/src/main/res/values/strings_publicmetadb.xml
+new file mode 100644
+index 000000000..00cd2ab59
+--- /dev/null
++++ b/app/src/main/res/values/strings_publicmetadb.xml
+@@ -0,0 +1,9 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="publicmetadb_name">PublicMetaDB</string>
++    <string name="publicmetadb_description">Send watched titles and resume points to PublicMetaDB. Uses your API key.</string>
++    <string name="publicmetadb_dialog_subtitle">Paste the API key from your PublicMetaDB account</string>
++    <string name="publicmetadb_key_hint">PublicMetaDB API key</string>
++    <string name="publicmetadb_connected_dialog">Connected. Watched titles and resume points are sent to PublicMetaDB.</string>
++    <string name="publicmetadb_save_key">Verify and save</string>
++</resources>
