@@ -36,6 +36,166 @@ index 10047e4d3..fc3a9111c 100644
      fun setVisible(context: Context, id: String, visible: Boolean) {
          ensureLoaded(context)
          val next = if (visible) _hidden.value - id else _hidden.value + id
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodeOptionsOverlay.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodeOptionsOverlay.kt
+index 6ef9864a3..03a60af1a 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodeOptionsOverlay.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodeOptionsOverlay.kt
+@@ -104,6 +104,7 @@ internal fun EpisodeOptionsOverlay(
+     onStartFromBeginning: () -> Unit = {},
+     onOpenEpisodeComments: () -> Unit = {},
+     showOpenEpisodeComments: Boolean = false,
++    onOpenRatingMap: (() -> Unit)? = null,
+     onPlayManually: () -> Unit = {},
+     showPlayManually: Boolean = false,
+     onToggleWatched: () -> Unit,
+@@ -242,6 +243,9 @@ internal fun EpisodeOptionsOverlay(
+                 )
+             )
+         }
++        onOpenRatingMap?.let { openMap ->
++            add(EpisodeOverlayAction(label = "Rating map", onClick = openMap))
++        }
+         if (showPlayManually && isPlayEnabled) {
+             add(
+                 EpisodeOverlayAction(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt
+index 7da9b832f..820f5226e 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt
+@@ -479,6 +479,20 @@ fun EpisodesRow(
+ ) {
+     val dedupedEpisodes = remember(episodes) { episodes.distinctBy { it.id } }
+     var optionsEpisode by remember { mutableStateOf<Video?>(null) }
++    var forkShowRatingMap by remember { mutableStateOf(false) }
++    val forkHasRatingMap = remember(episodes, episodeRatings) {
++        episodes.count { v ->
++            (v.season ?: 0) > 0 && v.episode != null &&
++                ((episodeRatings[v.season!! to v.episode!!] ?: v.rating ?: 0.0) > 0.0)
++        } >= 2
++    }
++    if (forkShowRatingMap) {
++        ForkTvRatingMapDialog(
++            episodes = episodes,
++            episodeRatings = episodeRatings,
++            onDismiss = { forkShowRatingMap = false }
++        )
++    }
+     val isOverlayOpen = optionsEpisode != null
+     val cardMetrics = rememberEpisodeCardMetrics(posterCardCornerRadiusDp)
+     val density = LocalDensity.current
+@@ -677,6 +691,9 @@ fun EpisodesRow(
+                 optionsEpisode = null
+             },
+             showOpenEpisodeComments = showOpenEpisodeComments,
++            onOpenRatingMap = if (forkHasRatingMap) {
++                { optionsEpisode = null; forkShowRatingMap = true }
++            } else null,
+             onPlayManually = {
+                 onEpisodeManualPlayClick(selectedEpisode)
+                 optionsEpisode = null
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/ForkTvRatingMap.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/ForkTvRatingMap.kt
+new file mode 100644
+index 000000000..2224ff7fd
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/ForkTvRatingMap.kt
+@@ -0,0 +1,97 @@
++package com.nuvio.tv.ui.screens.detail
++
++import androidx.compose.foundation.background
++import androidx.compose.foundation.horizontalScroll
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.foundation.verticalScroll
++import androidx.tv.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import com.nuvio.tv.domain.model.Video
++import com.nuvio.tv.ui.screens.settings.SettingsActionRow
++import java.util.Locale
++
++/** Nuvio fork: season by episode rating grid, colored by score tier. */
++@Composable
++internal fun ForkTvRatingMapDialog(
++    episodes: List<Video>,
++    episodeRatings: Map<Pair<Int, Int>, Double>,
++    onDismiss: () -> Unit,
++) {
++    val seasons = episodes
++        .filter { (it.season ?: 0) > 0 && it.episode != null }
++        .groupBy { it.season!! }
++        .toSortedMap()
++    com.nuvio.tv.ui.components.NuvioDialog(
++        onDismiss = onDismiss,
++        title = "Episode rating map",
++        subtitle = "Green is 8 and up, yellow 7 to 8, orange 6 to 7, red below 6.",
++        suppressFirstKeyUp = false
++    ) {
++        Column(
++            modifier = Modifier
++                .fillMaxWidth()
++                .heightIn(max = 380.dp)
++                .verticalScroll(rememberScrollState()),
++            verticalArrangement = Arrangement.spacedBy(10.dp)
++        ) {
++            seasons.forEach { (season, videos) ->
++                val scores = videos.sortedBy { it.episode }.map { v ->
++                    v.episode!! to (episodeRatings[season to v.episode!!] ?: v.rating?.toDouble())?.takeIf { it > 0.0 }
++                }
++                val rated = scores.mapNotNull { it.second }
++                val average = if (rated.isEmpty()) "-" else String.format(Locale.US, "%.1f", rated.average())
++                Text(text = "Season $season, average $average", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
++                Row(
++                    modifier = Modifier.horizontalScroll(rememberScrollState()),
++                    horizontalArrangement = Arrangement.spacedBy(4.dp)
++                ) {
++                    scores.forEach { (ep, score) ->
++                        Box(
++                            modifier = Modifier
++                                .size(width = 46.dp, height = 40.dp)
++                                .clip(RoundedCornerShape(6.dp))
++                                .background(forkRatingTierColor(score)),
++                            contentAlignment = Alignment.Center
++                        ) {
++                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
++                                Text(text = "E$ep", color = Color.Black.copy(alpha = 0.6f), fontSize = 9.sp)
++                                Text(
++                                    text = score?.let { String.format(Locale.US, "%.1f", it) } ?: "-",
++                                    color = Color.Black,
++                                    fontSize = 12.sp,
++                                    fontWeight = FontWeight.Bold
++                                )
++                            }
++                        }
++                    }
++                }
++            }
++            SettingsActionRow(title = "Close", subtitle = null, onClick = onDismiss, modifier = Modifier.padding(top = 4.dp))
++        }
++    }
++}
++
++private fun forkRatingTierColor(score: Double?): Color = when {
++    score == null -> Color(0xFF555555)
++    score >= 9.0 -> Color(0xFF3DB46D)
++    score >= 8.0 -> Color(0xFF7ACB8F)
++    score >= 7.0 -> Color(0xFFF2C94C)
++    score >= 6.0 -> Color(0xFFF2994A)
++    else -> Color(0xFFE5534B)
++}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
 index 7a0dd36e2..e126a2dd8 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
