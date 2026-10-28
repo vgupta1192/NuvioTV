@@ -1,0 +1,321 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/sync/ForkSettingsSync.kt b/app/src/main/java/com/nuvio/tv/core/sync/ForkSettingsSync.kt
+new file mode 100644
+index 000000000..01505d1c5
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/sync/ForkSettingsSync.kt
+@@ -0,0 +1,114 @@
++package com.nuvio.tv.core.sync
++
++import android.content.Context
++import android.content.SharedPreferences
++import kotlinx.serialization.json.JsonObject
++import kotlinx.serialization.json.JsonPrimitive
++import kotlinx.serialization.json.booleanOrNull
++import kotlinx.serialization.json.buildJsonObject
++import kotlinx.serialization.json.contentOrNull
++import kotlinx.serialization.json.floatOrNull
++import kotlinx.serialization.json.intOrNull
++import kotlinx.serialization.json.jsonObject
++import kotlinx.serialization.json.jsonPrimitive
++import kotlinx.serialization.json.longOrNull
++import kotlinx.serialization.json.put
++
++/**
++ * Nuvio TV fork: the fork's own settings (home rows, player extras, sounds, DoH) live in plain
++ * SharedPreferences files, not in the per-profile DataStores that the profile settings blob
++ * covers. This adds them to the blob under the extra feature key "fork_settings" so a second
++ * device gets the same setup. Mobile ignores the key. State that is not a setting (watch stats,
++ * remembered volume, insight facts, crash markers) is not synced.
++ */
++internal object ForkSettingsSync {
++    const val FEATURE = "fork_settings"
++
++    private val files = listOf(
++        "nuvio_fork_tv_settings",
++        "nuvio_tv_dx_remember",
++        "nuvio_tv_dx_sub2",
++        "nuvio_tv_dx_sound",
++        "nuvio_tv_dx_enhance",
++        "nuvio_tv_dx_hero_rotation",
++        "nuvio_tv_dx_sounds",
++        "nuvio_tv_doh",
++    )
++
++    // Per-device state that sits next to the settings in the same files.
++    private val deviceStateKeys = setOf("speed", "volume")
++
++    private fun prefs(context: Context, file: String): SharedPreferences =
++        context.applicationContext.getSharedPreferences(file, Context.MODE_PRIVATE)
++
++    fun export(context: Context): JsonObject = buildJsonObject {
++        files.forEach { file ->
++            val all = prefs(context, file).all
++            put(
++                file,
++                buildJsonObject {
++                    all.forEach { (key, value) ->
++                        if (key in deviceStateKeys) return@forEach
++                        when (value) {
++                            is Boolean -> put(key, JsonPrimitive(value))
++                            is Int -> put(key, JsonPrimitive(value))
++                            is Long -> put(key, JsonPrimitive(value))
++                            is Float -> put(key, JsonPrimitive(value))
++                            is String -> put(key, JsonPrimitive(value))
++                        }
++                    }
++                },
++            )
++        }
++    }
++
++    /** Applies a remote export. Returns true when any stored value changed. */
++    fun apply(context: Context, remote: JsonObject): Boolean {
++        var changed = false
++        files.forEach { file ->
++            val section = remote[file] as? JsonObject ?: return@forEach
++            val target = prefs(context, file)
++            val current = target.all
++            val editor = target.edit()
++            section.forEach { (key, element) ->
++                if (key in deviceStateKeys) return@forEach
++                val primitive = runCatching { element.jsonPrimitive }.getOrNull() ?: return@forEach
++                val existing = current[key]
++                when (existing) {
++                    is Boolean -> primitive.booleanOrNull?.let { if (it != existing) { editor.putBoolean(key, it); changed = true } }
++                    is Int -> primitive.intOrNull?.let { if (it != existing) { editor.putInt(key, it); changed = true } }
++                    is Long -> primitive.longOrNull?.let { if (it != existing) { editor.putLong(key, it); changed = true } }
++                    is Float -> primitive.floatOrNull?.let { if (it != existing) { editor.putFloat(key, it); changed = true } }
++                    is String -> primitive.contentOrNull?.let { if (it != existing) { editor.putString(key, it); changed = true } }
++                    else -> {
++                        // New key on this device: infer the type from the JSON value.
++                        val bool = primitive.booleanOrNull
++                        val num = primitive.longOrNull
++                        val float = primitive.floatOrNull
++                        when {
++                            primitive.isString -> editor.putString(key, primitive.content)
++                            bool != null -> editor.putBoolean(key, bool)
++                            num != null && !primitive.content.contains('.') -> editor.putLong(key, num)
++                            float != null -> editor.putFloat(key, float)
++                            else -> return@forEach
++                        }
++                        changed = true
++                    }
++                }
++            }
++            editor.apply()
++        }
++        return changed
++    }
++
++    /** Calls [onChange] when any synced fork file changes. Keep the returned handle to unregister. */
++    fun watch(context: Context, onChange: () -> Unit): List<Pair<SharedPreferences, SharedPreferences.OnSharedPreferenceChangeListener>> =
++        files.map { file ->
++            val p = prefs(context, file)
++            val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
++                if (key !in deviceStateKeys) onChange()
++            }
++            p.registerOnSharedPreferenceChangeListener(listener)
++            p to listener
++        }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/sync/ProfileSettingsSyncService.kt b/app/src/main/java/com/nuvio/tv/core/sync/ProfileSettingsSyncService.kt
+index fe6ba4272..3a2211446 100644
+--- a/app/src/main/java/com/nuvio/tv/core/sync/ProfileSettingsSyncService.kt
++++ b/app/src/main/java/com/nuvio/tv/core/sync/ProfileSettingsSyncService.kt
+@@ -57,6 +57,9 @@ import kotlinx.serialization.json.jsonObject
+ import kotlinx.serialization.json.jsonPrimitive
+ import kotlinx.serialization.json.longOrNull
+ import kotlinx.serialization.json.put
++import android.content.Context
++import dagger.hilt.android.qualifiers.ApplicationContext
++import kotlinx.coroutines.flow.MutableSharedFlow
+ import javax.inject.Inject
+ import javax.inject.Singleton
+ 
+@@ -184,7 +187,8 @@ class ProfileSettingsSyncService @Inject constructor(
+     private val mediaServerSyncService: MediaServerSyncService,
+     private val tmdbSettingsDataStore: TmdbSettingsDataStore,
+     private val metaRepository: MetaRepository,
+-    private val cwEnrichmentCache: ContinueWatchingEnrichmentCache
++    private val cwEnrichmentCache: ContinueWatchingEnrichmentCache,
++    @ApplicationContext private val appContext: Context // Nuvio fork: fork settings sync
+ ) {
+     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+     private val syncMutex = Mutex()
+@@ -213,8 +217,37 @@ class ProfileSettingsSyncService @Inject constructor(
+         "track_preference"
+     )
+ 
++    @Volatile
++    private var applyingForkSettings: Boolean = false
++    private val forkSettingsChanged = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
++    private val forkSettingsWatchers = ForkSettingsSync.watch(appContext) {
++        if (!applyingForkSettings) forkSettingsChanged.tryEmit(Unit)
++    }
++
+     init {
+         observeLocalSettingsChangesAndSync()
++        observeForkSettingsChanges()
++    }
++
++    // Nuvio fork: push when a fork setting (SharedPreferences) changes.
++    @OptIn(kotlinx.coroutines.FlowPreview::class)
++    private fun observeForkSettingsChanges() {
++        scope.launch {
++            forkSettingsChanged.debounce(SETTINGS_PUSH_DEBOUNCE_MS).collect {
++                if (!authManager.isAuthenticated || applyingRemoteBlob) return@collect
++                pushProfileSettingsToRemote(profileManager.activeProfileId.value)
++            }
++        }
++    }
++
++    private fun applyForkSettings(featuresJson: JsonObject) {
++        val remote = featuresJson[ForkSettingsSync.FEATURE] as? JsonObject ?: return
++        applyingForkSettings = true
++        try {
++            ForkSettingsSync.apply(appContext, remote)
++        } finally {
++            applyingForkSettings = false
++        }
+     }
+ 
+     private suspend fun <T> withJwtRefreshRetry(block: suspend () -> T): T {
+@@ -256,6 +289,7 @@ class ProfileSettingsSyncService @Inject constructor(
+ 
+                 val featuresJson = blob["features"]?.jsonObject
+                     ?: return@withLock Result.success(inheritedPluginSettingsApplied)
++                applyForkSettings(featuresJson) // Nuvio fork: fork settings sync
+                 val remoteSignature = buildSettingsSignature(featuresJson)
+                 val localSignature = buildSettingsSignature(profileId)
+                 if (remoteSignature == localSignature) {
+@@ -478,6 +512,7 @@ class ProfileSettingsSyncService @Inject constructor(
+                 }
+                 put(feature, serialized)
+             }
++            put(ForkSettingsSync.FEATURE, ForkSettingsSync.export(appContext)) // Nuvio fork: fork settings sync
+         }
+ 
+         return buildJsonObject {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt
+new file mode 100644
+index 000000000..5b47c3158
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt
+@@ -0,0 +1,58 @@
++@file:OptIn(ExperimentalTvMaterial3Api::class)
++
++package com.nuvio.tv.ui.screens.settings
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.unit.dp
++import androidx.tv.material3.ExperimentalTvMaterial3Api
++import com.nuvio.tv.ui.theme.NuvioTheme
++
++/** Nuvio fork: one Settings page that gathers the fork's own features, like Mobile's Features hub. */
++@Composable
++internal fun ForkFeaturesPane(
++    initialFocusRequester: FocusRequester?,
++    modifier: Modifier = Modifier
++) {
++    LazyColumn(
++        modifier = modifier
++            .fillMaxSize()
++            .padding(end = NuvioTheme.spacing.md),
++        verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.lg)
++    ) {
++        item {
++            SettingsDetailHeader(
++                title = "Features",
++                subtitle = "Extra features added by this fork, in one place."
++            )
++        }
++        item {
++            SettingsGroupCard(title = "Home") {
++                forkHomeVideoOnlyRow()
++                forkHomeLibraryRowsRows()
++            }
++        }
++        item {
++            SettingsGroupCard(title = "Details") {
++                forkFillerGuideRow()
++            }
++        }
++        item {
++            SettingsGroupCard(title = "Player") {
++                forkPlayerButtonsRow()
++                forkAutoAddTorboxRow()
++            }
++        }
++        item {
++            SettingsGroupCard(title = "Maintenance") {
++                forkClearImageCacheRow()
++                forkWhatsNewRow()
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsCatalog.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsCatalog.kt
+index fe4d44f2d..66789e55a 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsCatalog.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsCatalog.kt
+@@ -18,6 +18,7 @@ internal enum class SettingsCategory(val group: SettingsRailGroup) {
+     TV_CHANNELS(SettingsRailGroup.WATCH),
+     JELLYFIN(SettingsRailGroup.WATCH),
+     PLAYBACK(SettingsRailGroup.WATCH),
++    FEATURES(SettingsRailGroup.WATCH),
+     INTEGRATION(SettingsRailGroup.SERVICES),
+     TRACKING(SettingsRailGroup.SERVICES),
+     ADVANCED(SettingsRailGroup.SYSTEM),
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt
+index f3c059066..5614cb065 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt
+@@ -165,6 +165,7 @@ private fun settingsSectionSpec(category: SettingsCategory): SettingsSectionSpec
+     SettingsCategory.TV_CHANNELS -> SettingsSectionSpec(category, stringResource(R.string.settings_tv_channels), Icons.Rounded.Tv, destination = SettingsSectionDestination.Inline)
+     SettingsCategory.JELLYFIN -> SettingsSectionSpec(category, "Jellyfin", Icons.Rounded.VideoLibrary, destination = SettingsSectionDestination.Inline)
+     SettingsCategory.PLAYBACK -> SettingsSectionSpec(category, stringResource(R.string.settings_playback), Icons.Rounded.PlayArrow, destination = SettingsSectionDestination.Inline)
++    SettingsCategory.FEATURES -> SettingsSectionSpec(category, "Features", Icons.Default.Tune, destination = SettingsSectionDestination.Inline)
+     SettingsCategory.INTEGRATION -> SettingsSectionSpec(category, stringResource(R.string.settings_integration), Icons.Default.Link, destination = SettingsSectionDestination.Inline)
+     SettingsCategory.TRACKING -> SettingsSectionSpec(category, stringResource(R.string.settings_tracking_title), Icons.Default.Sync, destination = SettingsSectionDestination.Inline)
+     SettingsCategory.ADVANCED -> SettingsSectionSpec(category, stringResource(R.string.settings_advanced), Icons.Default.Build, destination = SettingsSectionDestination.Inline)
+@@ -239,6 +240,7 @@ fun SettingsScreen(
+             SettingsCategory.CONTENT_DISCOVERY to FocusRequester(),
+             SettingsCategory.TV_CHANNELS to FocusRequester(),
+             SettingsCategory.JELLYFIN to FocusRequester(),
++            SettingsCategory.FEATURES to FocusRequester(),
+             SettingsCategory.INTEGRATION to FocusRequester(),
+             SettingsCategory.TRACKING to FocusRequester(),
+             SettingsCategory.PLAYBACK to FocusRequester(),
+@@ -989,6 +991,13 @@ private fun SettingsDetailPane(
+                 null
+             }
+         )
++        SettingsCategory.FEATURES -> ForkFeaturesPane(
++            initialFocusRequester = if (allowDetailAutofocus) {
++                contentFocusRequesters[SettingsCategory.FEATURES]
++            } else {
++                null
++            }
++        )
+         SettingsCategory.ACCOUNT -> AccountSettingsInline(
+             onNavigateToAuthQrSignIn = onNavigateToAuthQrSignIn,
+             initialFocusRequester = if (allowDetailAutofocus) {
+diff --git a/app/src/test/java/com/nuvio/tv/core/sync/ProfileSettingsPluginSyncTest.kt b/app/src/test/java/com/nuvio/tv/core/sync/ProfileSettingsPluginSyncTest.kt
+index 51dee95bd..82a8f1c4b 100644
+--- a/app/src/test/java/com/nuvio/tv/core/sync/ProfileSettingsPluginSyncTest.kt
++++ b/app/src/test/java/com/nuvio/tv/core/sync/ProfileSettingsPluginSyncTest.kt
+@@ -339,7 +339,7 @@ class ProfileSettingsPluginSyncTest {
+         }
+         val service = ProfileSettingsSyncService(
+             authManager, postgrest, profileManager, factory, identity,
+-            mockk(relaxed = true), mockk(relaxed = true), mockk(relaxed = true), mockk(relaxed = true), mockk(relaxed = true)
++            mockk(relaxed = true), mockk(relaxed = true), mockk(relaxed = true), mockk(relaxed = true), mockk(relaxed = true), mockk(relaxed = true)
+         )
+         services += service
+         val plugins = PluginDataStore(mockk(relaxed = true), Moshi.Builder().build(), factory, profileManager)
