@@ -1,0 +1,281 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt
+index ba2399fb4..6c9728cad 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt
+@@ -614,6 +614,10 @@ fun EpisodesRow(
+             val progress = remember(seasonEp, episodeProgressMap) { seasonEp?.let { episodeProgressMap[it] } }
+             val imdbRating = remember(seasonEp, episodeRatings) { seasonEp?.let { episodeRatings[it] } }
+             val tmdbRating = seasonEp?.let { LocalForkTmdbEpisodeRatings.current[it] }
++            val extraSources = LocalForkExtraEpisodeRatings.current
++            val extraRatings = seasonEp?.let { key ->
++                extraSources.mapNotNull { (name, map) -> map[key]?.takeIf { it > 0.0 }?.let { name to it } }
++            }.orEmpty()
+             val isMarkedWatched = remember(seasonEp, watchedEpisodes) { seasonEp?.let { watchedEpisodes.contains(it) } ?: false }
+             val episodeFocusRequester = remember(episode.id) { episodeFocusRequesters.getOrPut(episode.id) { FocusRequester() } }
+             val episodeOnClick = remember(episode, onEpisodeClick) { { onEpisodeClick(episode) } }
+@@ -628,6 +632,7 @@ fun EpisodesRow(
+                 watchProgress = progress,
+                 imdbRating = imdbRating,
+                 forkTmdbRating = tmdbRating,
++                forkExtraRatings = extraRatings,
+                 isMarkedWatched = isMarkedWatched,
+                 blurUnwatched = blurUnwatchedEpisodes,
+                 suppressMarquee = isOverlayOpen,
+@@ -728,6 +733,7 @@ private fun EpisodeCard(
+     watchProgress: com.nuvio.tv.domain.model.WatchProgress? = null,
+     imdbRating: Double? = null,
+     forkTmdbRating: Double? = null,
++    forkExtraRatings: List<Pair<String, Double>> = emptyList(),
+     isMarkedWatched: Boolean = false,
+     blurUnwatched: Boolean = false,
+     suppressMarquee: Boolean = false,
+@@ -1117,11 +1123,10 @@ private fun EpisodeCard(
+                         }
+ 
+                         forkTmdbRating?.takeIf { it > 0.0 }?.let { tmdb ->
+-                            Text(
+-                                text = "TMDB " + String.format(Locale.US, "%.1f", tmdb),
+-                                style = ratingStyle,
+-                                maxLines = 1
+-                            )
++                            ForkEpisodeSourceRating("TMDB", tmdb, cardMetrics.imdbLogoWidth, cardMetrics.imdbLogoHeight, ratingStyle)
++                        }
++                        forkExtraRatings.forEach { (name, value) ->
++                            ForkEpisodeSourceRating(name, value, cardMetrics.imdbLogoWidth, cardMetrics.imdbLogoHeight, ratingStyle)
+                         }
+ 
+                         if (formattedDate.isNotBlank()) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/ForkTvExtraEpisodeRatings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/ForkTvExtraEpisodeRatings.kt
+new file mode 100644
+index 000000000..302e59e72
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/ForkTvExtraEpisodeRatings.kt
+@@ -0,0 +1,152 @@
++package com.nuvio.tv.ui.screens.detail
++
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.width
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.compositionLocalOf
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.layout.ContentScale
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.TextStyle
++import androidx.compose.ui.unit.Dp
++import androidx.compose.ui.unit.dp
++import androidx.tv.material3.Text
++import coil3.compose.AsyncImage
++import coil3.request.ImageRequest
++import com.nuvio.tv.R
++import com.nuvio.tv.data.repository.SimklIdResolver
++import com.nuvio.tv.data.simkl.SimklApiConfiguration
++import java.util.Locale
++import javax.inject.Inject
++import javax.inject.Named
++import javax.inject.Singleton
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import org.json.JSONArray
++
++/** Per-source episode ratings ("Simkl", "Trakt") keyed by (season, episode), shown as logo badges on episode cards. */
++internal val LocalForkExtraEpisodeRatings =
++    compositionLocalOf<Map<String, Map<Pair<Int, Int>, Double>>> { emptyMap() }
++
++@Singleton
++class ForkTvExtraEpisodeRatings @Inject constructor(
++    @Named("simkl") private val simklClient: OkHttpClient,
++    @Named("trakt") private val traktClient: OkHttpClient,
++    private val simklConfig: SimklApiConfiguration,
++    private val simklIdResolver: SimklIdResolver
++) {
++    private val cache = HashMap<String, Map<String, Map<Pair<Int, Int>, Double>>>()
++
++    suspend fun fetch(imdbId: String): Map<String, Map<Pair<Int, Int>, Double>> {
++        cache[imdbId]?.let { return it }
++        val simkl = fetchSimkl(imdbId)
++        val trakt = fetchTrakt(imdbId)
++        val out = buildMap {
++            if (simkl.isNotEmpty()) put("Simkl", simkl)
++            if (trakt.isNotEmpty()) put("Trakt", trakt)
++        }
++        if (out.isNotEmpty()) cache[imdbId] = out
++        return out
++    }
++
++    private suspend fun fetchSimkl(imdbId: String): Map<Pair<Int, Int>, Double> = withContext(Dispatchers.IO) {
++        if (simklConfig.clientId.isBlank()) return@withContext emptyMap()
++        try {
++            val ids = simklIdResolver.resolveIds("imdb", imdbId, "series") ?: return@withContext emptyMap()
++            val url = "${simklConfig.baseUrl}/${ids.type}/episodes/${ids.simklId}?extended=full" +
++                "&client_id=${simklConfig.clientId}&app-name=${simklConfig.appName}&app-version=${simklConfig.appVersion}"
++            val body = simklClient.newCall(Request.Builder().url(url).build()).execute().use { r ->
++                if (!r.isSuccessful) return@withContext emptyMap()
++                r.body?.string().orEmpty()
++            }
++            val arr = JSONArray(body)
++            val out = HashMap<Pair<Int, Int>, Double>()
++            for (i in 0 until arr.length()) {
++                val ep = arr.optJSONObject(i) ?: continue
++                if (ep.optString("type", "episode") != "episode") continue
++                val s = ep.optInt("season", -1)
++                val e = ep.optInt("episode", -1)
++                if (s < 0 || e < 0) continue
++                val rating = ep.optJSONObject("ratings")?.optJSONObject("simkl")?.optDouble("rating", 0.0)
++                    ?.takeIf { it > 0.0 }
++                    ?: ep.optDouble("rating", 0.0)
++                if (rating > 0.0) out[s to e] = rating
++            }
++            out
++        } catch (_: Exception) {
++            emptyMap()
++        }
++    }
++
++    private suspend fun fetchTrakt(imdbId: String): Map<Pair<Int, Int>, Double> = withContext(Dispatchers.IO) {
++        try {
++            val url = "https://api.trakt.tv/shows/$imdbId/seasons?extended=episodes,full"
++            val body = traktClient.newCall(Request.Builder().url(url).build()).execute().use { r ->
++                if (!r.isSuccessful) return@withContext emptyMap()
++                r.body?.string().orEmpty()
++            }
++            val seasons = JSONArray(body)
++            val out = HashMap<Pair<Int, Int>, Double>()
++            for (i in 0 until seasons.length()) {
++                val season = seasons.optJSONObject(i) ?: continue
++                val s = season.optInt("number", -1)
++                val eps = season.optJSONArray("episodes") ?: continue
++                for (j in 0 until eps.length()) {
++                    val ep = eps.optJSONObject(j) ?: continue
++                    val e = ep.optInt("number", -1)
++                    val rating = ep.optDouble("rating", 0.0)
++                    if (s >= 0 && e >= 0 && rating > 0.0) out[s to e] = rating
++                }
++            }
++            out
++        } catch (_: Exception) {
++            emptyMap()
++        }
++    }
++}
++
++/** Logo plus value for one non-IMDb episode rating source. */
++@Composable
++internal fun ForkEpisodeSourceRating(
++    source: String,
++    rating: Double,
++    logoWidth: Dp,
++    logoHeight: Dp,
++    textStyle: TextStyle
++) {
++    val logo = when (source) {
++        "TMDB" -> R.raw.mdblist_tmdb
++        "Simkl" -> R.raw.simkl_tv_glyph
++        "Trakt" -> R.raw.trakt_tv_glyph
++        else -> null
++    }
++    val context = LocalContext.current
++    Row(
++        horizontalArrangement = Arrangement.spacedBy(4.dp),
++        verticalAlignment = Alignment.CenterVertically
++    ) {
++        if (logo != null) {
++            val model = remember(context, logo) { ImageRequest.Builder(context).data(logo).build() }
++            AsyncImage(
++                model = model,
++                contentDescription = source,
++                modifier = Modifier.width(logoWidth).height(logoHeight),
++                contentScale = ContentScale.Fit
++            )
++        } else {
++            Text(text = source, style = textStyle, maxLines = 1)
++        }
++        Text(
++            text = String.format(Locale.US, "%.1f", rating),
++            style = textStyle,
++            maxLines = 1
++        )
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
+index 52eec32d8..3516fc28b 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
+@@ -889,6 +889,7 @@ fun MetaDetailsScreen(
+                     relatedWatchedStatus = uiState.relatedWatchedStatus,
+                     episodeImdbRatings = uiState.episodeImdbRatings,
+                     episodeTmdbRatings = uiState.episodeTmdbRatings,
++                    episodeExtraRatings = uiState.episodeExtraRatings,
+                     isEpisodeRatingsLoading = uiState.isEpisodeRatingsLoading,
+                     episodeRatingsError = uiState.episodeRatingsError,
+                     mdbListRatings = uiState.mdbListRatings,
+@@ -1233,6 +1234,7 @@ private fun MetaDetailsContent(
+     relatedWatchedStatus: Map<String, Boolean> = emptyMap(),
+     episodeImdbRatings: Map<Pair<Int, Int>, Double>,
+     episodeTmdbRatings: Map<Pair<Int, Int>, Double> = emptyMap(),
++    episodeExtraRatings: Map<String, Map<Pair<Int, Int>, Double>> = emptyMap(),
+     isEpisodeRatingsLoading: Boolean,
+     episodeRatingsError: String?,
+     mdbListRatings: MDBListRatings?,
+@@ -2337,6 +2339,7 @@ private fun MetaDetailsContent(
+         // Single scrollable column with hero + content
+         CompositionLocalProvider(
+             LocalForkTmdbEpisodeRatings provides episodeTmdbRatings,
++            LocalForkExtraEpisodeRatings provides episodeExtraRatings,
+             // The hero grows to full height during a trailer; keep the list from
+             // scrolling to follow the focused hero while it resizes.
+             LocalBringIntoViewSpec provides if (suppressRestoreBringIntoView || isTrailerPlaying) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsUiState.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsUiState.kt
+index a08fe94da..f4c8a0dd5 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsUiState.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsUiState.kt
+@@ -79,6 +79,7 @@ data class MetaDetailsUiState(
+     val relatedWatchedStatus: Map<String, Boolean> = emptyMap(),
+     val episodeImdbRatings: Map<Pair<Int, Int>, Double> = emptyMap(),
+     val episodeTmdbRatings: Map<Pair<Int, Int>, Double> = emptyMap(),
++    val episodeExtraRatings: Map<String, Map<Pair<Int, Int>, Double>> = emptyMap(),
+     val isEpisodeRatingsLoading: Boolean = false,
+     val episodeRatingsError: String? = null,
+     val mdbListRatings: MDBListRatings? = null,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt
+index 40a90573e..ed22d83a2 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt
+@@ -85,6 +85,7 @@ class MetaDetailsViewModel @Inject constructor(
+     private val tmdbService: TmdbService,
+     private val tmdbMetadataService: TmdbMetadataService,
+     private val imdbEpisodeRatingsRepository: ImdbEpisodeRatingsRepository,
++    private val forkExtraEpisodeRatings: ForkTvExtraEpisodeRatings,
+     private val mdbListRepository: MDBListRepository,
+     private val mdbListSettingsDataStore: MDBListSettingsDataStore,
+     private val libraryRepository: LibraryRepository,
+@@ -1463,6 +1464,7 @@ class MetaDetailsViewModel @Inject constructor(
+                 it.copy(
+                     episodeImdbRatings = emptyMap(),
+                     episodeTmdbRatings = emptyMap(),
++                    episodeExtraRatings = emptyMap(),
+                     isEpisodeRatingsLoading = true,
+                     episodeRatingsError = null
+                 )
+@@ -1541,6 +1543,15 @@ class MetaDetailsViewModel @Inject constructor(
+                         }
+                     }
+                 }
++                if (imdbId != null) {
++                    val extra = forkExtraEpisodeRatings.fetch(imdbId)
++                    if (extra.isNotEmpty()) {
++                        _uiState.update { state ->
++                            if (state.meta == null || state.meta.id != meta.id) state
++                            else state.copy(episodeExtraRatings = extra)
++                        }
++                    }
++                }
+             } catch (cancelled: CancellationException) {
+                 throw cancelled
+             } catch (error: Exception) {
