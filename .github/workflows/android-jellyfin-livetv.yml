@@ -62,7 +62,11 @@ jobs:
         if: steps.ver.outputs.should_build == 'true'
         with:
           repository: NuvioMedia/NuvioTV
-          ref: dev
+          # pinned: the full patch chain (121 patches) was verified to apply with zero failures
+          # at this commit on 2026-10-30. Upstream dev moved past it and broke 23 patches
+          # (incl. the mandatory tv-jellyfin-cinematic-ui). Re-pin only after re-simulating
+          # the whole chain against the new dev tip.
+          ref: 157caada0c365b0ae35e659a312cd2f829f9eda1
           lfs: true
 
       - uses: actions/checkout@v4
@@ -202,23 +206,38 @@ jobs:
             fi
           done
 
-      - name: Fetch CI signing keystore (from fork)
+      # Signing keystore comes from the repo secret TV_KEYSTORE_B64 (rotated 2026-10-30 after
+      # the old keystore was found committed publicly — that key must be considered burned).
+      # APKs signed with the new key do not update over installs signed with the old one.
+      - name: Fetch CI signing keystore (from secret)
         if: steps.ver.outputs.should_build == 'true'
+        env:
+          KS_B64: ${{ secrets.TV_KEYSTORE_B64 }}
         run: |
-          curl -fsSL https://raw.githubusercontent.com/vgupta1192/NuvioTV/master/nuviotv.jks -o nuviotv.jks
+          echo "$KS_B64" | base64 -d > nuviotv.jks
           test -s nuviotv.jks
 
       - name: Create local.properties (self-hosted backend)
         if: steps.ver.outputs.should_build == 'true'
+        env:
+          NUVIO_SUPABASE_ANON_KEY: ${{ secrets.NUVIO_SUPABASE_ANON_KEY }}
+          SIMKL_CLIENT_ID: ${{ secrets.SIMKL_CLIENT_ID }}
+          MDBLIST_CLIENT_ID: ${{ secrets.MDBLIST_CLIENT_ID }}
+          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+          NUVIO_RELEASE_STORE_PASSWORD: ${{ secrets.TV_KEYSTORE_PASSWORD }}
+          NUVIO_RELEASE_KEY_ALIAS: ${{ secrets.TV_KEY_ALIAS }}
         run: |
           printf '%s\n' \
             'NUVIO_SUPABASE_URL=https://nuviobackend.kissmissi.duckdns.org' \
-            'NUVIO_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzg5NzY2MDkyLCJleHAiOjE5NDc0NDYwOTJ9.XB5a12DpW9Uf11QARCv4AAfYHGyk4qRq2Oi_7t8t7X0' \
+            "NUVIO_SUPABASE_ANON_KEY=$NUVIO_SUPABASE_ANON_KEY" \
             'NUVIO_SUPABASE_FALLBACK_URL=' \
             'AVATAR_PUBLIC_BASE_URL=https://nuviobackend.kissmissi.duckdns.org/storage/v1/object/public/avatars' \
-            'SIMKL_CLIENT_ID=cf7f2a335cfcd9759fa01d752d9cf8f42fb4fa1a4e4ff08fe4cafb84ec836621' \
-            'MDBLIST_CLIENT_ID=37RRuqIIBQbBsHmxcdl3RGRMhrpTK8FdFxAGltS0' \
-            'TMDB_API_KEY=af624aa414c84ad32d55d5ac45feae76' \
+            "SIMKL_CLIENT_ID=$SIMKL_CLIENT_ID" \
+            "MDBLIST_CLIENT_ID=$MDBLIST_CLIENT_ID" \
+            "TMDB_API_KEY=$TMDB_API_KEY" \
+            "NUVIO_RELEASE_STORE_PASSWORD=$NUVIO_RELEASE_STORE_PASSWORD" \
+            "NUVIO_RELEASE_KEY_ALIAS=$NUVIO_RELEASE_KEY_ALIAS" \
+            "NUVIO_RELEASE_KEY_PASSWORD=$NUVIO_RELEASE_STORE_PASSWORD" \
             'TRAKT_REDIRECT_URI=urn:ietf:wg:oauth:2.0:oob' \
             'TV_LOGIN_WEB_BASE_URL=https://nuvioweb.kissmissi.duckdns.org/tv-login' \
             'DEVICE_LOGIN_WEB_BASE_URL=https://nuvioweb.kissmissi.duckdns.org/link' \
