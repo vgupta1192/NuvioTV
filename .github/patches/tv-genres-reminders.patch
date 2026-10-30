@@ -1,0 +1,1319 @@
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index df93d3b5..ac675bef 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -20,6 +20,8 @@
+     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
++    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
++    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+ 
+     <uses-feature
+         android:name="android.hardware.touchscreen"
+@@ -70,6 +72,14 @@
+             </intent-filter>
+         </receiver>
+ 
++        <receiver
++            android:name=".core.reminders.ReleaseReminderAlarmReceiver"
++            android:exported="true">
++            <intent-filter>
++                <action android:name="android.intent.action.BOOT_COMPLETED" />
++            </intent-filter>
++        </receiver>
++
+         <service
+             android:name=".core.sync.androidtv.TvChannelRefreshJobService"
+             android:exported="false"
+diff --git a/app/src/main/java/com/nuvio/tv/MainActivity.kt b/app/src/main/java/com/nuvio/tv/MainActivity.kt
+index 9330af6d..50747423 100644
+--- a/app/src/main/java/com/nuvio/tv/MainActivity.kt
++++ b/app/src/main/java/com/nuvio/tv/MainActivity.kt
+@@ -1073,6 +1073,7 @@ open class MainActivity : ComponentActivity() {
+                             add(Screen.Jellyfin.route)
+                             add(Screen.Search.route)
+                             add(Screen.Library.route)
++                            add(Screen.Genres.route)
+                             add(Screen.Settings.route)
+                             if (discoverLocation == DiscoverLocation.IN_SIDEBAR) {
+                                 add(Screen.Discover.route)
+@@ -1086,6 +1087,7 @@ open class MainActivity : ComponentActivity() {
+                     val strNavJellyfin = "Jellyfin"
+                     val strNavSearch = stringResource(R.string.nav_search)
+                     val strNavLibrary = stringResource(R.string.nav_library)
++                    val strNavGenres = stringResource(R.string.nav_genres)
+                     val strNavSettings = stringResource(R.string.nav_settings)
+                     val drawerItems = remember(
+                         strNavHome,
+@@ -1093,6 +1095,7 @@ open class MainActivity : ComponentActivity() {
+                         strNavTvChannels,
+                         strNavSearch,
+                         strNavLibrary,
++                        strNavGenres,
+                         strNavSettings,
+                         discoverLocation
+                     ) {
+@@ -1142,6 +1145,13 @@ open class MainActivity : ComponentActivity() {
+                                     iconRes = R.raw.sidebar_library
+                                 )
+                             )
++                            add(
++                                DrawerItem(
++                                    route = Screen.Genres.route,
++                                    label = strNavGenres,
++                                    iconRes = R.raw.sidebar_genres
++                                )
++                            )
+                             add(
+                                 DrawerItem(
+                                     route = Screen.Settings.route,
+diff --git a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
+index 33eb69f4..f407c8e2 100644
+--- a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
++++ b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
+@@ -48,6 +48,7 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+     @Inject lateinit var imagePerformancePreferences: ImagePerformancePreferences
+     @Inject lateinit var simklAnimeIdPreferenceHolder: SimklAnimeIdPreferenceHolder
+     @Inject lateinit var serverUserStateProjection: ServerUserStateProjection
++    @Inject lateinit var releaseReminderCoordinator: com.nuvio.tv.core.reminders.ReleaseReminderCoordinator
+ 
+     companion object {
+         /**
+@@ -91,6 +92,7 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+         com.nuvio.tv.ui.screens.player.PlayerEffects.ensureLoaded(this) // Nuvio fork: picture and sound effects, read by stream auto-play
+         androidTvChannelSyncService.start()
+         serverUserStateProjection.start()
++        releaseReminderCoordinator.start() // Nuvio fork: deliver + schedule "Remind me" notifications
+         // Load locale synchronously so it's available before Activity.attachBaseContext.
+         // SharedPreferences reads are fast (cached in memory after first access).
+         val tag = getSharedPreferences("app_locale", Context.MODE_PRIVATE)
+diff --git a/app/src/main/java/com/nuvio/tv/core/genres/GenreIndex.kt b/app/src/main/java/com/nuvio/tv/core/genres/GenreIndex.kt
+new file mode 100644
+index 00000000..d50415fd
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/genres/GenreIndex.kt
+@@ -0,0 +1,75 @@
++package com.nuvio.tv.core.genres
++
++import com.nuvio.tv.domain.model.CatalogRow
++import com.nuvio.tv.domain.model.MetaPreview
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++
++/**
++ * A genre and the catalog/hero titles that carry it. [items] are the home catalog
++ * [MetaPreview]s themselves, so the Genres screen can reuse the existing poster-card
++ * grid without a second fetch.
++ */
++data class GenreBucket(
++    /** Normalised (lowercase) genre key used for grouping and selection. */
++    val key: String,
++    /** Genre spelling as first seen on a catalog item; the UI localises known names. */
++    val label: String,
++    val items: List<MetaPreview>
++)
++
++/**
++ * Nuvio fork: in-memory genre index for the Genres sidebar destination.
++ *
++ * Derived entirely from meta the app already fetched for Home (catalog rows + hero
++ * items) — no new server API and no persistence. [com.nuvio.tv.ui.screens.home]
++ * pipelines refresh it every time catalog rows are recomputed, so the index tracks
++ * whatever the user's addons currently show. Empties on every process start until
++ * Home loads once, which the Genres screen presents as an empty state.
++ */
++object GenreIndex {
++
++    /** Per-genre cap; home catalogs can hold thousands of items across addons. */
++    private const val MAX_ITEMS_PER_GENRE = 200
++
++    private val _buckets = MutableStateFlow<List<GenreBucket>>(emptyList())
++
++    val buckets: StateFlow<List<GenreBucket>> = _buckets.asStateFlow()
++
++    /** Rebuilds the index from the given rows (plus hero items). Cheap; StateFlow dedupes equal results. */
++    fun updateFromCatalogs(rows: List<CatalogRow>, heroItems: List<MetaPreview>) {
++        val itemsByKey = LinkedHashMap<String, MutableGenreAccumulator>()
++        fun accumulate(item: MetaPreview) {
++            if (item.name.isBlank()) return
++            for (genre in item.genres) {
++                val key = genre.trim().lowercase()
++                if (key.isEmpty() || key == "none") continue
++                val accumulator = itemsByKey.getOrPut(key) { MutableGenreAccumulator(label = genre.trim()) }
++                if (accumulator.items.none { it.id == item.id && it.apiType == item.apiType }) {
++                    if (accumulator.items.size < MAX_ITEMS_PER_GENRE) {
++                        accumulator.items.add(item)
++                    }
++                }
++            }
++        }
++        rows.forEach { row -> row.items.forEach(::accumulate) }
++        heroItems.forEach(::accumulate)
++
++        val buckets = itemsByKey.map { (key, accumulator) ->
++            GenreBucket(key = key, label = accumulator.label, items = accumulator.items)
++        }.sortedWith(
++            compareByDescending<GenreBucket> { it.items.size }.thenBy { it.key }
++        )
++        _buckets.value = buckets
++    }
++
++    /** Returns the bucket whose key matches, for selection from the UI. */
++    fun bucketOrNull(key: String): GenreBucket? =
++        _buckets.value.firstOrNull { it.key == key }
++
++    private class MutableGenreAccumulator(
++        val label: String,
++        val items: MutableList<MetaPreview> = mutableListOf()
++    )
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/reminders/ReleaseReminderAlarmReceiver.kt b/app/src/main/java/com/nuvio/tv/core/reminders/ReleaseReminderAlarmReceiver.kt
+new file mode 100644
+index 00000000..1c26013b
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/reminders/ReleaseReminderAlarmReceiver.kt
+@@ -0,0 +1,55 @@
++package com.nuvio.tv.core.reminders
++
++import android.content.BroadcastReceiver
++import android.content.Context
++import android.content.Intent
++import android.util.Log
++import dagger.hilt.EntryPoint
++import dagger.hilt.InstallIn
++import dagger.hilt.android.EntryPointAccessors
++import dagger.hilt.components.SingletonComponent
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.launch
++
++/**
++ * Nuvio fork: fires the "Release reminders" alarm at a title's release moment
++ * (and re-arms after a reboot, via the BOOT_COMPLETED filter). Deliver + reschedule
++ * run inside goAsync's window; anything slow — reading the DataStore, loading the
++ * poster, posting the notification — happens on a background dispatcher.
++ */
++class ReleaseReminderAlarmReceiver : BroadcastReceiver() {
++
++    @EntryPoint
++    @InstallIn(SingletonComponent::class)
++    interface ReleaseReminderEntryPoint {
++        fun releaseReminderCoordinator(): ReleaseReminderCoordinator
++    }
++
++    override fun onReceive(context: Context, intent: Intent) {
++        if (intent.action != Intent.ACTION_BOOT_COMPLETED &&
++            intent.action != ACTION_DELIVER
++        ) {
++            return
++        }
++        val result = goAsync()
++        CoroutineScope(Dispatchers.Default).launch {
++            try {
++                val coordinator = EntryPointAccessors
++                    .fromApplication(context.applicationContext, ReleaseReminderEntryPoint::class.java)
++                    .releaseReminderCoordinator()
++                coordinator.deliverDue()
++                coordinator.scheduleNextAlarm()
++            } catch (e: Exception) {
++                Log.w(TAG, "Release reminder delivery failed", e)
++            } finally {
++                result.finish()
++            }
++        }
++    }
++
++    companion object {
++        const val ACTION_DELIVER = "com.nuvio.tv.action.DELIVER_RELEASE_REMINDERS"
++        private const val TAG = "ReleaseReminders"
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/reminders/ReleaseReminderCoordinator.kt b/app/src/main/java/com/nuvio/tv/core/reminders/ReleaseReminderCoordinator.kt
+new file mode 100644
+index 00000000..d78474dd
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/reminders/ReleaseReminderCoordinator.kt
+@@ -0,0 +1,146 @@
++package com.nuvio.tv.core.reminders
++
++import android.app.AlarmManager
++import android.app.PendingIntent
++import android.content.Context
++import android.content.Intent
++import android.os.Build
++import android.util.Log
++import com.nuvio.tv.data.local.ReleaseRemindersStore
++import dagger.hilt.android.qualifiers.ApplicationContext
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import javax.inject.Inject
++import javax.inject.Singleton
++
++/**
++ * Nuvio fork: delivers the detail screen's "Remind me".
++ *
++ * Scheduling choice (the tree has no AlarmManager infra of its own — its only
++ * scheduler is the TV-channel JobService, which is periodic, not exact): an
++ * [AlarmManager] alarm set with setExactAndAllowWhileIdle (setAndAllowWhileIdle
++ * when exact alarms are not grantable, Android 12+) fires at the release moment
++ * even when the app process is dead, handled by
++ * [ReleaseReminderAlarmReceiver]. While the process runs this coordinator also
++ * checks due reminders on start, on every reminder-list change, and on a
++ * 6-hour in-process loop, so a lost or deferred alarm (reboot, OEM battery
++ * rules, denied exact alarms) still delivers at the next check. Reminders are
++ * removed once delivered.
++ */
++@Singleton
++class ReleaseReminderCoordinator @Inject constructor(
++    @ApplicationContext private val context: Context,
++    private val store: ReleaseRemindersStore
++) {
++    companion object {
++        private const val TAG = "ReleaseReminders"
++        private const val IN_PROCESS_CHECK_INTERVAL_MS = 6L * 60 * 60 * 1000
++        private const val ALARM_REQUEST_CODE = 40321
++    }
++
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
++
++    @Volatile
++    private var started = false
++
++    /** Called once from Application.onCreate. */
++    fun start() {
++        if (started) return
++        started = true
++        scope.launch {
++            deliverDue()
++            scheduleNextAlarm()
++        }
++        scope.launch {
++            store.reminders.collect {
++                scheduleNextAlarm()
++            }
++        }
++        scope.launch {
++            while (true) {
++                delay(IN_PROCESS_CHECK_INTERVAL_MS)
++                deliverDue()
++                scheduleNextAlarm()
++            }
++        }
++    }
++
++    /** Fires every due reminder's notification, then forgets them. Returns how many fired. */
++    suspend fun deliverDue(): Int {
++        val due = try {
++            store.dueReminders()
++        } catch (e: Exception) {
++            Log.w(TAG, "Failed to read due reminders", e)
++            return 0
++        }
++        if (due.isEmpty()) return 0
++        ReleaseReminderNotifications.ensureChannel(context)
++        for (reminder in due) {
++            val poster = ReleaseReminderNotifications.posterBitmapOrNull(context, reminder.posterUrl)
++            ReleaseReminderNotifications.post(context, reminder, poster)
++        }
++        try {
++            store.removeAll(due.map { it.key })
++        } catch (e: Exception) {
++            Log.w(TAG, "Failed to clear delivered reminders", e)
++        }
++        return due.size
++    }
++
++    /**
++     * Arms the alarm for the next upcoming reminder (or cancels the alarm when
++     * there is none). Safe to call repeatedly; the PendingIntent is the same.
++     * Suspending so the DataStore read never blocks the caller's thread.
++     */
++    suspend fun scheduleNextAlarm() {
++        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
++        val pendingIntent = alarmPendingIntent()
++        val nextAtMs = try {
++            withContext(Dispatchers.IO) {
++                store.current()
++                    .filter { it.releaseDateMs > System.currentTimeMillis() }
++                    .minByOrNull { it.releaseDateMs }
++            }?.releaseDateMs
++        } catch (e: Exception) {
++            Log.w(TAG, "Failed to read reminders for scheduling", e)
++            null
++        }
++        try {
++            if (nextAtMs == null) {
++                alarmManager.cancel(pendingIntent)
++                return
++            }
++            val canExact = Build.VERSION.SDK_INT < Build.VERSION_CODES.S || alarmManager.canScheduleExactAlarms()
++            if (canExact) {
++                alarmManager.setExactAndAllowWhileIdle(
++                    AlarmManager.RTC_WAKEUP,
++                    nextAtMs,
++                    pendingIntent
++                )
++            } else {
++                alarmManager.setAndAllowWhileIdle(
++                    AlarmManager.RTC_WAKEUP,
++                    nextAtMs,
++                    pendingIntent
++                )
++            }
++        } catch (e: Exception) {
++            Log.w(TAG, "Failed to schedule release reminder alarm", e)
++        }
++    }
++
++    private fun alarmPendingIntent(): PendingIntent {
++        val intent = Intent(context, ReleaseReminderAlarmReceiver::class.java)
++            .setAction(ReleaseReminderAlarmReceiver.ACTION_DELIVER)
++        return PendingIntent.getBroadcast(
++            context,
++            ALARM_REQUEST_CODE,
++            intent,
++            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
++        )
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/reminders/ReleaseReminderNotifications.kt b/app/src/main/java/com/nuvio/tv/core/reminders/ReleaseReminderNotifications.kt
+new file mode 100644
+index 00000000..61155236
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/reminders/ReleaseReminderNotifications.kt
+@@ -0,0 +1,108 @@
++package com.nuvio.tv.core.reminders
++
++import android.app.NotificationChannel
++import android.app.NotificationManager
++import android.content.Context
++import android.graphics.Bitmap
++import android.os.Build
++import androidx.core.app.NotificationCompat
++import androidx.core.app.NotificationManagerCompat
++import coil3.BitmapImage
++import coil3.imageLoader
++import coil3.request.ImageRequest
++import coil3.request.SuccessResult
++import coil3.request.allowHardware
++import coil3.size.Size
++import com.nuvio.tv.R
++import com.nuvio.tv.data.local.ReleaseReminder
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++
++/**
++ * Nuvio fork: the "Release reminders" notification channel and its one poster
++ * (or plain) notification per title. Kept free of Compose so the AlarmManager
++ * receiver can post without an Activity.
++ */
++internal object ReleaseReminderNotifications {
++
++    const val CHANNEL_ID = "release_reminders"
++    private const val POSTER_WIDTH_PX = 256
++    private const val POSTER_HEIGHT_PX = 384
++
++    fun ensureChannel(context: Context) {
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
++        val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
++        if (manager.getNotificationChannel(CHANNEL_ID) != null) return
++        val channel = NotificationChannel(
++            CHANNEL_ID,
++            context.getString(R.string.reminder_channel_name),
++            NotificationManager.IMPORTANCE_DEFAULT
++        ).apply {
++            description = context.getString(R.string.reminder_channel_description)
++        }
++        manager.createNotificationChannel(channel)
++    }
++
++    /** Posts one notification for [reminder]; tapping opens the title's detail screen. */
++    fun post(context: Context, reminder: ReleaseReminder, poster: Bitmap?) {
++        ensureChannel(context)
++        // Android 13+: notifications need the runtime grant; silently skip otherwise.
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
++            context.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
++            android.content.pm.PackageManager.PERMISSION_GRANTED
++        ) {
++            return
++        }
++        val deepLink = "nuvio://detail/${reminder.itemType}/${android.net.Uri.encode(reminder.itemId)}"
++        val contentIntent = android.app.PendingIntent.getActivity(
++            context,
++            notificationId(reminder),
++            android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(deepLink))
++                .setPackage(context.packageName),
++            android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
++        )
++        val builder = NotificationCompat.Builder(context, CHANNEL_ID)
++            .setSmallIcon(R.drawable.ic_notification_reminder)
++            .setContentTitle(reminder.title)
++            .setContentText(context.getString(R.string.reminder_notification_text))
++            .setContentIntent(contentIntent)
++            .setAutoCancel(true)
++            .setCategory(NotificationCompat.CATEGORY_REMINDER)
++        if (poster != null) {
++            builder.setStyle(NotificationCompat.BigPictureStyle().bigPicture(poster))
++        }
++        runCatching {
++            NotificationManagerCompat.from(context).notify(notificationId(reminder), builder.build())
++        }
++    }
++
++    fun cancel(context: Context, reminder: ReleaseReminder) {
++        NotificationManagerCompat.from(context).cancel(notificationId(reminder))
++    }
++
++    private fun notificationId(reminder: ReleaseReminder): Int = reminder.key.hashCode()
++
++    /**
++     * Loads the poster for the notification's big picture, sampled small, bounded
++     * by Coil's own request timeout. Any failure returns null and the caller
++     * posts the plain variant.
++     */
++    suspend fun posterBitmapOrNull(context: Context, posterUrl: String?): Bitmap? =
++        withContext(Dispatchers.IO) {
++            if (posterUrl.isNullOrBlank()) return@withContext null
++            val request = ImageRequest.Builder(context)
++                .data(posterUrl)
++                .allowHardware(false)
++                .size(Size(POSTER_WIDTH_PX, POSTER_HEIGHT_PX))
++                .build()
++            val result = try {
++                context.imageLoader.execute(request)
++            } catch (cancellation: CancellationException) {
++                throw cancellation
++            } catch (_: Exception) {
++                return@withContext null
++            }
++            ((result as? SuccessResult)?.image as? BitmapImage)?.bitmap
++        }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/data/local/ReleaseRemindersStore.kt b/app/src/main/java/com/nuvio/tv/data/local/ReleaseRemindersStore.kt
+new file mode 100644
+index 00000000..89eb41de
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/local/ReleaseRemindersStore.kt
+@@ -0,0 +1,144 @@
++package com.nuvio.tv.data.local
++
++import androidx.datastore.preferences.core.Preferences
++import androidx.datastore.preferences.core.edit
++import androidx.datastore.preferences.core.stringPreferencesKey
++import com.nuvio.tv.core.profile.ProfileManager
++import kotlinx.coroutines.ExperimentalCoroutinesApi
++import kotlinx.coroutines.flow.Flow
++import kotlinx.coroutines.flow.distinctUntilChanged
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.flow.flatMapLatest
++import kotlinx.coroutines.flow.map
++import org.json.JSONArray
++import org.json.JSONObject
++import javax.inject.Inject
++import javax.inject.Singleton
++
++/**
++ * Nuvio fork: one "Remind me" entry on a title that has not come out yet.
++ * [releaseDateMs] is the epoch millisecond the notification should fire at
++ * (start of release day, UTC midnight for date-only values — matching the tree's
++ * episode release-date parser).
++ */
++data class ReleaseReminder(
++    val itemId: String,
++    val itemType: String,
++    val title: String,
++    val releaseDateMs: Long,
++    val releaseDateIso: String,
++    val posterUrl: String?,
++    val createdAtMs: Long
++) {
++    /** Stable identity of a reminder: one per title. */
++    val key: String get() = "$itemType|$itemId"
++}
++
++/**
++ * Nuvio fork: the detail screen's "Remind me", persisted per profile as a JSON
++ * list in the profile DataStore (same per-profile store pattern as
++ * [AmbientModeDataStore]). Delivery is handled by
++ * com.nuvio.tv.core.reminders.ReleaseReminderCoordinator (AlarmManager when the
++ * process is dead, in-process checks while it runs) via the "Release reminders"
++ * notification channel; the management list lives in Settings > Features.
++ */
++@OptIn(ExperimentalCoroutinesApi::class)
++@Singleton
++class ReleaseRemindersStore @Inject constructor(
++    private val factory: ProfileDataStoreFactory,
++    private val profileManager: ProfileManager
++) {
++    companion object {
++        const val FEATURE = "release_reminders"
++        internal val LIST_KEY = stringPreferencesKey("release_reminders_json")
++    }
++
++    private fun store() = factory.get(profileManager.activeProfileId.value, FEATURE)
++
++    /** Upcoming (and any undelivered past) reminders for the active profile. */
++    val reminders: Flow<List<ReleaseReminder>> =
++        profileManager.activeProfileId.flatMapLatest { profileId ->
++            factory.get(profileId, FEATURE).data.map(::decodeReminders)
++        }.distinctUntilChanged()
++
++    suspend fun current(): List<ReleaseReminder> = decodeReminders(store().data.first())
++
++    /** Adds [reminder] unless one for the same title already exists. Returns whether it was added. */
++    suspend fun add(reminder: ReleaseReminder): Boolean {
++        val existing = current()
++        if (existing.any { it.key == reminder.key }) return false
++        store().edit { prefs ->
++            val list = decodeReminders(prefs)
++            if (list.any { it.key == reminder.key }) return@edit
++            prefs[LIST_KEY] = JSONArray().apply {
++                list.forEach { put(encodeReminder(it)) }
++                put(encodeReminder(reminder))
++            }.toString()
++        }
++        return true
++    }
++
++    suspend fun remove(itemId: String, itemType: String) {
++        store().edit { prefs ->
++            val list = decodeReminders(prefs)
++            val targetKey = "$itemType|$itemId"
++            if (list.none { it.key == targetKey }) return@edit
++            prefs[LIST_KEY] = JSONArray().apply {
++                list.filterNot { it.key == targetKey }.forEach { put(encodeReminder(it)) }
++            }.toString()
++        }
++    }
++
++    /** Removes every reminder whose [ReleaseReminder.key] is in [keys] (used after delivery). */
++    suspend fun removeAll(keys: Collection<String>) {
++        if (keys.isEmpty()) return
++        store().edit { prefs ->
++            val list = decodeReminders(prefs)
++            if (list.none { it.key in keys }) return@edit
++            prefs[LIST_KEY] = JSONArray().apply {
++                list.filterNot { it.key in keys }.forEach { put(encodeReminder(it)) }
++            }.toString()
++        }
++    }
++
++    /**
++     * Reminders whose release moment has passed and that have not been delivered
++     * yet. The coordinator posts their notifications and removes them.
++     */
++    suspend fun dueReminders(nowMs: Long = System.currentTimeMillis()): List<ReleaseReminder> =
++        current().filter { it.releaseDateMs <= nowMs }
++}
++
++private fun encodeReminder(reminder: ReleaseReminder): String =
++    JSONObject().apply {
++        put("itemId", reminder.itemId)
++        put("itemType", reminder.itemType)
++        put("title", reminder.title)
++        put("releaseDateMs", reminder.releaseDateMs)
++        put("releaseDateIso", reminder.releaseDateIso)
++        put("posterUrl", reminder.posterUrl.orEmpty())
++        put("createdAtMs", reminder.createdAtMs)
++    }.toString()
++
++internal fun decodeReminders(preferences: Preferences): List<ReleaseReminder> {
++    val raw = preferences[ReleaseRemindersStore.LIST_KEY] ?: return emptyList()
++    val out = mutableListOf<ReleaseReminder>()
++    runCatching {
++        val array = JSONArray(raw)
++        for (index in 0 until array.length()) {
++            val entry = array.optJSONObject(index) ?: continue
++            val itemId = entry.optString("itemId").takeIf { it.isNotBlank() } ?: continue
++            val itemType = entry.optString("itemType").takeIf { it.isNotBlank() } ?: continue
++            out += ReleaseReminder(
++                itemId = itemId,
++                itemType = itemType,
++                title = entry.optString("title"),
++                releaseDateMs = entry.optLong("releaseDateMs", 0L),
++                releaseDateIso = entry.optString("releaseDateIso"),
++                posterUrl = entry.optString("posterUrl").takeIf { it.isNotBlank() },
++                createdAtMs = entry.optLong("createdAtMs", 0L)
++            )
++        }
++    }
++    return out
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
+index 4456e8e4..9ea866f9 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
+@@ -1283,6 +1283,24 @@ private fun PlaybackNavHost(
+             )
+         }
+ 
++        // Nuvio fork: Genres — browse the library by genre, derived locally from Home's catalogs.
++        composable(Screen.Genres.route) {
++            com.nuvio.tv.ui.screens.genres.GenresScreen(
++                showBuiltInHeader = !hideBuiltInHeaders,
++                onNavigateToDetail = { itemId, itemType, addonBaseUrl ->
++                    val heroBackdrop = HeroBackdropState.consumeAndClear()
++                    navController.navigate(
++                        Screen.Detail.createRoute(
++                            itemId = itemId,
++                            itemType = itemType,
++                            addonBaseUrl = addonBaseUrl ?: "",
++                            heroBackdropUrl = heroBackdrop
++                        )
++                    )
++                }
++            )
++        }
++
+         composable(Screen.TvChannels.route) {
+             TvChannelsScreen(
+                 onWatchFullscreenInMainPlayer = { channel, stream ->
+diff --git a/app/src/main/java/com/nuvio/tv/ui/navigation/Screen.kt b/app/src/main/java/com/nuvio/tv/ui/navigation/Screen.kt
+index 26111ed5..24782147 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/navigation/Screen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/navigation/Screen.kt
+@@ -149,6 +149,7 @@ sealed class Screen(val route: String) {
+         fun createRoute(itemId: String): String = "jellyfin_detail/" + encode(itemId)
+     }
+     data object Library : Screen("library")
++    data object Genres : Screen("genres")
+     data object Settings : Screen("settings")
+     data object Tracking : Screen("trakt")
+     data object WatchParty : Screen("watch_party?code={code}") {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/HeroSection.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/HeroSection.kt
+index b43b5533..9f03e9eb 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/HeroSection.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/HeroSection.kt
+@@ -349,6 +349,9 @@ fun HeroContentSection(
+                             !com.nuvio.tv.data.mediaserver.ServerItemRef.isServerId(meta.id)) {
+                             TvdbOrderControl(meta, onEpisodeOrderChanged)
+                         }
++                        // Nuvio fork: "Remind me" for titles with a future release date
++                        // (composes itself only when one exists).
++                        ReleaseReminderAction(meta = meta, onFocused = onHeroActionFocused)
+                     }
+ 
+                     Spacer(modifier = Modifier.height(NuvioTheme.spacing.lg))
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/ReleaseReminderAction.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/ReleaseReminderAction.kt
+new file mode 100644
+index 00000000..c60475d8
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/ReleaseReminderAction.kt
+@@ -0,0 +1,179 @@
++package com.nuvio.tv.ui.screens.detail
++
++import android.Manifest
++import android.content.pm.PackageManager
++import android.os.Build
++import androidx.activity.compose.rememberLauncherForActivityResult
++import androidx.activity.result.contract.ActivityResultContracts
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.Notifications
++import androidx.compose.material.icons.filled.NotificationsNone
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.focus.onFocusChanged
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.unit.dp
++import androidx.hilt.navigation.compose.hiltViewModel
++import androidx.lifecycle.ViewModel
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import androidx.lifecycle.viewModelScope
++import androidx.tv.material3.Border
++import androidx.tv.material3.Icon
++import androidx.tv.material3.IconButton
++import androidx.tv.material3.IconButtonDefaults
++import androidx.tv.material3.ExperimentalTvMaterial3Api
++import com.nuvio.tv.R
++import com.nuvio.tv.core.reminders.ReleaseReminderCoordinator
++import com.nuvio.tv.core.util.parseEpisodeReleaseLocalDate
++import com.nuvio.tv.data.local.ReleaseReminder
++import com.nuvio.tv.data.local.ReleaseRemindersStore
++import com.nuvio.tv.domain.model.Meta
++import com.nuvio.tv.ui.theme.NuvioTheme
++import dagger.hilt.android.lifecycle.HiltViewModel
++import java.time.LocalDate
++import java.time.ZoneOffset
++import javax.inject.Inject
++import kotlinx.coroutines.flow.SharingStarted
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.stateIn
++import kotlinx.coroutines.launch
++
++/**
++ * Nuvio fork: view model behind the hero's "Remind me" action. Holds the per-profile
++ * reminder list and keeps the delivery alarm in step after every change.
++ */
++@HiltViewModel
++class ReleaseReminderViewModel @Inject constructor(
++    private val store: ReleaseRemindersStore,
++    private val coordinator: ReleaseReminderCoordinator
++) : ViewModel() {
++
++    val reminders: StateFlow<List<ReleaseReminder>> =
++        store.reminders.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
++
++    fun add(reminder: ReleaseReminder) {
++        viewModelScope.launch {
++            store.add(reminder)
++            coordinator.scheduleNextAlarm()
++        }
++    }
++
++    fun remove(reminder: ReleaseReminder) {
++        viewModelScope.launch {
++            store.remove(reminder.itemId, reminder.itemType)
++            coordinator.scheduleNextAlarm()
++        }
++    }
++}
++
++/**
++ * Nuvio fork: the hero action row's "Remind me" icon button. Only composed for
++ * titles with a future release/air date (parsed with the tree's own
++ * [parseEpisodeReleaseLocalDate]); clicking toggles the reminder in the local
++ * DataStore, requesting POST_NOTIFICATIONS lazily on the first add for Android 13+.
++ */
++@OptIn(ExperimentalTvMaterial3Api::class)
++@Composable
++fun ReleaseReminderAction(
++    meta: Meta,
++    onFocused: () -> Unit = {}
++) {
++    val releaseDate = remember(meta.id, meta.released) {
++        parseEpisodeReleaseLocalDate(meta.released)
++    } ?: return
++    if (!releaseDate.isAfter(LocalDate.now())) return
++
++    val viewModel: ReleaseReminderViewModel = hiltViewModel()
++    val reminders by viewModel.reminders.collectAsStateWithLifecycle()
++    val context = LocalContext.current
++    val isSet = reminders.any { it.itemId == meta.id && it.itemType == meta.apiType }
++    var pendingReminder by remember { mutableStateOf<ReleaseReminder?>(null) }
++
++    val permissionLauncher = rememberLauncherForActivityResult(
++        ActivityResultContracts.RequestPermission()
++    ) { _ ->
++        pendingReminder?.let { viewModel.add(it) }
++        pendingReminder = null
++    }
++
++    ReleaseReminderIconButton(
++        isSet = isSet,
++        onFocused = onFocused,
++        onClick = {
++            val reminder = buildReleaseReminder(meta, releaseDate)
++            if (isSet) {
++                viewModel.remove(reminder)
++            } else {
++                val needsPermission = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
++                    context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
++                    PackageManager.PERMISSION_GRANTED
++                if (needsPermission) {
++                    pendingReminder = reminder
++                    permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
++                } else {
++                    viewModel.add(reminder)
++                }
++            }
++        }
++    )
++}
++
++@OptIn(ExperimentalTvMaterial3Api::class)
++@Composable
++private fun ReleaseReminderIconButton(
++    isSet: Boolean,
++    onClick: () -> Unit,
++    onFocused: () -> Unit
++) {
++    IconButton(
++        onClick = onClick,
++        modifier = Modifier
++            .size(NuvioTheme.spacing.xxxl)
++            .onFocusChanged { state ->
++                if (state.isFocused) onFocused()
++            },
++        colors = IconButtonDefaults.colors(
++            containerColor = if (isSet) NuvioTheme.colors.Secondary else NuvioTheme.colors.BackgroundCard,
++            focusedContainerColor = NuvioTheme.colors.Secondary,
++            contentColor = if (isSet) NuvioTheme.colors.OnSecondary else NuvioTheme.colors.TextPrimary,
++            focusedContentColor = NuvioTheme.colors.OnSecondary
++        ),
++        border = IconButtonDefaults.border(
++            focusedBorder = Border(
++                border = NuvioTheme.focusRing.border(NuvioTheme.spacing.xxs),
++                shape = CircleShape
++            )
++        ),
++        shape = IconButtonDefaults.shape(
++            shape = CircleShape
++        )
++    ) {
++        Icon(
++            imageVector = if (isSet) Icons.Default.Notifications else Icons.Default.NotificationsNone,
++            contentDescription = if (isSet) {
++                stringResource(R.string.reminder_set)
++            } else {
++                stringResource(R.string.remind_me)
++            },
++            modifier = Modifier.size(22.dp)
++        )
++    }
++}
++
++private fun buildReleaseReminder(meta: Meta, releaseDate: LocalDate): ReleaseReminder =
++    ReleaseReminder(
++        itemId = meta.id,
++        itemType = meta.apiType,
++        title = meta.name,
++        releaseDateMs = releaseDate.atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli(),
++        releaseDateIso = meta.released ?: releaseDate.toString(),
++        posterUrl = meta.poster ?: meta.landscapePoster ?: meta.rawPosterUrl,
++        createdAtMs = System.currentTimeMillis()
++    )
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/genres/GenresScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/genres/GenresScreen.kt
+new file mode 100644
+index 00000000..3ccc70fa
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/genres/GenresScreen.kt
+@@ -0,0 +1,247 @@
++package com.nuvio.tv.ui.screens.genres
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.lazy.grid.GridCells
++import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
++import androidx.compose.foundation.lazy.grid.items
++import androidx.compose.foundation.lazy.grid.itemsIndexed
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.saveable.rememberSaveable
++import androidx.compose.runtime.setValue
++import androidx.activity.compose.BackHandler
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import androidx.tv.material3.Border
++import androidx.tv.material3.Card
++import androidx.tv.material3.CardDefaults
++import androidx.tv.material3.ExperimentalTvMaterial3Api
++import androidx.tv.material3.MaterialTheme
++import androidx.tv.material3.Text
++import com.nuvio.tv.R
++import com.nuvio.tv.core.genres.GenreBucket
++import com.nuvio.tv.core.genres.GenreIndex
++import com.nuvio.tv.ui.components.EmptyScreenState
++import com.nuvio.tv.ui.components.GridContentCard
++import com.nuvio.tv.ui.components.PosterCardDefaults
++import com.nuvio.tv.ui.theme.NuvioTheme
++import com.nuvio.tv.ui.util.localizedGenreLabel
++
++private const val GENRE_CHIP_COLUMNS = 4
++
++/**
++ * Nuvio fork: browse the library by genre. Genre buckets come from
++ * [GenreIndex] (derived in-memory from Home's already-fetched catalog meta — no
++ * server calls); picking one shows a poster grid built on the same
++ * [GridContentCard] the library and search results use.
++ */
++@OptIn(ExperimentalTvMaterial3Api::class)
++@Composable
++fun GenresScreen(
++    showBuiltInHeader: Boolean = true,
++    onNavigateToDetail: (String, String, String?) -> Unit
++) {
++    val buckets by GenreIndex.buckets.collectAsState()
++    var selectedKey by rememberSaveable { mutableStateOf<String?>(null) }
++    val selectedBucket = selectedKey?.let { key -> buckets.firstOrNull { it.key == key } }
++
++    BackHandler(enabled = selectedKey != null) {
++        selectedKey = null
++    }
++
++    Column(
++        modifier = Modifier
++            .fillMaxSize()
++            .padding(horizontal = NuvioTheme.spacing.xxxl, vertical = NuvioTheme.spacing.lg)
++    ) {
++        Text(
++            text = stringResource(R.string.genres_title),
++            style = MaterialTheme.typography.headlineMedium,
++            color = if (showBuiltInHeader) NuvioTheme.colors.TextPrimary else Color.Transparent
++        )
++        Text(
++            text = stringResource(R.string.genres_subtitle),
++            style = MaterialTheme.typography.bodyMedium,
++            color = NuvioTheme.colors.TextSecondary,
++            modifier = Modifier.padding(top = NuvioTheme.spacing.xxs)
++        )
++
++        val bucket = selectedBucket
++        when {
++            buckets.isEmpty() -> {
++                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
++                    EmptyScreenState(
++                        title = stringResource(R.string.genres_title),
++                        subtitle = stringResource(R.string.genres_empty)
++                    )
++                }
++            }
++
++            bucket != null -> {
++                GenreItemsGrid(
++                    bucket = bucket,
++                    onBack = { selectedKey = null },
++                    onNavigateToDetail = onNavigateToDetail,
++                    modifier = Modifier
++                        .fillMaxSize()
++                        .padding(top = NuvioTheme.spacing.md)
++                )
++            }
++
++            else -> {
++                GenreChipsGrid(
++                    buckets = buckets,
++                    onSelect = { key -> selectedKey = key },
++                    modifier = Modifier
++                        .fillMaxSize()
++                        .padding(top = NuvioTheme.spacing.md)
++                )
++            }
++        }
++    }
++}
++
++@OptIn(ExperimentalTvMaterial3Api::class)
++@Composable
++private fun GenreChipsGrid(
++    buckets: List<GenreBucket>,
++    onSelect: (String) -> Unit,
++    modifier: Modifier = Modifier
++) {
++    val firstChipFocusRequester = remember { FocusRequester() }
++    var requestedInitialFocus by rememberSaveable { mutableStateOf(false) }
++    LaunchedEffect(buckets) {
++        if (buckets.isNotEmpty() && !requestedInitialFocus) {
++            requestedInitialFocus = true
++            runCatching { firstChipFocusRequester.requestFocus() }
++        }
++    }
++    LazyVerticalGrid(
++        columns = GridCells.Fixed(GENRE_CHIP_COLUMNS),
++        modifier = modifier,
++        horizontalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.md),
++        verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.md),
++        contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = NuvioTheme.spacing.lg)
++    ) {
++        itemsIndexed(buckets, key = { _, bucket -> bucket.key }) { index, bucket ->
++            val chipShape = RoundedCornerShape(14.dp)
++            Card(
++                onClick = { onSelect(bucket.key) },
++                modifier = Modifier
++                    .then(if (index == 0) Modifier.focusRequester(firstChipFocusRequester) else Modifier),
++                shape = CardDefaults.shape(shape = chipShape),
++                colors = CardDefaults.colors(
++                    containerColor = NuvioTheme.colors.BackgroundCard,
++                    focusedContainerColor = NuvioTheme.colors.Secondary
++                ),
++                border = CardDefaults.border(
++                    focusedBorder = Border(
++                        border = NuvioTheme.focusRing.border(NuvioTheme.spacing.xxs),
++                        shape = chipShape
++                    )
++                )
++            ) {
++                Column(
++                    modifier = Modifier
++                        .fillMaxWidth()
++                        .padding(horizontal = NuvioTheme.spacing.lg, vertical = NuvioTheme.spacing.md),
++                    verticalArrangement = Arrangement.spacedBy(2.dp)
++                ) {
++                    Text(
++                        text = localizedGenreLabel(bucket.label),
++                        style = MaterialTheme.typography.titleMedium,
++                        color = NuvioTheme.colors.TextPrimary,
++                        maxLines = 1,
++                        overflow = TextOverflow.Ellipsis
++                    )
++                    Text(
++                        text = stringResource(R.string.genres_item_count, bucket.items.size),
++                        style = MaterialTheme.typography.labelMedium,
++                        color = NuvioTheme.colors.TextSecondary
++                    )
++                }
++            }
++        }
++    }
++}
++
++@OptIn(ExperimentalTvMaterial3Api::class)
++@Composable
++private fun GenreItemsGrid(
++    bucket: GenreBucket,
++    onBack: () -> Unit,
++    onNavigateToDetail: (String, String, String?) -> Unit,
++    modifier: Modifier = Modifier
++) {
++    val firstCardFocusRequester = remember(bucket.key) { FocusRequester() }
++    LaunchedEffect(bucket.key) {
++        runCatching { firstCardFocusRequester.requestFocus() }
++    }
++    LazyVerticalGrid(
++        columns = GridCells.Adaptive(minSize = PosterCardDefaults.Style.width),
++        modifier = modifier,
++        horizontalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.md),
++        verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.md),
++        contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = NuvioTheme.spacing.lg)
++    ) {
++        item(span = { androidx.compose.foundation.lazy.grid.GridItemSpan(maxLineSpan) }) {
++            GenreBackChip(onBack = onBack, focusRequester = firstCardFocusRequester)
++        }
++        items(bucket.items, key = { "${it.apiType}:${it.id}" }) { item ->
++            GridContentCard(
++                item = item,
++                onClick = {
++                    onNavigateToDetail(item.id, item.apiType, item.sourceAddonBaseUrl ?: "")
++                },
++                posterCardStyle = PosterCardDefaults.Style,
++                showLabel = true,
++                showReleaseInfo = true
++            )
++        }
++    }
++}
++
++@OptIn(ExperimentalTvMaterial3Api::class)
++@Composable
++private fun GenreBackChip(onBack: () -> Unit, focusRequester: FocusRequester) {
++    val chipShape = RoundedCornerShape(50)
++    Card(
++        onClick = onBack,
++        modifier = Modifier
++            .focusRequester(focusRequester),
++        shape = CardDefaults.shape(shape = chipShape),
++        colors = CardDefaults.colors(
++            containerColor = NuvioTheme.colors.BackgroundCard,
++            focusedContainerColor = NuvioTheme.colors.Secondary
++        ),
++        border = CardDefaults.border(
++            focusedBorder = Border(
++                border = NuvioTheme.focusRing.border(NuvioTheme.spacing.xxs),
++                shape = chipShape
++            )
++        )
++    ) {
++        Text(
++            text = "\u2190 " + stringResource(R.string.genres_all),
++            style = MaterialTheme.typography.labelLarge,
++            color = NuvioTheme.colors.TextPrimary,
++            modifier = Modifier.padding(horizontal = NuvioTheme.spacing.lg, vertical = NuvioTheme.spacing.sm)
++        )
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogPipeline.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogPipeline.kt
+index 50e83f49..2f1287cb 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogPipeline.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogPipeline.kt
+@@ -892,6 +892,9 @@ internal suspend fun HomeViewModel.updateCatalogRowsPipeline() {
+         )
+     }
+ 
++    // Nuvio fork: keep the Genres screen's in-memory index in step with what Home shows.
++    com.nuvio.tv.core.genres.GenreIndex.updateFromCatalogs(displayRows, baseHeroItems)
++
+     val tmdbSettings = currentTmdbSettings
+     val tmdbEnabledForCurrentLayout = tmdbSettings.enabled &&
+         (currentLayout != HomeLayout.MODERN || tmdbSettings.modernHomeEnabled)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt
+index ef372ad8..db5eb9a1 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt
+@@ -43,6 +43,10 @@ internal fun ForkFeaturesPane(
+                 forkFillerGuideRow()
+             }
+         }
++        // Nuvio fork: the detail screen's "Remind me" management list.
++        item {
++            releaseRemindersCard()
++        }
+         item {
+             SettingsGroupCard(title = "Player") {
+                 forkPlayerButtonsRow()
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ReleaseRemindersSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ReleaseRemindersSettingsItems.kt
+new file mode 100644
+index 00000000..a8fc2851
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ReleaseRemindersSettingsItems.kt
+@@ -0,0 +1,83 @@
++package com.nuvio.tv.ui.screens.settings
++
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.Delete
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.res.stringResource
++import androidx.hilt.navigation.compose.hiltViewModel
++import androidx.lifecycle.ViewModel
++import androidx.lifecycle.viewModelScope
++import androidx.tv.material3.MaterialTheme
++import androidx.tv.material3.Text
++import com.nuvio.tv.R
++import com.nuvio.tv.data.local.ReleaseReminder
++import com.nuvio.tv.data.local.ReleaseRemindersStore
++import com.nuvio.tv.ui.screens.detail.formatReleaseDate
++import com.nuvio.tv.ui.theme.NuvioTheme
++import dagger.hilt.android.lifecycle.HiltViewModel
++import javax.inject.Inject
++import kotlinx.coroutines.flow.SharingStarted
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.stateIn
++import kotlinx.coroutines.launch
++
++/**
++ * Nuvio fork: backs the Settings > Features "Release reminders" management list.
++ */
++@HiltViewModel
++class ReleaseRemindersSettingsViewModel @Inject constructor(
++    private val store: ReleaseRemindersStore
++) : ViewModel() {
++
++    val reminders: StateFlow<List<ReleaseReminder>> =
++        store.reminders.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
++
++    fun remove(reminder: ReleaseReminder) {
++        viewModelScope.launch {
++            store.remove(reminder.itemId, reminder.itemType)
++        }
++    }
++}
++
++/**
++ * Nuvio fork: the "Remind me" management list — every upcoming release reminder
++ * with its release date; clicking a row cancels it. Rendered inside
++ * ForkFeaturesPane (Settings > Features).
++ */
++@Composable
++internal fun releaseRemindersCard() {
++    val viewModel: ReleaseRemindersSettingsViewModel = hiltViewModel()
++    val reminders by viewModel.reminders.collectAsState()
++    SettingsGroupCard(
++        title = stringResource(R.string.reminders_title),
++        subtitle = stringResource(R.string.reminders_subtitle)
++    ) {
++        val upcoming = reminders.sortedBy { it.releaseDateMs }
++        if (upcoming.isEmpty()) {
++            Text(
++                text = stringResource(R.string.reminders_empty),
++                style = MaterialTheme.typography.bodyMedium,
++                color = NuvioTheme.colors.TextSecondary,
++                modifier = Modifier.padding(horizontal = NuvioTheme.spacing.lg, vertical = NuvioTheme.spacing.md)
++            )
++        } else {
++            upcoming.forEach { reminder ->
++                SettingsActionRow(
++                    title = reminder.title,
++                    subtitle = reminderSubtitle(reminder),
++                    value = stringResource(R.string.reminders_remove),
++                    onClick = { viewModel.remove(reminder) },
++                    trailingIcon = Icons.Default.Delete
++                )
++            }
++        }
++    }
++}
++
++private fun reminderSubtitle(reminder: ReleaseReminder): String {
++    val formatted = formatReleaseDate(reminder.releaseDateIso)
++    return formatted.ifBlank { reminder.releaseDateIso }
++}
+diff --git a/app/src/main/res/drawable/ic_notification_reminder.xml b/app/src/main/res/drawable/ic_notification_reminder.xml
+new file mode 100644
+index 00000000..71392f6f
+--- /dev/null
++++ b/app/src/main/res/drawable/ic_notification_reminder.xml
+@@ -0,0 +1,10 @@
++<vector
++    xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++  <path
++      android:pathData="M12,22C13.1,22 14,21.1 14,20H10C10,21.1 10.9,22 12,22ZM18,16V11C18,7.93 16.36,5.36 13.5,4.68V4C13.5,3.17 12.83,2.5 12,2.5C11.17,2.5 10.5,3.17 10.5,4V4.68C7.63,5.36 6,7.92 6,11V16L4,18V19H20V18L18,16ZM16,17H8V11C8,8.52 9.51,6.5 12,6.5C14.49,6.5 16,8.52 16,11V17Z"
++      android:fillColor="#FFFFFFFF"/>
++</vector>
+diff --git a/app/src/main/res/raw/sidebar_genres.svg b/app/src/main/res/raw/sidebar_genres.svg
+new file mode 100644
+index 00000000..8b15c76e
+--- /dev/null
++++ b/app/src/main/res/raw/sidebar_genres.svg
+@@ -0,0 +1,4 @@
++<?xml version="1.0" encoding="utf-8"?>
++<svg width="24px" height="24px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
++  <path fill="#000000" fill-rule="evenodd" clip-rule="evenodd" d="M3.5 3C2.11929 3 1 4.11929 1 5.5C1 6.88071 2.11929 8 3.5 8C4.88071 8 6 6.88071 6 5.5C6 4.11929 4.88071 3 3.5 3ZM3.5 9C2.11929 9 1 10.1193 1 11.5C1 12.8807 2.11929 14 3.5 14C4.88071 14 6 12.8807 6 11.5C6 10.1193 4.88071 9 3.5 9ZM1 17.5C1 16.1193 2.11929 15 3.5 15C4.88071 15 6 16.1193 6 17.5C6 18.8807 4.88071 20 3.5 20C2.11929 20 1 18.8807 1 17.5ZM9 4.75H22V6.25H9V4.75ZM22 10.75H9V12.25H22V10.75ZM9 16.75H22V18.25H9V16.75Z"/>
++</svg>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index bfb88d04..d8519196 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -2462,10 +2462,29 @@
+     <string name="nav_movies">Movies</string>
+     <string name="nav_series">Series</string>
+     <string name="nav_settings">Settings</string>
++    <string name="nav_genres">Genres</string>
+     <string name="action_select">Select</string>
+     <string name="settings_rounded_ui">Rounded UI</string>
+     <string name="cd_expand_sidebar">Expand sidebar</string>
+ 
++    <!-- Genres browse screen -->
++    <string name="genres_title">Genres</string>
++    <string name="genres_subtitle">Browse your catalogs by genre</string>
++    <string name="genres_empty">Genres appear here once your catalogs finish loading on Home.</string>
++    <string name="genres_item_count">%1$d titles</string>
++    <string name="genres_all">All genres</string>
++
++    <!-- Release reminders -->
++    <string name="remind_me">Remind me</string>
++    <string name="reminder_set">Reminder set</string>
++    <string name="reminder_channel_name">Release reminders</string>
++    <string name="reminder_channel_description">Notifications when a title you follow is released</string>
++    <string name="reminder_notification_text">Now available on Nuvio</string>
++    <string name="reminders_title">Release reminders</string>
++    <string name="reminders_subtitle">Titles you asked to hear about on release day</string>
++    <string name="reminders_empty">No upcoming reminders. Use “Remind me” on a title’s details page.</string>
++    <string name="reminders_remove">Remove reminder</string>
++
+     <string name="update_checking">Checking for updates…</string>
+     <string name="update_waiting_for_stable">You’ll receive the next stable release when it becomes available</string>
+     <string name="update_download_complete">Download complete. Ready to install.</string>

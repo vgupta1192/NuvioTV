@@ -1,0 +1,543 @@
+diff --git a/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt b/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
+index 4bba9cb9..2c4074fe 100644
+--- a/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
++++ b/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
+@@ -328,6 +328,10 @@ data class PlayerSettings(
+     val nextEpisodeThresholdMinutesBeforeEnd: Float = 2f,
+     val streamReuseLastLinkEnabled: Boolean = true,
+     val streamReuseLastLinkCacheHours: Int = 1,
++    /** Auto quality hot swap for adaptive streams (rendition switching without restarting). */
++    val autoQualityEnabled: Boolean = true,
++    /** Fast start: begin adaptive streams at the lowest rendition, then hot-swap up. */
++    val fastStartEnabled: Boolean = false,
+     val externalPlayerForwardSubtitles: Boolean = false,
+     val externalPlayerSendSkipSegments: Boolean = false,
+     val subtitleOrganizationMode: SubtitleOrganizationMode = SubtitleOrganizationMode.NONE,
+@@ -655,6 +659,8 @@ class PlayerSettingsDataStore @Inject constructor(
+     private val nextEpisodeThresholdMinutesBeforeEndKey = floatPreferencesKey("next_episode_threshold_minutes_before_end_v2")
+     private val streamReuseLastLinkEnabledKey = booleanPreferencesKey("stream_reuse_last_link_enabled")
+     private val streamReuseLastLinkCacheHoursKey = intPreferencesKey("stream_reuse_last_link_cache_hours")
++    private val autoQualityEnabledKey = booleanPreferencesKey("auto_quality_enabled")
++    private val fastStartEnabledKey = booleanPreferencesKey("fast_start_enabled")
+     private val externalPlayerForwardSubtitlesKey = booleanPreferencesKey("external_player_forward_subtitles")
+     private val externalPlayerSendSkipSegmentsKey = booleanPreferencesKey("external_player_send_skip_segments")
+     private val subtitleOrganizationModeKey = stringPreferencesKey("subtitle_organization_mode")
+@@ -1095,6 +1101,8 @@ class PlayerSettingsDataStore @Inject constructor(
+                 ),
+                 streamReuseLastLinkEnabled = prefs[streamReuseLastLinkEnabledKey] ?: false,
+                 streamReuseLastLinkCacheHours = (prefs[streamReuseLastLinkCacheHoursKey] ?: 24).coerceIn(1, 168),
++                autoQualityEnabled = prefs[autoQualityEnabledKey] ?: true,
++                fastStartEnabled = prefs[fastStartEnabledKey] ?: false,
+                 externalPlayerForwardSubtitles = prefs[externalPlayerForwardSubtitlesKey] ?: false,
+                 externalPlayerSendSkipSegments = prefs[externalPlayerSendSkipSegmentsKey] ?: false,
+                 subtitleOrganizationMode = parseSubtitleOrganizationMode(prefs[subtitleOrganizationModeKey]),
+@@ -1538,6 +1546,18 @@ class PlayerSettingsDataStore @Inject constructor(
+         }
+     }
+ 
++    suspend fun setAutoQualityEnabled(enabled: Boolean) {
++        store().edit { prefs ->
++            prefs[autoQualityEnabledKey] = enabled
++        }
++    }
++
++    suspend fun setFastStartEnabled(enabled: Boolean) {
++        store().edit { prefs ->
++            prefs[fastStartEnabledKey] = enabled
++        }
++    }
++
+     suspend fun setStreamReuseLastLinkCacheHours(hours: Int) {
+         store().edit { prefs ->
+             prefs[streamReuseLastLinkCacheHoursKey] = hours.coerceIn(1, 168)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/DxStreamStats.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/DxStreamStats.kt
+index 3e8a309a..072d02ad 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/DxStreamStats.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/DxStreamStats.kt
+@@ -185,6 +185,7 @@ private fun collectRows(context: Context, viewModel: PlayerViewModel, downloadBy
+             .getOrDefault(C.LENGTH_UNSET.toLong())
+         val estimateText = if (estimate > 0L) " (est. ${DxStreamStats.formatBitrate(estimate)})" else ""
+         rows += "Download" to download + estimateText
++        speedTestRows()?.let { rows += it }
+         return rows
+     }
+     val mpv = viewModel.controller.mpvView ?: return rows
+@@ -218,9 +219,16 @@ private fun collectRows(context: Context, viewModel: PlayerViewModel, downloadBy
+     val dropped = (p("frame-drop-count")?.toLongOrNull() ?: 0L) + (p("decoder-frame-drop-count")?.toLongOrNull() ?: 0L)
+     rows += "Dropped frames" to dropped.toString()
+     rows += "Download" to download
++    speedTestRows()?.let { rows += it }
+     return rows
+ }
+ 
++/** The latest measured speed-test result, shown under the Download row when it is fresh. */
++private fun speedTestRows(): Pair<String, String>? {
++    val bps = AutoQualitySpeedTest.latestBps() ?: return null
++    return "Speed test" to DxStreamStats.formatBitrate(bps)
++}
++
+ /** Settings row in Playback > Player. */
+ @Composable
+ internal fun DxStreamStatsSettingsRows() {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerAutoQuality.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerAutoQuality.kt
+new file mode 100644
+index 00000000..67110432
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerAutoQuality.kt
+@@ -0,0 +1,322 @@
++package com.nuvio.tv.ui.screens.player
++
++import android.os.SystemClock
++import android.util.Log
++import androidx.media3.common.C
++import androidx.media3.common.Player
++import androidx.media3.common.util.UnstableApi
++import kotlinx.coroutines.flow.collect
++import kotlinx.coroutines.launch
++
++/**
++ * Auto quality for adaptive (multi-rendition) streams, driven by a measured throughput sample of the
++ * playing stream. Three pieces:
++ *
++ *  - [AutoQualitySpeedTest] keeps the latest measured download speed: on ExoPlayer it is fed from the
++ *    player's own bandwidth meter (an `AnalyticsListener` hook, real bytes over real load time), on
++ *    mpv from its `cache-speed` (real bytes into the demuxer cache). The latest result is surfaced in
++ *    the dx stream stats overlay.
++ *  - Auto quality hot swap: while it is enabled and an adaptive stream plays, the playing rendition is
++ *    compared against the measured speed every progress tick. An upgrade needs the estimate to stay
++ *    above 1.3x the next rendition's bitrate for [AUTO_QUALITY_UPGRADE_HOLD_MS] with buffer to spare;
++ *    a downgrade takes [AUTO_QUALITY_DOWNGRADE_SAMPLES] consecutive samples below the playing
++ *    rendition's bitrate. Switches happen through the same track-selection override the quality
++ *    chooser uses, so playback never restarts.
++ *  - Fast start: when enabled (with auto quality on), a fresh adaptive stream is pinned to its lowest
++ *    rendition as soon as its tracks are known, and upgrades run through the same hysteresis once the
++ *    first buffering has completed.
++ *
++ * A quality picked by hand in the player (a video track override that auto quality did not set)
++ * stands down until the chooser's Auto entry is picked again.
++ */
++internal object AutoQualitySpeedTest {
++    /** Smoothing weight of a new measurement, Echo-style EMA. */
++    private const val EMA_NEW_WEIGHT = 0.3
++
++    /** A result older than this is from another session and is not shown. */
++    private const val FRESH_MS = 120_000L
++
++    @Volatile private var estimateBps: Long = 0L
++    @Volatile private var latestRawBps: Long = 0L
++    @Volatile private var latestAtElapsedMs: Long = 0L
++
++    /** One bandwidth-meter reading (bits/s); several arrive while data loads. */
++    fun recordBandwidthEstimate(bitrateEstimateBps: Long) {
++        if (bitrateEstimateBps <= 0L) return
++        synchronized(this) {
++            latestRawBps = bitrateEstimateBps
++            val smoothed = if (estimateBps <= 0L) {
++                bitrateEstimateBps.toDouble()
++            } else {
++                estimateBps * (1.0 - EMA_NEW_WEIGHT) + bitrateEstimateBps * EMA_NEW_WEIGHT
++            }
++            estimateBps = smoothed.toLong()
++            latestAtElapsedMs = SystemClock.elapsedRealtime()
++        }
++    }
++
++    /** mpv's demuxer fill rate (bytes/s), sampled from the progress loop; feeds the overlay only. */
++    fun recordMpvCacheSpeed(bytesPerSecond: Long) {
++        if (bytesPerSecond <= 0L) return
++        recordBandwidthEstimate(bytesPerSecond * 8L)
++    }
++
++    /** The smoothed measurement, or null when nothing has been measured recently. */
++    fun latestBps(): Long? {
++        val at = latestAtElapsedMs
++        if (at == 0L || SystemClock.elapsedRealtime() - at > FRESH_MS) return null
++        return estimateBps.takeIf { it > 0L }
++    }
++}
++
++/** Per-playback state of the auto quality engine; one instance lives on the controller. */
++internal class AutoQualityState {
++    val speedTest = AutoQualitySpeedTest()
++
++    /** The stream the engine last saw; a change re-arms fast start and drops the streaks. */
++    var lastSeenStreamUrl: String? = null
++
++    /** Fast start is waiting for the stream's tracks so it can pin the lowest rendition. */
++    var fastStartPending: Boolean = false
++
++    /** The rendition auto quality itself pinned (null: none); a different override is the user's. */
++    var pinnedHeightPx: Int? = null
++
++    /** No switch this soon after the previous one: the new rendition needs time to settle. */
++    var lastSwitchAtElapsedMs: Long = Long.MIN_VALUE / 2
++
++    /** How long the estimate has been above the upgrade threshold (ms); null while it is below. */
++    var upgradeHoldSinceElapsedMs: Long? = null
++
++    /** Consecutive samples below the downgrade threshold. */
++    var downgradeStreak: Int = 0
++
++    /** Settings snapshot, kept current by [PlayerRuntimeController.observeAutoQualitySettings]. */
++    var autoEnabled: Boolean = true
++    var fastStartEnabled: Boolean = false
++
++    fun onStreamChanged() {
++        fastStartPending = false
++        upgradeHoldSinceElapsedMs = null
++        downgradeStreak = 0
++    }
++}
++
++// Tuning: an upgrade needs sustained headroom, a downgrade reacts quickly.
++private const val AUTO_QUALITY_UPGRADE_HEADROOM = 1.3
++private const val AUTO_QUALITY_UPGRADE_HOLD_MS = 5_000L
++private const val AUTO_QUALITY_UPGRADE_MIN_BUFFER_MS = 10_000L
++private const val AUTO_QUALITY_DOWNGRADE_SAMPLES = 2
++private const val AUTO_QUALITY_DOWNGRADE_HEADROOM = 1.1
++private const val AUTO_QUALITY_SWITCH_SETTLE_MS = 10_000L
++private const val AUTO_QUALITY_TAG = "AUTO_QUALITY"
++
++/**
++ * Settings observer: keeps the engine's snapshot current. Runs for the player's whole lifetime; the
++ * tick reads the snapshot, so no restart bookkeeping is needed here.
++ */
++internal fun PlayerRuntimeController.observeAutoQualitySettings() {
++    scope.launch {
++        playerSettingsDataStore.playerSettings.collect { settings ->
++            autoQualityState.autoEnabled = settings.autoQualityEnabled
++            autoQualityState.fastStartEnabled = settings.fastStartEnabled
++        }
++    }
++}
++
++/**
++ * One look at playback, from the existing progress loop (every ~500 ms while it runs). ExoPlayer
++ * only: mpv has no rendition hot swap in this tree, so nothing is faked there (its progress tick
++ * feeds the speed test instead). With auto quality off the function returns after the per-stream
++ * bookkeeping, and nothing about playback changes.
++ */
++@OptIn(UnstableApi::class)
++internal fun PlayerRuntimeController.autoQualityTick() {
++    val state = autoQualityState
++    val player = _exoPlayer ?: return
++    if (isUsingMpvEngine()) return
++    if (!state.autoEnabled) return
++
++    // A new stream: reset the per-stream bookkeeping, restore what auto quality itself pinned (the
++    // user's own override survives), and re-arm fast start.
++    if (currentStreamUrl != state.lastSeenStreamUrl) {
++        val wasOurs = state.pinnedHeightPx != null && currentVideoOverrideHeightPx() == state.pinnedHeightPx
++        if (wasOurs) {
++            player.applyVideoQuality(null)
++            state.pinnedHeightPx = null
++        }
++        state.onStreamChanged()
++        state.lastSeenStreamUrl = currentStreamUrl
++        state.fastStartPending = state.fastStartEnabled
++    }
++
++    val ui = _uiState.value
++    if (ui.playbackEnded || ui.error != null) return
++    if (_playbackTimeline.value.isLive || player.isCurrentMediaItemLive) return
++
++    val qualities = runCatching { player.extractVideoQualities() }.getOrDefault(emptyList())
++    if (qualities.size < 2) return
++    val overrideHeight = currentVideoOverrideHeightPx()
++    val isManual = overrideHeight != null && overrideHeight != state.pinnedHeightPx
++    if (isManual) {
++        // A hand-picked quality stands until the chooser's Auto entry clears it.
++        state.upgradeHoldSinceElapsedMs = null
++        state.downgradeStreak = 0
++        return
++    }
++
++    // Fast start: pin the lowest rendition the moment the tracks are known, before the initial ABR
++    // choice can start pulling a heavy variant. The settle window below is what defers the first
++    // upgrade until after the first buffering has completed.
++    if (state.fastStartPending) {
++        state.fastStartPending = false
++        val lowest = qualities.lastOrNull() ?: return
++        if (lowest.heightPx > 0 && lowest.heightPx != overrideHeight) {
++            player.applyVideoQuality(lowest.heightPx)
++            state.pinnedHeightPx = lowest.heightPx
++            state.lastSwitchAtElapsedMs = SystemClock.elapsedRealtime()
++            state.upgradeHoldSinceElapsedMs = null
++            state.downgradeStreak = 0
++            Log.i(
++                PlayerRuntimeController.TAG,
++                "$AUTO_QUALITY_TAG: fast start pinned ${lowest.label} (${qualities.size} renditions)"
++            )
++        }
++        return
++    }
++
++    if (player.playbackState != Player.STATE_READY) return
++    if (!player.playWhenReady || userPausedManually) return
++    val now = SystemClock.elapsedRealtime()
++    if (now - state.lastSwitchAtElapsedMs < AUTO_QUALITY_SWITCH_SETTLE_MS) return
++
++    val estimateBps = state.speedTest.latestBps() ?: return
++    val playing = qualities.firstOrNull { it.isSelected } ?: run {
++        // Nothing pinned and ABR is in charge: judge against the rendition the player reports.
++        val current = player.videoFormat?.height?.takeIf { it > 0 } ?: return
++        qualities.firstOrNull { it.heightPx == current } ?: return
++    }
++    val playingBitrateBps = playing.bitrate?.takeIf { it > 0 }?.toLong()
++        ?: PlayerBitrateEstimator.fileBitrateBps(currentVideoSize, _playbackTimeline.value.duration)
++            ?.toLong()
++        ?: return
++
++    // Downgrade first: two consecutive samples below what is playing. The target is the highest
++    // lower rendition the connection carries with a little to spare.
++    if (estimateBps < playingBitrateBps) {
++        state.upgradeHoldSinceElapsedMs = null
++        state.downgradeStreak += 1
++        if (state.downgradeStreak >= AUTO_QUALITY_DOWNGRADE_SAMPLES) {
++            state.downgradeStreak = 0
++            val target = qualities
++                .filter { it.heightPx < playing.heightPx }
++                .firstOrNull { candidate ->
++                    val candidateBps = candidate.bitrate?.takeIf { it > 0 }?.toLong()
++                        ?: return@firstOrNull true
++                    candidateBps * AUTO_QUALITY_DOWNGRADE_HEADROOM <= estimateBps
++                }
++                ?: return
++            switchAutoQualityRendition(
++                player,
++                state,
++                target,
++                reason = "bandwidth ${estimateBps / 1_000_000.0} Mbps below ${playingBitrateBps / 1_000_000.0} Mbps"
++            )
++        }
++        return
++    }
++    state.downgradeStreak = 0
++
++    // Upgrade: the estimate must stay above 1.3x the next rendition for a while, with buffer to
++    // hide the switch, and the next rendition must declare a bitrate (missing metadata is not
++    // evidence that it fits).
++    val bufferedAheadMs = (player.bufferedPosition - player.currentPosition).coerceAtLeast(0L)
++    val next = qualities
++        .filter { it.heightPx > playing.heightPx }
++        .minByOrNull { it.heightPx }
++    val nextBitrateBps = next?.bitrate?.takeIf { it > 0 }?.toLong()
++    val upgradeSustained = if (
++        bufferedAheadMs >= AUTO_QUALITY_UPGRADE_MIN_BUFFER_MS &&
++        !player.isLoading &&
++        nextBitrateBps != null &&
++        nextBitrateBps * AUTO_QUALITY_UPGRADE_HEADROOM <= estimateBps
++    ) {
++        val since = state.upgradeHoldSinceElapsedMs
++        if (since == null) {
++            state.upgradeHoldSinceElapsedMs = now
++            false
++        } else {
++            now - since >= AUTO_QUALITY_UPGRADE_HOLD_MS
++        }
++    } else {
++        state.upgradeHoldSinceElapsedMs = null
++        false
++    }
++    if (upgradeSustained && next != null) {
++        state.upgradeHoldSinceElapsedMs = null
++        switchAutoQualityRendition(
++            player,
++            state,
++            next,
++            reason = "bandwidth ${estimateBps / 1_000_000.0} Mbps sustained over ${AUTO_QUALITY_UPGRADE_HOLD_MS / 1000}s"
++        )
++    }
++}
++
++/** The video height pinned by a track override, or null when the selection is unconstrained. */
++@OptIn(UnstableApi::class)
++internal fun PlayerRuntimeController.currentVideoOverrideHeightPx(): Int? {
++    val player = _exoPlayer ?: return null
++    return runCatching {
++        player.trackSelectionParameters.overrides.values
++            .firstOrNull { it.mediaTrackGroup.type == C.TRACK_TYPE_VIDEO }
++            ?.let { pin -> pin.mediaTrackGroup.getFormat(pin.trackIndices.first()).height }
++            ?.takeIf { it > 0 }
++    }.getOrNull()
++}
++
++/**
++ * Applies a rendition switch through the same override the quality chooser uses (no seek, no media
++ * source change) and records it as auto quality's own pin, so a user's hand-picked quality is never
++ * mistaken for it.
++ */
++private fun PlayerRuntimeController.switchAutoQualityRendition(
++    player: ExoPlayer,
++    state: AutoQualityState,
++    target: VideoQualityOption,
++    reason: String,
++) {
++    val previous = state.pinnedHeightPx
++    runCatching { player.applyVideoQuality(target.heightPx) }
++        .onFailure {
++            Log.w(PlayerRuntimeController.TAG, "$AUTO_QUALITY_TAG: switch to ${target.label} failed", it)
++            return
++        }
++    state.pinnedHeightPx = target.heightPx
++    state.lastSwitchAtElapsedMs = SystemClock.elapsedRealtime()
++    val direction = if (previous == null || target.heightPx > previous) "up" else "down"
++    Log.i(
++        PlayerRuntimeController.TAG,
++        "$AUTO_QUALITY_TAG: $direction to ${target.label} ($reason)"
++    )
++}
++
++/**
++ * Fast start's other half: called from the player's analytics listener when the track selection
++ * changes. The first call after a stream change runs the tick, which may pin the lowest rendition;
++ * later calls drop auto quality's pin record when the override it set no longer holds (the player
++ * re-selected on its own), so the next decision starts from the truth.
++ */
++internal fun PlayerRuntimeController.onExoTracksChangedForAutoQuality() {
++    val state = autoQualityState
++    if (state.fastStartPending) {
++        autoQualityTick()
++        return
++    }
++    val pinned = state.pinnedHeightPx ?: return
++    val override = currentVideoOverrideHeightPx()
++    val playingHeight = _exoPlayer?.videoFormat?.height?.takeIf { it > 0 }
++    if (override == null && playingHeight != pinned) {
++        state.pinnedHeightPx = null
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
+index f53c59e8..1472cae6 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
+@@ -484,6 +484,7 @@ class PlayerRuntimeController(
+     internal var lastPlaybackIssueError: PlaybackIssueErrorInput? = null
+     internal val playbackIssueReportRequestVersion = AtomicLong(0L)
+     internal val playbackAnalyticsDiagnostics = PlayerPlaybackAnalyticsDiagnostics()
++    internal val autoQualityState = AutoQualityState() // Nuvio fork: auto quality hot swap
+     internal val loadingDiagnosticEvents: ArrayDeque<PlayerLoadingDiagnosticEvent> = ArrayDeque()
+     internal val loadingDiagnosticRawEventLines: ArrayDeque<String> = ArrayDeque()
+     internal val pendingPlaybackRawEventLines: ArrayDeque<String> = ArrayDeque()
+@@ -782,6 +783,7 @@ class PlayerRuntimeController(
+         observeDeviceLocalTransparentLetterbox()
+         observeDeviceLocalTunneledSurfaceFill()
+         observePlayerStatsHud()
++        observeAutoQualitySettings() // Nuvio fork: auto quality hot swap
+         observeStreamDelayTrackSelection()
+     }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+index 373da296..f870b2e2 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+@@ -1878,6 +1878,7 @@ internal fun PlayerRuntimeController.initializePlayer(
+                         totalBytesLoaded: Long,
+                         bitrateEstimate: Long
+                     ) {
++                        autoQualityState.speedTest.recordBandwidthEstimate(bitrateEstimate) // Nuvio fork: speed test
+                         playbackAnalyticsDiagnostics.onBandwidthEstimate(
+                             eventTime = eventTime,
+                             totalLoadTimeMs = totalLoadTimeMs,
+@@ -1925,6 +1926,14 @@ internal fun PlayerRuntimeController.initializePlayer(
+                             wasCanceled = wasCanceled
+                         )
+                     }
++
++                    override fun onTracksChanged(
++                        eventTime: AnalyticsListener.EventTime,
++                        tracks: androidx.media3.common.Tracks
++                    ) {
++                        // Nuvio fork: fast start pins the lowest rendition as soon as tracks are known.
++                        onExoTracksChangedForAutoQuality()
++                    }
+                 })
+             }
+             if (!startupSubtitlePreparation.fetchCompleted) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
+index c4d09a4d..f2a0cae7 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
+@@ -444,6 +444,11 @@ internal fun PlayerRuntimeController.startProgressUpdates() {
+                     }
+                     updateMpvTracksOnTick()
+                     mpvView?.sampleThroughput(context, currentStreamUrl) // Nuvio fork: connection-speed learning
++                    // Nuvio fork: mpv has no rendition hot swap, but its demuxer fill rate is a real
++                    // throughput measurement and feeds the speed-test row of the stream stats overlay.
++                    autoQualityState.speedTest.recordMpvCacheSpeed(
++                        view.dxProperty("cache-speed")?.toDoubleOrNull()?.toLong() ?: 0L
++                    )
+                     updateActiveSkipInterval(pos)
+                     ensureLocalSkipDetection(pos)
+                     if (!_playbackTimeline.value.isLive) {
+@@ -479,6 +484,7 @@ internal fun PlayerRuntimeController.startProgressUpdates() {
+                 )
+                 // Nuvio fork: connection-speed learning. A live stream only arrives at its own bitrate, so it says nothing about the network.
+                 com.nuvio.tv.core.connection.PlaybackThroughput.onExoTick(context, currentStreamUrl, !player.isCurrentMediaItemLive && playerDuration != androidx.media3.common.C.TIME_UNSET && player.isLoading)
++                autoQualityTick() // Nuvio fork: auto quality hot swap
+                 playbackAnalyticsDiagnostics.recordProgressSnapshot(
+                     player = player,
+                     hasRenderedFirstFrame = hasRenderedFirstFrame,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPlayerSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPlayerSettings.kt
+index 2956f524..81585b81 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPlayerSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPlayerSettings.kt
+@@ -38,6 +38,23 @@ internal fun PlaybackPlayerSection(
+         enabled = !usesExternalPlayer
+     )
+ 
++    if (!usesExternalPlayer) {
++        SettingsSectionLabel(text = stringResource(R.string.playback_video_quality_section))
++        SettingsToggleRow(
++            title = stringResource(R.string.playback_auto_quality),
++            subtitle = stringResource(R.string.playback_auto_quality_sub),
++            checked = settings.autoQualityEnabled,
++            onToggle = { onUpdate { setAutoQualityEnabled(!settings.autoQualityEnabled) } }
++        )
++        SettingsToggleRow(
++            title = stringResource(R.string.playback_fast_start),
++            subtitle = stringResource(R.string.playback_fast_start_sub),
++            checked = settings.fastStartEnabled,
++            onToggle = { onUpdate { setFastStartEnabled(!settings.fastStartEnabled) } },
++            enabled = settings.autoQualityEnabled
++        )
++    }
++
+     if (settings.playerPreference != PlayerPreference.INTERNAL) {
+         SettingsSectionLabel(text = stringResource(R.string.playback_external_player_label))
+         SettingsToggleRow(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSettingsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSettingsViewModel.kt
+index a3b68dc6..e511900e 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSettingsViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSettingsViewModel.kt
+@@ -574,6 +574,14 @@ class PlaybackSettingsViewModel @Inject constructor(
+         playerSettingsDataStore.setStreamReuseLastLinkCacheHours(hours)
+     }
+ 
++    suspend fun setAutoQualityEnabled(enabled: Boolean) {
++        playerSettingsDataStore.setAutoQualityEnabled(enabled)
++    }
++
++    suspend fun setFastStartEnabled(enabled: Boolean) {
++        playerSettingsDataStore.setFastStartEnabled(enabled)
++    }
++
+     suspend fun setVodCacheSizeMode(mode: VodCacheSizeMode) {
+         playerSettingsDataStore.setVodCacheSizeMode(mode)
+     }
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 95abec00..15852078 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -784,6 +784,11 @@
+     <string name="playback_engine_mvplayer">Libmpv (Beta)</string>
+     <string name="playback_auto_switch_internal_player_on_error">Auto-switch engine on startup error</string>
+     <string name="playback_auto_switch_internal_player_on_error_sub">If stream startup fails, switch between ExoPlayer and libmpv automatically.</string>
++    <string name="playback_video_quality_section">Video quality</string>
++    <string name="playback_auto_quality">Auto quality</string>
++    <string name="playback_auto_quality_sub">Adapts the video quality of adaptive streams to the measured connection speed, without restarting playback. Picking a quality in the player pauses it until Auto is picked again.</string>
++    <string name="playback_fast_start">Fast start</string>
++    <string name="playback_fast_start_sub">Starts adaptive streams at the lowest quality and steps up automatically once the first buffering completes and the connection allows it. Requires Auto quality.</string>
+     <string name="playback_external_forward_subtitles">Forward subtitles to external player</string>
+     <string name="playback_external_forward_subtitles_sub">Fetch subtitles in your preferred language from addons and pass them to the external player.</string>
+     <string name="playback_external_send_skip_segments">Send intro and outro timestamps</string>

@@ -1,0 +1,830 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/skiptimes/CreditsDetector.kt b/app/src/main/java/com/nuvio/tv/core/player/skiptimes/CreditsDetector.kt
+new file mode 100644
+index 00000000..809ba4d9
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/player/skiptimes/CreditsDetector.kt
+@@ -0,0 +1,169 @@
++package com.nuvio.tv.core.player.skiptimes
++
++import android.graphics.Bitmap
++import com.nuvio.tv.data.repository.SkipInterval
++
++/**
++ * Finds end credits on black in keyframe pictures of a file's last minutes, the way Intro Skipper's black-frame pass
++ * does: a run of pictures that are almost all black and mostly lettered (a little colourless bright text), long
++ * enough to be credits. Credits over the picture, or on a colour card, aren't found.
++ */
++internal object CreditsDetector {
++    /** At or below this (0–255 luma) a pixel is black. */
++    private const val BLACK_LUMA = 24
++    /** At or above this a pixel is bright, as credit lettering is. */
++    private const val BRIGHT_LUMA = 150
++    /** Lettering's pixels are near grey: their channels differ by this at most. */
++    private const val COLOURLESS_SPREAD = 48
++    /**
++     * A picture this black (share of pixels) is a black one. Intro Skipper's default is 85% of a full frame; shrunk to
++     * a thumbnail, lettering blurs into grey, so a page dense with names reads a little less black.
++     */
++    private const val BLACK_SHARE = 0.80f
++    /** A lettered picture's bright share: text, not a lit scene (nor a speck of light in a dark one). */
++    private const val MIN_TEXT_SHARE = 0.003f
++    private const val MAX_TEXT_SHARE = 0.15f
++    /** Most of the bright pixels must be colourless for lettering. */
++    private const val COLOURLESS_SHARE = 0.6f
++
++    /** Where TV credits are looked for: the last 7.5 minutes (Intro Skipper's longest credits), every 15 s. */
++    private const val TV_WINDOW_MS = 450_000L
++    private const val TV_STEP_MS = 15_000L
++    /** A movie's: its last 15 minutes, every 30 s. */
++    private const val MOVIE_WINDOW_MS = 900_000L
++    private const val MOVIE_STEP_MS = 30_000L
++    /** The last picture looked at is this far from the end (the very last frames may not be keyframes). */
++    private const val END_GUARD_MS = 3_000L
++    /** Credits shorter than this are a title card or a gap between acts. */
++    private const val MIN_CREDITS_MS = 20_000L
++    /** Halvings that place each edge of a found run between two looks (15 s becomes about 4 s). */
++    private const val REFINE_STEPS = 2
++    /** What follows the credits for less than this (a studio logo) is part of them. */
++    private const val SHORT_TAIL_MS = 15_000L
++
++    /** How far before the end credits are looked for. */
++    fun windowMs(movie: Boolean): Long = if (movie) MOVIE_WINDOW_MS else TV_WINDOW_MS
++
++    class FrameStats(val black: Float, val bright: Float, val colourless: Float) {
++        val isBlack: Boolean get() = black >= BLACK_SHARE
++        val isLettered: Boolean
++            get() = isBlack && bright in MIN_TEXT_SHARE..MAX_TEXT_SHARE && colourless >= COLOURLESS_SHARE
++
++        override fun toString(): String =
++            "black=%.2f bright=%.3f grey=%.2f".format(java.util.Locale.ROOT, black, bright, colourless)
++    }
++
++    fun stats(bitmap: Bitmap): FrameStats {
++        val width = bitmap.width
++        val height = bitmap.height
++        val pixels = IntArray(width * height)
++        bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
++        return stats(pixels)
++    }
++
++    /** [pixels] as ARGB ints. */
++    fun stats(pixels: IntArray): FrameStats {
++        if (pixels.isEmpty()) return FrameStats(0f, 0f, 0f)
++        var black = 0
++        var bright = 0
++        var colourless = 0
++        for (c in pixels) {
++            val r = (c shr 16) and 0xFF
++            val g = (c shr 8) and 0xFF
++            val b = c and 0xFF
++            val luma = (r * 299 + g * 587 + b * 114) / 1000
++            if (luma <= BLACK_LUMA) {
++                black++
++            } else if (luma >= BRIGHT_LUMA) {
++                bright++
++                if (maxOf(r, g, b) - minOf(r, g, b) <= COLOURLESS_SPREAD) colourless++
++            }
++        }
++        val n = pixels.size.toFloat()
++        return FrameStats(black / n, bright / n, if (bright == 0) 0f else colourless / bright.toFloat())
++    }
++
++    /**
++     * The credits of a file [durationMs] long, or null. [grab] gives the picture's stats at a time (ms), null when
++     * there's no picture; [log] hears each look, for tuning.
++     */
++    suspend fun find(
++        durationMs: Long,
++        movie: Boolean,
++        grab: suspend (Long) -> FrameStats?,
++        log: (String) -> Unit = {}
++    ): SkipInterval? {
++        if (durationMs <= 0) return null
++        val window = windowMs(movie)
++        val step = if (movie) MOVIE_STEP_MS else TV_STEP_MS
++        val from = maxOf(durationMs / 2, durationMs - window)
++        val last = durationMs - END_GUARD_MS
++        if (last <= from) return null
++        val times = ArrayList<Long>()
++        var t = from
++        while (t < last) {
++            times += t
++            t += step
++        }
++        times += last
++
++        val looks = times.map { at -> at to grab(at).also { log("${at / 1000}s ${it ?: "no picture"}") } }
++
++        // The first run of black pictures that's long enough and lettered on more than half of them (a black stretch
++        // lettered on half or less is a gap between acts); a missing picture doesn't break it.
++        var runStart = -1
++        var runEnd = -1
++        var i = 0
++        while (i < looks.size && runStart < 0) {
++            if (looks[i].second?.isBlack != true) {
++                i++
++                continue
++            }
++            var j = i
++            var blacks = 0
++            var lettered = 0
++            var lastBlack = i
++            while (j < looks.size) {
++                val stats = looks[j].second
++                if (stats != null) {
++                    if (!stats.isBlack) break
++                    blacks++
++                    if (stats.isLettered) lettered++
++                    lastBlack = j
++                }
++                j++
++            }
++            val spanMs = looks[lastBlack].first - looks[i].first + step
++            if (blacks >= 2 && lettered * 2 > blacks && spanMs >= MIN_CREDITS_MS) {
++                runStart = i
++                runEnd = lastBlack
++            }
++            i = j
++        }
++        if (runStart < 0) return null
++
++        suspend fun black(at: Long) = grab(at)?.isBlack == true
++
++        // The start lies between the last picture before the run and its first.
++        var before = looks.getOrNull(runStart - 1)?.first ?: (looks[runStart].first - step).coerceAtLeast(0L)
++        var start = looks[runStart].first
++        repeat(REFINE_STEPS) {
++            val mid = (before + start) / 2
++            if (black(mid)) start = mid else before = mid
++        }
++        // The end, between its last picture and the next; a run to the last look ends with the file.
++        var end = durationMs
++        if (runEnd < looks.lastIndex) {
++            var inside = looks[runEnd].first
++            var after = looks[runEnd + 1].first
++            repeat(REFINE_STEPS) {
++                val mid = (inside + after) / 2
++                if (black(mid)) inside = mid else after = mid
++            }
++            end = after
++        }
++        if (durationMs - end <= SHORT_TAIL_MS) end = durationMs
++        log("credits ${start / 1000}s to ${end / 1000}s")
++        return SkipInterval(start / 1000.0, end / 1000.0, if (movie) "movie-credits" else "outro", "picture")
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/skiptimes/SkipFrameGrabber.kt b/app/src/main/java/com/nuvio/tv/core/player/skiptimes/SkipFrameGrabber.kt
+new file mode 100644
+index 00000000..c9ff2e2f
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/player/skiptimes/SkipFrameGrabber.kt
+@@ -0,0 +1,87 @@
++package com.nuvio.tv.core.player.skiptimes
++
++import android.content.Context
++import android.graphics.Bitmap
++import android.media.MediaMetadataRetriever
++import android.net.Uri
++import android.os.Build
++import kotlin.math.roundToInt
++
++/**
++ * Decodes a small keyframe picture at an arbitrary time of the stream the credits are looked for in, without
++ * touching the player: its own [MediaMetadataRetriever] session, one per search, each picture scaled to
++ * [FRAME_WIDTH] (Intro Skipper's thresholds are thumbnail-scale, where lettering blurs into grey).
++ *
++ * A stream whose container the retriever can't seek (HLS, for one) gives no pictures at all — the detector treats
++ * them as missing and finds nothing. Best-effort, as [com.nuvio.tv.ui.screens.player.MatroskaChapterLoader] is.
++ */
++internal class SkipFrameGrabber(
++    context: Context,
++    url: String,
++    headers: Map<String, String>
++) {
++    private val retriever = MediaMetadataRetriever()
++    private var opened = false
++    private var released = false
++
++    init {
++        // setDataSource with a header map needs the framework http source; anything it refuses means no pictures.
++        runCatching {
++            retriever.setDataSource(context, Uri.parse(url), headers)
++            opened = true
++        }.onFailure {
++            runCatching { retriever.release() }
++            released = true
++        }
++    }
++
++    /**
++     * The keyframe at or just before [positionMs], [FRAME_WIDTH] wide (aspect kept), or null. Blocking; call off
++     * the main thread, one grab at a time (the retriever isn't thread-safe).
++     */
++    fun grab(positionMs: Long): Bitmap? {
++        if (released || !opened) return null
++        return runCatching {
++            val frame = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
++                retriever.getScaledFrameAtTime(
++                    positionMs * 1000,
++                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
++                    FRAME_WIDTH,
++                    FRAME_HEIGHT
++                )
++            } else {
++                val full = retriever.getFrameAtTime(
++                    positionMs * 1000,
++                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC
++                ) ?: return null
++                val scale = FRAME_WIDTH.toFloat() / full.width.coerceAtLeast(1)
++                val scaled = Bitmap.createScaledBitmap(
++                    full,
++                    FRAME_WIDTH,
++                    (full.height * scale).roundToInt().coerceAtLeast(1),
++                    true
++                )
++                if (scaled !== full) full.recycle()
++                scaled
++            }
++            // getScaledFrameAtTime can hand back a frame larger than asked when it can't scale down.
++            if (frame.width > FRAME_WIDTH * 2) {
++                val scaled = Bitmap.createScaledBitmap(frame, FRAME_WIDTH, FRAME_HEIGHT, true)
++                frame.recycle()
++                scaled
++            } else frame
++        }.getOrNull()
++    }
++
++    fun release() {
++        if (released) return
++        released = true
++        runCatching { retriever.release() }
++    }
++
++    companion object {
++        /** A keyframe this wide reads like a seek thumbnail, which the detector's shares were tuned for. */
++        const val FRAME_WIDTH = 320
++        const val FRAME_HEIGHT = 180
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/skiptimes/SkipTimeFitter.kt b/app/src/main/java/com/nuvio/tv/core/player/skiptimes/SkipTimeFitter.kt
+new file mode 100644
+index 00000000..c39b46b5
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/player/skiptimes/SkipTimeFitter.kt
+@@ -0,0 +1,181 @@
++package com.nuvio.tv.core.player.skiptimes
++
++import com.nuvio.tv.data.repository.SkipInterval
++import kotlin.math.abs
++
++/** A chapter of the file playing, as its container lists it. [endMs] is the next chapter's start when known. */
++data class MediaChapter(val startMs: Long, val endMs: Long?, val title: String)
++
++/**
++ * Turns the databases' skip times into ones for the file that plays, from what that file says about itself: its
++ * chapter names (exact for this release), its chapter starts (where its cuts really are) and credits found in its
++ * pictures ([CreditsDetector]). The chapter-name patterns follow Intro Skipper's (GPL-3.0, as this app is), with
++ * Western "Main Titles" added.
++ *
++ * The databases' times arrive already merged best-of by [com.nuvio.tv.data.repository.SkipIntroRepository], so
++ * unlike Echo's original there is no judging between providers here: chapter names win over the databases, database
++ * edges snap onto chapter starts, and the pictures' credits fill a missing ending or sharpen the database's one.
++ */
++internal object SkipTimeFitter {
++    private val PREVIEW = Regex(
++        """(^|\s)(Preview|PV|Sneak\s?Peek|Coming\s?(Up|Soon)|Next\s+(time|on|episode)|Extra|Teaser|Trailer)(?![\s:]+End)(\s|:|$)""",
++        RegexOption.IGNORE_CASE
++    )
++    /** The title sequence by name; wins over a plain "Intro", which in anime releases is the cold open before the OP. */
++    private val OPENING = Regex(
++        """(^|\s)(OP|Opening|Main\s+Titles?|Title\s+Sequence)(?![\s:]+End)(\s|:|$)""",
++        RegexOption.IGNORE_CASE
++    )
++    private val INTRO = Regex("""(^|\s)(Intro|Introduction)(?![\s:]+End)(\s|:|$)""", RegexOption.IGNORE_CASE)
++    private val RECAP = Regex(
++        """(^|\s)(Re?cap|Sum{1,2}ary|Prev(ious(ly)?)?|(Last|Earlier)(\s\w+)?|Catch[ -]up)(?![\s:]+End)(\s|:|$)""",
++        RegexOption.IGNORE_CASE
++    )
++    private val CREDITS = Regex("""(^|\s)(Credits?|ED|Ending|Outro)(?![\s:]+End)(\s|:|$)""", RegexOption.IGNORE_CASE)
++
++    /** An edge moves onto a chapter start this close. */
++    private const val CHAPTER_SNAP_S = 5.0
++    /** Credits found in the pictures this close to a database's take their start from the pictures. */
++    private const val CREDITS_AGREE_S = 60.0
++
++    private const val KIND_OPENING = "opening"
++    private const val KIND_RECAP = "recap"
++    private const val KIND_ENDING = "ending"
++    private const val KIND_MOVIE_CREDITS = "movie-credits"
++    private val KINDS = listOf(KIND_OPENING, KIND_RECAP, KIND_ENDING, KIND_MOVIE_CREDITS)
++
++    /**
++     * The skip times for a file [durationMs] long: the databases' [remote] with what the file has said so far —
++     * named chapters ([chapters], when the file lists any) and [credits] found in its pictures.
++     */
++    fun combine(
++        remote: List<SkipInterval>,
++        durationMs: Long,
++        movie: Boolean,
++        chapters: List<MediaChapter>?,
++        credits: SkipInterval?
++    ): List<SkipInterval> {
++        val named = fromChapters(chapters.orEmpty(), durationMs, movie)
++        val marks = chapters?.let(::chapterMarks) ?: DoubleArray(0)
++        val out = ArrayList<SkipInterval>()
++        for (kind in KINDS) {
++            val ofKind = { interval: SkipInterval -> category(interval.type) == kind }
++            var chosen = named.firstOrNull(ofKind)
++                ?: remote.firstOrNull(ofKind)?.let { snap(it, marks, durationMs) }
++            if (kind == KIND_ENDING || kind == KIND_MOVIE_CREDITS) {
++                chosen = withCredits(chosen, credits?.takeIf(ofKind), durationMs)
++            }
++            chosen?.let(out::add)
++        }
++        // What has no kind (a movie's post-credits scene) passes through.
++        val scenes = remote.filter { category(it.type) == null }
++        // Skipping credits must not also skip the post-credits scene behind them.
++        val scene = scenes.minByOrNull { it.startTime }
++        val clamped = if (scene != null && scene.startTime.isFinite()) {
++            out.map { interval ->
++                val clampedEnd = minOf(interval.endTime, scene.startTime)
++                if (clampedEnd < interval.endTime && clampedEnd > interval.startTime) {
++                    interval.copy(endTime = clampedEnd)
++                } else interval
++            }
++        } else out
++        return (clamped + scenes).sortedBy { it.startTime }
++    }
++
++    /**
++     * Segments the file's chapter names give, the first of each kind (an opening by name before a plain "Intro"); a
++     * movie's chapters only give its credits.
++     */
++    fun fromChapters(chapters: List<MediaChapter>, durationMs: Long, movie: Boolean): List<SkipInterval> {
++        if (chapters.isEmpty() || durationMs <= 0) return emptyList()
++        val found = LinkedHashMap<String, SkipInterval>()
++        val namedOpening = !movie && chapters.any { OPENING.containsMatchIn(it.title) && !PREVIEW.containsMatchIn(it.title) }
++        chapters.forEachIndexed { i, chapter ->
++            val title = chapter.title
++            if (title.isBlank() || PREVIEW.containsMatchIn(title)) return@forEachIndexed
++            val type = when {
++                movie -> if (CREDITS.containsMatchIn(title)) "movie-credits" else null
++                OPENING.containsMatchIn(title) -> "intro"
++                INTRO.containsMatchIn(title) -> if (namedOpening) null else "intro"
++                RECAP.containsMatchIn(title) -> "recap"
++                CREDITS.containsMatchIn(title) -> "outro"
++                else -> null
++            } ?: return@forEachIndexed
++            val kind = category(type) ?: return@forEachIndexed
++            if (kind in found) return@forEachIndexed
++            val endMs = (chapter.endMs ?: chapters.getOrNull(i + 1)?.startMs ?: durationMs).coerceAtMost(durationMs)
++            val interval = SkipInterval(chapter.startMs / 1000.0, endMs / 1000.0, type, "chapters")
++            if (lengthFits(interval, kind) && plausible(interval, durationMs)) found[kind] = interval
++        }
++        return found.values.toList()
++    }
++
++    private fun lengthFits(interval: SkipInterval, kind: String): Boolean {
++        val length = interval.endTime - interval.startTime
++        return when (kind) {
++            KIND_OPENING -> length in 10.0..180.0
++            KIND_RECAP -> length in 5.0..240.0
++            KIND_ENDING -> length in 10.0..600.0
++            else -> length in 10.0..1200.0
++        }
++    }
++
++    /** A chapter segment within the file and not covering it whole; the same sanity the databases' are given. */
++    private fun plausible(interval: SkipInterval, durationMs: Long): Boolean {
++        if (!interval.startTime.isFinite() || !interval.endTime.isFinite()) return false
++        if (interval.startTime < 0.0 || interval.endTime <= interval.startTime) return false
++        return durationMs <= 0 || interval.endTime <= durationMs / 1000.0
++    }
++
++    /** Chapter starts (s), the file's start left out: every cut a chapter marks. */
++    private fun chapterMarks(chapters: List<MediaChapter>): DoubleArray =
++        chapters.map { it.startMs / 1000.0 }.filter { it > 0.5 }.distinct().sorted().toDoubleArray()
++
++    /** Edges onto a chapter start close by. */
++    private fun snap(interval: SkipInterval, marks: DoubleArray, durationMs: Long): SkipInterval {
++        if (marks.isEmpty()) return interval
++        fun onChapter(edge: Double): Double? = nearest(marks, edge)?.takeIf { abs(it - edge) <= CHAPTER_SNAP_S }
++        val length = if (durationMs > 0) durationMs / 1000.0 else Double.MAX_VALUE
++        val start = onChapter(interval.startTime) ?: interval.startTime
++        var end = interval.endTime
++        if (end.isFinite() && end < length) end = onChapter(end) ?: end
++        if (end <= start) return interval
++        return if (start == interval.startTime && end == interval.endTime) interval
++        else interval.copy(startTime = start, endTime = end)
++    }
++
++    /**
++     * The database's ending, its start set by the credits found in the pictures when the two are close; the pictures'
++     * credits alone when no database has an ending.
++     */
++    private fun withCredits(db: SkipInterval?, found: SkipInterval?, durationMs: Long): SkipInterval? {
++        if (found == null || db?.provider == "chapters") return db
++        if (db == null) return found
++        if (abs(found.startTime - db.startTime) > CREDITS_AGREE_S) return db
++        val fileEnd = if (durationMs > 0) durationMs / 1000.0 else Double.MAX_VALUE
++        // The database knows how the credits end, unless it runs past this file or the pictures agree anyway.
++        val end = if (db.endTime > fileEnd || abs(found.endTime - db.endTime) <= CREDITS_AGREE_S) found.endTime else db.endTime
++        return db.copy(startTime = found.startTime, endTime = maxOf(end, found.startTime + 1.0))
++    }
++
++    private fun category(type: String): String? = when (type.trim().lowercase()) {
++        "intro", "op", "opening", "mixed-op" -> KIND_OPENING
++        "recap" -> KIND_RECAP
++        "outro", "ed", "ending", "mixed-ed", "credits" -> KIND_ENDING
++        "movie-credits" -> KIND_MOVIE_CREDITS
++        else -> null
++    }
++
++    private fun nearest(sorted: DoubleArray, value: Double): Double? {
++        if (sorted.isEmpty()) return null
++        var lo = 0
++        var hi = sorted.size - 1
++        while (lo < hi) {
++            val mid = (lo + hi) ushr 1
++            if (sorted[mid] < value) lo = mid + 1 else hi = mid
++        }
++        val after = sorted[lo]
++        val before = if (lo > 0) sorted[lo - 1] else after
++        return if (abs(before - value) <= abs(after - value)) before else after
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt b/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
+index 43d3a1ae..4bba9cb9 100644
+--- a/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
++++ b/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
+@@ -286,6 +286,7 @@ data class PlayerSettings(
+     val pauseOverlayEnabled: Boolean = true,
+     val osdClockEnabled: Boolean = true,
+     val skipIntroEnabled: Boolean = true,
++    val localCreditsDetection: Boolean = false,
+     val parentalGuideEnabled: Boolean = true,
+     val autoSkipSegmentTypes: Set<AutoSkipSegmentType> = emptySet(),
+     // Dolby Vision settings (libdovi conversion). dv7HandlingMode == HDR10_BASE_LAYER
+@@ -610,6 +611,7 @@ class PlayerSettingsDataStore @Inject constructor(
+     private val pauseOverlayEnabledKey = booleanPreferencesKey("pause_overlay_enabled")
+     private val osdClockEnabledKey = booleanPreferencesKey("osd_clock_enabled")
+     private val skipIntroEnabledKey = booleanPreferencesKey("skip_intro_enabled")
++    private val localCreditsDetectionKey = booleanPreferencesKey("local_credits_detection")
+     private val parentalGuideEnabledKey = booleanPreferencesKey("parental_guide_enabled")
+     private val autoSkipSegmentTypesKey = stringSetPreferencesKey("auto_skip_segment_types")
+ 
+@@ -1018,6 +1020,7 @@ class PlayerSettingsDataStore @Inject constructor(
+                 pauseOverlayEnabled = prefs[pauseOverlayEnabledKey] ?: true,
+                 osdClockEnabled = prefs[osdClockEnabledKey] ?: true,
+                 skipIntroEnabled = prefs[skipIntroEnabledKey] ?: true,
++                localCreditsDetection = prefs[localCreditsDetectionKey] ?: false,
+                 parentalGuideEnabled = prefs[parentalGuideEnabledKey] ?: true,
+                 autoSkipSegmentTypes = prefs[autoSkipSegmentTypesKey]
+                     ?.mapNotNull(AutoSkipSegmentType::fromStoredValue)
+@@ -1337,6 +1340,12 @@ class PlayerSettingsDataStore @Inject constructor(
+         }
+     }
+ 
++    suspend fun setLocalCreditsDetection(enabled: Boolean) {
++        store().edit { prefs ->
++            prefs[localCreditsDetectionKey] = enabled
++        }
++    }
++
+     suspend fun setParentalGuideEnabled(enabled: Boolean) {
+         store().edit { prefs ->
+             prefs[parentalGuideEnabledKey] = enabled
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
+index 1ddc637d..f53c59e8 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
+@@ -541,6 +541,8 @@ class PlayerRuntimeController(
+     internal var autoSkipSegmentTypes: Set<AutoSkipSegmentType> = emptySet()
+     internal var playerSettingsInitialized: Boolean = false
+     internal var skipIntroFetchedKey: String? = null
++    /** Remote skip times and the local (picture) fallback's own state; see PlayerRuntimeControllerSkipTimes.kt. */
++    internal val localSkipTimes = LocalSkipTimesState()
+     internal val autoSkippedIntervalKeys: MutableSet<String> = mutableSetOf()
+     internal var lastActiveSkipType: String? = null
+     internal var autoSubtitleSelected: Boolean = false
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerObservers.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerObservers.kt
+index 3a79ca9a..834e90c0 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerObservers.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerObservers.kt
+@@ -492,6 +492,8 @@ internal fun PlayerRuntimeController.observeSubtitleSettings() {
+             skipIntroEnabled = settings.skipIntroEnabled
+             parentalGuideEnabled = settings.parentalGuideEnabled
+             autoSkipSegmentTypes = settings.autoSkipSegmentTypes
++            val wasLocalSkipEnabled = localSkipTimes.enabled
++            localSkipTimes.enabled = settings.localCreditsDetection
+             playerSettingsInitialized = true
+ 
+             // Fetch parental guide on first settings emission (after we know
+@@ -507,11 +509,22 @@ internal fun PlayerRuntimeController.observeSubtitleSettings() {
+                     autoSkippedIntervalKeys.clear()
+                     _uiState.update { it.copy(activeSkipInterval = null, skipIntervalDismissed = true) }
+                 }
++                stopLocalSkipTimes()
+             } else {
+                 if (!wasEnabled || skipIntroFetchedKey == null) {
+                     _uiState.update { it.copy(skipIntervalDismissed = false) }
+                     fetchSkipIntervals(contentId, currentSeason, currentEpisode)
+                 }
++                if (wasLocalSkipEnabled != localSkipTimes.enabled) {
++                    if (localSkipTimes.enabled) {
++                        // On: the position tick starts the search once the remote databases
++                        // have answered and had nothing for this stream.
++                        localSkipTimes.searchedFor = null
++                    } else {
++                        // Off: stop the search and drop what it found.
++                        stopLocalSkipTimes()
++                    }
++                }
+             }
+         }
+     }
+@@ -637,9 +650,9 @@ internal fun PlayerRuntimeController.fetchSkipIntervals(id: String?, season: Int
+         if (skipIntroFetchedKey == key) return
+         skipIntroFetchedKey = key
+         scope.launch {
+-            skipIntervals = withTimeoutOrNull(15_000L) {
++            applyRemoteSkipTimes(withTimeoutOrNull(15_000L) {
+                 skipIntroRepository.getMovieSkipIntervals(id, effectiveId)
+-            } ?: emptyList()
++            } ?: emptyList())
+         }
+         return
+     }
+@@ -659,9 +672,9 @@ internal fun PlayerRuntimeController.fetchSkipIntervals(id: String?, season: Int
+         skipIntroFetchedKey = key
+         val imdbId = id?.takeIf { it.startsWith("tt") } ?: metaImdbId
+         scope.launch {
+-            skipIntervals = withTimeoutOrNull(15_000L) {
++            applyRemoteSkipTimes(withTimeoutOrNull(15_000L) {
+                 skipIntroRepository.getSkipIntervalsForMal(malId, malEpisode, imdbId = imdbId, imdbSeason = season, imdbEpisode = episode)
+-            } ?: emptyList()
++            } ?: emptyList())
+         }
+         return
+     }
+@@ -676,9 +689,9 @@ internal fun PlayerRuntimeController.fetchSkipIntervals(id: String?, season: Int
+         skipIntroFetchedKey = key
+         val imdbId = id?.takeIf { it.startsWith("tt") } ?: metaImdbId
+         scope.launch {
+-            skipIntervals = withTimeoutOrNull(15_000L) {
++            applyRemoteSkipTimes(withTimeoutOrNull(15_000L) {
+                 skipIntroRepository.getSkipIntervalsForKitsu(kitsuId, kitsuEpisode, imdbId = imdbId, imdbSeason = season, imdbEpisode = episode)
+-            } ?: emptyList()
++            } ?: emptyList())
+         }
+         return
+     }
+@@ -691,9 +704,9 @@ internal fun PlayerRuntimeController.fetchSkipIntervals(id: String?, season: Int
+     skipIntroFetchedKey = key
+ 
+     scope.launch {
+-        skipIntervals = withTimeoutOrNull(15_000L) {
++        applyRemoteSkipTimes(withTimeoutOrNull(15_000L) {
+             skipIntroRepository.getSkipIntervals(imdbId, season, episode)
+-        } ?: emptyList()
++        } ?: emptyList())
+     }
+ }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
+index 020ac0ff..c4d09a4d 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
+@@ -445,6 +445,7 @@ internal fun PlayerRuntimeController.startProgressUpdates() {
+                     updateMpvTracksOnTick()
+                     mpvView?.sampleThroughput(context, currentStreamUrl) // Nuvio fork: connection-speed learning
+                     updateActiveSkipInterval(pos)
++                    ensureLocalSkipDetection(pos)
+                     if (!_playbackTimeline.value.isLive) {
+                         evaluatePostPlayOverlayVisibility(
+                             positionMs = pos,
+@@ -515,6 +516,7 @@ internal fun PlayerRuntimeController.startProgressUpdates() {
+                     }
+                 }
+                 updateActiveSkipInterval(pos)
++                ensureLocalSkipDetection(pos)
+                 if (!_playbackTimeline.value.isLive) {
+                     evaluatePostPlayOverlayVisibility(
+                         positionMs = pos,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerSkipTimes.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerSkipTimes.kt
+new file mode 100644
+index 00000000..f2ca7adb
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerSkipTimes.kt
+@@ -0,0 +1,144 @@
++package com.nuvio.tv.ui.screens.player
++
++import android.util.Log
++import com.nuvio.tv.core.player.skiptimes.CreditsDetector
++import com.nuvio.tv.core.player.skiptimes.MediaChapter
++import com.nuvio.tv.core.player.skiptimes.SkipFrameGrabber
++import com.nuvio.tv.core.player.skiptimes.SkipTimeFitter
++import com.nuvio.tv.data.repository.SkipInterval
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import kotlinx.coroutines.withTimeoutOrNull
++
++/** Local (no-API) skip detection's state: what the remote databases gave, and what the file's own pictures gave. */
++internal class LocalSkipTimesState {
++    /** The remote databases' result for the current stream; cleared when the stream changes. */
++    var remote: List<SkipInterval> = emptyList()
++    /** Credits found in the current stream's pictures, or null while none. */
++    var found: SkipInterval? = null
++    /** The stream the search ran (or was given up) for: it runs once per stream. */
++    var searchedFor: String? = null
++    var job: Job? = null
++    /** The playback setting; off (default) because the search decodes pictures of its own. */
++    var enabled: Boolean = false
++}
++
++/** Between two pictures, so the retriever and the network stay free for playback and scrubbing. */
++private const val LOCAL_SKIP_GRAB_PACE_MS = 250L
++/** One picture at most this long; a stream the retriever hangs on gives up that look, not the search. */
++private const val LOCAL_SKIP_GRAB_TIMEOUT_MS = 12_000L
++/** Credits are searched this long before the stretch they could start in, which leaves time to finish. */
++private const val LOCAL_SKIP_SEARCH_LEAD_MS = 5 * 60_000L
++
++/**
++ * The remote databases' result applied and merged with what the file itself has said. Every path that used to
++ * assign [PlayerRuntimeController.skipIntervals] directly goes through here, so the local fallback (when the
++ * databases had nothing) and the chapter/credits sharpening see each result.
++ */
++internal fun PlayerRuntimeController.applyRemoteSkipTimes(times: List<SkipInterval>) {
++    localSkipTimes.remote = times
++    refreshSkipIntervals()
++}
++
++/** [PlayerRuntimeController.skipIntervals] again, from the remote times and what the file has said so far. */
++internal fun PlayerRuntimeController.refreshSkipIntervals() {
++    if (!skipIntroEnabled) return
++    val next = SkipTimeFitter.combine(
++        remote = localSkipTimes.remote,
++        durationMs = currentPlaybackDurationMs().coerceAtLeast(0L),
++        movie = contentType.equals("movie", ignoreCase = true),
++        chapters = currentMediaChapters(),
++        credits = localSkipTimes.found
++    )
++    if (next == skipIntervals) return
++    skipIntervals = next
++    Log.i(
++        PlayerRuntimeController.TAG,
++        "SKIP_TIMES: " + next.joinToString { "${it.type} ${it.startTime}-${it.endTime} (${it.provider})" }
++            .ifEmpty { "none" }
++    )
++}
++
++/** The playing file's chapters, with each one's end set to the next chapter's start. */
++private fun PlayerRuntimeController.currentMediaChapters(): List<MediaChapter>? {
++    val chapters = _uiState.value.chapters
++    if (chapters.isEmpty()) return null
++    return chapters.mapIndexed { i, chapter ->
++        MediaChapter(chapter.startMs, chapters.getOrNull(i + 1)?.startMs, chapter.title.orEmpty())
++    }
++}
++
++/** Turning local detection off stops its search and drops what it found. */
++internal fun PlayerRuntimeController.stopLocalSkipTimes() {
++    localSkipTimes.job?.cancel()
++    localSkipTimes.job = null
++    localSkipTimes.searchedFor = null
++    localSkipTimes.found = null
++    refreshSkipIntervals()
++}
++
++/** A new episode or source: its times start over. */
++internal fun PlayerRuntimeController.resetSkipTimesForSourceChange() {
++    localSkipTimes.job?.cancel()
++    localSkipTimes.job = null
++    localSkipTimes.remote = emptyList()
++    localSkipTimes.searchedFor = null
++    localSkipTimes.found = null
++}
++
++/**
++ * On every position tick: starts the credits search of the file playing once the remote databases have answered and
++ * had nothing, the position is near the stretch the credits could start in, and the search hasn't run for this
++ * stream yet. The pictures come from the stream itself ([SkipFrameGrabber]), not the player's surface.
++ */
++internal fun PlayerRuntimeController.ensureLocalSkipDetection(positionMs: Long) {
++    val state = localSkipTimes
++    if (!state.enabled || !skipIntroEnabled || !playerSettingsInitialized) return
++    if (state.job?.isActive == true || state.searchedFor == currentStreamUrl) return
++    if (_playbackTimeline.value.isLive) return
++    // Only a fallback: the remote path has to have run and come back empty first.
++    if (skipIntroFetchedKey == null || skipIntervals.isNotEmpty()) return
++    val durationMs = currentPlaybackDurationMs().takeIf { it > 0 && !isShortPlaceholderDuration(it) } ?: return
++    val url = currentStreamUrl.takeIf { it.isNotBlank() } ?: return
++    val movie = contentType.equals("movie", ignoreCase = true)
++    if (positionMs < durationMs - CreditsDetector.windowMs(movie) - LOCAL_SKIP_SEARCH_LEAD_MS) return
++    // Don't compete with the network while playback is still finding its feet.
++    if (_uiState.value.isBuffering) return
++    state.searchedFor = url
++    state.job = scope.launch { findLocalSkipTimes(url, durationMs, movie) }
++}
++
++private suspend fun PlayerRuntimeController.findLocalSkipTimes(url: String, durationMs: Long, movie: Boolean) {
++    Log.i(
++        PlayerRuntimeController.TAG,
++        "LOCAL_SKIP_TIMES: searching credits (${if (movie) "movie" else "episode"}, ${durationMs / 1000}s)"
++    )
++    val request = PlayerMediaSourceFactory.normalizePlaybackRequest(url, currentHeaders)
++    // Opening the retriever reads the stream header: off the main thread, like every grab.
++    val grabber = withContext(Dispatchers.IO) { SkipFrameGrabber(context, request.url, request.headers) }
++    try {
++        val found = CreditsDetector.find(
++            durationMs = durationMs,
++            movie = movie,
++            grab = { positionMs ->
++                delay(LOCAL_SKIP_GRAB_PACE_MS)
++                withTimeoutOrNull(LOCAL_SKIP_GRAB_TIMEOUT_MS) {
++                    withContext(Dispatchers.IO) { grabber.grab(positionMs) }
++                }?.let { bitmap ->
++                    withContext(Dispatchers.Default) {
++                        CreditsDetector.stats(bitmap).also { bitmap.recycle() }
++                    }
++                }
++            },
++            log = { Log.i(PlayerRuntimeController.TAG, "LOCAL_SKIP_TIMES: $it") }
++        )
++        if (currentStreamUrl != url) return
++        localSkipTimes.found = found
++        refreshSkipIntervals()
++    } finally {
++        grabber.release()
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
+index f51d423b..a2519bc6 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
+@@ -1628,6 +1628,7 @@ internal fun PlayerRuntimeController.switchToEpisodeStream(
+     skipIntroFetchedKey = null
+     lastActiveSkipType = null
+     autoSkippedIntervalKeys.clear()
++    resetSkipTimesForSourceChange()
+ 
+     fetchParentalGuide(contentId, contentType, currentSeason, currentEpisode)
+     fetchSkipIntervals(contentId, currentSeason, currentEpisode)
+@@ -1742,6 +1743,7 @@ private fun PlayerRuntimeController.switchToEpisodeStreamCommon(
+     skipIntroFetchedKey = null
+     lastActiveSkipType = null
+     autoSkippedIntervalKeys.clear()
++    resetSkipTimesForSourceChange()
+ 
+     fetchParentalGuide(contentId, contentType, currentSeason, currentEpisode)
+     fetchSkipIntervals(contentId, currentSeason, currentEpisode)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPlayerSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPlayerSettings.kt
+index 481f351a..2956f524 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPlayerSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPlayerSettings.kt
+@@ -71,6 +71,14 @@ internal fun PlaybackSkipSegmentsSection(
+         enabled = internalPlayer
+     )
+ 
++    SettingsToggleRow(
++        title = stringResource(R.string.playback_local_skip_segments),
++        subtitle = stringResource(R.string.playback_local_skip_segments_sub),
++        checked = settings.localCreditsDetection,
++        onToggle = { onUpdate { setLocalCreditsDetection(!settings.localCreditsDetection) } },
++        enabled = autoSkipEnabled
++    )
++
+     SettingsSectionLabel(
+         text = stringResource(R.string.playback_auto_skip_segments),
+         description = stringResource(R.string.playback_auto_skip_segments_sub)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSettingsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSettingsViewModel.kt
+index cf336790..a3b68dc6 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSettingsViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSettingsViewModel.kt
+@@ -184,6 +184,10 @@ class PlaybackSettingsViewModel @Inject constructor(
+         playerSettingsDataStore.setSkipIntroEnabled(enabled)
+     }
+ 
++    suspend fun setLocalCreditsDetection(enabled: Boolean) {
++        playerSettingsDataStore.setLocalCreditsDetection(enabled)
++    }
++
+     suspend fun setParentalGuideEnabled(enabled: Boolean) {
+         playerSettingsDataStore.setParentalGuideEnabled(enabled)
+     }
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index dd8d4cbc..7f90b64d 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -753,6 +753,8 @@
+     <string name="playback_osd_clock">OSD Clock</string>
+     <string name="playback_skip_intro">Skip Intro</string>
+     <string name="playback_skip_intro_sub">Use introdb.app to detect intros and recaps.</string>
++    <string name="playback_local_skip_segments">Local Skip Detection</string>
++    <string name="playback_local_skip_segments_sub">Find credits from the video itself when the databases have none. Uses extra CPU near the end.</string>
+     <string name="playback_parental_guide">Content Warnings</string>
+     <string name="playback_parental_guide_sub">Show parental guidance overlay when playback starts.</string>
+     <string name="playback_auto_skip_segments">Automatic Skipping</string>

@@ -1,0 +1,2382 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/di/RepositoryModule.kt b/app/src/main/java/com/nuvio/tv/core/di/RepositoryModule.kt
+index 56f9dd5b..c8f23970 100644
+--- a/app/src/main/java/com/nuvio/tv/core/di/RepositoryModule.kt
++++ b/app/src/main/java/com/nuvio/tv/core/di/RepositoryModule.kt
+@@ -20,8 +20,14 @@ import dagger.Binds
+ import dagger.Module
+ import dagger.hilt.InstallIn
+ import dagger.hilt.components.SingletonComponent
++import javax.inject.Qualifier
+ import javax.inject.Singleton
+ 
++/** Un-overlaid metadata provider repository (bypasses any selected TVDB episode order). */
++@Qualifier
++@Retention(AnnotationRetention.RUNTIME)
++annotation class ProviderMetadata
++
+ @Module
+ @InstallIn(SingletonComponent::class)
+ abstract class RepositoryModule {
+@@ -40,7 +46,11 @@ abstract class RepositoryModule {
+ 
+     @Binds
+     @Singleton
+-    abstract fun bindMetaRepository(impl: MetaRepositoryImpl): MetaRepository
++    abstract fun bindMetaRepository(impl: com.nuvio.tv.data.tvdb.TvdbMetaRepository): MetaRepository
++
++    @Binds
++    @ProviderMetadata
++    abstract fun bindProviderMetadata(impl: MetaRepositoryImpl): MetaRepository
+ 
+     @Binds
+     @Singleton
+diff --git a/app/src/main/java/com/nuvio/tv/core/di/TvdbModule.kt b/app/src/main/java/com/nuvio/tv/core/di/TvdbModule.kt
+new file mode 100644
+index 00000000..221efef6
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/di/TvdbModule.kt
+@@ -0,0 +1,26 @@
++package com.nuvio.tv.core.di
++
++import com.nuvio.tv.core.profile.ProfileScopedCredentialStore
++import com.nuvio.tv.data.tvdb.TvdbCredentialStore
++import dagger.Module
++import dagger.Provides
++import dagger.hilt.InstallIn
++import dagger.hilt.components.SingletonComponent
++import dagger.multibindings.IntoSet
++import okhttp3.OkHttpClient
++import java.util.concurrent.TimeUnit
++import javax.inject.Named
++import javax.inject.Singleton
++
++@Module
++@InstallIn(SingletonComponent::class)
++object TvdbModule {
++    // Dedicated client: no HTTP logging or permissive addon TLS interceptors.
++    @Provides @Singleton @Named("tvdb")
++    fun http(): OkHttpClient = OkHttpClient.Builder()
++        .connectTimeout(15, TimeUnit.SECONDS).readTimeout(30, TimeUnit.SECONDS)
++        .callTimeout(45, TimeUnit.SECONDS).followRedirects(false).build()
++
++    @Provides @IntoSet
++    fun credentialStore(store: TvdbCredentialStore): ProfileScopedCredentialStore = store
++}
+diff --git a/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbClient.kt b/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbClient.kt
+new file mode 100644
+index 00000000..84397d34
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbClient.kt
+@@ -0,0 +1,226 @@
++package com.nuvio.tv.data.tvdb
++
++import com.nuvio.tv.domain.model.EpisodeCoordinates
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.ensureActive
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
++import kotlinx.coroutines.withContext
++import kotlinx.coroutines.suspendCancellableCoroutine
++import kotlinx.serialization.json.*
++import okhttp3.MediaType.Companion.toMediaType
++import okhttp3.OkHttpClient
++import okhttp3.Call
++import okhttp3.Callback
++import okhttp3.Response
++import okhttp3.Request
++import okhttp3.RequestBody.Companion.toRequestBody
++import java.io.IOException
++import javax.inject.Inject
++import javax.inject.Named
++import javax.inject.Singleton
++import kotlin.coroutines.coroutineContext
++import kotlin.coroutines.resume
++import kotlin.coroutines.resumeWithException
++
++class TvdbException(val reason: Reason) : IOException(reason.name) {
++    enum class Reason { NO_KEY, AUTHENTICATION, RATE_LIMIT, UNAVAILABLE, NETWORK, INVALID_RESPONSE, CREDENTIALS_CHANGED }
++}
++
++data class TvdbOrder(val type: String, val name: String)
++data class TvdbEpisode(
++    val id: Long, val coordinates: EpisodeCoordinates, val title: String,
++    val overview: String?, val image: String?, val aired: String?, val runtime: Int?
++)
++
++@Singleton
++class TvdbClient @Inject constructor(
++    private val credentials: TvdbCredentialStore,
++    @Named("tvdb") private val http: OkHttpClient
++) {
++    private class Token(val revision: Long, val value: String, val expiresAt: Long)
++    private val mutex = Mutex()
++    private val tokens = mutableMapOf<Int, Token>()
++    private val json = Json { ignoreUnknownKeys = true }
++
++    /** Login only: never persist or display the bearer token. */
++    suspend fun testConnection(profileId: Int) = mutex.withLock {
++        withContext(Dispatchers.IO) {
++            tokens.remove(profileId)
++            token(profileId)
++            Unit
++        }
++    }
++
++    suspend fun orders(profileId: Int, seriesId: Long): List<TvdbOrder> {
++        require(seriesId > 0)
++        val series = get(profileId, "series/$seriesId/extended").objectData()
++        return series["seasons"].array().mapNotNull { value ->
++            val type = value.jsonObject["type"] as? JsonObject ?: return@mapNotNull null
++            val id = type["type"].string() ?: return@mapNotNull null
++            TvdbOrder(id, type["name"].string() ?: id)
++        }.distinctBy { it.type }
++    }
++
++    suspend fun seriesByRemoteId(profileId: Int, remoteId: String): Long? {
++        require(remoteId.matches(Regex("[A-Za-z0-9:_-]+")))
++        return get(profileId, "search/remoteid/$remoteId")["data"].array()
++            .mapNotNull { (it.jsonObject["series"] as? JsonObject)?.get("id").long() }
++            .distinct().singleOrNull()
++    }
++
++    /** All pages must succeed. Never return a truncated order after a page error. */
++    suspend fun episodes(profileId: Int, seriesId: Long, order: String, language: String = "eng"): List<TvdbEpisode> {
++        require(seriesId > 0 && order.matches(Regex("[a-zA-Z0-9_-]+")) && language.matches(Regex("[a-z]{3}")))
++        val revision = credentials.revision(profileId)
++        val result = mutableListOf<TvdbEpisode>()
++        val seenIds = mutableSetOf<Long>()
++        var page = 0
++        do {
++            val response = get(profileId, "series/$seriesId/episodes/$order/$language?page=$page")
++            val rows = response.objectData()["episodes"] as? JsonArray
++                ?: throw TvdbException(TvdbException.Reason.INVALID_RESPONSE)
++            val pageEpisodes = rows.map { parseTvdbEpisode(it.jsonObject) }
++            if (pageEpisodes.isNotEmpty() && pageEpisodes.all { it.id in seenIds }) {
++                throw TvdbException(TvdbException.Reason.INVALID_RESPONSE)
++            }
++            pageEpisodes.forEach { seenIds += it.id }
++            result += pageEpisodes
++            val next = (response["links"] as? JsonObject)?.get("next").string()
++            if (next == null) break
++            if (rows.isEmpty() || ++page > 1000) throw TvdbException(TvdbException.Reason.INVALID_RESPONSE)
++        } while (true)
++        if (result.groupBy { it.id }.any { it.value.distinct().size != 1 }) {
++            throw TvdbException(TvdbException.Reason.INVALID_RESPONSE)
++        }
++        checkRevision(profileId, revision)
++        val unique = result.distinctBy { it.id }
++        if (unique.groupBy { it.coordinates }.any { it.value.size > 1 }) throw TvdbException(TvdbException.Reason.INVALID_RESPONSE)
++        return unique
++    }
++
++    suspend fun episodesFromSeasons(profileId: Int, seriesId: Long, order: String): List<TvdbEpisode> {
++        require(seriesId > 0 && order.matches(Regex("[a-zA-Z0-9_-]+")))
++        val series = get(profileId, "series/$seriesId/extended").objectData()
++        val result = mutableListOf<TvdbEpisode>()
++        for (season in series["seasons"].array().map { it.jsonObject }) {
++            val type = season["type"] as? JsonObject ?: continue
++            if (type["type"].string() != order) continue
++            val id = season["id"].long()?.takeIf { it > 0 } ?: continue
++            val number = season["number"].long() ?: throw TvdbException(TvdbException.Reason.INVALID_RESPONSE)
++            val details = get(profileId, "seasons/$id/extended").objectData()
++            for (episode in details["episodes"].array()) {
++                result += parseTvdbEpisode(JsonObject(episode.jsonObject + ("seasonNumber" to JsonPrimitive(number))))
++            }
++        }
++        if (result.groupBy { it.id }.any { it.value.size > 1 } || result.groupBy { it.coordinates }.any { it.value.size > 1 }) {
++            throw TvdbException(TvdbException.Reason.INVALID_RESPONSE)
++        }
++        return result
++    }
++
++    private suspend fun get(profileId: Int, path: String): JsonObject = mutex.withLock {
++        withContext(Dispatchers.IO) {
++            repeat(2) { attempt ->
++                val token = token(profileId)
++                val request = Request.Builder().url("$BASE/$path")
++                    .header("Authorization", "Bearer ${token.value}").build()
++                try {
++                    val (code, body) = executeRequest(request)
++                    coroutineContext.ensureActive()
++                    checkRevision(profileId, token.revision)
++                    if (code == 401 && attempt == 0) {
++                        tokens.remove(profileId)
++                    } else {
++                        checkStatus(code)
++                        return@withContext decode(body)
++                    }
++                } catch (e: TvdbException) { throw e }
++                catch (_: IOException) { throw TvdbException(TvdbException.Reason.NETWORK) }
++            }
++            throw TvdbException(TvdbException.Reason.AUTHENTICATION)
++        }
++    }
++
++    private suspend fun token(profileId: Int): Token {
++        val revision = credentials.revision(profileId)
++        tokens[profileId]?.takeIf { it.revision == revision && it.expiresAt > System.currentTimeMillis() }?.let { return it }
++        val key = credentials.read(profileId) ?: throw TvdbException(TvdbException.Reason.NO_KEY)
++        // PIN deliberately omitted: API-key-only authentication is supported.
++        val body = buildJsonObject { put("apikey", key) }.toString().toRequestBody("application/json".toMediaType())
++        try {
++            val (code, responseBody) = executeRequest(Request.Builder().url("$BASE/login").post(body).build())
++            checkRevision(profileId, revision)
++            checkStatus(code)
++            val value = decode(responseBody).objectData()["token"].string()
++                ?: throw TvdbException(TvdbException.Reason.INVALID_RESPONSE)
++            return Token(revision, value, System.currentTimeMillis() + 28L * 24 * 60 * 60 * 1000)
++                .also { tokens[profileId] = it }
++        } catch (e: TvdbException) { throw e }
++        catch (_: IOException) { throw TvdbException(TvdbException.Reason.NETWORK) }
++    }
++
++    /** Cancellation must stop the socket too, so a timed-out show releases the
++     * client lock instead of blocking every other TVDB request until HTTP timeout. */
++    private suspend fun executeRequest(request: Request): Pair<Int, String> = suspendCancellableCoroutine { continuation ->
++        val call = http.newCall(request)
++        continuation.invokeOnCancellation { call.cancel() }
++        call.enqueue(object : Callback {
++            override fun onFailure(call: Call, error: IOException) {
++                continuation.resumeWithException(TvdbException(TvdbException.Reason.NETWORK))
++            }
++            override fun onResponse(call: Call, response: Response) {
++                val result = try {
++                    response.use {
++                        val body = it.body?.string() ?: throw TvdbException(TvdbException.Reason.INVALID_RESPONSE)
++                        it.code to body
++                    }
++                } catch (error: Exception) {
++                    val reason = if (error is IOException) TvdbException.Reason.NETWORK else TvdbException.Reason.INVALID_RESPONSE
++                    continuation.resumeWithException(error as? TvdbException ?: TvdbException(reason))
++                    return
++                }
++                continuation.resume(result)
++            }
++        })
++    }
++
++    private fun checkRevision(profileId: Int, revision: Long) {
++        if (credentials.revision(profileId) != revision) throw TvdbException(TvdbException.Reason.CREDENTIALS_CHANGED)
++    }
++    private fun decode(body: String): JsonObject = try { json.parseToJsonElement(body).jsonObject }
++        catch (_: Exception) { throw TvdbException(TvdbException.Reason.INVALID_RESPONSE) }
++
++    private fun checkStatus(code: Int) {
++        if (code in 200..299) return
++        throw TvdbException(when (code) {
++            401, 403 -> TvdbException.Reason.AUTHENTICATION
++            404 -> TvdbException.Reason.UNAVAILABLE
++            429 -> TvdbException.Reason.RATE_LIMIT
++            else -> TvdbException.Reason.NETWORK
++        })
++    }
++    private companion object { const val BASE = "https://api4.thetvdb.com/v4" }
++}
++
++internal fun parseTvdbEpisode(row: JsonObject): TvdbEpisode {
++    val id = row["id"].long()?.takeIf { it > 0 }
++        ?: throw TvdbException(TvdbException.Reason.INVALID_RESPONSE)
++    val season = row["seasonNumber"].long()?.toInt()?.takeIf { it >= 0 }
++        ?: throw TvdbException(TvdbException.Reason.INVALID_RESPONSE)
++    val number = row["number"].long()?.toInt()?.takeIf { it > 0 }
++        ?: throw TvdbException(TvdbException.Reason.INVALID_RESPONSE)
++    return TvdbEpisode(id, EpisodeCoordinates(season, number), row["name"].string().orEmpty(),
++        row["overview"].string(), row["image"].string()?.let { image ->
++            when {
++                image.startsWith("https://") || image.startsWith("http://") -> image
++                image.startsWith("//") -> "https:$image"
++                else -> "https://artworks.thetvdb.com/${image.trimStart('/')}"
++            }
++        }, row["aired"].string(), row["runtime"].long()?.toInt())
++}
++private fun JsonObject.objectData(): JsonObject = this["data"] as? JsonObject
++    ?: throw TvdbException(TvdbException.Reason.INVALID_RESPONSE)
++private fun JsonElement?.string(): String? = (this as? JsonPrimitive)?.contentOrNull?.takeIf(String::isNotBlank)
++private fun JsonElement?.long(): Long? = (this as? JsonPrimitive)?.longOrNull
++private fun JsonElement?.array(): List<JsonElement> = (this as? JsonArray).orEmpty()
+diff --git a/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbCloudProgress.kt b/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbCloudProgress.kt
+new file mode 100644
+index 00000000..846998e4
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbCloudProgress.kt
+@@ -0,0 +1,89 @@
++package com.nuvio.tv.data.tvdb
++
++import com.nuvio.tv.domain.model.EpisodeSourceIdentity
++import com.nuvio.tv.domain.model.TvdbPlaybackContext
++import com.nuvio.tv.domain.model.WatchProgress
++
++// Fixed protocol cutover: pre-fix cloud rows lost their selected-order identity.
++// Keep them stored, but do not reinterpret them as verified native TVDB resume data.
++internal const val TVDB_NATIVE_CLOUD_PROGRESS_FROM = 1793239048000L
++
++private fun TvdbPlaybackContext.nativeReferences(): List<EpisodeSourceIdentity>? {
++    if (episodeIds.isEmpty()) return null
++    val refs = providerSources.orEmpty().filter { it.episodeIds.any(episodeIds::contains) }
++    return refs.takeIf { episodeIds.all { id -> refs.count { id in it.episodeIds } == 1 } &&
++        refs.all { it.videoId.isNotBlank() && it.episodeIds.isNotEmpty() } }
++}
++
++/** Numeric keys are enforced by Nuvio cloud, which also derives watched entries at 90%.
++ * Estimate only within verified native coverage; never send selected-order coordinates. */
++internal fun WatchProgress.forNuvioCloud(completedIds: Set<Long> = emptySet()): List<WatchProgress> {
++    val context = tvdbContext ?: return listOf(this)
++    val refs = context.nativeReferences() ?: return emptyList()
++    if (refs.size == 1 && refs.single().episodeIds.toSet() == context.episodeIds.toSet() && tvdbCoverageVerified != false) {
++        val native = refs.single()
++        return listOf(copy(videoId = native.videoId, season = native.coordinates.season,
++            episode = native.coordinates.episode, tvdbContext = null))
++    }
++    if (duration <= 0L) return emptyList()
++    val fraction = if (isCompleted()) 1.0 else (position.toDouble() / duration).coerceIn(0.0, 1.0)
++    val weights = context.progressWeights(refs)
++    val source = context.episodeIds.progressRanges(weights)
++    val completed = completedIds + tvdbWatchedIds
++    return refs.mapNotNull { native ->
++        if (fraction <= 0.0) return@mapNotNull null
++        val played = projectTvdbFraction(context.episodeIds, native.episodeIds, weights, fraction)
++            ?.takeIf { it > 0.0 } ?: return@mapNotNull null
++        val covered = context.episodeIds.containsAll(native.episodeIds) || completed.containsAll(native.episodeIds)
++        val lastBoundary = native.episodeIds.mapNotNull { source[it]?.endInclusive }.maxOrNull() ?: return@mapNotNull null
++        val complete = tvdbCoverageVerified != false && covered && fraction >= lastBoundary
++        // Keep the backend below its automatic completion threshold until the part boundary.
++        val percent = if (complete) 1.0 else played.coerceAtMost(0.89)
++        val nativeDuration = native.runtimeMinutes?.takeIf { it > 0 }?.times(60_000L)
++            ?: (duration * native.episodeIds.sumOf { weights.getValue(it) } /
++                context.episodeIds.sumOf { weights.getValue(it) }).toLong().coerceAtLeast(1L)
++        copy(videoId = native.videoId, season = native.coordinates.season, episode = native.coordinates.episode,
++            position = if (complete) nativeDuration else (nativeDuration * percent).toLong(), duration = nativeDuration,
++            progressPercent = null, tvdbContext = null, tvdbEpisodeId = native.episodeIds.first(),
++            tvdbEpisodeIds = native.episodeIds, tvdbCompletedEpisodeIds = if (complete) native.episodeIds else emptyList())
++    }
++}
++
++/** Inverse of the cloud projection. The local player can apply this percentage to
++ * its actual video duration; an existing exact local position wins timestamp ties. */
++internal fun nativeCloudResume(contentId: String, context: TvdbPlaybackContext, entries: List<WatchProgress>): WatchProgress? {
++    val refs = context.nativeReferences() ?: return null
++    val weights = context.progressWeights(refs)
++    val source = context.episodeIds.progressRanges(weights)
++    val candidates = entries.mapNotNull { entry ->
++        if (entry.contentId != contentId || entry.duration <= 0) return@mapNotNull null
++        val native = refs.singleOrNull { it.videoId == entry.videoId &&
++            it.coordinates.season == entry.season && it.coordinates.episode == entry.episode } ?: return@mapNotNull null
++        val target = native.episodeIds.progressRanges(weights)
++        val fraction = entry.progressPercentage.toDouble()
++        val position = context.episodeIds.mapNotNull { id ->
++            val part = target[id] ?: return@mapNotNull null
++            if (fraction < part.start) return@mapNotNull null
++            val within = ((fraction - part.start) / (part.endInclusive - part.start)).coerceIn(0.0, 1.0)
++            source.getValue(id).let { it.start + within * (it.endInclusive - it.start) }
++        }.maxOrNull() ?: return@mapNotNull null
++        Triple(entry, position, native)
++    }
++    val selected = candidates.maxWithOrNull(compareBy<Triple<WatchProgress, Double, EpisodeSourceIdentity>> { it.first.lastWatched }
++        .thenBy { it.second }) ?: return null
++    val (entry, fraction, native) = selected
++    val completed = context.episodeIds.filter { id ->
++        val reference = refs.single { id in it.episodeIds }
++        val record = entries.filter { it.contentId == contentId && it.videoId == reference.videoId &&
++            it.season == reference.coordinates.season && it.episode == reference.coordinates.episode }
++            .maxByOrNull { it.lastWatched }
++        record != null && (record.isCompleted() || record.progressPercentage.toDouble() >= reference.episodeIds.progressRanges(weights).getValue(id).endInclusive)
++    }
++    val estimatedDuration = (entry.duration * context.episodeIds.sumOf { weights.getValue(it) } /
++        native.episodeIds.sumOf { weights.getValue(it) }).toLong().coerceAtLeast(1L)
++    return entry.copy(videoId = context.requestVideoId, season = context.season, episode = context.episode,
++        position = 0, duration = estimatedDuration, progressPercent = (fraction * 100).toFloat(),
++        tvdbContext = context, tvdbEpisodeId = context.episodeIds.first(), tvdbEpisodeIds = context.episodeIds,
++        tvdbCompletedEpisodeIds = completed,
++        tvdbCoverageVerified = fraction < WatchProgress.COMPLETED_THRESHOLD || completed.containsAll(context.episodeIds))
++}
+diff --git a/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbCredentialStore.kt b/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbCredentialStore.kt
+new file mode 100644
+index 00000000..d0345c31
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbCredentialStore.kt
+@@ -0,0 +1,32 @@
++package com.nuvio.tv.data.tvdb
++
++import android.content.Context
++import com.nuvio.tv.core.profile.ProfileScopedCredentialStore
++import com.nuvio.tv.core.profile.ProtectedProfilePreferences
++import dagger.hilt.android.qualifiers.ApplicationContext
++import java.util.concurrent.ConcurrentHashMap
++import javax.inject.Inject
++import javax.inject.Singleton
++
++/** Same encrypted persistence and profile lifecycle used by native integrations. */
++@Singleton
++class TvdbCredentialStore @Inject constructor(@ApplicationContext context: Context) : ProfileScopedCredentialStore {
++    private val protected = ProtectedProfilePreferences(context, "tvdb_credentials", "com.nuvio.tv.tvdb.credentials.v1")
++    private val revisions = ConcurrentHashMap<Int, Long>()
++    @Volatile private var epoch = 0L
++    private val lock = Any()
++
++    fun read(profileId: Int): String? = synchronized(lock) { protected.read(profileId) }
++    fun revision(profileId: Int): Long = epoch + (revisions[profileId] ?: 0L)
++
++    fun save(profileId: Int, apiKey: String?) = synchronized(lock) {
++        protected.write(profileId, apiKey?.trim()?.takeIf(String::isNotBlank))
++        revisions[profileId] = (revisions[profileId] ?: 0L) + 1
++    }
++
++    override fun removeProfile(profileId: Int) { save(profileId, null) }
++    override fun clearAllProfiles() = synchronized(lock) {
++        protected.clear()
++        epoch += 1_000_000L
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbEpisodeCorrespondence.kt b/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbEpisodeCorrespondence.kt
+new file mode 100644
+index 00000000..453ebe5a
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbEpisodeCorrespondence.kt
+@@ -0,0 +1,100 @@
++package com.nuvio.tv.data.tvdb
++
++private val extendedLabel = Regex("\\s*\\((?:extended(?: cut| edition)?|superfan(?: episode)?)\\)\\s*$", RegexOption.IGNORE_CASE)
++private val partLabel = Regex("^(.*?)\\s*(?:\\((\\d+)\\)|[-:]?\\s*Part\\s+(\\d+))$", RegexOption.IGNORE_CASE)
++private val titleArticle = Regex("\\bthe\\b")
++private val titleSpaces = Regex("\\s+")
++
++private fun matchStem(title: String): String = normalizeEpisodeName(title)
++    .replace(titleArticle, " ").replace(titleSpaces, " ").trim()
++
++internal fun tvdbEpisodeMatchTitle(title: String): String {
++    val cut = title.replace(extendedLabel, "").trim()
++    val part = partLabel.matchEntire(cut)
++    return if (part == null) matchStem(cut) else matchStem(part.groupValues[1]) + " part " +
++        part.groupValues[2].ifBlank { part.groupValues[3] }
++}
++
++internal fun tvdbEpisodeBaseTitle(title: String): String {
++    val cut = title.replace(extendedLabel, "").trim()
++    return matchStem(partLabel.matchEntire(cut)?.groupValues?.get(1) ?: cut)
++}
++
++internal fun tvdbEpisodePartNumber(title: String): Int? {
++    val part = partLabel.matchEntire(title.replace(extendedLabel, "").trim()) ?: return null
++    return part.groupValues[2].ifBlank { part.groupValues[3] }.toIntOrNull()
++}
++
++internal fun tvdbEpisodeFamilies(episodes: List<TvdbEpisode>): List<List<TvdbEpisode>> = episodes
++    .filter { tvdbEpisodePartNumber(it.title) != null }
++    .groupBy { tvdbEpisodeBaseTitle(it.title) to it.coordinates.season }.values.mapNotNull { rows ->
++        val sorted = rows.sortedBy { tvdbEpisodePartNumber(it.title) }
++        sorted.takeIf { it.size > 1 && it.map { row -> tvdbEpisodePartNumber(row.title) } == (1..it.size).toList() }
++    }
++
++/** A bounded metadata correspondence, not a second history store. Complete part
++ * families establish content boundaries; display numbers never establish them. */
++internal class TvdbContentCoverage(order: TvdbEpisodeOrder) {
++    val records = (order.officialEpisodes + order.episodes + order.relatedOrders.toSortedMap().values.flatten()).distinctBy { it.id }
++    private val lists = listOf(order.officialEpisodes) +
++        order.relatedOrders.toSortedMap(compareBy<String> { if (it == "alternate") "0" else it }).values + listOf(order.episodes)
++    private val allFamilies = lists.flatMap(::tvdbEpisodeFamilies)
++        .filter { !it.first().aired.isNullOrBlank() }
++    private val anchors = allFamilies.flatMap { family -> family.map { it.id to
++        Triple(tvdbEpisodeBaseTitle(family.first().title), family.first().aired?.take(10), family.size) } }.groupBy({ it.first }, { it.second })
++    private val families = allFamilies
++        .distinctBy { tvdbEpisodeBaseTitle(it.first().title) to it.first().aired?.take(10) }
++    private val familiesByTitle = families.groupBy { tvdbEpisodeBaseTitle(it.first().title) }
++    private val official = order.officialEpisodes.associateBy { it.id }
++    private val scalar = tvdbEpisodeCorrespondence(order)
++    val byId: Map<Long, List<TvdbEpisode>> = records.mapNotNull { row ->
++        val family = familiesByTitle[tvdbEpisodeBaseTitle(row.title)].orEmpty().filter {
++            (it.any { part -> part.id == row.id } ||
++                (tvdbEpisodePartNumber(row.title) == null && it.first().aired?.take(10) == row.aired?.take(10)) ||
++                anchors[row.id].orEmpty().contains(Triple(tvdbEpisodeBaseTitle(it.first().title), it.first().aired?.take(10), it.size))) }.singleOrNull()
++        val coverage = if (family != null) {
++            val number = tvdbEpisodePartNumber(row.title)
++            if (number == null) family else family.singleOrNull { tvdbEpisodePartNumber(it.title) == number }?.let(::listOf)
++        } else official[row.id]?.let(::listOf) ?: scalar[row.id]?.let(::listOf)
++        coverage?.let { row.id to it }
++    }.toMap()
++
++    private val byTitleDate = records.groupBy { tvdbEpisodeMatchTitle(it.title) to it.aired?.take(10) }
++
++    fun match(title: String, date: String?): List<TvdbEpisode> {
++        if (date.isNullOrBlank()) return emptyList()
++        val signature = tvdbEpisodeMatchTitle(title)
++        return byTitleDate[signature to date.take(10)].orEmpty()
++            .mapNotNull { byId[it.id] }.distinctBy { it.map(TvdbEpisode::id).toSet() }.singleOrNull().orEmpty()
++    }
++}
++
++/** Stable IDs lead. Variant names additionally require a unique official title/date
++ * anchor; numbered parts require a complete 1..N group, not positional matching. */
++internal fun tvdbEpisodeCorrespondence(order: TvdbEpisodeOrder): Map<Long, TvdbEpisode> {
++    val official = order.officialEpisodes.groupBy { it.id }
++    val byTitle = order.officialEpisodes.groupBy { tvdbEpisodeMatchTitle(it.title) }
++    val result = order.episodes.mapNotNull { episode -> official[episode.id]?.singleOrNull()?.let { episode.id to it } }.toMap().toMutableMap()
++    val parts = mutableListOf<Triple<TvdbEpisode, String, Int>>()
++    for (episode in order.episodes) {
++        if (episode.id in result) continue
++        val title = episode.title.replace(extendedLabel, "").trim()
++        val exact = byTitle[tvdbEpisodeMatchTitle(title)].orEmpty().filter {
++            !it.aired.isNullOrBlank() && it.aired.take(10) == episode.aired?.take(10)
++        }.singleOrNull()
++        if (exact != null) { result[episode.id] = exact; continue }
++        val part = partLabel.matchEntire(title)
++        if (part != null) {
++            val number = (part.groupValues[2].ifBlank { part.groupValues[3] }).toIntOrNull() ?: continue
++            parts += Triple(episode, matchStem(part.groupValues[1]), number)
++        }
++    }
++    for (group in parts.groupBy { it.second to it.first.coordinates.season }.values) {
++        val sorted = group.sortedBy { it.third }
++        if (sorted.size < 2 || sorted.map { it.third } != (1..sorted.size).toList()) continue
++        val anchor = sorted.first().first.aired?.take(10) ?: continue
++        val canonical = byTitle[sorted.first().second].orEmpty().filter { it.aired?.take(10) == anchor }.singleOrNull() ?: continue
++        sorted.forEach { result[it.first.id] = canonical }
++    }
++    return result
++}
+diff --git a/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbEpisodeOverlay.kt b/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbEpisodeOverlay.kt
+new file mode 100644
+index 00000000..c9155041
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbEpisodeOverlay.kt
+@@ -0,0 +1,102 @@
++package com.nuvio.tv.data.tvdb
++
++import com.nuvio.tv.domain.model.*
++import java.text.Normalizer
++
++private val episodeCombiningMarks = Regex("\\p{M}")
++private val episodePunctuation = Regex("[^\\p{L}\\p{N}]+")
++private val genericEpisodeTitle = Regex("(?:episode|ep|e) ?\\d+")
++
++private data class ProviderCoverage(val video: Video, val episodes: List<TvdbEpisode>) {
++    val ids get() = episodes.map { it.id }
++    fun reference() = EpisodeSourceIdentity(video.id, EpisodeCoordinates(video.season!!, video.episode!!), ids, video.title, video.runtime)
++}
++
++/** The selected order supplies stream-search numbers. Content correspondence is
++ * used for metadata restrictions, legacy history and tracker translation only. */
++internal fun tvdbEpisodeOverlay(meta: Meta, seriesId: Long, order: TvdbEpisodeOrder,
++    sources: Map<Long, TvdbSourceReference> = emptyMap()): Meta {
++    val graph = TvdbContentCoverage(order)
++    val coverage = graph.byId
++    fun oldCoverage(ref: TvdbSourceReference) = ref.trackingEpisodeIds.flatMap { coverage[it]?.map(TvdbEpisode::id) ?: listOf(it) }
++    val oldByVideo = sources.values.groupBy { it.videoId }
++    val oldByCoordinates = sources.values.groupBy { it.coordinates }
++    val eligible = meta.videos.filter { it.id.isNotBlank() && it.season != null && it.season >= 0 && it.episode != null && it.episode > 0 }
++    val uniqueIds = eligible.groupingBy { it.id }.eachCount()
++    val numberedId = Regex("^(.*):(\\d+):(\\d+)$")
++    val prefixes = eligible.mapNotNull { video -> numberedId.matchEntire(video.id)?.takeIf {
++        it.groupValues[2].toIntOrNull() == video.season && it.groupValues[3].toIntOrNull() == video.episode
++    }?.groupValues?.get(1) }.distinct()
++    val requestPrefix = prefixes.singleOrNull() ?: (meta.imdbId ?: meta.id).takeIf {
++        prefixes.isEmpty() && it.matches(Regex("(?:tt\\d+|tmdb:\\d+|tvdb:\\d+)"))
++    }
++    val provider = eligible.filter { uniqueIds[it.id] == 1 }.mapNotNull { video ->
++        val explicit = video.episodeIdentity
++        val episodes = if (explicit != null) {
++            if (explicit.tvdbSeriesId != seriesId || explicit.trackingEpisodeIds.any { it !in coverage }) emptyList()
++            else explicit.trackingEpisodeIds.flatMap { coverage.getValue(it) }.distinctBy { it.id }
++        } else {
++            val date = video.released?.take(10)
++            val signature = tvdbEpisodeMatchTitle(video.title)
++            if (date == null || signature.isBlank() || genericEpisodeTitle.matches(signature)) emptyList()
++            else graph.match(video.title, date)
++        }
++        episodes.takeIf { it.isNotEmpty() }?.let { ProviderCoverage(video, it) }
++    }
++    val videos = order.episodes.map { episode ->
++        val content = coverage[episode.id].orEmpty()
++        val ids = content.map { it.id }.toSet()
++        val covering = provider.filter { it.ids.toSet().containsAll(ids) && ids.isNotEmpty() }
++        val whole = covering.filter { it.ids.toSet() == ids }.ifEmpty { covering }
++        val chosen = if (whole.size == 1) whole else if (whole.isNotEmpty() || ids.isEmpty()) emptyList() else {
++            val pieces = provider.filter { it.ids.all(ids::contains) }
++            if (ids.all { id -> pieces.count { id in it.ids } == 1 }) pieces else emptyList()
++        }
++        val verified = chosen.takeIf { matches -> matches.all { candidate ->
++            val current = TvdbSourceReference(candidate.ids.first(), candidate.video.id, candidate.reference().coordinates)
++            val previous = (sources[episode.id]?.takeIf { matches.size == 1 }
++                ?: sources[candidate.ids.first()])?.takeIf { sameEpisodeSourceParent(it, current) }
++            (previous == null || (previous.videoId == candidate.video.id && previous.coordinates == candidate.reference().coordinates)) &&
++                (oldByVideo[candidate.video.id].orEmpty() + oldByCoordinates[candidate.reference().coordinates].orEmpty().filter { sameEpisodeSourceParent(it, current) })
++                    .none { old -> !candidate.ids.containsAll(oldCoverage(old)) }
++        } }.orEmpty()
++        val refs = verified.map { it.reference() }
++        val primary = verified.firstOrNull()
++        val requestId = requestPrefix?.let { "$it:${episode.coordinates.season}:${episode.coordinates.episode}" }
++        val identity = EpisodeIdentity(episode.id, seriesId, order.effectiveType, episode.coordinates,
++            content.firstOrNull()?.coordinates, primary?.video?.id, refs.firstOrNull()?.coordinates,
++            canonicalTvdbEpisodeId = content.firstOrNull()?.id?.takeIf { it != episode.id },
++            providerTitle = primary?.video?.title, canonicalEpisodeIds = content.map { it.id }, providerSources = refs,
++            contentRuntimeMinutes = (content + verified.flatMap { it.episodes }).distinctBy { it.id }.mapNotNull { row -> row.runtime?.takeIf { it > 0 }?.let { row.id to it } }.toMap(),
++            streamVideoId = requestId, streamCoordinates = episode.coordinates.takeIf { requestId != null },
++            contentVerified = content.isNotEmpty(), usesSelectedOrderForStreams = true)
++        val available = when {
++            verified.isEmpty() -> null
++            verified.any { it.video.available == false } -> false
++            verified.all { it.video.available == true } -> true
++            else -> null
++        }
++        val display = Video(requestId ?: "tvdb-unresolved:$seriesId:${episode.id}", episode.title, episode.aired,
++            episode.image?.takeIf(String::isNotBlank) ?: primary?.video?.thumbnail,
++            streams = emptyList(),
++            season = episode.coordinates.season, episode = episode.coordinates.episode, overview = episode.overview,
++            runtime = episode.runtime, available = available, episodeIdentity = identity)
++        display
++    }.sortedWith(episodeSequenceComparator)
++    val unresolved = videos.count { it.episodeIdentity?.contentVerified != true }
++    val messages = listOfNotNull("Using ${order.effectiveType}".takeIf { order.selectedType != order.effectiveType },
++        "Using cached TVDB metadata".takeIf { order.stale },
++        "$unresolved episode(s) have no verified tracking correspondence; remote tracking is withheld".takeIf { unresolved > 0 })
++    return meta.copy(videos = videos,
++        behaviorHints = meta.behaviorHints?.copy(defaultVideoId = null),
++        episodeOrder = EpisodeOrderStatus(seriesId, order.selectedType, order.effectiveType,
++            messages.takeIf { it.isNotEmpty() }?.joinToString(". "),
++            graph.records.mapNotNull { row -> coverage[row.id]?.let { atoms ->
++                EpisodeContentIdentity(row.id, row.title, row.aired,
++                    order.officialEpisodes.singleOrNull { it.id == row.id }?.coordinates, atoms.map { it.id })
++            } }))
++}
++
++internal fun normalizeEpisodeName(value: String): String = Normalizer.normalize(value, Normalizer.Form.NFKD)
++    .lowercase(java.util.Locale.ROOT).replace(episodeCombiningMarks, "")
++    .replace(episodePunctuation, " ").trim()
+diff --git a/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbEpisodeResolver.kt b/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbEpisodeResolver.kt
+new file mode 100644
+index 00000000..e02a73e8
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbEpisodeResolver.kt
+@@ -0,0 +1,89 @@
++package com.nuvio.tv.data.tvdb
++
++import com.nuvio.tv.core.tmdb.TmdbService
++import com.nuvio.tv.domain.model.*
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++import kotlinx.coroutines.withTimeoutOrNull
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
++import javax.inject.Inject
++import javax.inject.Singleton
++
++@Singleton
++class TvdbEpisodeResolver @Inject constructor(
++    private val preferences: TvdbOrderStore,
++    private val orders: TvdbOrderRepository,
++    private val api: TvdbClient,
++    private val tmdb: TmdbService
++) {
++    private data class ProjectionKey(val profile: Int, val meta: Meta, val selection: TvdbOrderPreference,
++        val order: TvdbEpisodeOrder, val sources: Map<Long, TvdbSourceReference>)
++    private val projectionMutex = Mutex()
++    private val projections = object : LinkedHashMap<ProjectionKey, Meta>(16, .75f, true) {
++        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<ProjectionKey, Meta>?) = size > 16
++    }
++
++    private suspend fun project(profile: Int, meta: Meta, selection: TvdbOrderPreference,
++        order: TvdbEpisodeOrder, sources: Map<Long, TvdbSourceReference>): Meta = projectionMutex.withLock {
++        projections.getOrPut(ProjectionKey(profile, meta, selection, order, sources)) {
++            tvdbEpisodeOverlay(meta, selection.seriesId, order, sources)
++        }
++    }
++
++    suspend fun seriesId(profileId: Int, meta: Meta, aliases: Collection<String>): Long? {
++        preferences.knownSeries(profileId, aliases)?.let { return it }
++        meta.id.takeIf { it.startsWith("tvdb:") }?.substringAfter(':')?.substringBefore(':')?.toLongOrNull()?.let { return it }
++        val imdb = meta.imdbId ?: meta.id.takeIf { it.startsWith("tt") }
++            ?: meta.id.takeIf { it.startsWith("tmdb:") }?.substringAfter(':')?.toIntOrNull()?.let {
++                tmdb.tmdbToImdb(it, "series")
++            }
++        return imdb?.let { api.seriesByRemoteId(profileId, it) }
++    }
++
++    suspend fun apply(profileId: Int, meta: Meta): Meta {
++        if (meta.apiType !in listOf("series", "tv") || com.nuvio.tv.data.mediaserver.ServerItemRef.isServerId(meta.id)) return meta
++        val aliases = listOfNotNull(meta.id, meta.imdbId)
++        repeat(3) {
++            val selected = preferences.selected(profileId, aliases) ?: return meta
++            val result = try {
++                withTimeoutOrNull(20_000L) {
++                    withContext(Dispatchers.Default) {
++                        val started = System.nanoTime()
++                        fun timing(stage: String) { android.util.Log.d("TvdbResolution", "series=${selected.seriesId} order=${selected.orderType} stage=$stage elapsedMs=${(System.nanoTime() - started) / 1_000_000}") }
++                        timing("load")
++                        val order = orders.load(profileId, selected.seriesId, selected.orderType, includeRelated = true)
++                        timing("metadata")
++                        val existing = preferences.sources(profileId, selected.seriesId)
++                        val proposed = project(profileId, meta, selected, order, existing)
++                        timing("mapped")
++                        val references = proposed.videos.flatMap { video ->
++                            video.episodeIdentity?.providerSources.orEmpty().map { source ->
++                                TvdbSourceReference(source.episodeIds.first(), source.videoId, source.coordinates,
++                                    tvdbEpisodeMatchTitle(source.title), canonicalEpisodeIds = source.episodeIds)
++                            }
++                        }
++                        val sources = preferences.rememberSources(profileId, selected.seriesId, references)
++                        timing("aliases")
++                        (if (sources == existing) proposed else project(profileId, meta, selected, order, sources))
++                            .also { timing("complete") }
++                    }
++                } ?: fallback(meta, selected, "TVDB timed out. Using metadata provider episodes.")
++            } catch (e: CancellationException) { throw e }
++            catch (_: Exception) { fallback(meta, selected, "TVDB unavailable. Using metadata provider episodes.") }
++            if (preferences.selected(profileId, aliases) == selected) return result
++        }
++        return meta // a rapidly changing selection is resolved by the caller's reload
++    }
++
++    /** Resolve an immutable playback selection without changing profile preferences. */
++    suspend fun forOrder(profileId: Int, meta: Meta, selection: TvdbOrderPreference): Meta = withContext(Dispatchers.Default) {
++        project(profileId, meta, selection,
++            orders.load(profileId, selection.seriesId, selection.orderType, includeRelated = true),
++            preferences.sources(profileId, selection.seriesId))
++    }
++
++    private fun fallback(meta: Meta, selected: TvdbOrderPreference, message: String) = meta.copy(
++        episodeOrder = EpisodeOrderStatus(selected.seriesId, selected.orderType, null, message))
++}
+diff --git a/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbMetaRepository.kt b/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbMetaRepository.kt
+new file mode 100644
+index 00000000..edf6617e
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbMetaRepository.kt
+@@ -0,0 +1,75 @@
++package com.nuvio.tv.data.tvdb
++
++import com.nuvio.tv.core.network.NetworkResult
++import com.nuvio.tv.core.profile.ProfileManager
++import com.nuvio.tv.data.repository.MetaRepositoryImpl
++import com.nuvio.tv.domain.model.Meta
++import com.nuvio.tv.domain.repository.MetaRepository
++import kotlinx.coroutines.flow.Flow
++import kotlinx.coroutines.flow.map
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.CancellationException
++import com.nuvio.tv.domain.model.EpisodeOrderStatus
++import javax.inject.Inject
++import javax.inject.Singleton
++
++/** Overlay AFTER existing provider selection/caching, leaving its rules untouched. */
++@Singleton
++class TvdbMetaRepository @Inject constructor(
++    private val delegate: MetaRepositoryImpl,
++    private val resolver: dagger.Lazy<TvdbEpisodeResolver>,
++    private val preferences: TvdbOrderStore,
++    private val profiles: ProfileManager
++) : MetaRepository by delegate {
++    private val effectiveCache = java.util.Collections.synchronizedMap(
++        object : LinkedHashMap<String, Meta>(64, .75f, true) {
++            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Meta>?) = size > 64
++        }
++    )
++    private fun key(profileId: Int, type: String, id: String) = "$profileId|${type.lowercase()}|$id"
++    private fun Flow<NetworkResult<Meta>>.effective(type: String, id: String): Flow<NetworkResult<Meta>> = map { result ->
++        if (result is NetworkResult.Success) {
++            val profileId = profiles.activeProfileId.value
++            val original = result.data
++            var selected: TvdbOrderPreference? = null
++            val meta = try {
++                selected = if (original.apiType in listOf("series", "tv"))
++                    preferences.selected(profileId, listOfNotNull(original.id, original.imdbId)) else null
++                if (selected == null) original else resolver.get().apply(profileId, original)
++            } catch (cancelled: CancellationException) { throw cancelled }
++            catch (_: Exception) {
++                selected?.let { original.copy(episodeOrder = EpisodeOrderStatus(it.seriesId, it.orderType, null,
++                    "TVDB unavailable. Using metadata provider episodes. You can restore Provider Default.")) } ?: original
++            }
++            for (alias in listOf(id, original.id)) {
++                val cacheKey = key(profileId, type, alias)
++                if (selected == null) effectiveCache.remove(cacheKey) else effectiveCache[cacheKey] = meta
++            }
++            if (profiles.activeProfileId.value != profileId) NetworkResult.Loading else NetworkResult.Success(meta)
++        } else result
++    }
++    override fun getMeta(addonBaseUrl: String, type: String, id: String) = delegate.getMeta(addonBaseUrl, type, id).effective(type, id)
++    override fun getMetaFromAllAddons(type: String, id: String, sourceAddonBaseUrl: String?) =
++        delegate.getMetaFromAllAddons(type, id, sourceAddonBaseUrl).effective(type, id)
++    override fun getProviderMeta(type: String, id: String) = delegate.getMetaFromAllAddons(type, id)
++    override fun getMetaFromPrimaryAddon(type: String, id: String) = delegate.getMetaFromPrimaryAddon(type, id).effective(type, id)
++    override fun getCachedMeta(type: String, id: String): Meta? {
++        if (type !in listOf("series", "tv")) return delegate.getCachedMeta(type, id)
++        val profileId = profiles.activeProfileId.value
++        if (!preferences.hasSnapshot(profileId)) return null
++        val selected = preferences.cachedSelection(profileId, id) ?: return delegate.getCachedMeta(type, id)
++        return effectiveCache[key(profileId, type, id)]?.takeIf {
++            it.episodeOrder?.seriesId == selected.seriesId && it.episodeOrder.selectedType == selected.orderType &&
++                it.episodeOrder.effectiveType != null
++        }
++    }
++    override suspend fun getPlaybackMeta(profileId: Int, type: String, id: String,
++        context: com.nuvio.tv.domain.model.TvdbPlaybackContext): Meta? {
++        if (profiles.activeProfileId.value != profileId || preferences.knownSeries(profileId, listOf(id)) != context.seriesId) return null
++        val raw = delegate.getCachedMeta(type, id) ?: (delegate.getMetaFromAllAddons(type, id)
++            .first { it !is NetworkResult.Loading } as? NetworkResult.Success)?.data ?: return null
++        return resolver.get().forOrder(profileId, raw, TvdbOrderPreference(context.seriesId, context.orderType))
++            .takeIf { profiles.activeProfileId.value == profileId }
++    }
++    override fun clearCache() { effectiveCache.clear(); delegate.clearCache() }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbOrderRepository.kt b/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbOrderRepository.kt
+new file mode 100644
+index 00000000..321e7b57
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbOrderRepository.kt
+@@ -0,0 +1,110 @@
++package com.nuvio.tv.data.tvdb
++
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
++import kotlinx.coroutines.withTimeoutOrNull
++import javax.inject.Inject
++import javax.inject.Singleton
++
++data class TvdbEpisodeOrder(
++    val selectedType: String,
++    val effectiveType: String,
++    val episodes: List<TvdbEpisode>,
++    val officialEpisodes: List<TvdbEpisode>,
++    val stale: Boolean = false,
++    val relatedOrders: Map<String, List<TvdbEpisode>> = emptyMap()
++)
++
++/** Bounded metadata cache, not a separate episode/history database. */
++@Singleton
++class TvdbOrderRepository @Inject constructor(private val api: TvdbClient) {
++    private data class Cached<T>(val value: T, val at: Long)
++    private val mutex = Mutex()
++    private val discoveries = object : LinkedHashMap<Long, Cached<List<TvdbOrder>>>(32, .75f, true) {
++        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, Cached<List<TvdbOrder>>>?) = size > 32
++    }
++    private val orders = object : LinkedHashMap<String, Cached<TvdbEpisodeOrder>>(32, .75f, true) {
++        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Cached<TvdbEpisodeOrder>>?) = size > 32
++    }
++    private val missingDirect = object : LinkedHashMap<String, Long>(32, .75f, true) {
++        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?) = size > 32
++    }
++    private fun fresh(at: Long) = System.currentTimeMillis() - at in 0 until 24 * 60 * 60 * 1000L
++
++    suspend fun available(profileId: Int, seriesId: Long): List<TvdbOrder> = mutex.withLock {
++        discover(profileId, seriesId)
++    }
++
++    private suspend fun discover(profileId: Int, seriesId: Long): List<TvdbOrder> {
++        discoveries[seriesId]?.takeIf { fresh(it.at) }?.let { return it.value }
++        val result = api.orders(profileId, seriesId)
++        discoveries[seriesId] = Cached(result, System.currentTimeMillis())
++        return result
++    }
++
++    suspend fun load(profileId: Int, seriesId: Long, selected: String, language: String = "eng",
++        includeRelated: Boolean = false): TvdbEpisodeOrder = mutex.withLock {
++        val current = loadBase(profileId, seriesId, selected, language)
++        if (!includeRelated) return@withLock current
++        val related = linkedMapOf("official" to current.officialEpisodes, selected to current.episodes)
++        // Supplementary metadata must not turn a successful selected-order load
++        // into a timeout. Partial supplementary reads are safe: unknown links block.
++        withTimeoutOrNull(5_000L) { for (type in discover(profileId, seriesId).map { it.type }) {
++            if (type in related) continue
++            try {
++                val key = "$seriesId:$type:$language"
++                val cached = orders[key]?.takeIf { fresh(it.at) }?.value?.episodes
++                if (cached == null && missingDirect[key]?.let(::fresh) == true) continue
++                val episodes = cached
++                    ?: api.episodes(profileId, seriesId, type, language).also { rows ->
++                        if (rows.isNotEmpty()) orders[key] = Cached(TvdbEpisodeOrder(type, type, rows, current.officialEpisodes), System.currentTimeMillis())
++                        else missingDirect[key] = System.currentTimeMillis()
++                    }
++                if (episodes.isNotEmpty()) related[type] = episodes
++            }
++            catch (cancelled: CancellationException) { throw cancelled }
++            catch (_: TvdbException) { /* Only the selected order may perform an expensive season fallback. */ }
++        } }
++        current.copy(relatedOrders = related)
++    }
++
++    private suspend fun loadBase(profileId: Int, seriesId: Long, selected: String, language: String): TvdbEpisodeOrder {
++        val key = "$seriesId:$selected:$language"
++        val cached = orders[key]
++        cached?.takeIf { fresh(it.at) }?.let { return it.value }
++        return try {
++            val available = discover(profileId, seriesId)
++            // Only an affirmative discovery response establishes unavailability.
++            var effective = if (selected == "official" || available.any { it.type == selected }) selected else "official"
++            val officialKey = "$seriesId:official:$language"
++            val official = orders[officialKey]?.takeIf { fresh(it.at) }?.value?.officialEpisodes
++                ?: api.episodes(profileId, seriesId, "official", language).also { rows ->
++                    if (rows.isNotEmpty()) orders[officialKey] = Cached(
++                        TvdbEpisodeOrder("official", "official", rows, rows), System.currentTimeMillis())
++                }
++            var episodes = if (effective == "official") official else try {
++                api.episodes(profileId, seriesId, effective, language)
++            } catch (e: TvdbException) {
++                if (e.reason != TvdbException.Reason.UNAVAILABLE) throw e
++                emptyList()
++            }
++            if (episodes.isEmpty() && effective != "official") {
++                val base = official.associateBy { it.id }
++                episodes = api.episodesFromSeasons(profileId, seriesId, effective).map { episode ->
++                    base[episode.id]?.copy(coordinates = episode.coordinates) ?: episode
++                }
++                if (episodes.isEmpty()) { effective = "official"; episodes = official }
++            }
++            if (episodes.isEmpty() || official.isEmpty()) throw TvdbException(TvdbException.Reason.UNAVAILABLE)
++            TvdbEpisodeOrder(selected, effective, episodes, official).also {
++                orders[key] = Cached(it, System.currentTimeMillis())
++            }
++        } catch (e: CancellationException) { throw e }
++        catch (e: TvdbException) {
++            // Authentication errors are not treated as missing orders. Existing
++            // complete data remains usable with an explicit stale indication.
++            cached?.value?.copy(stale = true) ?: throw e
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbOrderStore.kt b/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbOrderStore.kt
+new file mode 100644
+index 00000000..32396c76
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbOrderStore.kt
+@@ -0,0 +1,139 @@
++package com.nuvio.tv.data.tvdb
++
++import androidx.datastore.preferences.core.edit
++import androidx.datastore.preferences.core.longPreferencesKey
++import androidx.datastore.preferences.core.stringPreferencesKey
++import com.nuvio.tv.data.local.ProfileDataStoreFactory
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.flow.map
++import kotlinx.coroutines.flow.distinctUntilChanged
++import kotlinx.serialization.json.*
++import com.nuvio.tv.domain.model.EpisodeCoordinates
++import javax.inject.Inject
++import javax.inject.Singleton
++
++data class TvdbOrderPreference(val seriesId: Long, val orderType: String)
++data class TvdbSourceReference(val episodeId: Long, val videoId: String, val coordinates: EpisodeCoordinates,
++    val titleKey: String? = null, val canonicalEpisodeId: Long? = null,
++    val canonicalEpisodeIds: List<Long> = emptyList()) {
++    val trackingEpisodeIds: List<Long> get() = canonicalEpisodeIds.ifEmpty { listOf(canonicalEpisodeId ?: episodeId) }
++    val trackingEpisodeId: Long get() = trackingEpisodeIds.first()
++}
++
++/** Numeric slots are scoped to their native catalogue, not the TVDB series that
++ * may combine several native shows. Opaque IDs retain the conservative old guard. */
++internal fun episodeSourceParent(videoId: String, coordinates: EpisodeCoordinates): String? =
++    videoId.takeIf { it.endsWith(":${coordinates.season}:${coordinates.episode}") }
++        ?.removeSuffix(":${coordinates.season}:${coordinates.episode}")
++
++internal fun sameEpisodeSourceParent(first: TvdbSourceReference, second: TvdbSourceReference): Boolean {
++    val a = episodeSourceParent(first.videoId, first.coordinates)
++    val b = episodeSourceParent(second.videoId, second.coordinates)
++    return a == null || b == null || a == b
++}
++
++/** All aliases are learned at explicit selection time; reading never resolves IDs online. */
++@Singleton
++class TvdbOrderStore @Inject constructor(private val factory: ProfileDataStoreFactory) {
++    private val snapshots = java.util.concurrent.ConcurrentHashMap<Int, androidx.datastore.preferences.core.Preferences>()
++
++    /** Unknown snapshots cannot safely expose raw cached episode streams. */
++    fun cachedSelection(profileId: Int, alias: String): TvdbOrderPreference? {
++        val prefs = snapshots[profileId] ?: return null
++        val series = prefs[longPreferencesKey("alias:$alias")] ?: return null
++        return prefs[stringPreferencesKey("order:$series")]?.let { TvdbOrderPreference(series, it) }
++    }
++    fun hasSnapshot(profileId: Int) = snapshots.containsKey(profileId)
++
++    fun observeSelection(profileId: Int, alias: String) = factory.get(profileId, "tvdb_orders").data.map { prefs ->
++        snapshots[profileId] = prefs
++        val series = prefs[longPreferencesKey("alias:$alias")]
++        series?.let { prefs[stringPreferencesKey("order:$it")]?.let { type -> TvdbOrderPreference(series, type) } }
++    }.distinctUntilChanged()
++
++    fun observeSelectedSeries(profileId: Int) = factory.get(profileId, "tvdb_orders").data.map { prefs ->
++        prefs.asMap().keys.mapNotNull { key -> key.name.takeIf { it.startsWith("order:") }?.substringAfter(':')?.toLongOrNull() }.toSet()
++    }.distinctUntilChanged()
++
++    suspend fun sources(profileId: Int, seriesId: Long): Map<Long, TvdbSourceReference> =
++        decodeSources(factory.get(profileId, "tvdb_orders").data.first()[stringPreferencesKey("sources:$seriesId")])
++
++    /** First verified references win; remapping one numeric history slot is unsafe. */
++    suspend fun rememberSources(profileId: Int, seriesId: Long, candidates: Collection<TvdbSourceReference>): Map<Long, TvdbSourceReference> {
++        val existing = sources(profileId, seriesId)
++        if (candidates.all { candidate -> existing[candidate.episodeId]?.let {
++            (it.titleKey != null || candidate.titleKey == null) && it.trackingEpisodeIds == candidate.trackingEpisodeIds
++        } == true }) return existing
++        var result = existing
++        factory.get(profileId, "tvdb_orders").edit { prefs ->
++            val key = stringPreferencesKey("sources:$seriesId")
++            val merged = decodeSources(prefs[key]).toMutableMap()
++            for (candidate in candidates) {
++                val previous = merged[candidate.episodeId]
++                if (previous != null) {
++                    if (previous.titleKey == null && previous.videoId == candidate.videoId && previous.coordinates == candidate.coordinates) {
++                        merged[candidate.episodeId] = previous.copy(titleKey = candidate.titleKey)
++                    }
++                    if (previous.videoId == candidate.videoId && previous.coordinates == candidate.coordinates &&
++                        (candidate.trackingEpisodeIds.containsAll(previous.trackingEpisodeIds) ||
++                            candidate.titleKey != null && candidate.titleKey == previous.titleKey)) {
++                        merged[candidate.episodeId] = merged.getValue(candidate.episodeId).copy(
++                            canonicalEpisodeId = candidate.canonicalEpisodeId, canonicalEpisodeIds = candidate.canonicalEpisodeIds)
++                    }
++                    continue
++                }
++                if (merged.values.any { (it.videoId == candidate.videoId ||
++                    it.coordinates == candidate.coordinates && sameEpisodeSourceParent(it, candidate)) &&
++                    !candidate.trackingEpisodeIds.containsAll(it.trackingEpisodeIds) &&
++                    !(candidate.canonicalEpisodeIds.isNotEmpty() && candidate.titleKey != null && candidate.titleKey == it.titleKey) }) continue
++                merged[candidate.episodeId] = candidate
++            }
++            prefs[key] = buildJsonArray {
++                merged.values.forEach { ref -> add(buildJsonObject {
++                    put("tvdb", ref.episodeId); put("video", ref.videoId)
++                    put("season", ref.coordinates.season); put("episode", ref.coordinates.episode)
++                    ref.titleKey?.let { put("titleKey", it) }
++                    ref.canonicalEpisodeId?.let { put("canonical", it) }
++                    if (ref.canonicalEpisodeIds.isNotEmpty()) put("coverage", buildJsonArray { ref.canonicalEpisodeIds.forEach { add(it) } })
++                }) }
++            }.toString()
++            result = merged
++        }
++        return result
++    }
++    suspend fun knownSeries(profileId: Int, aliases: Collection<String>): Long? {
++        val prefs = factory.get(profileId, "tvdb_orders").data.first()
++        return aliases.mapNotNull { prefs[longPreferencesKey("alias:$it")] }.distinct().singleOrNull()
++    }
++    suspend fun selected(profileId: Int, aliases: Collection<String>): TvdbOrderPreference? {
++        val prefs = factory.get(profileId, "tvdb_orders").data.first()
++        snapshots[profileId] = prefs
++        val ids = aliases.mapNotNull { prefs[longPreferencesKey("alias:$it")] }.distinct()
++        val id = ids.singleOrNull() ?: return null
++        val order = prefs[stringPreferencesKey("order:$id")] ?: return null
++        return TvdbOrderPreference(id, order)
++    }
++
++    suspend fun save(profileId: Int, seriesId: Long, order: String?, aliases: Collection<String>) {
++        require(seriesId > 0)
++        require(order == null || order.matches(Regex("[A-Za-z0-9_-]+")))
++        factory.get(profileId, "tvdb_orders").edit { prefs ->
++            val key = stringPreferencesKey("order:$seriesId")
++            if (order == null) prefs.remove(key) else prefs[key] = order
++            aliases.filter(String::isNotBlank).forEach { prefs[longPreferencesKey("alias:$it")] = seriesId }
++        }.also { snapshots[profileId] = it }
++    }
++}
++
++private fun decodeSources(raw: String?): Map<Long, TvdbSourceReference> = try {
++    if (raw == null) emptyMap() else Json.parseToJsonElement(raw).jsonArray.mapNotNull { element ->
++        val value = element.jsonObject
++        val id = value["tvdb"]?.jsonPrimitive?.longOrNull?.takeIf { it > 0 } ?: return@mapNotNull null
++        val video = value["video"]?.jsonPrimitive?.contentOrNull?.takeIf(String::isNotBlank) ?: return@mapNotNull null
++        val season = value["season"]?.jsonPrimitive?.intOrNull?.takeIf { it >= 0 } ?: return@mapNotNull null
++        val episode = value["episode"]?.jsonPrimitive?.intOrNull?.takeIf { it > 0 } ?: return@mapNotNull null
++        id to TvdbSourceReference(id, video, EpisodeCoordinates(season, episode), value["titleKey"]?.jsonPrimitive?.contentOrNull,
++            value["canonical"]?.jsonPrimitive?.longOrNull?.takeIf { it > 0 },
++            (value["coverage"] as? JsonArray).orEmpty().mapNotNull { it.jsonPrimitive.longOrNull?.takeIf { id -> id > 0 } })
++    }.toMap()
++} catch (_: Exception) { emptyMap() }
+diff --git a/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbProgressProjection.kt b/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbProgressProjection.kt
+new file mode 100644
+index 00000000..825799f4
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbProgressProjection.kt
+@@ -0,0 +1,80 @@
++package com.nuvio.tv.data.tvdb
++
++import com.nuvio.tv.domain.model.*
++
++/** Stable IDs win over coordinates. Unverifiable legacy records are retained in
++ * storage but cannot mark a different episode watched in a selected order. */
++internal fun reconcileTvdbProgress(meta: Meta?, progress: Map<Pair<Int, Int>, WatchProgress>, local: List<WatchProgress> = emptyList()): Map<Pair<Int, Int>, WatchProgress> {
++    if (meta?.episodeOrder?.effectiveType == null) return progress
++    val records = meta.episodeOrder.content.associateBy { it.tvdbId }
++    val identified = (progress.values + local).map { entry ->
++        val ids = entry.tvdbContentIds.flatMap { records[it]?.episodeIds ?: listOf(it) }.distinct()
++        if (ids.isEmpty()) entry else entry.copy(tvdbEpisodeId = ids.first(), tvdbEpisodeIds = ids,
++            tvdbContext = entry.tvdbContext?.copy(episodeIds = ids),
++            tvdbCompletedEpisodeIds = entry.tvdbCompletedEpisodeIds?.flatMap { records[it]?.episodeIds ?: listOf(it) }?.distinct())
++    }
++    return reconcileTvdbVideoRecords(meta.videos, identified)
++}
++
++internal fun reconcileTvdbVideoProgress(videos: List<Video>, progress: Map<Pair<Int, Int>, WatchProgress>): Map<Pair<Int, Int>, WatchProgress> {
++    return reconcileTvdbVideoRecords(videos, progress.values.toList())
++}
++
++private fun reconcileTvdbVideoRecords(videos: List<Video>, progress: List<WatchProgress>): Map<Pair<Int, Int>, WatchProgress> {
++    if (videos.none { it.episodeIdentity != null }) return progress.mapNotNull { p -> p.season?.let { s -> p.episode?.let { e -> (s to e) to p } } }.toMap()
++    // Resolve a legacy record only once, not once for every displayed episode.
++    // Keep input order for equal timestamps, matching the original reconciliation.
++    val byContent = mutableMapOf<Long, MutableList<Int>>()
++    val legacyByVideo = mutableMapOf<String, MutableList<Int>>()
++    progress.forEachIndexed { index, entry ->
++        if (entry.tvdbEpisodeIds?.isEmpty() == true) return@forEachIndexed
++        val ids = entry.tvdbContentIds
++        if (ids.isNotEmpty()) ids.forEach { byContent.getOrPut(it, ::mutableListOf).add(index) }
++        else resolveTvdbProgressVideo(videos, entry)?.id?.let { legacyByVideo.getOrPut(it, ::mutableListOf).add(index) }
++    }
++    return videos.filter { it.hasResolvedSource }.distinctEpisodeSources().mapNotNull { video ->
++        val identity = video.episodeIdentity ?: return@mapNotNull null
++        val ids = identity.trackingEpisodeIds.toSet()
++        if (ids.isEmpty()) return@mapNotNull null
++        val entries = (ids.flatMap { byContent[it].orEmpty() } + legacyByVideo[video.id].orEmpty())
++            .distinct().sorted().map(progress::get)
++        if (entries.isEmpty()) return@mapNotNull null
++        // A newer replay replaces older completion for the content it covers.
++        val complete = ids.filterTo(mutableSetOf()) { id ->
++            val covering = entries.filter { it.tvdbContentIds.isEmpty() || id in it.tvdbContentIds }
++            val latest = covering.maxOfOrNull { it.lastWatched }
++            covering.any { entry -> entry.lastWatched == latest &&
++                (if (entry.tvdbContentIds.isEmpty()) entry.isCompleted() else id in entry.tvdbWatchedIds) }
++        }
++        val actual = entries.filter { it.tvdbContentIds.isEmpty() || it.tvdbContentIds == ids }
++            .maxByOrNull { it.lastWatched }
++        val entry = actual ?: entries.maxBy { it.lastWatched }.copy(position = 0, duration = 0, progressPercent = null)
++        val whole = complete.containsAll(ids)
++        (video.season!! to video.episode!!) to entry.copy(videoId = video.id, season = video.season, episode = video.episode,
++            position = if (whole) entry.duration.coerceAtLeast(1) else entry.position,
++            duration = if (whole) entry.duration.coerceAtLeast(1) else entry.duration,
++            progressPercent = if (whole) 100f else entry.progressPercent,
++            tvdbEpisodeId = ids.first(), tvdbEpisodeIds = ids.toList(), tvdbCompletedEpisodeIds = complete.toList(),
++            tvdbContext = video.tvdbPlaybackContext())
++    }.toMap()
++}
++
++internal fun resolveTvdbProgressVideo(videos: List<Video>, entry: WatchProgress): Video? =
++    if (entry.tvdbEpisodeIds?.isEmpty() == true) null else videos.filter { it.hasResolvedSource }.let { resolved ->
++        if (entry.tvdbContext != null) {
++            resolved.filter { it.episodeIdentity?.trackingEpisodeIds?.toSet() == entry.tvdbContentIds && entry.tvdbContentIds.isNotEmpty() }
++                .singleOrNull { it.episodeIdentity?.tvdbEpisodeId == entry.tvdbContext.episodeId }
++                ?: resolved.filter { it.episodeIdentity?.trackingEpisodeIds?.toSet() == entry.tvdbContentIds && entry.tvdbContentIds.isNotEmpty() }.singleOrNull()
++        } else if (entry.tvdbEpisodeId != null) {
++            resolved.singleOrNull { it.episodeIdentity?.tvdbEpisodeId == entry.tvdbEpisodeId }
++                ?: resolved.filter { it.episodeIdentity?.trackingEpisodeId == entry.tvdbEpisodeId }.singleEpisodeSource()
++        } else if (entry.trackingProviderId == "simkl") {
++            resolved.filter { it.episodeIdentity?.aired?.season == entry.season && it.episodeIdentity?.aired?.episode == entry.episode }.singleEpisodeSource()
++        } else {
++            val title = entry.episodeTitle?.let(::normalizeEpisodeName)?.takeIf { it.isNotBlank() }
++            resolved.filter { video -> title != null && (video.episodeIdentity?.providerSources?.any { ref ->
++                ref.videoId == entry.videoId && ref.coordinates.season == entry.season && ref.coordinates.episode == entry.episode &&
++                    normalizeEpisodeName(ref.title) == title
++            } ?: (video.id == entry.videoId && normalizeEpisodeName(video.title) == title)) }.singleEpisodeSource()
++        }
++    }
+diff --git a/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbProportionalProgress.kt b/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbProportionalProgress.kt
+new file mode 100644
+index 00000000..f53668cf
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbProportionalProgress.kt
+@@ -0,0 +1,42 @@
++package com.nuvio.tv.data.tvdb
++
++import com.nuvio.tv.domain.model.EpisodeSourceIdentity
++import com.nuvio.tv.domain.model.TvdbPlaybackContext
++
++internal fun TvdbPlaybackContext.progressWeights(refs: List<EpisodeSourceIdentity> = providerSources.orEmpty(), additionalIds: Collection<Long> = emptyList()): Map<Long, Double> {
++    val ids = (episodeIds + refs.flatMap { it.episodeIds } + additionalIds).distinct()
++    val durations = ids.associateWith { id ->
++        refs.singleOrNull { it.episodeIds == listOf(id) }?.runtimeMinutes?.takeIf { it > 0 }
++            ?: episodeRuntimeMinutes?.get(id)?.takeIf { it > 0 }
++    }
++    return ids.associateWith { if (durations.values.all { it != null }) durations.getValue(it)!!.toDouble() else 1.0 }
++}
++
++internal fun List<Long>.progressRanges(weights: Map<Long, Double>): Map<Long, ClosedFloatingPointRange<Double>> {
++    val total = sumOf { weights.getValue(it) }
++    var offset = 0.0
++    return associateWith { id ->
++        val start = offset / total
++        offset += weights.getValue(id)
++        start..(offset / total)
++    }
++}
++
++/** Shared timeline math; identity correspondence must already be verified. */
++internal fun projectTvdbFraction(sourceIds: List<Long>, targetIds: List<Long>, weights: Map<Long, Double>, fraction: Double): Double? {
++    val source = sourceIds.progressRanges(weights)
++    val target = targetIds.progressRanges(weights)
++    return targetIds.mapNotNull { id ->
++        val part = source[id] ?: return@mapNotNull null
++        if (fraction < part.start) return@mapNotNull null
++        val within = ((fraction - part.start) / (part.endInclusive - part.start)).coerceIn(0.0, 1.0)
++        target.getValue(id).let { it.start + within * (it.endInclusive - it.start) }
++    }.maxOrNull()
++}
++
++internal fun TvdbPlaybackContext.activeProgressPart(percent: Double, weights: Map<Long, Double> = progressWeights()): Long? {
++    if (!percent.isFinite() || episodeIds.isEmpty()) return null
++    val fraction = (percent / 100).coerceIn(0.0, 1.0)
++    return episodeIds.progressRanges(weights).entries.firstOrNull { fraction < it.value.endInclusive }?.key
++        ?: episodeIds.last()
++}
+diff --git a/app/src/main/java/com/nuvio/tv/domain/model/EpisodeIdentity.kt b/app/src/main/java/com/nuvio/tv/domain/model/EpisodeIdentity.kt
+new file mode 100644
+index 00000000..95e5da94
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/domain/model/EpisodeIdentity.kt
+@@ -0,0 +1,96 @@
++package com.nuvio.tv.domain.model
++
++import androidx.compose.runtime.Immutable
++
++@Immutable
++data class EpisodeOrderStatus(
++    val seriesId: Long,
++    val selectedType: String,
++    val effectiveType: String?,
++    val message: String? = null,
++    val content: List<EpisodeContentIdentity> = emptyList()
++)
++
++@Immutable
++data class EpisodeContentIdentity(val tvdbId: Long, val title: String, val aired: String?,
++    val officialCoordinates: EpisodeCoordinates?, val episodeIds: List<Long>)
++
++val Video.displaySeason: Int? get() = episodeIdentity?.displayed?.season ?: season
++val Video.displayEpisode: Int? get() = episodeIdentity?.displayed?.episode ?: episode
++val Video.sourceSeason: Int? get() = episodeIdentity?.streamCoordinates?.season ?: episodeIdentity?.providerCoordinates?.season ?: season
++val Video.sourceEpisode: Int? get() = episodeIdentity?.streamCoordinates?.episode ?: episodeIdentity?.providerCoordinates?.episode ?: episode
++val Video.hasResolvedSource: Boolean get() = episodeIdentity == null ||
++    (if (episodeIdentity.usesSelectedOrderForStreams) episodeIdentity.streamVideoId != null && episodeIdentity.streamCoordinates != null
++    else ((episodeIdentity.streamVideoId ?: episodeIdentity.providerVideoId) != null &&
++        (episodeIdentity.streamCoordinates ?: episodeIdentity.providerCoordinates) != null)
++    )
++val Video.episodeListKey: String get() = episodeIdentity?.canonicalKey ?: id
++
++val episodeSequenceComparator: Comparator<Video> = compareBy<Video> { it.displaySeason ?: Int.MAX_VALUE }
++    .thenBy { it.displayEpisode ?: Int.MAX_VALUE }
++
++fun Video.forEpisodeDisplay(): Video = if (episodeIdentity == null) this else
++    copy(season = displaySeason, episode = displayEpisode)
++
++fun Video.forEpisodeSource(): Video = if (episodeIdentity == null) this else
++    copy(season = sourceSeason, episode = sourceEpisode)
++
++/** Coordinates always belong to a particular source; they are not an identity. */
++@Immutable
++data class EpisodeCoordinates(val season: Int, val episode: Int) {
++    init {
++        require(season >= 0 && episode > 0)
++    }
++}
++
++@Immutable
++data class EpisodeSourceIdentity(val videoId: String, val coordinates: EpisodeCoordinates,
++    val episodeIds: List<Long>, val title: String, val runtimeMinutes: Int? = null)
++
++/** Additional identity for an explicitly selected TVDB episode. Ordinary videos need none. */
++@Immutable
++data class EpisodeIdentity(
++    val tvdbEpisodeId: Long,
++    val tvdbSeriesId: Long,
++    val orderType: String,
++    val displayed: EpisodeCoordinates,
++    val aired: EpisodeCoordinates?,
++    val providerVideoId: String? = null,
++    val providerCoordinates: EpisodeCoordinates? = null,
++    val canonicalTvdbEpisodeId: Long? = null,
++    val providerTitle: String? = null,
++    val canonicalEpisodeIds: List<Long> = emptyList(),
++    val providerSources: List<EpisodeSourceIdentity> = emptyList(),
++    val contentRuntimeMinutes: Map<Long, Int> = emptyMap(),
++    val streamVideoId: String? = null,
++    val streamCoordinates: EpisodeCoordinates? = null,
++    val contentVerified: Boolean = true,
++    val usesSelectedOrderForStreams: Boolean = false
++) {
++    init {
++        require(tvdbEpisodeId > 0 && tvdbSeriesId > 0 && orderType.isNotBlank())
++    }
++
++    val canonicalKey: String get() = "tvdb:$tvdbSeriesId:episode:$tvdbEpisodeId"
++    val contentEpisodeIds: List<Long> get() = canonicalEpisodeIds.ifEmpty { listOf(canonicalTvdbEpisodeId ?: tvdbEpisodeId) }
++    val trackingEpisodeIds: List<Long> get() = if (contentVerified) contentEpisodeIds else emptyList()
++    val trackingEpisodeId: Long get() = trackingEpisodeIds.firstOrNull() ?: tvdbEpisodeId
++}
++
++/** Several display entries may share one verified physical episode, never two destinations. */
++fun Iterable<Video>.singleEpisodeSource(): Video? {
++    val videos = toList()
++    if (videos.none { it.episodeIdentity != null }) return videos.singleOrNull()
++    if (videos.size > 1 && (videos.any { !it.hasResolvedSource } ||
++        videos.map { it.episodeListKey }.distinct().size != videos.size)) return null
++    return videos.distinctBy {
++        Triple(it.id, it.episodeIdentity?.trackingEpisodeId, it.season to it.episode)
++    }.singleOrNull()
++}
++
++fun Iterable<Video>.distinctEpisodeSources(): List<Video> {
++    val seen = mutableSetOf<Triple<String, Long, Pair<Int?, Int?>>>()
++    return filter { video -> video.episodeIdentity?.let {
++        seen.add(Triple(video.id, it.trackingEpisodeId, video.season to video.episode))
++    } ?: true }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/domain/model/Meta.kt b/app/src/main/java/com/nuvio/tv/domain/model/Meta.kt
+index 86d98659..21d50a3c 100644
+--- a/app/src/main/java/com/nuvio/tv/domain/model/Meta.kt
++++ b/app/src/main/java/com/nuvio/tv/domain/model/Meta.kt
+@@ -45,7 +45,9 @@ data class Meta(
+     val hasLandscapePoster: Boolean? = null,
+     val hasLogo: Boolean? = null,
+     val hasLinks: Boolean? = null,
+-    val hasVideos: Boolean? = null
++    val hasVideos: Boolean? = null,
++    /** Present only while a TVDB episode order overlays the metadata provider episodes. */
++    val episodeOrder: EpisodeOrderStatus? = null
+ ) {
+     val apiType: String
+         get() = type.toApiString(rawType)
+@@ -63,18 +65,18 @@ data class Meta(
+ 
+ fun List<Video>.watchableEpisodes(): List<Video> {
+     val candidates = filter {
+-        it.season != null && it.episode != null && (it.season ?: 0) > 0
+-    }
++        it.season != null && it.episode != null && (it.displaySeason ?: 0) > 0 && it.hasResolvedSource
++    }.distinctEpisodeSources()
+     fun isFutureRelease(raw: String?): Boolean = isEpisodeReleaseAired(raw) == false
+-    val unavailableSeasons = candidates.groupBy { it.season }
++    val unavailableSeasons = candidates.groupBy { it.displaySeason }
+         .filter { (_, eps) ->
+-            val first = eps.minByOrNull { it.episode ?: Int.MAX_VALUE }
++            val first = eps.minByOrNull { it.displayEpisode ?: Int.MAX_VALUE }
+                 ?: return@filter false
+             if (first.available == false) return@filter true
+             isFutureRelease(first.released)
+         }.keys
+     return candidates
+-        .filter { it.season !in unavailableSeasons }
++        .filter { it.displaySeason !in unavailableSeasons }
+         .filter { it.available != false && !isFutureRelease(it.released) }
+ }
+ 
+@@ -198,7 +200,9 @@ data class Video(
+     val runtime: Int? = null, // episode runtime in minutes
+     /** Per-episode rating supplied by the addon, when it provides one. */
+     val rating: Double? = null,
+-    val available: Boolean? = null
++    val available: Boolean? = null,
++    /** Set only for episodes of a series with a selected TVDB order. */
++    val episodeIdentity: EpisodeIdentity? = null
+ )
+ 
+ @Immutable
+diff --git a/app/src/main/java/com/nuvio/tv/domain/model/TvdbPlaybackContext.kt b/app/src/main/java/com/nuvio/tv/domain/model/TvdbPlaybackContext.kt
+new file mode 100644
+index 00000000..22df765b
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/domain/model/TvdbPlaybackContext.kt
+@@ -0,0 +1,55 @@
++package com.nuvio.tv.domain.model
++
++import com.google.gson.Gson
++
++/** Immutable episode selection. Search coordinates are deliberately independent
++ * of the verified content IDs used by tracking destinations. No stream is selected. */
++data class TvdbPlaybackContext(
++    val seriesId: Long,
++    val orderType: String,
++    val episodeId: Long?,
++    val season: Int,
++    val episode: Int,
++    val episodeIds: List<Long>,
++    val requestVideoId: String,
++    val expectedRuntimeMinutes: Int? = null,
++    val providerSources: List<EpisodeSourceIdentity>? = null,
++    val episodeRuntimeMinutes: Map<Long, Int>? = null
++) {
++    fun storageKey(contentId: String) = "${contentId}_tvdb1:$seriesId:$orderType:${episodeId ?: 0}:$season:$episode:${episodeIds.joinToString(".")}:${expectedRuntimeMinutes ?: 0}"
++    /** Duration can reject clearly incomplete combined coverage; it cannot identify a part or add IDs. */
++    fun permitsTracking(actualDurationMs: Long): Boolean = episodeIds.size <= 1 ||
++        (expectedRuntimeMinutes != null && expectedRuntimeMinutes > 0 && actualDurationMs >= expectedRuntimeMinutes * 60_000L * 0.75)
++
++    fun encode(): String = gson.toJson(this)
++
++    companion object {
++        private val gson = Gson()
++        fun decode(value: String?): TvdbPlaybackContext? = runCatching {
++            value?.takeIf(String::isNotBlank)?.let { gson.fromJson(it, TvdbPlaybackContext::class.java) }?.takeIf {
++                it.seriesId > 0 && it.orderType.matches(Regex("[A-Za-z0-9_-]+")) && it.season >= 0 && it.episode > 0 &&
++                    it.requestVideoId.isNotBlank() && it.episodeIds.all { id -> id > 0 }
++            }
++        }.getOrNull()
++
++        fun fromStorageKey(contentId: String, key: String, videoId: String): TvdbPlaybackContext? = runCatching {
++            val prefix = "${contentId}_tvdb1:"
++            if (!key.startsWith(prefix)) return null
++            val parts = key.removePrefix(prefix).split(':')
++            if (parts.size !in 6..7) return null
++            TvdbPlaybackContext(parts[0].toLong(), parts[1], parts[2].toLong().takeIf { it > 0 },
++                parts[3].toInt(), parts[4].toInt(), parts[5].split('.').filter(String::isNotBlank).map(String::toLong), videoId, parts.getOrNull(6)?.toIntOrNull()?.takeIf { it > 0 })
++        }.getOrNull()
++    }
++}
++
++fun Video.tvdbPlaybackContext(): TvdbPlaybackContext? = episodeIdentity?.tvdbPlaybackContext(id)
++
++internal fun EpisodeIdentity.tvdbPlaybackContext(requestVideoId: String): TvdbPlaybackContext = TvdbPlaybackContext(
++    tvdbSeriesId, orderType, tvdbEpisodeId, displayed.season, displayed.episode, trackingEpisodeIds, requestVideoId,
++    trackingEpisodeIds.takeIf { ids -> ids.size > 1 && ids.all { (contentRuntimeMinutes[it] ?: 0) > 0 } }
++        ?.sumOf { contentRuntimeMinutes.getValue(it) },
++    providerSources, contentRuntimeMinutes)
++
++val WatchProgress.storageKey: String get() = tvdbContext?.storageKey(contentId)
++    ?: if (season != null && episode != null) "${contentId}_s${season}e${episode}" else contentId
+diff --git a/app/src/main/java/com/nuvio/tv/domain/model/WatchProgress.kt b/app/src/main/java/com/nuvio/tv/domain/model/WatchProgress.kt
+index 8f19f593..47c40c79 100644
+--- a/app/src/main/java/com/nuvio/tv/domain/model/WatchProgress.kt
++++ b/app/src/main/java/com/nuvio/tv/domain/model/WatchProgress.kt
+@@ -32,11 +32,21 @@ data class WatchProgress(
+     override val trackingProviderItemId: String? = null,
+     override val trackingSourceUrl: String? = null,
+     val completionThresholdOverride: Float? = null,
+-    val excludedNextUpSeasons: Set<Int> = emptySet()
++    val excludedNextUpSeasons: Set<Int> = emptySet(),
++    val tvdbEpisodeId: Long? = null,
++    val tvdbEpisodeIds: List<Long>? = null,
++    val tvdbCompletedEpisodeIds: List<Long>? = null,
++    val tvdbContext: TvdbPlaybackContext? = null,
++    val providerDefaultPlayback: Boolean = false,
++    val tvdbCoverageVerified: Boolean? = null
+ ) : TrackingAttributedItem {
+     override val trackingContentId: String
+         get() = contentId
+ 
++    val tvdbContentIds: Set<Long> get() = (tvdbContext?.episodeIds ?: tvdbEpisodeIds ?: listOfNotNull(tvdbEpisodeId)).toSet()
++    val tvdbWatchedIds: Set<Long> get() = if (tvdbCoverageVerified == false) emptySet() else tvdbCompletedEpisodeIds?.toSet()
++        ?: if (isCompleted()) tvdbContentIds else emptySet()
++
+     companion object {
+         const val SOURCE_LOCAL = "local"
+         const val SOURCE_TRAKT_PLAYBACK = "trakt_playback"
+@@ -64,13 +74,13 @@ data class WatchProgress(
+     /**
+      * Returns true if the content has been watched past the threshold (default 90%)
+      */
+-    fun isCompleted(threshold: Float = completionThreshold()): Boolean = progressPercentage >= threshold
++    fun isCompleted(threshold: Float = completionThreshold()): Boolean = tvdbCoverageVerified != false && progressPercentage >= threshold
+ 
+     /**
+      * Returns true if the content has been started but not completed
+      */
+     fun isInProgress(startThreshold: Float = STARTED_THRESHOLD, endThreshold: Float = completionThreshold()): Boolean =
+-        progressPercentage >= startThreshold && progressPercentage < endThreshold
++        progressPercentage >= startThreshold && (progressPercentage < endThreshold || tvdbCoverageVerified == false)
+ 
+     private fun completionThreshold(): Float =
+         completionThresholdOverride?.takeIf { it.isFinite() && it > 0f && it <= 1f }
+diff --git a/app/src/main/java/com/nuvio/tv/domain/repository/MetaRepository.kt b/app/src/main/java/com/nuvio/tv/domain/repository/MetaRepository.kt
+index 3fcd341a..3aae2804 100644
+--- a/app/src/main/java/com/nuvio/tv/domain/repository/MetaRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/domain/repository/MetaRepository.kt
+@@ -27,6 +27,13 @@ interface MetaRepository {
+      * reading backdrop URLs synchronously before navigation.
+      */
+     fun getCachedMeta(type: String, id: String): Meta?
+-    
++
++    /** Raw metadata provider meta, bypassing any selected TVDB episode order overlay. */
++    fun getProviderMeta(type: String, id: String): Flow<NetworkResult<Meta>> = getMetaFromAllAddons(type, id)
++
++    /** Re-project cached/provider meta under an explicit TVDB playback selection. */
++    suspend fun getPlaybackMeta(profileId: Int, type: String, id: String,
++        context: com.nuvio.tv.domain.model.TvdbPlaybackContext): Meta? = null
++
+     fun clearCache()
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt
+index 6c9728ca..b66ee418 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt
+@@ -91,6 +91,8 @@ import coil3.request.crossfade
+ import coil3.request.transformations
+ import com.nuvio.tv.R
+ import com.nuvio.tv.domain.model.Video
++import com.nuvio.tv.domain.model.episodeListKey
++import com.nuvio.tv.domain.model.hasResolvedSource
+ import com.nuvio.tv.domain.model.EpisodeOptionsOverlayStyle
+ import com.nuvio.tv.ui.components.FocusMarqueeText
+ import com.nuvio.tv.ui.components.ImdbRatingSourceLabel
+@@ -477,7 +479,7 @@ fun EpisodesRow(
+     anchorEpisodeId: String? = null,
+     windowResetKey: String? = null
+ ) {
+-    val dedupedEpisodes = remember(episodes) { episodes.distinctBy { it.id } }
++    val dedupedEpisodes = remember(episodes) { episodes.distinctBy { it.episodeListKey } }
+     var optionsEpisode by remember { mutableStateOf<Video?>(null) }
+     var forkShowRatingMap by remember { mutableStateOf(false) }
+     val forkHasRatingMap = remember(episodes, episodeRatings) {
+@@ -499,7 +501,7 @@ fun EpisodesRow(
+     val rowPrefetchStrategy = remember { LazyListPrefetchStrategy(nestedPrefetchItemCount = 2) }
+     val initialEpisodeIndex = remember(dedupedEpisodes, restoreEpisodeId, scrollToEpisodeId, anchorEpisodeId) {
+         val initialEpisodeId = restoreEpisodeId ?: scrollToEpisodeId ?: anchorEpisodeId
+-        val targetIndex = dedupedEpisodes.indexOfFirst { it.id == initialEpisodeId }
++        val targetIndex = dedupedEpisodes.indexOfFirst { it.episodeListKey == initialEpisodeId || it.id == initialEpisodeId }
+         if (restoreEpisodeId != null) {
+             (targetIndex - 1).coerceAtLeast(0)
+         } else {
+@@ -510,29 +512,29 @@ fun EpisodesRow(
+         initialFirstVisibleItemIndex = initialEpisodeIndex,
+         prefetchStrategy = rowPrefetchStrategy
+     )
+-    val episodeWindowIds = remember(dedupedEpisodes) { dedupedEpisodes.map { it.id } }
++    val episodeWindowIds = remember(dedupedEpisodes) { dedupedEpisodes.map { it.episodeListKey } }
+     lazyListState.keepDetailRowWindow(
+         itemIds = episodeWindowIds,
+-        lazyKeyAt = { index -> dedupedEpisodes.getOrNull(index)?.id },
++        lazyKeyAt = { index -> dedupedEpisodes.getOrNull(index)?.episodeListKey },
+         resetKey = windowResetKey
+     )
+     var lastHorizontalKeyRepeatTime by remember { mutableStateOf(0L) }
+-    val episodeIds = remember(dedupedEpisodes) { dedupedEpisodes.mapTo(mutableSetOf()) { it.id } }
++    val episodeIds = remember(dedupedEpisodes) { dedupedEpisodes.mapTo(mutableSetOf()) { it.episodeListKey } }
+     LaunchedEffect(episodeIds, episodeFocusRequesters) {
+         episodeFocusRequesters.keys.retainAll(episodeIds)
+     }
+ 
+     LaunchedEffect(restoreFocusToken, restoreEpisodeId, dedupedEpisodes) {
+         if (restoreFocusToken <= 0 || restoreEpisodeId.isNullOrBlank()) return@LaunchedEffect
+-        if (dedupedEpisodes.none { it.id == restoreEpisodeId }) {
++        if (dedupedEpisodes.none { it.episodeListKey == restoreEpisodeId || it.id == restoreEpisodeId }) {
+             if (dedupedEpisodes.isEmpty()) return@LaunchedEffect
+             delay(EPISODE_RESTORE_FALLBACK_MS)
+-            if (dedupedEpisodes.none { it.id == restoreEpisodeId }) {
++            if (dedupedEpisodes.none { it.episodeListKey == restoreEpisodeId || it.id == restoreEpisodeId }) {
+                 onRestoreFocusHandled()
+             }
+             return@LaunchedEffect
+         }
+-        val index = dedupedEpisodes.indexOfFirst { it.id == restoreEpisodeId }
++        val index = dedupedEpisodes.indexOfFirst { it.episodeListKey == restoreEpisodeId || it.id == restoreEpisodeId }
+         if (index >= 0) {
+             val offsetPx = with(density) { (cardMetrics.cardWidth * 2f / 3f - cardMetrics.itemSpacing).roundToPx() }
+             lazyListState.scrollToItem(index, scrollOffset = -offsetPx)
+@@ -550,7 +552,7 @@ fun EpisodesRow(
+ 
+     LaunchedEffect(scrollToEpisodeId, dedupedEpisodes) {
+         if (scrollToEpisodeId.isNullOrBlank()) return@LaunchedEffect
+-        val index = dedupedEpisodes.indexOfFirst { it.id == scrollToEpisodeId }
++        val index = dedupedEpisodes.indexOfFirst { it.episodeListKey == scrollToEpisodeId || it.id == scrollToEpisodeId }
+         if (index < 0) return@LaunchedEffect
+         val offsetPx = with(density) { (cardMetrics.cardWidth * 2f / 3f - cardMetrics.itemSpacing).roundToPx() }
+         lazyListState.scrollToItem(index, scrollOffset = -offsetPx)
+@@ -568,7 +570,7 @@ fun EpisodesRow(
+             anchorPlaced = true
+             return@LaunchedEffect
+         }
+-        val index = dedupedEpisodes.indexOfFirst { it.id == anchor }
++        val index = dedupedEpisodes.indexOfFirst { it.episodeListKey == anchor || it.id == anchor }
+         if (index < 0) return@LaunchedEffect
+         snapshotFlow { lazyListState.layoutInfo.visibleItemsInfo.map { it.index } }
+             .first { it.isNotEmpty() }
+@@ -607,7 +609,7 @@ fun EpisodesRow(
+     ) {
+         items(
+             items = dedupedEpisodes,
+-            key = { it.id },
++            key = { it.episodeListKey },
+             contentType = { EPISODE_CARD_CONTENT_TYPE }
+         ) { episode ->
+             val seasonEp = remember(episode.season, episode.episode) { episode.season?.let { s -> episode.episode?.let { e -> s to e } } }
+@@ -619,11 +621,11 @@ fun EpisodesRow(
+                 extraSources.mapNotNull { (name, map) -> map[key]?.takeIf { it > 0.0 }?.let { name to it } }
+             }.orEmpty()
+             val isMarkedWatched = remember(seasonEp, watchedEpisodes) { seasonEp?.let { watchedEpisodes.contains(it) } ?: false }
+-            val episodeFocusRequester = remember(episode.id) { episodeFocusRequesters.getOrPut(episode.id) { FocusRequester() } }
++            val episodeFocusRequester = remember(episode.episodeListKey) { episodeFocusRequesters.getOrPut(episode.episodeListKey) { FocusRequester() } }
+             val episodeOnClick = remember(episode, onEpisodeClick) { { onEpisodeClick(episode) } }
+-            val episodeOnLongPress = remember(episode.id) { { optionsEpisode = episode } }
+-            val episodeOnFocused = remember(episode.id) { { onEpisodeFocused(episode.id) } }
+-            val isRestoreTarget = episode.id == restoreEpisodeId
++            val episodeOnLongPress = remember(episode.episodeListKey) { { optionsEpisode = episode } }
++            val episodeOnFocused = remember(episode.episodeListKey) { { onEpisodeFocused(episode.episodeListKey) } }
++            val isRestoreTarget = episode.episodeListKey == restoreEpisodeId || episode.id == restoreEpisodeId
+             val episodeOnFocusRestored = remember(isRestoreTarget, onRestoreFocusHandled) {
+                 if (isRestoreTarget) onRestoreFocusHandled else null
+             }
+@@ -767,6 +769,7 @@ private fun EpisodeCard(
+     val showCompletedBadge = isWatched
+     val showNotStartedBadge = remember(showCompletedBadge, progressPercent) { !showCompletedBadge && progressPercent < 0.02f }
+     val isUnavailable = remember(episode.available) { episode.available == false }
++    val isUnmatched = !episode.hasResolvedSource
+     val cardBgColor = NuvioTheme.colors.BackgroundCard
+     val isFocusedState = remember { mutableStateOf(false) }
+     val cardCornerRadius = remember(cardMetrics.cornerRadius, density) {
+@@ -903,6 +906,7 @@ private fun EpisodeCard(
+     }
+     val strEpisode = stringResource(R.string.episodes_episode)
+     val strUnavailable = stringResource(R.string.episodes_unavailable)
++    val strUnmatched = stringResource(R.string.tvdb_episode_unmatched)
+     val episodeCode = remember(episode.episode, strEpisode) {
+         val prefix = strEpisode.uppercase(Locale.getDefault())
+         episode.episode?.let { number -> "$prefix $number" } ?: prefix
+@@ -1184,7 +1188,7 @@ private fun EpisodeCard(
+                 )
+             }
+ 
+-            if (isUnavailable) {
++            if (isUnavailable || isUnmatched) {
+                 Box(
+                     modifier = Modifier
+                         .align(if (showCompletedBadge) Alignment.TopStart else Alignment.TopEnd)
+@@ -1203,7 +1207,7 @@ private fun EpisodeCard(
+                         )
+                 ) {
+                     Text(
+-                        text = strUnavailable.uppercase(Locale.getDefault()),
++                        text = (if (isUnmatched) strUnmatched else strUnavailable).uppercase(Locale.getDefault()),
+                         style = episodeBadgeStyle,
+                         maxLines = 1
+                     )
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/HeroSection.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/HeroSection.kt
+index 4a72413e..b43b5533 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/HeroSection.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/HeroSection.kt
+@@ -118,6 +118,7 @@ fun HeroContentSection(
+     shuffleActionPending: Boolean = false,
+     onRandomEpisodeClick: () -> Unit = {},
+     randomEpisodeFocusRequester: FocusRequester? = null,
++    onEpisodeOrderChanged: (() -> Unit)? = null,
+     rateAvailable: Boolean = false,
+     userRating: Int? = null,
+     onRateClick: () -> Unit = {},
+@@ -344,6 +345,10 @@ fun HeroContentSection(
+                                 onFocused = onHeroActionFocused
+                             )
+                         }
++                        if (onEpisodeOrderChanged != null && meta.apiType in listOf("series", "tv") &&
++                            !com.nuvio.tv.data.mediaserver.ServerItemRef.isServerId(meta.id)) {
++                            TvdbOrderControl(meta, onEpisodeOrderChanged)
++                        }
+                     }
+ 
+                     Spacer(modifier = Modifier.height(NuvioTheme.spacing.lg))
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
+index 3516fc28..64a82850 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
+@@ -127,6 +127,9 @@ import com.nuvio.tv.domain.model.DetailImdbRatingsVisibility
+ import com.nuvio.tv.domain.model.EpisodeOptionsOverlayStyle
+ import com.nuvio.tv.domain.model.HomeImdbRatingsVisibility
+ import com.nuvio.tv.domain.model.LibraryListTab
++import com.nuvio.tv.domain.model.hasResolvedSource
++import com.nuvio.tv.domain.model.sourceEpisode
++import com.nuvio.tv.domain.model.sourceSeason
+ import com.nuvio.tv.domain.model.localizedMembershipTitle
+ import com.nuvio.tv.domain.model.LibrarySourceMode
+ import com.nuvio.tv.domain.model.Meta
+@@ -706,8 +709,10 @@ fun MetaDetailsScreen(
+                     formatDetailYearRange(meta.releaseInfo)
+                 }
+                 val playEpisode: (Video) -> Unit = playEpisode@{ video ->
+-                    if (!playbackAvailability.canStream(meta.apiType, video.id, meta.id, video)) {
+-                        Toast.makeText(context, R.string.playback_unavailable_message, Toast.LENGTH_SHORT).show()
++                    if (!video.hasResolvedSource || !playbackAvailability.canStream(meta.apiType, video.id, meta.id, video)) {
++                        Toast.makeText(context, if (!video.hasResolvedSource) R.string.tvdb_episode_unmatched_message
++                            else R.string.playback_unavailable_message,
++                            if (!video.hasResolvedSource) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).show()
+                         return@playEpisode
+                     }
+                     onPlayClick(
+@@ -718,8 +723,8 @@ fun MetaDetailsScreen(
+                         video.thumbnail ?: meta.poster,
+                         meta.backdropUrl,
+                         meta.logo,
+-                        video.season,
+-                        video.episode,
++                        video.sourceSeason,
++                        video.sourceEpisode,
+                         video.title,
+                         null,
+                         null,
+@@ -728,8 +733,10 @@ fun MetaDetailsScreen(
+                     )
+                 }
+                 val playEpisodeManually: (Video) -> Unit = playEpisodeManually@{ video ->
+-                    if (!playbackAvailability.canStream(meta.apiType, video.id, meta.id, video)) {
+-                        Toast.makeText(context, R.string.playback_unavailable_message, Toast.LENGTH_SHORT).show()
++                    if (!video.hasResolvedSource || !playbackAvailability.canStream(meta.apiType, video.id, meta.id, video)) {
++                        Toast.makeText(context, if (!video.hasResolvedSource) R.string.tvdb_episode_unmatched_message
++                            else R.string.playback_unavailable_message,
++                            if (!video.hasResolvedSource) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).show()
+                         return@playEpisodeManually
+                     }
+                     onPlayManuallyClick(
+@@ -740,8 +747,8 @@ fun MetaDetailsScreen(
+                         video.thumbnail ?: meta.poster,
+                         meta.backdropUrl,
+                         meta.logo,
+-                        video.season,
+-                        video.episode,
++                        video.sourceSeason,
++                        video.sourceEpisode,
+                         video.title,
+                         null,
+                         null,
+@@ -875,6 +882,7 @@ fun MetaDetailsScreen(
+                     episodeShuffle = uiState.episodeShuffle,
+                     shufflePoolEmpty = uiState.shufflePoolEmpty,
+                     onEpisodeShuffleChange = viewModel::setEpisodeShuffle,
++                    onEpisodeOrderChanged = viewModel::reloadEpisodeOrder,
+                     episodeOptionsOverlayStyle = uiState.episodeOptionsOverlayStyle,
+                     showFullReleaseDate = uiState.showFullReleaseDate,
+                     overallRatingsVisibility = uiState.overallRatingsVisibility,
+@@ -912,8 +920,10 @@ fun MetaDetailsScreen(
+                     onPlayClick = playTitle,
+                     onPlayManuallyClick = playTitleManually,
+                     onEpisodeStartFromBeginningClick = onEpisodeStartFromBeginningClick@{ video ->
+-                        if (!playbackAvailability.canStream(meta.apiType, video.id, meta.id, video)) {
+-                            Toast.makeText(context, R.string.playback_unavailable_message, Toast.LENGTH_SHORT).show()
++                        if (!video.hasResolvedSource || !playbackAvailability.canStream(meta.apiType, video.id, meta.id, video)) {
++                            Toast.makeText(context, if (!video.hasResolvedSource) R.string.tvdb_episode_unmatched_message
++                                else R.string.playback_unavailable_message,
++                                if (!video.hasResolvedSource) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).show()
+                             return@onEpisodeStartFromBeginningClick
+                         }
+                         onPlayStartFromBeginningClick(
+@@ -924,8 +934,8 @@ fun MetaDetailsScreen(
+                             video.thumbnail ?: meta.poster,
+                             meta.backdropUrl,
+                             meta.logo,
+-                            video.season,
+-                            video.episode,
++                            video.sourceSeason,
++                            video.sourceEpisode,
+                             video.title,
+                             null,
+                             null,
+@@ -1220,6 +1230,7 @@ private fun MetaDetailsContent(
+     episodeShuffle: com.nuvio.tv.domain.model.EpisodeShuffleSettings,
+     shufflePoolEmpty: Boolean,
+     onEpisodeShuffleChange: suspend (com.nuvio.tv.domain.model.EpisodeShuffleSettings) -> Boolean,
++    onEpisodeOrderChanged: () -> Unit,
+     episodeOptionsOverlayStyle: EpisodeOptionsOverlayStyle,
+     showFullReleaseDate: Boolean,
+     overallRatingsVisibility: HomeImdbRatingsVisibility,
+@@ -2534,6 +2545,7 @@ private fun MetaDetailsContent(
+                         episodeShuffle = episodeShuffle,
+                         shuffleActionPending = stoppingShuffle,
+                         randomEpisodeFocusRequester = randomEpisodeFocusRequester,
++                        onEpisodeOrderChanged = onEpisodeOrderChanged,
+                         hideLogoDuringTrailer = hideLogoDuringTrailer,
+                         isTrailerPlaying = isTrailerPlaying,
+                         playButtonFocusRequester = heroPlayButtonFocusRequester,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsUiState.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsUiState.kt
+index f4c8a0dd..8667ef85 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsUiState.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsUiState.kt
+@@ -97,7 +97,9 @@ data class MetaDetailsUiState(
+     val commentsEpisodeTarget: Video? = null,
+     val selectedComment: TraktCommentReview? = null,
+     val userMessage: String? = null,
+-    val userMessageIsError: Boolean = false
++    val userMessageIsError: Boolean = false,
++    /** Historical progress records that could not be verified against the selected TVDB order. */
++    val unverifiedEpisodeProgress: Int = 0
+ )
+ 
+ sealed class MetaDetailsEvent {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt
+index ed22d83a..c65efd17 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt
+@@ -35,12 +35,15 @@ import com.nuvio.tv.domain.model.TmdbSettings
+ import com.nuvio.tv.domain.model.TraktCommentReview
+ import com.nuvio.tv.domain.model.Video
+ import com.nuvio.tv.domain.model.WatchProgress
++import com.nuvio.tv.domain.model.tvdbPlaybackContext
++import com.nuvio.tv.domain.model.distinctEpisodeSources
+ import com.nuvio.tv.domain.repository.LibraryRepository
+ import com.nuvio.tv.domain.repository.MetaRepository
+ import com.nuvio.tv.domain.repository.WatchProgressRepository
+ import com.nuvio.tv.data.local.WatchedItemsPreferences
+ import com.nuvio.tv.data.local.TrailerSettingsDataStore
+ import com.nuvio.tv.data.mediaserver.ServerItemRef
++import com.nuvio.tv.data.tvdb.reconcileTvdbProgress
+ import com.nuvio.tv.data.trailer.TrailerService
+ import com.nuvio.tv.core.util.withAppLocale
+ import com.nuvio.tv.core.util.isUnreleased
+@@ -119,7 +122,7 @@ class MetaDetailsViewModel @Inject constructor(
+     val uiState: StateFlow<MetaDetailsUiState> = combine(
+         _uiState, episodeShuffleStore.profiles, watchProgressRepository.continueWatching
+     ) { state, profile, progress ->
+-        applyDetailShuffle(state, profile, progress, episodeShuffle, shuffleVisit, localizedContext)
++        applyDetailShuffle(state, profile, progress, episodeShuffle, shuffleVisit, localizedContext).withTvdbDisplay()
+     }.stateIn(viewModelScope, SharingStarted.Eagerly, MetaDetailsUiState())
+ 
+     private val _posterCardCornerRadiusDp = MutableStateFlow(12)
+@@ -485,14 +488,15 @@ class MetaDetailsViewModel @Inject constructor(
+                 } else {
+                     watchProgressRepository.getAllEpisodeProgress(cid)
+                 }
+-            }
+-                .distinctUntilChanged()
+-                .collectLatest { progressMap ->
++            }.combine(_uiState.map { it.meta }.distinctUntilChanged()) { raw, meta ->
++                raw to reconcileTvdbProgress(meta, raw)
++            }.distinctUntilChanged()
++                .collectLatest { (raw, progressMap) ->
+                 _uiState.update { state ->
+-                    if (state.episodeProgressMap == progressMap) {
++                    if (state.episodeProgressMap == progressMap && state.unverifiedEpisodeProgress == (raw.size - progressMap.size).coerceAtLeast(0)) {
+                         state
+                     } else {
+-                        state.copy(episodeProgressMap = progressMap)
++                        state.copy(episodeProgressMap = progressMap, unverifiedEpisodeProgress = (raw.size - progressMap.size).coerceAtLeast(0))
+                     }
+                 }
+                 revalidateLocalWatchedEpisodesAgainstActiveProvider(progressMap)
+@@ -517,6 +521,8 @@ class MetaDetailsViewModel @Inject constructor(
+     private fun revalidateLocalWatchedEpisodesAgainstActiveProvider(
+         providerProgressMap: Map<Pair<Int, Int>, WatchProgress>
+     ) {
++        // Unverified legacy records are deliberately hidden, never deleted by reconciliation.
++        if (_uiState.value.meta?.episodeOrder != null) return
+         if (itemType.equals("other", ignoreCase = true)) return
+         if (itemType.equals("movie", ignoreCase = true)) return
+         if (providerProgressMap.isEmpty()) return
+@@ -560,8 +566,10 @@ class MetaDetailsViewModel @Inject constructor(
+                     watchProgressRepository.getAllEpisodeProgress(cid),
+                     _uiState.map { it.meta?.videos }.distinctUntilChanged(),
+                 ) { localWatched, progressMap, videos ->
+-                    val fromProgress = progressMap.filterValues { it.isCompleted() }.keys
+-                    val merged = (localWatched + fromProgress).toMutableSet()
++                    val meta = _uiState.value.meta
++                    val native = meta?.episodeOrder?.effectiveType != null
++                    val fromProgress = reconcileTvdbProgress(meta, progressMap).filterValues { it.isCompleted() }.keys
++                    val merged = ((if (native) emptySet() else localWatched) + fromProgress).toMutableSet()
+                     // Remove optimistic unmarks — episodes the user just batch-unmarked
+                     // that may still linger in localWatched/fromProgress briefly.
+                     merged -= _optimisticUnmarks
+@@ -570,7 +578,7 @@ class MetaDetailsViewModel @Inject constructor(
+                         val s = video.season ?: continue
+                         val e = video.episode ?: continue
+                         val key = s to e
+-                        val watchedByVideoId = watchProgressRepository.isWatchedByVideoId(video.id, e)
++                        val watchedByVideoId = if (native) null else watchProgressRepository.isWatchedByVideoId(video.id, e)
+                         val isWatched = resolveEpisodeWatchedState(
+                             currentlyWatched = key in merged,
+                             completedByProgress = key in fromProgress,
+@@ -739,6 +747,13 @@ class MetaDetailsViewModel @Inject constructor(
+         }
+     }
+ 
++    /** Re-apply the selected TVDB episode order: the overlay lives in the meta pipeline. */
++    fun reloadEpisodeOrder() {
++        nextToWatchJob?.cancel()
++        _uiState.update { it.copy(nextToWatch = null, episodeProgressMap = emptyMap(), watchedEpisodes = emptySet()) }
++        loadMeta()
++    }
++
+     private fun loadMeta() {
+         viewModelScope.launch {
+             cancelCommentsRequests()
+@@ -1052,8 +1067,10 @@ class MetaDetailsViewModel @Inject constructor(
+         val watchedDeferred = viewModelScope.async {
+             watchedItemsPreferences.getWatchedEpisodesForContent(contentId).first()
+         }
+-        val progressMap = progressDeferred.await()
+-        val watchedEpisodes = watchedDeferred.await()
++        val progressMap = reconcileTvdbProgress(enriched, progressDeferred.await())
++        val localWatched = watchedDeferred.await()
++        val watchedEpisodes = if (enriched.episodeOrder?.effectiveType != null)
++            progressMap.filterValues { it.isCompleted() }.keys else localWatched
+         val precomputedNextToWatch = computeNextToWatch(enriched, progressMap, watchedEpisodes)
+         updateNextToWatch(precomputedNextToWatch)
+     }
+@@ -1446,6 +1463,10 @@ class MetaDetailsViewModel @Inject constructor(
+ 
+     private fun loadEpisodeRatingsAsync(meta: Meta) {
+         episodeRatingsJob?.cancel()
++        if (meta.episodeOrder?.effectiveType != null) {
++            _uiState.update { it.copy(episodeImdbRatings = emptyMap(), isEpisodeRatingsLoading = false) }
++            return // Numeric provider ratings cannot be applied to a different numbering scheme.
++        }
+ 
+         val isSeries = meta.type == ContentType.SERIES || meta.type == ContentType.TV || meta.apiType in listOf("series", "tv")
+         if (!isSeries) {
+@@ -2715,7 +2736,7 @@ class MetaDetailsViewModel @Inject constructor(
+                 val isWatched = _uiState.value.episodeProgressMap[s to e]?.isCompleted() == true
+                     || _uiState.value.watchedEpisodes.contains(s to e)
+                 !isWatched
+-            }
++            }.distinctEpisodeSources()
+             if (unwatched.isEmpty()) {
+                 showMessage(localizedContext.getString(R.string.detail_all_previous_seasons_watched))
+                 return@launch
+@@ -2785,7 +2806,10 @@ class MetaDetailsViewModel @Inject constructor(
+             position = runtimeMs,
+             duration = runtimeMs,
+             lastWatched = System.currentTimeMillis(),
+-            progressPercent = 100f
++            progressPercent = 100f,
++            tvdbContext = video.tvdbPlaybackContext(),
++            tvdbEpisodeIds = video.episodeIdentity?.trackingEpisodeIds,
++            tvdbEpisodeId = video.episodeIdentity?.trackingEpisodeIds?.firstOrNull()
+         )
+     }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/TvdbDetailProjection.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/TvdbDetailProjection.kt
+new file mode 100644
+index 00000000..4b88f01d
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/TvdbDetailProjection.kt
+@@ -0,0 +1,37 @@
++package com.nuvio.tv.ui.screens.detail
++
++import com.nuvio.tv.domain.model.*
++
++/** Presentation of the already reconciled selected-order progress. Historical native
++ * records are retained separately; selected search slots never rewrite them. */
++internal fun MetaDetailsUiState.withTvdbDisplay(): MetaDetailsUiState {
++    val original = meta ?: return this
++    if (original.episodeOrder?.effectiveType == null) return this
++    val bySource = original.videos.filter { it.hasResolvedSource }
++        .groupBy { it.season to it.episode }
++    fun displayKeys(key: Pair<Int, Int>): List<Pair<Int, Int>> = bySource[key].orEmpty().mapNotNull { video ->
++        video.displaySeason?.let { s -> video.displayEpisode?.let { e -> s to e } }
++    }
++    val nextVideo = original.videos.filter { it.id == nextToWatch?.nextVideoId }.singleEpisodeSource()
++    val completedIds = episodeProgressMap.values.flatMap { it.tvdbWatchedIds }.toSet()
++    val displayWatched = if (episodeProgressMap.values.any { it.tvdbContentIds.isNotEmpty() }) {
++        original.videos.filter { video -> video.episodeIdentity?.contentEpisodeIds?.all(completedIds::contains) == true }
++            .mapNotNull { video -> video.displaySeason?.let { s -> video.displayEpisode?.let { e -> s to e } } }.toSet()
++    } else watchedEpisodes.flatMap(::displayKeys).toSet()
++    return copy(
++        meta = original.copy(videos = original.videos.map(Video::forEpisodeDisplay), episodeOrder = original.episodeOrder.let { status ->
++            if (unverifiedEpisodeProgress == 0) status else status.copy(message = listOfNotNull(status.message,
++                "$unverifiedEpisodeProgress historical progress record(s) could not be verified; history has been retained.").joinToString(". "))
++        }),
++        episodesForSeason = episodesForSeason.map(Video::forEpisodeDisplay),
++        watchedEpisodes = displayWatched,
++        episodeProgressMap = episodeProgressMap.flatMap { (key, progress) -> displayKeys(key).map { it to progress } }.toMap(),
++        episodeImdbRatings = episodeImdbRatings.flatMap { (key, value) -> displayKeys(key).map { it to value } }.toMap(),
++        commentsEpisodeTarget = commentsEpisodeTarget?.forEpisodeDisplay(),
++        nextToWatch = nextToWatch?.let { next ->
++            if (nextVideo == null) next else next.copy(nextSeason = nextVideo.displaySeason,
++                nextEpisode = nextVideo.displayEpisode,
++                displayText = "${if (next.isResume) "Resume" else "Play"} S${nextVideo.displaySeason}E${nextVideo.displayEpisode}")
++        }
++    )
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/TvdbOrderControl.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/TvdbOrderControl.kt
+new file mode 100644
+index 00000000..f8603849
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/TvdbOrderControl.kt
+@@ -0,0 +1,139 @@
++package com.nuvio.tv.ui.screens.detail
++
++import androidx.compose.foundation.layout.*
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.items
++import androidx.compose.runtime.*
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalUriHandler
++import androidx.compose.ui.unit.dp
++import androidx.hilt.navigation.compose.hiltViewModel
++import androidx.lifecycle.ViewModel
++import androidx.lifecycle.SavedStateHandle
++import androidx.lifecycle.viewModelScope
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import androidx.tv.material3.Button
++import androidx.tv.material3.Text
++import com.nuvio.tv.core.profile.ProfileManager
++import com.nuvio.tv.data.tvdb.*
++import com.nuvio.tv.domain.model.Meta
++import com.nuvio.tv.ui.components.NuvioDialog
++import dagger.hilt.android.lifecycle.HiltViewModel
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.drop
++import kotlinx.coroutines.launch
++import javax.inject.Inject
++
++data class TvdbSelectorState(val open: Boolean = false, val busy: Boolean = false,
++    val seriesId: Long? = null, val orders: List<TvdbOrder> = emptyList(), val error: String? = null)
++
++@HiltViewModel
++class TvdbOrderControlViewModel @Inject constructor(
++    private val resolver: dagger.Lazy<TvdbEpisodeResolver>,
++    private val repository: dagger.Lazy<TvdbOrderRepository>,
++    private val store: TvdbOrderStore,
++    private val profiles: ProfileManager,
++    savedStateHandle: SavedStateHandle
++) : ViewModel() {
++    val state = MutableStateFlow(TvdbSelectorState())
++    private val routeId: String? = savedStateHandle["itemId"]
++    private var job: Job? = null
++    private var generation = 0L
++    init {
++        viewModelScope.launch { profiles.activeProfileId.drop(1).collect { close() } }
++    }
++    private fun aliases(meta: Meta) = listOfNotNull(routeId, meta.id, meta.imdbId)
++
++    fun open(meta: Meta) {
++        job?.cancel()
++        val request = ++generation
++        val profile = profiles.activeProfileId.value
++        state.value = TvdbSelectorState(open = true, busy = true, seriesId = meta.episodeOrder?.seriesId)
++        job = viewModelScope.launch {
++            try {
++                val id = resolver.get().seriesId(profile, meta, aliases(meta))
++                    ?: error("This series could not be identified on TVDB.")
++                val orders = repository.get().available(profile, id).filter { it.type != "default" }
++                if (request == generation && profile == profiles.activeProfileId.value) {
++                    state.value = TvdbSelectorState(open = true, seriesId = id,
++                        orders = (listOf(TvdbOrder("official", "TVDB Standard / Aired")) + orders).distinctBy { it.type })
++                }
++            } catch (e: CancellationException) { throw e }
++            catch (e: Exception) {
++                if (request == generation && profile == profiles.activeProfileId.value) {
++                    state.value = state.value.copy(busy = false, error = when ((e as? TvdbException)?.reason) {
++                        TvdbException.Reason.NO_KEY -> "Configure your TVDB API key in Settings → Integrations → TheTVDB."
++                        TvdbException.Reason.AUTHENTICATION -> "TVDB rejected your key. Test the connection in Settings."
++                        else -> "Unable to load TVDB orders. Check the connection and try again."
++                    })
++                }
++            }
++        }
++    }
++
++    fun close() { generation++; job?.cancel(); state.value = TvdbSelectorState() }
++
++    fun select(meta: Meta, type: String?, onChanged: () -> Unit) {
++        if (state.value.busy && type != null) return
++        job?.cancel()
++        val id = state.value.seriesId ?: meta.episodeOrder?.seriesId ?: return
++        val profile = profiles.activeProfileId.value
++        val request = ++generation
++        state.value = state.value.copy(busy = true, error = null)
++        job = viewModelScope.launch {
++            try {
++                store.save(profile, id, type, aliases(meta))
++                if (request == generation && profile == profiles.activeProfileId.value) {
++                    close()
++                    onChanged()
++                }
++            } catch (e: CancellationException) { throw e }
++            catch (_: Exception) {
++                if (request == generation) state.value = state.value.copy(busy = false, error = "Unable to save the episode order.")
++            }
++        }
++    }
++}
++
++@Composable
++internal fun TvdbOrderControl(meta: Meta, onChanged: () -> Unit,
++    viewModel: TvdbOrderControlViewModel = hiltViewModel()) {
++    val state by viewModel.state.collectAsStateWithLifecycle()
++    val uri = LocalUriHandler.current
++    val status = meta.episodeOrder
++    val label = when {
++        status == null -> "TVDB"
++        status.selectedType != status.effectiveType -> "TVDB: ${status.selectedType} → ${status.effectiveType ?: "Provider"}"
++        else -> "TVDB: ${status.selectedType}"
++    }
++    Button(onClick = { viewModel.open(meta) }) {
++        Text(label, maxLines = 2)
++    }
++    if (state.open) {
++        NuvioDialog(onDismiss = viewModel::close, title = "Episode order",
++            subtitle = meta.episodeOrder?.message ?: "Choose provider episodes or actual TVDB episode metadata", width = 720.dp) {
++            LazyColumn(modifier = Modifier.heightIn(max = 380.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
++                item(key = "provider") {
++                    Button(onClick = { viewModel.select(meta, null, onChanged) }) {
++                        Text("${if (meta.episodeOrder == null) "✓ " else ""}Default / Metadata Provider")
++                    }
++                }
++                if (state.busy) item { Text("Loading…") }
++                items(state.orders, key = { it.type }) { order ->
++                    Button(enabled = !state.busy, onClick = { viewModel.select(meta, order.type, onChanged) }) {
++                        Text("${if (meta.episodeOrder?.selectedType == order.type) "✓ " else ""}${order.name}")
++                    }
++                }
++                state.error?.let { error -> item { Text(error) } }
++                if (state.error != null) item {
++                    Button(onClick = { viewModel.open(meta) }) { Text("Retry") }
++                }
++                item {
++                    Button(onClick = { uri.openUri("https://thetvdb.com") }) { Text("Metadata provided by TheTVDB") }
++                }
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt
+index 5614cb06..cd245efa 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt
+@@ -110,7 +110,8 @@ private enum class IntegrationSettingsSection {
+     Debrid,
+     Tmdb,
+     MdbList,
+-    AnimeSkip
++    AnimeSkip,
++    Tvdb
+ }
+ 
+ internal enum class SettingsSectionDestination {
+@@ -255,6 +256,7 @@ fun SettingsScreen(
+     val integrationTmdbFocusRequester = remember { FocusRequester() }
+     val integrationMdbListFocusRequester = remember { FocusRequester() }
+     val integrationAnimeSkipFocusRequester = remember { FocusRequester() }
++    val integrationTvdbFocusRequester = remember { FocusRequester() }
+     var integrationSection by remember { mutableStateOf(IntegrationSettingsSection.Hub) }
+     var integrationHubReturnSection by remember { mutableStateOf(IntegrationSettingsSection.Hub) }
+     var pendingContentFocusCategory by remember { mutableStateOf<SettingsCategory?>(null) }
+@@ -956,6 +958,7 @@ private fun SettingsDetailPane(
+             tmdbFocusRequester = integrationTmdbFocusRequester,
+             mdbListFocusRequester = integrationMdbListFocusRequester,
+             animeSkipFocusRequester = integrationAnimeSkipFocusRequester,
++            tvdbFocusRequester = integrationTvdbFocusRequester,
+             autoFocusEnabled = allowDetailAutofocus
+         )
+         SettingsCategory.ABOUT -> AboutSettingsContent(
+@@ -1098,6 +1101,7 @@ private fun IntegrationSettingsContent(
+     tmdbFocusRequester: FocusRequester,
+     mdbListFocusRequester: FocusRequester,
+     animeSkipFocusRequester: FocusRequester,
++    tvdbFocusRequester: FocusRequester,
+     autoFocusEnabled: Boolean
+ ) {
+     BackHandler(enabled = selectedSection != IntegrationSettingsSection.Hub) {
+@@ -1110,6 +1114,7 @@ private fun IntegrationSettingsContent(
+         IntegrationSettingsSection.Tmdb -> tmdbFocusRequester
+         IntegrationSettingsSection.MdbList -> mdbListFocusRequester
+         IntegrationSettingsSection.AnimeSkip -> animeSkipFocusRequester
++        IntegrationSettingsSection.Tvdb -> tvdbFocusRequester
+     }
+     val hubEntryTargetSection = hubReturnSection.takeIf {
+         it != IntegrationSettingsSection.Hub
+@@ -1123,6 +1128,7 @@ private fun IntegrationSettingsContent(
+             IntegrationSettingsSection.Tmdb -> tmdbFocusRequester
+             IntegrationSettingsSection.MdbList -> mdbListFocusRequester
+             IntegrationSettingsSection.AnimeSkip -> animeSkipFocusRequester
++            IntegrationSettingsSection.Tvdb -> tvdbFocusRequester
+         }
+         runCatching { requester.requestFocus() }
+     }
+@@ -1201,6 +1207,19 @@ private fun IntegrationSettingsContent(
+                                     }
+                                 )
+                             }
++                            item(key = "integration_hub_tvdb") {
++                                SettingsActionRow(
++                                    title = "TheTVDB",
++                                    subtitle = "Personal API key and native episode ordering",
++                                    leadingIcon = Icons.Default.CloudDownload,
++                                    onClick = { onSelectSection(IntegrationSettingsSection.Tvdb) },
++                                    modifier = if (hubEntryTargetSection == IntegrationSettingsSection.Tvdb) {
++                                        Modifier.focusRequester(hubEntryFocusRequester)
++                                    } else {
++                                        Modifier
++                                    }
++                                )
++                            }
+                         }
+                         SettingsVerticalScrollIndicators(state = integrationHubState)
+                     }
+@@ -1231,6 +1250,10 @@ private fun IntegrationSettingsContent(
+                 initialFocusRequester = animeSkipFocusRequester
+             )
+         }
++
++        IntegrationSettingsSection.Tvdb -> {
++            TvdbSettingsContent(initialFocusRequester = tvdbFocusRequester)
++        }
+     }
+ }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvdbSettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvdbSettingsScreen.kt
+new file mode 100644
+index 00000000..781cd44d
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvdbSettingsScreen.kt
+@@ -0,0 +1,86 @@
++@file:OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
++
++package com.nuvio.tv.ui.screens.settings
++
++import androidx.compose.foundation.layout.*
++import androidx.compose.foundation.text.BasicTextField
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.rememberLazyListState
++import androidx.compose.foundation.text.KeyboardOptions
++import androidx.compose.runtime.*
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.graphics.SolidColor
++import androidx.compose.ui.platform.LocalUriHandler
++import androidx.compose.ui.text.input.KeyboardType
++import androidx.compose.ui.text.input.PasswordVisualTransformation
++import androidx.compose.ui.unit.dp
++import androidx.hilt.navigation.compose.hiltViewModel
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import androidx.tv.material3.Button
++import androidx.tv.material3.MaterialTheme
++import androidx.tv.material3.Text
++import com.nuvio.tv.ui.components.NuvioDialog
++
++@Composable
++fun TvdbSettingsContent(
++    viewModel: TvdbSettingsViewModel = hiltViewModel(),
++    initialFocusRequester: FocusRequester? = null
++) {
++    val state by viewModel.state.collectAsStateWithLifecycle()
++    var editing by remember { mutableStateOf(false) }
++    val uriHandler = LocalUriHandler.current
++    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
++        SettingsDetailHeader(title = "TheTVDB", subtitle = "Use your own API key for native episode ordering. Settings apply to this profile.")
++        SettingsGroupCard(modifier = Modifier.fillMaxWidth().weight(1f)) {
++            val listState = rememberLazyListState()
++            Box(modifier = Modifier.fillMaxSize()) {
++            LazyColumn(state = listState, modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
++                item(key = "key") {
++                SettingsActionRow(
++                    title = if (state.configured) "Replace API key" else "Enter API key",
++                    subtitle = "Stored locally using Android Keystore encryption",
++                    value = if (state.configured) "Configured" else "Not configured",
++                    enabled = !state.busy, onClick = { editing = true },
++                    modifier = if (initialFocusRequester != null) Modifier.focusRequester(initialFocusRequester) else Modifier
++                )
++                }
++                item(key = "test") {
++                SettingsActionRow(title = "Test connection", subtitle = state.message ?: "Verify authentication with TVDB",
++                    enabled = state.configured && !state.busy, onClick = viewModel::test)
++                }
++                item(key = "remove") {
++                SettingsActionRow(title = "Remove API key", subtitle = "Keeps your saved episode-order selections",
++                    enabled = state.configured && !state.busy, onClick = { viewModel.save(null) })
++                }
++                if (state.busy) item(key = "busy") { Text("Connecting…") }
++                state.message?.let { message -> item(key = "status") { Text(message) } }
++                item(key = "attribution") {
++                SettingsActionRow(title = "Metadata provided by TheTVDB", subtitle = "TheTVDB.com — API access and attribution",
++                    onClick = { uriHandler.openUri("https://thetvdb.com/api-information") })
++                }
++            }
++            SettingsVerticalScrollIndicators(state = listState)
++            }
++        }
++    }
++    if (editing) {
++        // Do not put secrets in saved-instance state or prefill the existing key.
++        var value by remember { mutableStateOf("") }
++        val inputFocus = remember { FocusRequester() }
++        NuvioDialog(onDismiss = { editing = false }, title = "TVDB API key", subtitle = "Enter a personal TVDB v4 API key", width = 700.dp) {
++            BasicTextField(value = value, onValueChange = { value = it }, singleLine = true,
++                visualTransformation = PasswordVisualTransformation(),
++                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
++                textStyle = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurface),
++                cursorBrush = SolidColor(MaterialTheme.colorScheme.onSurface),
++                modifier = Modifier.fillMaxWidth().padding(16.dp).focusRequester(inputFocus))
++            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
++                Button(onClick = { value = ""; editing = false }) { Text("Cancel") }
++                Button(enabled = value.isNotBlank(), onClick = { viewModel.save(value); value = ""; editing = false }) { Text("Save") }
++            }
++            LaunchedEffect(Unit) { inputFocus.requestFocus() }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvdbSettingsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvdbSettingsViewModel.kt
+new file mode 100644
+index 00000000..74fef4e8
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvdbSettingsViewModel.kt
+@@ -0,0 +1,71 @@
++package com.nuvio.tv.ui.screens.settings
++
++import androidx.lifecycle.ViewModel
++import androidx.lifecycle.viewModelScope
++import com.nuvio.tv.core.profile.ProfileManager
++import com.nuvio.tv.data.tvdb.TvdbClient
++import com.nuvio.tv.data.tvdb.TvdbCredentialStore
++import com.nuvio.tv.data.tvdb.TvdbException
++import dagger.hilt.android.lifecycle.HiltViewModel
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import javax.inject.Inject
++
++data class TvdbConnectionState(val configured: Boolean = false, val busy: Boolean = false, val message: String? = null)
++
++@HiltViewModel
++class TvdbSettingsViewModel @Inject constructor(
++    private val credentials: TvdbCredentialStore,
++    private val client: TvdbClient,
++    private val profiles: ProfileManager
++) : ViewModel() {
++    private val mutableState = MutableStateFlow(TvdbConnectionState())
++    private var generation = 0L
++    val state = mutableState.asStateFlow()
++    init {
++        viewModelScope.launch {
++            profiles.activeProfileId.collect { id ->
++                generation++
++                val configured = withContext(Dispatchers.IO) { credentials.read(id) != null }
++                mutableState.value = TvdbConnectionState(configured)
++            }
++        }
++    }
++
++    fun save(value: String?) = operation { profileId ->
++        withContext(Dispatchers.IO) { credentials.save(profileId, value) }
++        TvdbConnectionState(!value.isNullOrBlank(), message = if (value.isNullOrBlank()) "API key removed" else "API key saved. Test the connection to verify it.")
++    }
++
++    fun test() = operation { profileId ->
++        client.testConnection(profileId)
++        TvdbConnectionState(true, message = "Connected to TheTVDB")
++    }
++
++    private fun operation(action: suspend (Int) -> TvdbConnectionState) {
++        if (state.value.busy) return
++        val profileId = profiles.activeProfileId.value
++        val requestGeneration = generation
++        mutableState.value = state.value.copy(busy = true, message = null)
++        viewModelScope.launch {
++            val result = try { action(profileId) }
++            catch (e: CancellationException) { throw e }
++            catch (e: TvdbException) {
++                state.value.copy(busy = false, message = when (e.reason) {
++                    TvdbException.Reason.NO_KEY -> "Save a TVDB API key first."
++                    TvdbException.Reason.AUTHENTICATION -> "TVDB rejected the key. Check its API access or replace it. Some keys may require subscriber access."
++                    TvdbException.Reason.RATE_LIMIT -> "TVDB rate limit reached. Try again later."
++                    TvdbException.Reason.CREDENTIALS_CHANGED -> "Credentials changed. Test the saved key again."
++                    else -> "Unable to connect to TVDB. Check your connection and try again."
++                })
++            } catch (_: Exception) {
++                state.value.copy(busy = false, message = "Unable to access TVDB credentials. Try saving the key again.")
++            }
++            if (profiles.activeProfileId.value == profileId && generation == requestGeneration) mutableState.value = result
++        }
++    }
++}
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index dd8d4cbc..36925d1c 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1,4 +1,4 @@
+-<resources>
++<resources xmlns:tools="http://schemas.android.com/tools">
+     <string name="app_name">Nuvio</string>
+     <string name="tv_channel_continue_watching">Continue Watching</string>
+     <string name="type_movie">Movie</string>
+@@ -288,6 +288,8 @@
+     <string name="tmdb_entity_empty_title">No titles found</string>
+     <string name="tmdb_entity_empty_subtitle">TMDB does not currently have browseable titles for this selection.</string>
+     <string name="episodes_unavailable">Unavailable</string>
++    <string name="tvdb_episode_unmatched" tools:ignore="MissingTranslation">Not matched</string>
++    <string name="tvdb_episode_unmatched_message" tools:ignore="MissingTranslation">A stream request could not be created for this TVDB episode. Try Provider Default.</string>
+     <!-- Status labels for series (some languages need gendered forms) -->
+     <string name="series_status_ended">Ended</string>
+     <string name="series_status_continuing">Ongoing</string>

@@ -1,0 +1,221 @@
+diff --git a/app/src/main/java/com/nuvio/tv/MainActivity.kt b/app/src/main/java/com/nuvio/tv/MainActivity.kt
+index d0e99061..9644ff7c 100644
+--- a/app/src/main/java/com/nuvio/tv/MainActivity.kt
++++ b/app/src/main/java/com/nuvio/tv/MainActivity.kt
+@@ -249,6 +249,7 @@ private data class MainUiPrefs(
+     val font: AppFont = AppFont.INTER,
+     val amoledMode: Boolean = false,
+     val amoledSurfacesMode: Boolean = false,
++    val quietFocus: Boolean = false,
+     val hasChosenLayout: Boolean? = null,
+     val experienceMode: ExperienceMode? = null,
+     val experienceModeLoaded: Boolean = false,
+@@ -546,6 +547,8 @@ open class MainActivity : ComponentActivity() {
+                         experienceMode = experienceMode,
+                         experienceModeLoaded = true,
+                     )
++                }.combine(themeDataStore.quietFocus) { prefs, quietFocus ->
++                    prefs.copy(quietFocus = quietFocus)
+                 }
+                 val layoutAndFeaturesFlow = combine(
+                     layoutPreferenceDataStore.hasChosenLayout,
+@@ -622,6 +625,7 @@ open class MainActivity : ComponentActivity() {
+                 appFont = mainUiPrefs.font,
+                 amoledMode = mainUiPrefs.amoledMode,
+                 amoledSurfacesMode = mainUiPrefs.amoledSurfacesMode,
++                quietFocus = mainUiPrefs.quietFocus,
+                 settingsUiStyle = mainUiPrefs.settingsUiStyle
+             ) {
+                 val defaultBringIntoViewSpec = LocalBringIntoViewSpec.current
+diff --git a/app/src/main/java/com/nuvio/tv/data/local/ThemeDataStore.kt b/app/src/main/java/com/nuvio/tv/data/local/ThemeDataStore.kt
+index 990d9463..3f2c2b1c 100644
+--- a/app/src/main/java/com/nuvio/tv/data/local/ThemeDataStore.kt
++++ b/app/src/main/java/com/nuvio/tv/data/local/ThemeDataStore.kt
+@@ -33,6 +33,7 @@ class ThemeDataStore @Inject constructor(
+     private val fontKey = stringPreferencesKey("selected_font")
+     private val amoledModeKey = booleanPreferencesKey("amoled_mode")
+     private val amoledSurfacesModeKey = booleanPreferencesKey("amoled_surfaces_mode")
++    private val quietFocusKey = booleanPreferencesKey("quiet_focus")
+     private val settingsUiStyleKey = stringPreferencesKey("settings_ui_style")
+ 
+     val themeSelection: Flow<ThemeSelection> = profileManager.activeProfileId.flatMapLatest { pid ->
+@@ -67,6 +68,12 @@ class ThemeDataStore @Inject constructor(
+         }
+     }
+ 
++    val quietFocus: Flow<Boolean> = profileManager.activeProfileId.flatMapLatest { pid ->
++        factory.get(pid, FEATURE).data.map { prefs ->
++            prefs[quietFocusKey] ?: false
++        }
++    }
++
+     val settingsUiStyle: Flow<SettingsUiStyle> = profileManager.activeProfileId.flatMapLatest { pid ->
+         factory.get(pid, FEATURE).data.map { prefs ->
+             val styleName = prefs[settingsUiStyleKey] ?: SettingsUiStyle.CLASSIC.name
+@@ -112,6 +119,12 @@ class ThemeDataStore @Inject constructor(
+         }
+     }
+ 
++    suspend fun setQuietFocus(enabled: Boolean) {
++        store().edit { prefs ->
++            prefs[quietFocusKey] = enabled
++        }
++    }
++
+     suspend fun setSettingsUiStyle(style: SettingsUiStyle) {
+         store().edit { prefs ->
+             prefs[settingsUiStyleKey] = style.name
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ThemeSettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ThemeSettingsScreen.kt
+index f3050778..a928bf6b 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ThemeSettingsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ThemeSettingsScreen.kt
+@@ -260,6 +260,14 @@ fun ThemeSettingsContent(
+                         }
+                     )
+                 }
++                SettingsToggleRow(
++                    title = stringResource(R.string.appearance_quiet_focus),
++                    subtitle = stringResource(R.string.appearance_quiet_focus_subtitle),
++                    checked = uiState.quietFocus,
++                    onToggle = {
++                        viewModel.onEvent(ThemeSettingsEvent.ToggleQuietFocus(!uiState.quietFocus))
++                    }
++                )
+             }
+ 
+             SettingsGroupCard(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ThemeSettingsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ThemeSettingsViewModel.kt
+index 140c791e..c7457a06 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ThemeSettingsViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ThemeSettingsViewModel.kt
+@@ -35,6 +35,7 @@ data class ThemeSettingsUiState(
+     val availableFonts: List<AppFont> = AppFont.entries.toList(),
+     val amoledMode: Boolean = false,
+     val amoledSurfacesMode: Boolean = false,
++    val quietFocus: Boolean = false,
+     val settingsUiStyle: SettingsUiStyle = SettingsUiStyle.CLASSIC,
+     val availableSettingsUiStyles: List<SettingsUiStyle> = SettingsUiStyle.entries.toList()
+ )
+@@ -45,6 +46,7 @@ sealed class ThemeSettingsEvent {
+     data class SelectFont(val font: AppFont) : ThemeSettingsEvent()
+     data class ToggleAmoledMode(val enabled: Boolean) : ThemeSettingsEvent()
+     data class ToggleAmoledSurfacesMode(val enabled: Boolean) : ThemeSettingsEvent()
++    data class ToggleQuietFocus(val enabled: Boolean) : ThemeSettingsEvent()
+     data class SelectSettingsUiStyle(val style: SettingsUiStyle) : ThemeSettingsEvent()
+     data object DismissAppIconFailure : ThemeSettingsEvent()
+ }
+@@ -124,6 +126,15 @@ class ThemeSettingsViewModel @Inject constructor(
+                     }
+                 }
+         }
++        viewModelScope.launch {
++            themeDataStore.quietFocus
++                .distinctUntilChanged()
++                .collectLatest { enabled ->
++                    _uiState.update { state ->
++                        if (state.quietFocus == enabled) state else state.copy(quietFocus = enabled)
++                    }
++                }
++        }
+         viewModelScope.launch {
+             themeDataStore.settingsUiStyle
+                 .distinctUntilChanged()
+@@ -146,6 +157,7 @@ class ThemeSettingsViewModel @Inject constructor(
+             is ThemeSettingsEvent.SelectFont -> selectFont(event.font)
+             is ThemeSettingsEvent.ToggleAmoledMode -> setAmoledMode(event.enabled)
+             is ThemeSettingsEvent.ToggleAmoledSurfacesMode -> setAmoledSurfacesMode(event.enabled)
++            is ThemeSettingsEvent.ToggleQuietFocus -> setQuietFocus(event.enabled)
+             is ThemeSettingsEvent.SelectSettingsUiStyle -> selectSettingsUiStyle(event.style)
+             ThemeSettingsEvent.DismissAppIconFailure -> appIconManager.clearFailure()
+         }
+@@ -190,6 +202,13 @@ class ThemeSettingsViewModel @Inject constructor(
+         }
+     }
+ 
++    private fun setQuietFocus(enabled: Boolean) {
++        if (_uiState.value.quietFocus == enabled) return
++        viewModelScope.launch {
++            themeDataStore.setQuietFocus(enabled)
++        }
++    }
++
+     private fun selectSettingsUiStyle(style: SettingsUiStyle) {
+         if (_uiState.value.settingsUiStyle == style) return
+         restoreStyleFocus = true
+diff --git a/app/src/main/java/com/nuvio/tv/ui/theme/FocusRingStyle.kt b/app/src/main/java/com/nuvio/tv/ui/theme/FocusRingStyle.kt
+index 4ed83653..d84bc2d1 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/theme/FocusRingStyle.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/theme/FocusRingStyle.kt
+@@ -2,11 +2,18 @@ package com.nuvio.tv.ui.theme
+ 
+ import androidx.compose.foundation.BorderStroke
+ import androidx.compose.runtime.Immutable
++import androidx.compose.runtime.staticCompositionLocalOf
+ import androidx.compose.ui.graphics.Brush
+ import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.graphics.SolidColor
+ import androidx.compose.ui.unit.Dp
+ 
++/** Quiet focus (Appearance): a white hairline focus ring instead of the theme's coloured ring. */
++val LocalQuietFocus = staticCompositionLocalOf { false }
++
++/** The quiet focus hairline: near-white, right on the edge. */
++internal val QuietFocusColor = Color(0xC7E8E8E8)
++
+ @Immutable
+ class NuvioFocusRingStyle internal constructor(
+     val solidColor: Color,
+@@ -43,3 +50,11 @@ internal fun createFocusRingStyle(palette: ThemeColorPalette): NuvioFocusRingSty
+         gradientColors = palette.focusRingGradient
+     )
+ }
++
++/** The quiet focus ring: a single near-white hairline colour, no gradient. */
++internal fun createQuietFocusRingStyle(): NuvioFocusRingStyle {
++    return NuvioFocusRingStyle(
++        solidColor = QuietFocusColor,
++        gradientColors = listOf(QuietFocusColor)
++    )
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/theme/Theme.kt b/app/src/main/java/com/nuvio/tv/ui/theme/Theme.kt
+index 5ebdb1ce..ab565086 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/theme/Theme.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/theme/Theme.kt
+@@ -58,6 +58,7 @@ fun NuvioTheme(
+     appFont: AppFont = AppFont.INTER,
+     amoledMode: Boolean = false,
+     amoledSurfacesMode: Boolean = false,
++    quietFocus: Boolean = false,
+     settingsUiStyle: SettingsUiStyle = SettingsUiStyle.CLASSIC,
+     customThemeColors: CustomThemeColors = CustomThemeColors.Default,
+     content: @Composable () -> Unit
+@@ -65,7 +66,7 @@ fun NuvioTheme(
+     val palette = androidx.compose.runtime.remember(appTheme, customThemeColors) {
+         ThemeColors.getColorPalette(appTheme, customThemeColors)
+     }
+-    val focusRingStyle = createFocusRingStyle(palette)
++    val focusRingStyle = if (quietFocus) createQuietFocusRingStyle() else createFocusRingStyle(palette)
+     val colorScheme = NuvioColorScheme(
+         palette = palette,
+         amoledMode = amoledMode,
+@@ -105,6 +106,7 @@ fun NuvioTheme(
+         LocalAppTheme provides appTheme,
+         LocalThemePalette provides palette,
+         LocalSettingsUiStyle provides settingsUiStyle,
++        LocalQuietFocus provides quietFocus,
+         LocalNuvioFocusRingStyle provides focusRingStyle
+     ) {
+         MaterialTheme(
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index dd8d4cbc..d00af14b 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -364,6 +364,8 @@
+     <string name="appearance_amoled_mode_subtitle">Use pure black for app backgrounds</string>
+     <string name="appearance_amoled_surfaces_mode">Pure Black Surfaces</string>
+     <string name="appearance_amoled_surfaces_mode_subtitle">Also make cards, panels, and containers pure black</string>
++    <string name="appearance_quiet_focus">Quiet Focus</string>
++    <string name="appearance_quiet_focus_subtitle">Use a plain white hairline for the focus ring instead of the theme color</string>
+     <string name="appearance_startup_splash">Startup Splash</string>
+     <string name="appearance_startup_splash_subtitle">Show logo and loading indicator after selecting a profile</string>
+     <string name="appearance_settings_style">Settings Style</string>
