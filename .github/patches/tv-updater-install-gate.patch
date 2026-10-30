@@ -1,0 +1,90 @@
+diff --git a/app/src/full/java/com/nuvio/tv/updater/ApkInstaller.kt b/app/src/full/java/com/nuvio/tv/updater/ApkInstaller.kt
+index 7683ce3d..c23bbb91 100644
+--- a/app/src/full/java/com/nuvio/tv/updater/ApkInstaller.kt
++++ b/app/src/full/java/com/nuvio/tv/updater/ApkInstaller.kt
+@@ -32,6 +32,27 @@ object ApkInstaller {
+         }
+     }
+ 
++    /**
++     * Opens the first settings page that actually launches on this device, in order of precision:
++     * this app's own "Install unknown apps" page, then the app-info page (carries the same toggle
++     * on modern TVs), then global settings. TVs differ in which of these resolve; the per-app page
++     * matters because several Nuvio-family entries can share one label in the settings list.
++     */
++    fun openUnknownSourcesSettings(context: Context): Boolean {
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return false
++        val packageUri = Uri.parse("package:${context.packageName}")
++        val candidates = listOf(
++            Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, packageUri),
++            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, packageUri),
++            Intent(Settings.ACTION_APPLICATION_SETTINGS),
++        )
++        for (intent in candidates) {
++            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
++            if (runCatching { context.startActivity(intent) }.isSuccess) return true
++        }
++        return false
++    }
++
+ 
+     /**
+      * Installs [apkFile] as an update of this app through a PackageInstaller session, adding the APK's own dex
+diff --git a/app/src/full/java/com/nuvio/tv/updater/UpdateViewModel.kt b/app/src/full/java/com/nuvio/tv/updater/UpdateViewModel.kt
+index 57c58ca9..79389a66 100644
+--- a/app/src/full/java/com/nuvio/tv/updater/UpdateViewModel.kt
++++ b/app/src/full/java/com/nuvio/tv/updater/UpdateViewModel.kt
+@@ -374,6 +374,6 @@ class UpdateViewModel @Inject constructor(
+     }
+ 
+     fun openUnknownSourcesSettings() {
+-        ApkInstaller.buildUnknownSourcesSettingsIntent(context)?.let(context::startActivity)
++        ApkInstaller.openUnknownSourcesSettings(context)
+     }
+ }
+diff --git a/app/src/full/java/com/nuvio/tv/updater/ui/UpdateDialogs.kt b/app/src/full/java/com/nuvio/tv/updater/ui/UpdateDialogs.kt
+index 52b64836..8d0741ae 100644
+--- a/app/src/full/java/com/nuvio/tv/updater/ui/UpdateDialogs.kt
++++ b/app/src/full/java/com/nuvio/tv/updater/ui/UpdateDialogs.kt
+@@ -22,6 +22,7 @@ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.rememberCoroutineScope
+ import androidx.compose.runtime.setValue
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalContext
+ import androidx.compose.ui.draw.clip
+ import androidx.compose.ui.draw.drawWithContent
+ import androidx.compose.ui.focus.FocusRequester
+@@ -151,6 +152,8 @@ internal fun UpdateUnknownSourcesDialog(
+         settingsFocusRequester.requestFocusAfterFrames()
+     }
+ 
++    val appContext = LocalContext.current
++
+     NuvioDialog(
+         onDismiss = onDismiss,
+         title = stringResource(R.string.update_title),
+@@ -158,6 +161,12 @@ internal fun UpdateUnknownSourcesDialog(
+         width = 560.dp,
+         suppressFirstKeyUp = false
+     ) {
++        Text(
++            text = stringResource(R.string.update_unknown_sources_hint, appContext.packageName),
++            style = MaterialTheme.typography.bodySmall,
++            color = NuvioTheme.colors.TextSecondary,
++            modifier = Modifier.padding(bottom = NuvioTheme.spacing.md)
++        )
+         Row(
+             modifier = Modifier.fillMaxWidth(),
+             horizontalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.md)
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 3beb4def..c157d943 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -2418,6 +2418,7 @@
+     <string name="update_latest_version">You’re using the latest version.</string>
+     <string name="update_unknown_sources">Allow installs from unknown sources to continue.</string>
+     <string name="update_unknown_sources_hint">Grant &quot;Install unknown apps&quot; for this exact app: %1$s — the list may show several Nuvio entries.</string>
++    <string name="update_unknown_sources_hint">Grant &quot;Install unknown apps&quot; for this exact app: %1$s — the list may show several Nuvio entries.</string>
+     <!-- AccountScreen -->
+     <string name="account_title">Account</string>
+     <string name="account_sign_in_description">Sign in to sync your library, watch progress, addons, and plugins across devices. Library sync uses Nuvio Sync when Trakt is not connected, and watch progress can use either Trakt or Nuvio Sync.</string>
