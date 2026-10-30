@@ -1,0 +1,123 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
+index 9ea866f9..07f340cd 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
+@@ -21,7 +21,6 @@ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.collectAsState
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.input.key.onPreviewKeyEvent
+-import androidx.compose.ui.input.key.nativeKeyEvent
+ import androidx.lifecycle.compose.collectAsStateWithLifecycle
+ import androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner
+ import androidx.navigation.NavHostController
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelSmartHighlights.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelSmartHighlights.kt
+index aa000e1e..31b28e8f 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelSmartHighlights.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelSmartHighlights.kt
+@@ -11,6 +11,7 @@ import com.nuvio.tv.domain.model.LibraryEntry
+ import com.nuvio.tv.domain.model.MetaPreview
+ import com.nuvio.tv.domain.model.PosterShape
+ import com.nuvio.tv.domain.model.WatchProgress
++import androidx.lifecycle.viewModelScope
+ import kotlinx.coroutines.CancellationException
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.delay
+@@ -100,7 +101,7 @@ internal suspend fun HomeViewModel.computeSmartHighlightPicks(
+     val hash = candidates.joinToString("|") { "${it.item.apiType}:${it.item.id}" } +
+         "#${candidates.size}"
+     val cached = withContext(Dispatchers.IO) { smartHighlightsRankingCache.read(hash) }
+-    if (cached != null) return applySmartHighlightsRanking(candidates, cached)
++    if (cached != null) return applySmartHighlightsRanking(candidates, cached) { fallbackReason(it) }
+ 
+     val fetched = withContext(Dispatchers.IO) {
+         runCatching {
+@@ -117,13 +118,14 @@ internal suspend fun HomeViewModel.computeSmartHighlightPicks(
+         }
+     }
+     if (fetched != null) smartHighlightsRankingCache.write(hash, fetched)
+-    return fetched?.let { applySmartHighlightsRanking(candidates, it) } ?: fallback
++    return fetched?.let { applySmartHighlightsRanking(candidates, it) { fallbackReason(it) } } ?: fallback
+ }
+ 
+ /** Ranked picks in Gemini's order, with the remaining candidates appended in fallback order. */
+ private fun applySmartHighlightsRanking(
+     candidates: List<SmartHighlightCandidate>,
+-    ranking: List<GeminiRankEntry>
++    ranking: List<GeminiRankEntry>,
++    fallbackReasonFor: (SmartHighlightCandidate) -> String
+ ): List<SmartHighlightPick> {
+     val byIndex = candidates.withIndex().associate { (index, candidate) -> index to candidate }
+     val ranked = ranking.mapNotNull { entry ->
+@@ -134,7 +136,7 @@ private fun applySmartHighlightsRanking(
+     val rankedIds = ranked.map { it.item.id }.toSet()
+     val remainder = candidates
+         .filter { it.item.id !in rankedIds }
+-        .map { it.toPick(fallbackReason(it)) }
++        .map { it.toPick(fallbackReasonFor(it)) }
+     return (ranked + remainder)
+         .distinctBy { it.item.id }
+         .take(SmartHighlightsLimits.MAX_PICKS)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerAutoQuality.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerAutoQuality.kt
+index 67110432..23e13ff1 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerAutoQuality.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerAutoQuality.kt
+@@ -5,6 +5,7 @@ import android.util.Log
+ import androidx.media3.common.C
+ import androidx.media3.common.Player
+ import androidx.media3.common.util.UnstableApi
++import androidx.media3.exoplayer.ExoPlayer
+ import kotlinx.coroutines.flow.collect
+ import kotlinx.coroutines.launch
+ 
+@@ -71,7 +72,7 @@ internal object AutoQualitySpeedTest {
+ 
+ /** Per-playback state of the auto quality engine; one instance lives on the controller. */
+ internal class AutoQualityState {
+-    val speedTest = AutoQualitySpeedTest()
++    val speedTest = AutoQualitySpeedTest
+ 
+     /** The stream the engine last saw; a change re-arms fast start and drops the streaks. */
+     var lastSeenStreamUrl: String? = null
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ReleaseRemindersSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ReleaseRemindersSettingsItems.kt
+index a8fc2851..f0d98021 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ReleaseRemindersSettingsItems.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ReleaseRemindersSettingsItems.kt
+@@ -2,6 +2,7 @@ package com.nuvio.tv.ui.screens.settings
+ 
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.filled.Delete
++import androidx.compose.foundation.layout.padding
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.collectAsState
+ import androidx.compose.runtime.getValue
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt
+index 7907d445..d82dd8c3 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt
+@@ -668,6 +668,8 @@ fun SettingsScreen(
+                                 integrationTmdbFocusRequester = integrationTmdbFocusRequester,
+                                 integrationMdbListFocusRequester = integrationMdbListFocusRequester,
+                                 integrationAnimeSkipFocusRequester = integrationAnimeSkipFocusRequester,
++                                integrationTvdbFocusRequester = integrationTvdbFocusRequester,
++                                integrationGeminiFocusRequester = integrationGeminiFocusRequester,
+                                 onNavigateToManageProfiles = onNavigateToManageProfiles,
+                                 onOpenDetail = onOpenDetail,
+                                 onNavigateToAddons = onNavigateToAddons,
+@@ -829,6 +831,8 @@ fun SettingsScreen(
+                         integrationTmdbFocusRequester = integrationTmdbFocusRequester,
+                         integrationMdbListFocusRequester = integrationMdbListFocusRequester,
+                         integrationAnimeSkipFocusRequester = integrationAnimeSkipFocusRequester,
++                        integrationTvdbFocusRequester = integrationTvdbFocusRequester,
++                        integrationGeminiFocusRequester = integrationGeminiFocusRequester,
+                         onNavigateToManageProfiles = onNavigateToManageProfiles,
+                         onOpenDetail = onOpenDetail,
+                         onNavigateToAddons = onNavigateToAddons,
+@@ -860,6 +864,8 @@ private fun SettingsDetailPane(
+     integrationTmdbFocusRequester: FocusRequester,
+     integrationMdbListFocusRequester: FocusRequester,
+     integrationAnimeSkipFocusRequester: FocusRequester,
++    integrationTvdbFocusRequester: FocusRequester,
++    integrationGeminiFocusRequester: FocusRequester,
+     onNavigateToManageProfiles: () -> Unit,
+     onOpenDetail: (String, String, String?) -> Unit,
+     onNavigateToAddons: () -> Unit,
