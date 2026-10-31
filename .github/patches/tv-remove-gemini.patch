@@ -1,0 +1,878 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/di/GeminiModule.kt b/app/src/main/java/com/nuvio/tv/core/di/GeminiModule.kt
+deleted file mode 100644
+index 97c1b460..00000000
+--- a/app/src/main/java/com/nuvio/tv/core/di/GeminiModule.kt
++++ /dev/null
+@@ -1,29 +0,0 @@
+-package com.nuvio.tv.core.di
+-
+-import com.nuvio.tv.core.profile.ProfileScopedCredentialStore
+-import com.nuvio.tv.data.gemini.GeminiCredentialStore
+-import dagger.Module
+-import dagger.Provides
+-import dagger.hilt.InstallIn
+-import dagger.hilt.components.SingletonComponent
+-import dagger.multibindings.IntoSet
+-import okhttp3.OkHttpClient
+-import java.util.concurrent.TimeUnit
+-import javax.inject.Named
+-import javax.inject.Singleton
+-
+-@Module
+-@InstallIn(SingletonComponent::class)
+-object GeminiModule {
+-    // Dedicated client: no HTTP logging or permissive addon TLS interceptors,
+-    // and a hard call timeout so home never waits on the ranking request.
+-    @Provides @Singleton @Named("gemini")
+-    fun http(): OkHttpClient = OkHttpClient.Builder()
+-        .connectTimeout(10, TimeUnit.SECONDS)
+-        .readTimeout(45, TimeUnit.SECONDS)
+-        .callTimeout(60, TimeUnit.SECONDS)
+-        .build()
+-
+-    @Provides @IntoSet
+-    fun credentialStore(store: GeminiCredentialStore): ProfileScopedCredentialStore = store
+-}
+diff --git a/app/src/main/java/com/nuvio/tv/data/gemini/GeminiCredentialStore.kt b/app/src/main/java/com/nuvio/tv/data/gemini/GeminiCredentialStore.kt
+deleted file mode 100644
+index 86fc7645..00000000
+--- a/app/src/main/java/com/nuvio/tv/data/gemini/GeminiCredentialStore.kt
++++ /dev/null
+@@ -1,30 +0,0 @@
+-package com.nuvio.tv.data.gemini
+-
+-import android.content.Context
+-import com.nuvio.tv.core.profile.ProfileScopedCredentialStore
+-import com.nuvio.tv.core.profile.ProtectedProfilePreferences
+-import dagger.hilt.android.qualifiers.ApplicationContext
+-import java.util.concurrent.ConcurrentHashMap
+-import javax.inject.Inject
+-import javax.inject.Singleton
+-
+-/**
+- * Per-profile Gemini API key, kept under the same Keystore-backed encrypted
+- * persistence the other native integrations use. The key is only ever handed
+- * to the ranking client as a request header; it is never logged or displayed.
+- */
+-@Singleton
+-class GeminiCredentialStore @Inject constructor(@ApplicationContext context: Context) : ProfileScopedCredentialStore {
+-    private val protected = ProtectedProfilePreferences(context, "gemini_credentials", "com.nuvio.tv.gemini.credentials.v1")
+-    private val lock = Any()
+-
+-    fun read(profileId: Int): String? = synchronized(lock) { protected.read(profileId) }
+-
+-    fun save(profileId: Int, apiKey: String?) = synchronized(lock) {
+-        protected.write(profileId, apiKey?.trim()?.takeIf(String::isNotBlank))
+-    }
+-
+-    override fun removeProfile(profileId: Int) = save(profileId, null)
+-
+-    override fun clearAllProfiles() = synchronized(lock) { protected.clear() }
+-}
+diff --git a/app/src/main/java/com/nuvio/tv/data/gemini/GeminiRankingClient.kt b/app/src/main/java/com/nuvio/tv/data/gemini/GeminiRankingClient.kt
+deleted file mode 100644
+index 33790b01..00000000
+--- a/app/src/main/java/com/nuvio/tv/data/gemini/GeminiRankingClient.kt
++++ /dev/null
+@@ -1,138 +0,0 @@
+-package com.nuvio.tv.data.gemini
+-
+-import android.util.Log
+-import kotlinx.coroutines.CancellationException
+-import kotlinx.coroutines.Dispatchers
+-import kotlinx.coroutines.withContext
+-import okhttp3.MediaType.Companion.toMediaType
+-import okhttp3.OkHttpClient
+-import okhttp3.Request
+-import okhttp3.RequestBody.Companion.toRequestBody
+-import org.json.JSONArray
+-import org.json.JSONObject
+-import java.io.IOException
+-import javax.inject.Inject
+-import javax.inject.Named
+-import javax.inject.Singleton
+-
+-/** One ranked candidate: the candidate list index plus a short "why" for the reason chip. */
+-data class GeminiRankEntry(val index: Int, val reason: String)
+-
+-/** Thrown when Gemini cannot serve a ranking; callers fall back to the unranked order. */
+-class GeminiRankingException(val reason: Reason) : IOException(reason.name) {
+-    enum class Reason { NO_KEY, AUTHENTICATION, RATE_LIMIT, UNAVAILABLE, INVALID_RESPONSE }
+-}
+-
+-/**
+- * REST call to Gemini (`generateContent`) that orders a compact candidate list and returns a
+- * short reason per pick. The key travels in the `x-goog-api-key` header only — never in a URL,
+- * a log line, or storage outside the encrypted credential store. Every failure mode maps to
+- * [GeminiRankingException] so the caller can fall back silently.
+- */
+-@Singleton
+-class GeminiRankingClient @Inject constructor(
+-    private val credentials: GeminiCredentialStore,
+-    @Named("gemini") private val http: OkHttpClient
+-) {
+-    fun hasKey(profileId: Int): Boolean = credentials.read(profileId) != null
+-
+-    /** Cheap round trip used by the settings screen to verify a key. */
+-    suspend fun testConnection(profileId: Int) {
+-        val body = JSONObject()
+-            .put("contents", JSONArray().put(
+-                JSONObject().put("parts", JSONArray().put(JSONObject().put("text", "Reply with the single word: ok")))
+-            ))
+-            .put("generationConfig", JSONObject().put("maxOutputTokens", 8))
+-        post(profileId, body)
+-    }
+-
+-    /**
+-     * Ranks [candidates] (already formatted one-per-line, 1-based). Returns entries in the
+-     * order Gemini preferred them, restricted to in-range indexes with a non-blank reason.
+-     */
+-    suspend fun rank(profileId: Int, candidates: List<String>, pickCount: Int): List<GeminiRankEntry> {
+-        if (candidates.isEmpty()) return emptyList()
+-        val prompt = buildString {
+-            append("You curate a short \"Smart Highlights\" row on a TV streaming app's home screen. ")
+-            append("Below is a numbered list of titles from this viewer's own library and continue-watching progress. ")
+-            append("Choose the ")
+-            append(pickCount.coerceAtMost(candidates.size))
+-            append(" most appealing titles to feature first — favour a good mix, momentum (things they are part way through) ")
+-            append("and what fits together — and order them best first. ")
+-            append("For each pick give a reason of at most 6 words, addressed like a note to the viewer (e.g. \"you left off mid-season\"). ")
+-            append("Respond with the picks as a JSON array of {\"index\": <candidate number>, \"reason\": \"...\"} objects, best pick first.\n\n")
+-            append(candidates.joinToString("\n"))
+-        }
+-        val schema = JSONObject()
+-            .put("type", "ARRAY")
+-            .put("items", JSONObject()
+-                .put("type", "OBJECT")
+-                .put("properties", JSONObject()
+-                    .put("index", JSONObject().put("type", "INTEGER"))
+-                    .put("reason", JSONObject().put("type", "STRING")))
+-                .put("required", JSONArray().put("index").put("reason")))
+-        val body = JSONObject()
+-            .put("contents", JSONArray().put(
+-                JSONObject().put("parts", JSONArray().put(JSONObject().put("text", prompt)))
+-            ))
+-            .put("generationConfig", JSONObject()
+-                .put("responseMimeType", "application/json")
+-                .put("responseSchema", schema)
+-                .put("temperature", 0.3))
+-        val text = withContext(Dispatchers.IO) { post(profileId, body) }
+-        return parse(text, candidates.size)
+-    }
+-
+-    private fun parse(text: String, candidateCount: Int): List<GeminiRankEntry> {
+-        val array = runCatching {
+-            JSONArray(text.trim().removePrefix("```json").removePrefix("```").trim().removeSuffix("```"))
+-        }.getOrNull() ?: throw GeminiRankingException(GeminiRankingException.Reason.INVALID_RESPONSE)
+-        val out = ArrayList<GeminiRankEntry>(array.length())
+-        for (i in 0 until array.length()) {
+-            val entry = array.optJSONObject(i) ?: continue
+-            val index = entry.optInt("index", -1) - 1
+-            if (index < 0 || index >= candidateCount) continue
+-            val reason = entry.optString("reason").trim().takeIf { it.isNotEmpty() } ?: continue
+-            out += GeminiRankEntry(index, reason.take(MAX_REASON_LENGTH))
+-        }
+-        if (out.isEmpty()) throw GeminiRankingException(GeminiRankingException.Reason.INVALID_RESPONSE)
+-        return out.distinctBy { it.index }
+-    }
+-
+-    private fun post(profileId: Int, body: JSONObject): String {
+-        val apiKey = credentials.read(profileId)
+-            ?: throw GeminiRankingException(GeminiRankingException.Reason.NO_KEY)
+-        val request = Request.Builder()
+-            .url("https://generativelanguage.googleapis.com/v1beta/models/$MODEL:generateContent?key=$apiKey")
+-            .post(body.toString().toRequestBody("application/json".toMediaType()))
+-            .build()
+-        http.newCall(request).execute().use { resp ->
+-            when (resp.code) {
+-                200, 201 -> Unit
+-                401, 403 -> throw GeminiRankingException(GeminiRankingException.Reason.AUTHENTICATION)
+-                429 -> throw GeminiRankingException(GeminiRankingException.Reason.RATE_LIMIT)
+-                else -> throw GeminiRankingException(GeminiRankingException.Reason.UNAVAILABLE)
+-            }
+-            val payload = resp.body?.string().orEmpty()
+-            val text = runCatching {
+-                JSONObject(payload)
+-                    .optJSONArray("candidates")?.optJSONObject(0)
+-                    ?.optJSONObject("content")?.optJSONArray("parts")?.optJSONObject(0)
+-                    ?.optString("text")
+-            }.getOrNull().orEmpty()
+-            if (text.isBlank()) {
+-                Log.w(TAG, "generateContent returned no text")
+-                throw GeminiRankingException(GeminiRankingException.Reason.INVALID_RESPONSE)
+-            }
+-            return text
+-        }
+-    }
+-
+-    companion object {
+-        private const val TAG = "GeminiRanking"
+-        private const val MODEL = "gemini-flash-latest"
+-
+-        /** Reason chips are one short line; anything longer is clipped. */
+-        const val MAX_REASON_LENGTH = 48
+-    }
+-}
+diff --git a/app/src/main/java/com/nuvio/tv/data/gemini/SmartHighlightsRankingCache.kt b/app/src/main/java/com/nuvio/tv/data/gemini/SmartHighlightsRankingCache.kt
+deleted file mode 100644
+index bfa0a483..00000000
+--- a/app/src/main/java/com/nuvio/tv/data/gemini/SmartHighlightsRankingCache.kt
++++ /dev/null
+@@ -1,83 +0,0 @@
+-package com.nuvio.tv.data.gemini
+-
+-import androidx.datastore.preferences.core.edit
+-import androidx.datastore.preferences.core.longPreferencesKey
+-import androidx.datastore.preferences.core.stringPreferencesKey
+-import com.nuvio.tv.core.profile.ProfileManager
+-import com.nuvio.tv.data.local.ProfileDataStoreFactory
+-import kotlinx.coroutines.flow.first
+-import javax.inject.Inject
+-import javax.inject.Singleton
+-
+-/**
+- * Persisted Gemini ranking for the Smart Highlights rail, scoped to the active profile.
+- * A ranking is valid for [TTL_MS] and only for the candidate set it was computed from
+- * ([hash]); a changed library or a changed progress picture simply misses the cache.
+- */
+-@Singleton
+-class SmartHighlightsRankingCache @Inject constructor(
+-    private val factory: ProfileDataStoreFactory,
+-    private val profileManager: ProfileManager
+-) {
+-    companion object {
+-        private const val FEATURE = "smart_highlights"
+-        private const val HASH_KEY = "ranking_hash"
+-        private const val PAYLOAD_KEY = "ranking_payload"
+-        private const val SAVED_AT_KEY = "ranking_saved_at"
+-
+-        /** How long a Gemini ranking is reused before home asks Gemini again. */
+-        const val TTL_MS = 6L * 60L * 60L * 1000L
+-    }
+-
+-    private fun store() = factory.get(profileManager.activeProfileId.value, FEATURE)
+-
+-    /** The cached ranking for [hash], or null when absent, stale, or unreadable. */
+-    suspend fun read(hash: String): List<GeminiRankEntry>? {
+-        if (hash.isBlank()) return null
+-        return runCatching {
+-            val prefs = store().data.first()
+-            val savedHash = prefs[stringPreferencesKey(HASH_KEY)] ?: return@runCatching null
+-            if (savedHash != hash) return@runCatching null
+-            val savedAt = prefs[longPreferencesKey(SAVED_AT_KEY)] ?: 0L
+-            if (System.currentTimeMillis() - savedAt > TTL_MS) return@runCatching null
+-            decode(prefs[stringPreferencesKey(PAYLOAD_KEY)].orEmpty())
+-        }.getOrNull()?.takeIf { it.isNotEmpty() }
+-    }
+-
+-    suspend fun write(hash: String, ranking: List<GeminiRankEntry>) {
+-        if (hash.isBlank() || ranking.isEmpty()) return
+-        runCatching {
+-            store().edit { prefs ->
+-                prefs[stringPreferencesKey(HASH_KEY)] = hash
+-                prefs[stringPreferencesKey(PAYLOAD_KEY)] = encode(ranking)
+-                prefs[longPreferencesKey(SAVED_AT_KEY)] = System.currentTimeMillis()
+-            }
+-        }
+-    }
+-
+-    /** Called when the key is removed so a stale ranking cannot resurface for this profile. */
+-    suspend fun clear() {
+-        runCatching {
+-            store().edit { prefs ->
+-                prefs.remove(stringPreferencesKey(HASH_KEY))
+-                prefs.remove(stringPreferencesKey(PAYLOAD_KEY))
+-                prefs.remove(longPreferencesKey(SAVED_AT_KEY))
+-            }
+-        }
+-    }
+-
+-    private fun encode(ranking: List<GeminiRankEntry>): String =
+-        ranking.joinToString("|") { entry ->
+-            entry.index.toString() + ":" + entry.reason.replace("\n", " ").replace("|", "/")
+-        }
+-
+-    private fun decode(payload: String): List<GeminiRankEntry> =
+-        payload.split("|").mapNotNull { part ->
+-            val separator = part.indexOf(':')
+-            if (separator <= 0) return@mapNotNull null
+-            val index = part.substring(0, separator).toIntOrNull() ?: return@mapNotNull null
+-            val reason = part.substring(separator + 1)
+-            if (reason.isBlank()) return@mapNotNull null
+-            GeminiRankEntry(index, reason)
+-        }
+-}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModel.kt
+index fc0bbf85..a0aa64d3 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModel.kt
+@@ -88,8 +88,6 @@ class HomeViewModel @Inject constructor(
+     internal val profileManager: com.nuvio.tv.core.profile.ProfileManager,
+     internal val tvRecommendationManager: TvRecommendationManager,
+     internal val serverCatalog: ServerCatalog,
+-    internal val geminiRankingClient: com.nuvio.tv.data.gemini.GeminiRankingClient,
+-    internal val smartHighlightsRankingCache: com.nuvio.tv.data.gemini.SmartHighlightsRankingCache,
+     internal val metaPreviewEnricher: MetaPreviewEnricher = MetaPreviewEnricher(
+         tmdbService,
+         tmdbMetadataService,
+@@ -151,8 +149,8 @@ class HomeViewModel @Inject constructor(
+     private val _focusState = MutableStateFlow(HomeScreenFocusState())
+     val focusState: StateFlow<HomeScreenFocusState> = _focusState.asStateFlow()
+ 
+-    // Nuvio fork: Smart Highlights rail — library picks with reasons, ordered by Gemini when a
+-    // key is configured, fallback order otherwise. Empty when the rail has nothing to show.
++    // Nuvio fork: Smart Highlights rail — library picks with fallback-order reasons.
++    // Empty when the rail has nothing to show.
+     internal val _smartHighlights = MutableStateFlow<List<SmartHighlightPick>>(emptyList())
+     val smartHighlights: StateFlow<List<SmartHighlightPick>> = _smartHighlights.asStateFlow()
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelSmartHighlights.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelSmartHighlights.kt
+index 31b28e8f..ae571c2a 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelSmartHighlights.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelSmartHighlights.kt
+@@ -1,32 +1,25 @@
+ package com.nuvio.tv.ui.screens.home
+ 
+-import android.util.Log
+ import androidx.compose.runtime.Immutable
+ import com.nuvio.tv.R
+-import com.nuvio.tv.data.gemini.GeminiRankEntry
+-import com.nuvio.tv.data.gemini.GeminiRankingClient
+-import com.nuvio.tv.data.gemini.SmartHighlightsRankingCache
+ import com.nuvio.tv.domain.model.ContentType
+ import com.nuvio.tv.domain.model.LibraryEntry
+ import com.nuvio.tv.domain.model.MetaPreview
+ import com.nuvio.tv.domain.model.PosterShape
+ import com.nuvio.tv.domain.model.WatchProgress
+ import androidx.lifecycle.viewModelScope
+-import kotlinx.coroutines.CancellationException
+-import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.delay
+ import kotlinx.coroutines.flow.combine
+ import kotlinx.coroutines.flow.collectLatest
+ import kotlinx.coroutines.flow.distinctUntilChanged
+ import kotlinx.coroutines.launch
+-import kotlinx.coroutines.withContext
+ 
+ /** One featured title with the short reason its chip shows. */
+ @Immutable
+ data class SmartHighlightPick(
+     val item: MetaPreview,
+     val reason: String,
+-    /** True when Gemini chose the position and wrote the reason; false for the fallback order. */
++    /** Retained for chip styling; the fallback pipeline always renders false. */
+     val ranked: Boolean
+ )
+ 
+@@ -41,7 +34,6 @@ internal data class SmartHighlightCandidate(
+ 
+ private data class SmartHighlightsInput(
+     val enabled: Boolean,
+-    val profileId: Int,
+     val library: List<LibraryEntry>,
+     val progress: List<WatchProgress>
+ )
+@@ -51,20 +43,18 @@ private data class SmartHighlightsInput(
+  *
+  * Candidates are a blend of the profile's saved library (most recently listed first) and
+  * in-progress playback (most recently watched first), deduplicated and capped. The rail renders
+- * the fallback order straight away; while a Gemini key is configured for the profile, a cached
+- * or freshly fetched ranking reorders the same candidates and attaches a short reason to each
+- * pick. With no key nothing is fetched — the fallback order is the rail, silently.
++ * the fallback order straight away: continue-watching and library picks, each with a short
++ * reason.
+  */
+ internal fun HomeViewModel.observeSmartHighlightsPipeline() {
+     viewModelScope.launch {
+         var firstRun = true
+         combine(
+             layoutPreferenceDataStore.smartHighlightsEnabled,
+-            profileManager.activeProfileId,
+             libraryRepository.libraryItems,
+             watchProgressRepository.allProgress
+-        ) { enabled, profileId, library, progress ->
+-            SmartHighlightsInput(enabled, profileId, library, progress)
++        ) { enabled, library, progress ->
++            SmartHighlightsInput(enabled, library, progress)
+         }
+             .distinctUntilChanged()
+             .collectLatest { input ->
+@@ -82,65 +72,18 @@ internal fun HomeViewModel.observeSmartHighlightsPipeline() {
+                 _smartHighlights.value = if (candidates.isEmpty()) {
+                     emptyList()
+                 } else {
+-                    computeSmartHighlightPicks(input.profileId, candidates)
++                    computeSmartHighlightPicks(candidates)
+                 }
+             }
+     }
+ }
+ 
+-internal suspend fun HomeViewModel.computeSmartHighlightPicks(
+-    profileId: Int,
++/** Picks in fallback order: most recent first, with a short reason per pick. */
++internal fun HomeViewModel.computeSmartHighlightPicks(
+     candidates: List<SmartHighlightCandidate>
+-): List<SmartHighlightPick> {
+-    val fallback = candidates
+-        .take(SmartHighlightsLimits.MAX_PICKS)
+-        .map { it.toPick(fallbackReason(it)) }
+-    if (!geminiRankingClient.hasKey(profileId)) return fallback
+-
+-    // The cache key covers the candidate set: a changed library or progress picture misses it.
+-    val hash = candidates.joinToString("|") { "${it.item.apiType}:${it.item.id}" } +
+-        "#${candidates.size}"
+-    val cached = withContext(Dispatchers.IO) { smartHighlightsRankingCache.read(hash) }
+-    if (cached != null) return applySmartHighlightsRanking(candidates, cached) { fallbackReason(it) }
+-
+-    val fetched = withContext(Dispatchers.IO) {
+-        runCatching {
+-            geminiRankingClient.rank(
+-                profileId = profileId,
+-                candidates = candidates.take(SmartHighlightsLimits.MAX_CANDIDATES)
+-                    .map(::describeCandidate),
+-                pickCount = SmartHighlightsLimits.MAX_PICKS
+-            )
+-        }.getOrElse { error ->
+-            if (error is CancellationException) throw error
+-            Log.i(HomeViewModel.TAG, "Smart Highlights ranking skipped: ${error.message}")
+-            null
+-        }
+-    }
+-    if (fetched != null) smartHighlightsRankingCache.write(hash, fetched)
+-    return fetched?.let { applySmartHighlightsRanking(candidates, it) { fallbackReason(it) } } ?: fallback
+-}
+-
+-/** Ranked picks in Gemini's order, with the remaining candidates appended in fallback order. */
+-private fun applySmartHighlightsRanking(
+-    candidates: List<SmartHighlightCandidate>,
+-    ranking: List<GeminiRankEntry>,
+-    fallbackReasonFor: (SmartHighlightCandidate) -> String
+-): List<SmartHighlightPick> {
+-    val byIndex = candidates.withIndex().associate { (index, candidate) -> index to candidate }
+-    val ranked = ranking.mapNotNull { entry ->
+-        byIndex[entry.index]?.let { candidate ->
+-            SmartHighlightPick(item = candidate.item, reason = entry.reason, ranked = true)
+-        }
+-    }
+-    val rankedIds = ranked.map { it.item.id }.toSet()
+-    val remainder = candidates
+-        .filter { it.item.id !in rankedIds }
+-        .map { it.toPick(fallbackReasonFor(it)) }
+-    return (ranked + remainder)
+-        .distinctBy { it.item.id }
+-        .take(SmartHighlightsLimits.MAX_PICKS)
+-}
++): List<SmartHighlightPick> = candidates
++    .take(SmartHighlightsLimits.MAX_PICKS)
++    .map { it.toPick(fallbackReason(it)) }
+ 
+ internal fun buildSmartHighlightCandidates(
+     library: List<LibraryEntry>,
+@@ -194,32 +137,6 @@ private fun WatchProgress.candidateProgressPercent(): Int? {
+     return percent.takeIf { it in 1..99 }
+ }
+ 
+-/** One prompt line per candidate: title, type, year, genres and how far along the viewer is. */
+-private fun describeCandidate(candidate: SmartHighlightCandidate): String = buildString {
+-    append(candidate.item.name)
+-    append(" (")
+-    append(candidate.item.apiType)
+-    candidate.item.releaseInfo?.takeIf { it.isNotBlank() }?.let { year ->
+-        append(", ")
+-        append(year.take(12))
+-    }
+-    append(")")
+-    val genres = candidate.item.genres.take(3).filter { it.isNotBlank() }
+-    if (genres.isNotEmpty()) {
+-        append(" [")
+-        append(genres.joinToString(", "))
+-        append("]")
+-    }
+-    when {
+-        candidate.progressPercent != null -> {
+-            append(" — ")
+-            append(candidate.progressPercent)
+-            append("% watched")
+-        }
+-        candidate.fromLibrary -> append(" — in their watchlist")
+-    }
+-}
+-
+ private fun SmartHighlightCandidate.toPick(reason: String) =
+     SmartHighlightPick(item = item, reason = reason, ranked = false)
+ 
+@@ -234,13 +151,13 @@ internal object SmartHighlightsLimits {
+     /** Picks actually shown; a handful. */
+     const val MAX_PICKS = 6
+ 
+-    /** Candidates described to Gemini. */
++    /** Candidates considered for the rail before the cap. */
+     const val MAX_CANDIDATES = 12
+ 
+     /** In-progress and library candidates considered before the cap. */
+     const val MAX_PROGRESS_CANDIDATES = 8
+     const val MAX_LIBRARY_CANDIDATES = 8
+ 
+-    /** Home is given this long to settle before the first ranking pass. */
++    /** Home is given this long to settle before the first rail pass. */
+     const val STARTUP_DELAY_MS = 5_000L
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/GeminiSettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/GeminiSettingsScreen.kt
+deleted file mode 100644
+index adcf0a99..00000000
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/GeminiSettingsScreen.kt
++++ /dev/null
+@@ -1,131 +0,0 @@
+-package com.nuvio.tv.ui.screens.settings
+-
+-import androidx.compose.foundation.layout.Arrangement
+-import androidx.compose.foundation.layout.Box
+-import androidx.compose.foundation.layout.Column
+-import androidx.compose.foundation.layout.Row
+-import androidx.compose.foundation.layout.fillMaxSize
+-import androidx.compose.foundation.layout.fillMaxWidth
+-import androidx.compose.foundation.layout.padding
+-import androidx.compose.foundation.lazy.LazyColumn
+-import androidx.compose.foundation.lazy.rememberLazyListState
+-import androidx.compose.foundation.text.BasicTextField
+-import androidx.compose.foundation.text.KeyboardOptions
+-import androidx.compose.runtime.Composable
+-import androidx.compose.runtime.LaunchedEffect
+-import androidx.compose.runtime.getValue
+-import androidx.compose.runtime.mutableStateOf
+-import androidx.compose.runtime.remember
+-import androidx.compose.runtime.setValue
+-import androidx.compose.ui.Modifier
+-import androidx.compose.ui.focus.FocusRequester
+-import androidx.compose.ui.focus.focusRequester
+-import androidx.compose.ui.graphics.SolidColor
+-import androidx.compose.ui.platform.LocalUriHandler
+-import androidx.compose.ui.text.input.KeyboardType
+-import androidx.compose.ui.text.input.PasswordVisualTransformation
+-import androidx.compose.ui.unit.dp
+-import androidx.hilt.navigation.compose.hiltViewModel
+-import androidx.lifecycle.compose.collectAsStateWithLifecycle
+-import androidx.tv.material3.Button
+-import androidx.tv.material3.MaterialTheme
+-import androidx.tv.material3.Text
+-import com.nuvio.tv.ui.components.NuvioDialog
+-
+-@Composable
+-fun GeminiSettingsContent(
+-    viewModel: GeminiSettingsViewModel = hiltViewModel(),
+-    initialFocusRequester: FocusRequester? = null
+-) {
+-    val state by viewModel.state.collectAsStateWithLifecycle()
+-    val uriHandler = LocalUriHandler.current
+-    var editing by remember { mutableStateOf(false) }
+-    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+-        SettingsDetailHeader(
+-            title = "Google Gemini",
+-            subtitle = "Optional: a personal Gemini API key lets Smart Highlights rank your picks and write the reason chips. Settings apply to this profile."
+-        )
+-        SettingsGroupCard(modifier = Modifier.fillMaxWidth().weight(1f)) {
+-            val listState = rememberLazyListState()
+-            Box(modifier = Modifier.fillMaxSize()) {
+-                LazyColumn(
+-                    state = listState,
+-                    modifier = Modifier.fillMaxSize(),
+-                    verticalArrangement = Arrangement.spacedBy(10.dp)
+-                ) {
+-                    item(key = "key") {
+-                        SettingsActionRow(
+-                            title = if (state.configured) "Replace API key" else "Enter API key",
+-                            subtitle = "Stored locally using Android Keystore encryption",
+-                            value = if (state.configured) "Configured" else "Not configured",
+-                            enabled = !state.busy,
+-                            onClick = { editing = true },
+-                            modifier = if (initialFocusRequester != null) {
+-                                Modifier.focusRequester(initialFocusRequester)
+-                            } else {
+-                                Modifier
+-                            }
+-                        )
+-                    }
+-                    item(key = "test") {
+-                        SettingsActionRow(
+-                            title = "Test connection",
+-                            subtitle = state.message ?: "Verify the key with generativelanguage.googleapis.com",
+-                            enabled = state.configured && !state.busy,
+-                            onClick = viewModel::test
+-                        )
+-                    }
+-                    item(key = "remove") {
+-                        SettingsActionRow(
+-                            title = "Remove API key",
+-                            subtitle = "Smart Highlights keeps working with its fallback picks",
+-                            enabled = state.configured && !state.busy,
+-                            onClick = { viewModel.save(null) }
+-                        )
+-                    }
+-                    if (state.busy) item(key = "busy") { Text("Connecting…") }
+-                    state.message?.let { message -> item(key = "status") { Text(message) } }
+-                    item(key = "attribution") {
+-                        SettingsActionRow(
+-                            title = "Get an API key",
+-                            subtitle = "Google AI Studio — free-tier keys are supported",
+-                            onClick = { uriHandler.openUri("https://aistudio.google.com/app/apikey") }
+-                        )
+-                    }
+-                }
+-                SettingsVerticalScrollIndicators(state = listState)
+-            }
+-        }
+-    }
+-    if (editing) {
+-        // Do not put secrets in saved-instance state or prefill the existing key.
+-        var value by remember { mutableStateOf("") }
+-        val inputFocus = remember { FocusRequester() }
+-        NuvioDialog(
+-            onDismiss = { editing = false },
+-            title = "Gemini API key",
+-            subtitle = "Enter a personal Google AI Studio API key",
+-            width = 700.dp
+-        ) {
+-            BasicTextField(
+-                value = value,
+-                onValueChange = { value = it },
+-                singleLine = true,
+-                visualTransformation = PasswordVisualTransformation(),
+-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+-                textStyle = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurface),
+-                cursorBrush = SolidColor(MaterialTheme.colorScheme.onSurface),
+-                modifier = Modifier.fillMaxWidth().padding(16.dp).focusRequester(inputFocus)
+-            )
+-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+-                Button(onClick = { value = ""; editing = false }) { Text("Cancel") }
+-                Button(enabled = value.isNotBlank(), onClick = {
+-                    viewModel.save(value)
+-                    value = ""
+-                    editing = false
+-                }) { Text("Save") }
+-            }
+-            LaunchedEffect(Unit) { inputFocus.requestFocus() }
+-        }
+-    }
+-}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/GeminiSettingsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/GeminiSettingsViewModel.kt
+deleted file mode 100644
+index db515410..00000000
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/GeminiSettingsViewModel.kt
++++ /dev/null
+@@ -1,94 +0,0 @@
+-package com.nuvio.tv.ui.screens.settings
+-
+-import androidx.lifecycle.ViewModel
+-import androidx.lifecycle.viewModelScope
+-import com.nuvio.tv.core.profile.ProfileManager
+-import com.nuvio.tv.data.gemini.GeminiCredentialStore
+-import com.nuvio.tv.data.gemini.GeminiRankingClient
+-import com.nuvio.tv.data.gemini.GeminiRankingException
+-import com.nuvio.tv.data.gemini.SmartHighlightsRankingCache
+-import dagger.hilt.android.lifecycle.HiltViewModel
+-import kotlinx.coroutines.CancellationException
+-import kotlinx.coroutines.Dispatchers
+-import kotlinx.coroutines.flow.MutableStateFlow
+-import kotlinx.coroutines.flow.asStateFlow
+-import kotlinx.coroutines.launch
+-import kotlinx.coroutines.withContext
+-import javax.inject.Inject
+-
+-data class GeminiConnectionState(
+-    val configured: Boolean = false,
+-    val busy: Boolean = false,
+-    val message: String? = null
+-)
+-
+-@HiltViewModel
+-class GeminiSettingsViewModel @Inject constructor(
+-    private val credentials: GeminiCredentialStore,
+-    private val client: GeminiRankingClient,
+-    private val rankingCache: SmartHighlightsRankingCache,
+-    private val profiles: ProfileManager
+-) : ViewModel() {
+-    private val mutableState = MutableStateFlow(GeminiConnectionState())
+-    private var generation = 0L
+-    val state = mutableState.asStateFlow()
+-
+-    init {
+-        viewModelScope.launch {
+-            profiles.activeProfileId.collect { id ->
+-                generation++
+-                val configured = withContext(Dispatchers.IO) { credentials.read(id) != null }
+-                mutableState.value = GeminiConnectionState(configured)
+-            }
+-        }
+-    }
+-
+-    fun save(value: String?) = operation { profileId ->
+-        withContext(Dispatchers.IO) {
+-            credentials.save(profileId, value)
+-            // A removed key must not leave a stale ranking behind for this profile.
+-            if (value.isNullOrBlank()) rankingCache.clear()
+-        }
+-        GeminiConnectionState(
+-            configured = !value.isNullOrBlank(),
+-            message = if (value.isNullOrBlank()) {
+-                "API key removed"
+-            } else {
+-                "API key saved. Test the connection to verify it."
+-            }
+-        )
+-    }
+-
+-    fun test() = operation { profileId ->
+-        client.testConnection(profileId)
+-        GeminiConnectionState(true, message = "Connected to Google Gemini")
+-    }
+-
+-    private fun operation(action: suspend (Int) -> GeminiConnectionState) {
+-        if (state.value.busy) return
+-        val profileId = profiles.activeProfileId.value
+-        val requestGeneration = generation
+-        mutableState.value = state.value.copy(busy = true, message = null)
+-        viewModelScope.launch {
+-            val result = try {
+-                action(profileId)
+-            } catch (e: CancellationException) {
+-                throw e
+-            } catch (e: GeminiRankingException) {
+-                state.value.copy(busy = false, message = when (e.reason) {
+-                    GeminiRankingException.Reason.NO_KEY -> "Save a Gemini API key first."
+-                    GeminiRankingException.Reason.AUTHENTICATION ->
+-                        "Gemini rejected the key. Check that the Generative Language API is enabled for it."
+-                    GeminiRankingException.Reason.RATE_LIMIT ->
+-                        "Gemini rate limit reached. Try again later."
+-                    else -> "Unable to reach Gemini. Check your connection and try again."
+-                })
+-            } catch (_: Exception) {
+-                state.value.copy(busy = false, message = "Unable to access Gemini credentials. Try saving the key again.")
+-            }
+-            if (profiles.activeProfileId.value == profileId && generation == requestGeneration) {
+-                mutableState.value = result
+-            }
+-        }
+-    }
+-}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt
+index d82dd8c3..6dfae9ad 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt
+@@ -111,8 +111,7 @@ private enum class IntegrationSettingsSection {
+     Tmdb,
+     MdbList,
+     AnimeSkip,
+-    Tvdb,
+-    Gemini
++    Tvdb
+ }
+ 
+ internal enum class SettingsSectionDestination {
+@@ -258,7 +257,6 @@ fun SettingsScreen(
+     val integrationMdbListFocusRequester = remember { FocusRequester() }
+     val integrationAnimeSkipFocusRequester = remember { FocusRequester() }
+     val integrationTvdbFocusRequester = remember { FocusRequester() }
+-    val integrationGeminiFocusRequester = remember { FocusRequester() }
+     var integrationSection by remember { mutableStateOf(IntegrationSettingsSection.Hub) }
+     var integrationHubReturnSection by remember { mutableStateOf(IntegrationSettingsSection.Hub) }
+     var pendingContentFocusCategory by remember { mutableStateOf<SettingsCategory?>(null) }
+@@ -669,7 +667,6 @@ fun SettingsScreen(
+                                 integrationMdbListFocusRequester = integrationMdbListFocusRequester,
+                                 integrationAnimeSkipFocusRequester = integrationAnimeSkipFocusRequester,
+                                 integrationTvdbFocusRequester = integrationTvdbFocusRequester,
+-                                integrationGeminiFocusRequester = integrationGeminiFocusRequester,
+                                 onNavigateToManageProfiles = onNavigateToManageProfiles,
+                                 onOpenDetail = onOpenDetail,
+                                 onNavigateToAddons = onNavigateToAddons,
+@@ -832,7 +829,6 @@ fun SettingsScreen(
+                         integrationMdbListFocusRequester = integrationMdbListFocusRequester,
+                         integrationAnimeSkipFocusRequester = integrationAnimeSkipFocusRequester,
+                         integrationTvdbFocusRequester = integrationTvdbFocusRequester,
+-                        integrationGeminiFocusRequester = integrationGeminiFocusRequester,
+                         onNavigateToManageProfiles = onNavigateToManageProfiles,
+                         onOpenDetail = onOpenDetail,
+                         onNavigateToAddons = onNavigateToAddons,
+@@ -865,7 +861,6 @@ private fun SettingsDetailPane(
+     integrationMdbListFocusRequester: FocusRequester,
+     integrationAnimeSkipFocusRequester: FocusRequester,
+     integrationTvdbFocusRequester: FocusRequester,
+-    integrationGeminiFocusRequester: FocusRequester,
+     onNavigateToManageProfiles: () -> Unit,
+     onOpenDetail: (String, String, String?) -> Unit,
+     onNavigateToAddons: () -> Unit,
+@@ -967,7 +962,6 @@ private fun SettingsDetailPane(
+             mdbListFocusRequester = integrationMdbListFocusRequester,
+             animeSkipFocusRequester = integrationAnimeSkipFocusRequester,
+             tvdbFocusRequester = integrationTvdbFocusRequester,
+-            geminiFocusRequester = integrationGeminiFocusRequester,
+             autoFocusEnabled = allowDetailAutofocus
+         )
+         SettingsCategory.ABOUT -> AboutSettingsContent(
+@@ -1111,7 +1105,6 @@ private fun IntegrationSettingsContent(
+     mdbListFocusRequester: FocusRequester,
+     animeSkipFocusRequester: FocusRequester,
+     tvdbFocusRequester: FocusRequester,
+-    geminiFocusRequester: FocusRequester,
+     autoFocusEnabled: Boolean
+ ) {
+     BackHandler(enabled = selectedSection != IntegrationSettingsSection.Hub) {
+@@ -1125,7 +1118,6 @@ private fun IntegrationSettingsContent(
+         IntegrationSettingsSection.MdbList -> mdbListFocusRequester
+         IntegrationSettingsSection.AnimeSkip -> animeSkipFocusRequester
+         IntegrationSettingsSection.Tvdb -> tvdbFocusRequester
+-        IntegrationSettingsSection.Gemini -> geminiFocusRequester
+     }
+     val hubEntryTargetSection = hubReturnSection.takeIf {
+         it != IntegrationSettingsSection.Hub
+@@ -1140,7 +1132,6 @@ private fun IntegrationSettingsContent(
+             IntegrationSettingsSection.MdbList -> mdbListFocusRequester
+             IntegrationSettingsSection.AnimeSkip -> animeSkipFocusRequester
+             IntegrationSettingsSection.Tvdb -> tvdbFocusRequester
+-            IntegrationSettingsSection.Gemini -> geminiFocusRequester
+         }
+         runCatching { requester.requestFocus() }
+     }
+@@ -1232,19 +1223,6 @@ private fun IntegrationSettingsContent(
+                                     }
+                                 )
+                             }
+-                            item(key = "integration_hub_gemini") {
+-                                SettingsActionRow(
+-                                    title = "Google Gemini",
+-                                    subtitle = "Optional API key that ranks the Smart Highlights rail",
+-                                    leadingIcon = Icons.Default.Explore,
+-                                    onClick = { onSelectSection(IntegrationSettingsSection.Gemini) },
+-                                    modifier = if (hubEntryTargetSection == IntegrationSettingsSection.Gemini) {
+-                                        Modifier.focusRequester(hubEntryFocusRequester)
+-                                    } else {
+-                                        Modifier
+-                                    }
+-                                )
+-                            }
+                         }
+                         SettingsVerticalScrollIndicators(state = integrationHubState)
+                     }
+@@ -1280,9 +1258,6 @@ private fun IntegrationSettingsContent(
+             TvdbSettingsContent(initialFocusRequester = tvdbFocusRequester)
+         }
+ 
+-        IntegrationSettingsSection.Gemini -> {
+-            GeminiSettingsContent(initialFocusRequester = geminiFocusRequester)
+-        }
+     }
+ }
+ 
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 7841ea59..d18ef838 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1048,7 +1048,7 @@
+     <string name="layout_ambient_tint">Ambient Poster Tint</string>
+     <string name="layout_ambient_tint_sub">Wash home background with the focused item\'s artwork colors.</string>
+     <string name="layout_smart_highlights" tools:ignore="MissingTranslation">Smart Highlights</string>
+-    <string name="layout_smart_highlights_sub" tools:ignore="MissingTranslation">Show a top-picks rail from your library on home. Add a Gemini API key under Integrations to have it ranked with reasons.</string>
++    <string name="layout_smart_highlights_sub" tools:ignore="MissingTranslation">Show a top-picks rail from your library on home.</string>
+     <string name="smart_highlights_title" tools:ignore="MissingTranslation">Smart Highlights</string>
+     <string name="smart_highlights_reason_continue" tools:ignore="MissingTranslation">Continue watching</string>
+     <string name="smart_highlights_reason_recent" tools:ignore="MissingTranslation">Saved recently</string>
