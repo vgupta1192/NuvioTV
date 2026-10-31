@@ -1,0 +1,68 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/account/AccountViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/account/AccountViewModel.kt
+index afd1561c..f9f0568a 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/account/AccountViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/account/AccountViewModel.kt
+@@ -29,6 +29,7 @@ import com.nuvio.tv.data.local.LibraryPreferences
+ import com.nuvio.tv.data.local.WatchedItemsPreferences
+ import com.nuvio.tv.data.local.TraktAuthDataStore
+ import com.nuvio.tv.data.local.WatchProgressPreferences
++import com.nuvio.tv.data.remote.supabase.DeviceLoginStartResult
+ import com.nuvio.tv.data.repository.AddonRepositoryImpl
+ import com.nuvio.tv.data.repository.AuthDiagnosticReportRepository
+ import com.nuvio.tv.data.repository.LibraryRepositoryImpl
+@@ -321,19 +322,44 @@ class AccountViewModel @Inject constructor(
+                     qrLoginExpiresAtMillis = null
+                 )
+             }
+-            Log.d(TAG, "QR_LOGIN[$traceId] start_device_login_session call begin")
+-            authManager.startDeviceLoginSession(
+-                deviceNonce = nonce,
+-                deviceName = Build.MODEL,
+-                deviceType = "tv",
+-                redirectBaseUrl = serverConfiguration.deviceLoginWebBaseUrl.orEmpty(),
+-                legacyRedirectBaseUrl = serverConfiguration.tvLoginWebBaseUrl.orEmpty(),
+-                traceId = traceId,
+-                diagnostics = diagnostics
+-            ).fold(
++            Log.d(TAG, "QR_LOGIN[$traceId] qr login start call begin")
++            // The tv-login page approves by device code and works across backend generations;
++            // prefer it whenever a tv-login web base URL is configured, and fall back to the
++            // device-login flow (short user code) only when that URL is absent.
++            val legacyRedirectBaseUrl = serverConfiguration.tvLoginWebBaseUrl.orEmpty()
++            val startSessionResult = if (legacyRedirectBaseUrl.isNotBlank()) {
++                authManager.startTvLoginSession(
++                    deviceNonce = nonce,
++                    deviceName = Build.MODEL,
++                    redirectBaseUrl = legacyRedirectBaseUrl,
++                    traceId = traceId,
++                    diagnostics = diagnostics
++                ).map { legacy ->
++                    DeviceLoginStartResult(
++                        deviceCode = legacy.code,
++                        userCode = "",
++                        verificationUri = legacyRedirectBaseUrl,
++                        verificationUriComplete = legacy.webUrl,
++                        expiresAt = legacy.expiresAt,
++                        pollIntervalSeconds = legacy.pollIntervalSeconds,
++                        legacy = true
++                    )
++                }
++            } else {
++                authManager.startDeviceLoginSession(
++                    deviceNonce = nonce,
++                    deviceName = Build.MODEL,
++                    deviceType = "tv",
++                    redirectBaseUrl = serverConfiguration.deviceLoginWebBaseUrl.orEmpty(),
++                    legacyRedirectBaseUrl = legacyRedirectBaseUrl,
++                    traceId = traceId,
++                    diagnostics = diagnostics
++                )
++            }
++            startSessionResult.fold(
+                 onSuccess = { result ->
+                     val expiresAtMillis = parseTimestampMillis(result.expiresAt)
+-                    if (result.deviceCode.isBlank() || result.userCode.isBlank() || result.verificationUriComplete.isBlank()) {
++                    if (!result.legacy && (result.deviceCode.isBlank() || result.userCode.isBlank() || result.verificationUriComplete.isBlank())) {
+                         Log.w(TAG, "QR_LOGIN[$traceId] start_device_login_session returned incomplete data deviceCodeBlank=${result.deviceCode.isBlank()} userCodeBlank=${result.userCode.isBlank()} urlBlank=${result.verificationUriComplete.isBlank()}")
+                     }
+                     val qrStartedAtMs = SystemClock.elapsedRealtime()
