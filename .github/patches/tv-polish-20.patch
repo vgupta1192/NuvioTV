@@ -1,5 +1,5 @@
 diff --git a/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt
-index ba392256a..0f99719a7 100644
+index ba392256a..0e3b613cb 100644
 --- a/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt
 @@ -69,7 +69,7 @@ object JellyfinRepository {
@@ -11,13 +11,14 @@ index ba392256a..0f99719a7 100644
  
      private val json = Json { ignoreUnknownKeys = true }
      private val client by lazy {
-@@ -354,11 +354,24 @@ object JellyfinRepository {
+@@ -354,11 +354,55 @@ object JellyfinRepository {
              },
          )
          val items = root.array("Items").orEmpty().mapNotNull { element ->
 -            (element as? JsonObject)?.let(::parseItem)
+-        }
 +            (element as? JsonObject)?.takeIf(::hasPlayableMedia)?.let(::parseItem)
-         }
++        }.let { parsed -> pruneEmptyFolders(session, parsed) }
          return JellyfinItemPage(items = items, totalRecordCount = root.int("TotalRecordCount") ?: items.size)
      }
  
@@ -32,6 +33,37 @@ index ba392256a..0f99719a7 100644
 +            type.equals("Season", true) -> (obj.int("ChildCount") ?: 1) > 0
 +            else -> true
 +        }
++    }
++
++    /** Folder entries only stay when at least one video file with a container sits below them. */
++    private suspend fun pruneEmptyFolders(session: JellyfinSession, items: List<JellyfinItem>): List<JellyfinItem> {
++        if (items.none { it.isFolder }) return items
++        val keep = kotlinx.coroutines.coroutineScope {
++            items.map { item ->
++                async {
++                    if (!item.isFolder) return@async true
++                    runCatching {
++                        val root = call(
++                            session,
++                            "/Users/${session.userId}/Items",
++                            mapOf(
++                                "ParentId" to item.id,
++                                "Recursive" to "true",
++                                "IncludeItemTypes" to "Movie,Video,Episode",
++                                "Fields" to "Container",
++                                "Limit" to "5",
++                            ),
++                        )
++                        root.array("Items").orEmpty().any { el ->
++                            val o = el as? JsonObject ?: return@any false
++                            !o.string("Container").isNullOrBlank() &&
++                                !o.string("LocationType").equals("Virtual", ignoreCase = true)
++                        }
++                    }.getOrDefault(true)
++                }
++            }.map { it.await() }
++        }
++        return items.filterIndexed { i, _ -> keep[i] }
 +    }
 +
      private suspend fun getItem(session: JellyfinSession, itemId: String): JellyfinItem? {
@@ -158,10 +190,18 @@ index a0aa64d35..7bb7a7597 100644
              // Clear CW state when profile changes so items don't leak between profiles.
              var previousProfileId = profileManager.activeProfileId.value
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
-index a7dfcc104..c638fb3a1 100644
+index a7dfcc104..07071e00e 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
-@@ -263,10 +263,10 @@ fun JellyfinDetailsScreen(
+@@ -180,6 +180,7 @@ fun JellyfinDetailsScreen(
+         }
+         LaunchedEffect(item.id, meta.imdbId, seasonNumbers) {
+             ratingsViewModel.load(item, meta, seasonNumbers)
++            ratingsViewModel.bindLibrary(item, meta)
+         }
+         // Same "Play S1E2" / "Resume S1E2" wording the addon detail page shows.
+         val nextToWatch = remember(playable, item.id) {
+@@ -263,10 +264,10 @@ fun JellyfinDetailsScreen(
          val episodeListState = rememberLazyListState()
          var goToEpisodeOpen by remember(item.id) { mutableStateOf(false) }
          val episodeScope = rememberCoroutineScope()
@@ -174,7 +214,30 @@ index a7dfcc104..c638fb3a1 100644
                  if (ratings.moreLikeThis.isNotEmpty()) add(JellyfinTab.SIMILAR)
                  if (ratings.trailers.any { !it.ytId.isNullOrBlank() }) add(JellyfinTab.TRAILER)
              }
-@@ -372,18 +372,24 @@ fun JellyfinDetailsScreen(
+@@ -287,8 +288,20 @@ fun JellyfinDetailsScreen(
+                 tmdbRating = ratings.tmdbRating,
+                 onPlayClick = { playable?.let(onPlay) },
+                 isPlayEnabled = playable != null,
+-                isInLibrary = false,
+-                onToggleLibrary = {},
++                isInLibrary = ratings.isInLibrary,
++                onToggleLibrary = {
++                    ratingsViewModel.toggleLibrary(item, meta) { added ->
++                        android.widget.Toast.makeText(
++                            ratingContext,
++                            when (added) {
++                                true -> com.nuvio.tv.R.string.detail_added_to_library
++                                false -> com.nuvio.tv.R.string.detail_removed_from_library
++                                null -> com.nuvio.tv.R.string.detail_error_update_library_failed
++                            },
++                            android.widget.Toast.LENGTH_SHORT,
++                        ).show()
++                    }
++                },
+                 onLibraryLongPress = {},
+                 isMovieWatched = false,
+                 isMovieWatchedPending = false,
+@@ -372,18 +385,24 @@ fun JellyfinDetailsScreen(
                      )
  
                      JellyfinTab.RATINGS -> {
@@ -210,7 +273,7 @@ index a7dfcc104..c638fb3a1 100644
                          }
                          EpisodeRatingsSection(
                              episodes = ratingVideos,
-@@ -391,6 +397,11 @@ fun JellyfinDetailsScreen(
+@@ -391,6 +410,11 @@ fun JellyfinDetailsScreen(
                              isLoading = false,
                              error = null,
                              title = "",
@@ -222,6 +285,107 @@ index a7dfcc104..c638fb3a1 100644
                          )
                      }
  
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinRatingsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinRatingsViewModel.kt
+index efc430775..6dbc0160e 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinRatingsViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinRatingsViewModel.kt
+@@ -17,6 +17,10 @@ import com.nuvio.tv.domain.model.JellyfinItem
+ import com.nuvio.tv.domain.model.MDBListRatings
+ import com.nuvio.tv.domain.model.MDBListSettings
+ import com.nuvio.tv.domain.model.Meta
++import com.nuvio.tv.domain.model.LibraryEntryInput
++import com.nuvio.tv.domain.repository.LibraryRepository
++import com.nuvio.tv.data.repository.parseContentIds
++import kotlinx.coroutines.flow.collectLatest
+ import com.nuvio.tv.ui.screens.detail.ForkTvExtraEpisodeRatings
+ import dagger.hilt.android.lifecycle.HiltViewModel
+ import javax.inject.Inject
+@@ -42,6 +46,7 @@ data class JellyfinRatingsState(
+     val trailers: List<MetaTrailer> = emptyList(),
+     val moreLikeThis: List<MetaPreview> = emptyList(),
+     val trailerOverlay: JellyfinTrailerOverlay? = null,
++    val isInLibrary: Boolean = false,
+ )
+ 
+ /** State of the in-page trailer player overlay. */
+@@ -63,6 +68,7 @@ class JellyfinRatingsViewModel @Inject constructor(
+     private val forkExtraEpisodeRatings: ForkTvExtraEpisodeRatings,
+     private val tmdbSettingsDataStore: TmdbSettingsDataStore,
+     private val trailerService: TrailerService,
++    private val libraryRepository: LibraryRepository,
+ ) : ViewModel() {
+ 
+     private val _state = MutableStateFlow(JellyfinRatingsState())
+@@ -178,6 +184,69 @@ class JellyfinRatingsViewModel @Inject constructor(
+         }
+     }
+ 
++    private var libraryKey: String? = null
++    private var libraryJob: Job? = null
++    private var libraryBusy = false
++
++    /** The "+" button saves the title under its IMDb id when Jellyfin knows one, else under the Jellyfin id. */
++    private fun libraryInput(item: JellyfinItem, meta: Meta): LibraryEntryInput {
++        val id = item.imdbId ?: item.id
++        val parsed = parseContentIds(id)
++        return LibraryEntryInput(
++            itemId = id,
++            itemType = meta.apiType,
++            title = meta.name,
++            year = item.productionYear,
++            traktId = parsed.trakt,
++            imdbId = parsed.imdb,
++            tmdbId = parsed.tmdb ?: item.tmdbId?.toIntOrNull(),
++            poster = meta.poster,
++            posterShape = meta.posterShape,
++            background = meta.background,
++            logo = meta.logo,
++            description = meta.description,
++            releaseInfo = meta.releaseInfo,
++            imdbRating = meta.imdbRating,
++            genres = meta.genres,
++            addonBaseUrl = null,
++        )
++    }
++
++    /** Follows the library membership of the open title so the "+" icon turns into a check. */
++    fun bindLibrary(item: JellyfinItem, meta: Meta) {
++        val input = libraryInput(item, meta)
++        val key = "${input.itemId}:${input.itemType}"
++        if (key == libraryKey) return
++        libraryKey = key
++        libraryJob?.cancel()
++        libraryJob = viewModelScope.launch {
++            libraryRepository.isInLibrary(input.itemId, input.itemType).collectLatest { inLibrary ->
++                _state.update { it.copy(isInLibrary = inLibrary) }
++            }
++        }
++    }
++
++    /** Adds or removes the open title. [onResult] gets true for added, false for removed, null on failure. */
++    fun toggleLibrary(item: JellyfinItem, meta: Meta, onResult: (Boolean?) -> Unit) {
++        if (libraryBusy) return
++        libraryBusy = true
++        val wasIn = _state.value.isInLibrary
++        viewModelScope.launch {
++            val ok = runCatching {
++                val input = libraryInput(item, meta)
++                val first = libraryRepository.toggleDefault(input)
++                if (first.requiresRemovalConfirmation) {
++                    libraryRepository.toggleDefault(
++                        input,
++                        first.requiredRemovalConfirmations.mapTo(linkedSetOf()) { it.providerId },
++                    )
++                }
++            }
++            libraryBusy = false
++            onResult(if (ok.isSuccess) !wasIn else null)
++        }
++    }
++
+     fun dismissTrailer() {
+         _state.update { it.copy(trailerOverlay = null) }
+     }
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
 index d6ea5c94f..3521a6c27 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
@@ -486,7 +650,7 @@ index b0210c348..02d85e2be 100644
          SettingsToggleRow(
              title = stringResource(R.string.layout_fullscreen_hero_backdrop),
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
-index f5b6be7a6..68cb5109c 100644
+index f5b6be7a6..d6cf95b34 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
 @@ -1069,6 +1069,11 @@ fun TvChannelsScreen(
@@ -510,7 +674,15 @@ index f5b6be7a6..68cb5109c 100644
                          .fillMaxHeight()
                  ) {
                      when {
-@@ -1276,10 +1281,11 @@ fun TvChannelsScreen(
+@@ -1229,6 +1234,7 @@ fun TvChannelsScreen(
+                                             channel = channel,
+                                             isSelected = isSelected,
+                                             isPlaying = isPlaying,
++                                            compact = previewPanelHasFocus,
+                                             modifier = itemModifier,
+                                             onFocused = onItemFocused,
+                                             onClick = onItemClick,
+@@ -1276,10 +1282,11 @@ fun TvChannelsScreen(
                      onStreamSelected = { idx ->
                          viewModel.selectStreamIndex(idx)
                      },
@@ -669,8 +841,84 @@ index 321a9c050..4aae381b3 100644
                  }
                  if (!isDrawerOpen) {
                      hudVisible = true
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelListItem.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelListItem.kt
+index 8b016f404..327d1b904 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelListItem.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelListItem.kt
+@@ -38,6 +38,7 @@ import androidx.compose.ui.res.stringResource
+ import androidx.compose.ui.text.font.FontWeight
+ import androidx.compose.ui.text.style.TextOverflow
+ import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.TextUnit
+ import androidx.compose.ui.unit.sp
+ import androidx.tv.material3.Border
+ import androidx.tv.material3.ClickableSurfaceDefaults
+@@ -56,6 +57,8 @@ fun TvChannelListItem(
+     channel: TvChannelItem,
+     isSelected: Boolean,
+     isPlaying: Boolean = false,
++    /** Narrow list (right panel enlarged): logo and name only, name on two lines, no badges. */
++    compact: Boolean = false,
+     onFocused: () -> Unit,
+     onClick: () -> Unit,
+     onLongClick: () -> Unit,
+@@ -102,14 +105,14 @@ fun TvChannelListItem(
+         Row(
+             modifier = Modifier
+                 .fillMaxWidth()
+-                .padding(horizontal = 14.dp, vertical = 12.dp),
++                .padding(horizontal = if (compact) 8.dp else 14.dp, vertical = if (compact) 8.dp else 12.dp),
+             verticalAlignment = Alignment.CenterVertically,
+-            horizontalArrangement = Arrangement.spacedBy(12.dp)
++            horizontalArrangement = Arrangement.spacedBy(if (compact) 8.dp else 12.dp)
+         ) {
+             // Logo / Thumbnail do Canal
+             Box(
+                 modifier = Modifier
+-                    .size(width = 72.dp, height = 48.dp)
++                    .size(width = if (compact) 44.dp else 72.dp, height = if (compact) 36.dp else 48.dp)
+                     .clip(RoundedCornerShape(12.dp))
+                     .background(
+                         androidx.compose.ui.graphics.Brush.linearGradient(
+@@ -150,13 +153,14 @@ fun TvChannelListItem(
+                         style = MaterialTheme.typography.titleSmall,
+                         fontWeight = FontWeight.Bold,
+                         color = Color.White,
+-                        maxLines = 1,
++                        maxLines = if (compact) 2 else 1,
+                         overflow = TextOverflow.Ellipsis,
++                        fontSize = if (compact) 13.sp else TextUnit.Unspecified,
+                         modifier = Modifier.weight(1f, fill = false)
+                     )
+ 
+                     // Badge Ao Vivo
+-                    Row(
++                    if (!compact) Row(
+                         modifier = Modifier
+                             .clip(RoundedCornerShape(50))
+                             .background(Color(0xFFE50914))
+@@ -187,7 +191,7 @@ fun TvChannelListItem(
+                         )
+                     }
+ 
+-                    if (isPlaying) {
++                    if (isPlaying && !compact) {
+                         Box(
+                             modifier = Modifier
+                                 .clip(RoundedCornerShape(3.dp))
+@@ -209,7 +213,9 @@ fun TvChannelListItem(
+                 // Programa EPG Atual
+                 val epg = channel.epgInfo
+                 val nowProgram = epg?.nowProgram
+-                if (nowProgram != null) {
++                if (compact) {
++                    // name only
++                } else if (nowProgram != null) {
+                     Text(
+                         text = nowProgram.title,
+                         style = MaterialTheme.typography.bodySmall,
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt
-index 1c08693a3..b3bf2bede 100644
+index 1c08693a3..f579e8882 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt
 @@ -13,7 +13,9 @@ import androidx.compose.foundation.layout.Spacer
@@ -688,7 +936,7 @@ index 1c08693a3..b3bf2bede 100644
  
          // 1. Player de Vídeo em 16:9 ou Card de Início de Prévia
 +        // Height is capped so the buttons and description below always fit; the 16:9 video is centred.
-+        val playerMaxHeight = (LocalConfiguration.current.screenHeightDp * 0.34f).dp
++        val playerMaxHeight = (LocalConfiguration.current.screenHeightDp * 0.30f).dp
          Box(
              modifier = Modifier
                  .fillMaxWidth()
@@ -708,10 +956,128 @@ index 1c08693a3..b3bf2bede 100644
 +        }
  
 -        Spacer(modifier = Modifier.height(18.dp))
-+        Spacer(modifier = Modifier.height(14.dp))
++        Spacer(modifier = Modifier.height(10.dp))
  
          val scrollState = rememberScrollState()
          val coroutineScope = rememberCoroutineScope()
+@@ -290,7 +301,7 @@ fun TvChannelPreviewPanel(
+             modifier = Modifier
+                 .fillMaxWidth()
+                 .weight(1f)
+-                .verticalScroll(scrollState)
++                .clip(androidx.compose.ui.graphics.RectangleShape)
+         ) {
+             // Cabeçalho do Canal
+             Row(
+@@ -302,8 +313,8 @@ fun TvChannelPreviewPanel(
+                 if (!logoUrl.isNullOrBlank()) {
+                     Box(
+                         modifier = Modifier
+-                            .size(60.dp)
+-                            .clip(RoundedCornerShape(12.dp))
++                            .size(44.dp)
++                            .clip(RoundedCornerShape(10.dp))
+                             .background(Color(0xFF1E1E24))
+                             .padding(4.dp),
+                         contentAlignment = Alignment.Center
+@@ -334,7 +345,7 @@ fun TvChannelPreviewPanel(
+                 }
+             }
+ 
+-            Spacer(modifier = Modifier.height(18.dp))
++            Spacer(modifier = Modifier.height(10.dp))
+ 
+             // Botões de Ação para TV (Assistir Tela Cheia, Favoritar, Guia EPG)
+             Row(
+@@ -346,7 +357,7 @@ fun TvChannelPreviewPanel(
+                 Button(
+                     onClick = onWatchFullscreen,
+                     shape = ButtonDefaults.shape(shape = RoundedCornerShape(22.dp)),
+-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 12.dp),
++                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp, vertical = 7.dp),
+                     colors = ButtonDefaults.colors(
+                         containerColor = Color.White.copy(alpha = 0.12f),
+                         focusedContainerColor = Color.White,
+@@ -394,7 +405,7 @@ fun TvChannelPreviewPanel(
+                 Button(
+                     onClick = onToggleFavorite,
+                     shape = ButtonDefaults.shape(shape = RoundedCornerShape(22.dp)),
+-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 12.dp),
++                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp, vertical = 7.dp),
+                     colors = ButtonDefaults.colors(
+                         containerColor = if (channel.isFavorite) Color(0xFFFFD700).copy(alpha = 0.18f) else Color.White.copy(alpha = 0.12f),
+                         focusedContainerColor = Color.White,
+@@ -435,7 +446,7 @@ fun TvChannelPreviewPanel(
+                 Button(
+                     onClick = onOpenSchedule,
+                     shape = ButtonDefaults.shape(shape = RoundedCornerShape(22.dp)),
+-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 12.dp),
++                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp, vertical = 7.dp),
+                     colors = ButtonDefaults.colors(
+                         containerColor = Color.White.copy(alpha = 0.12f),
+                         focusedContainerColor = Color.White,
+@@ -468,7 +479,7 @@ fun TvChannelPreviewPanel(
+ 
+             // Seletor de Transmissões / Qualidades se houver mais de 1
+             if (streams.size > 1) {
+-                Spacer(modifier = Modifier.height(10.dp))
++                Spacer(modifier = Modifier.height(6.dp))
+                 Text(
+                     text = stringResource(R.string.tv_channels_available_sources),
+                     style = MaterialTheme.typography.labelSmall,
+@@ -519,7 +530,7 @@ fun TvChannelPreviewPanel(
+             val nowProg = epg?.nowProgram
+             if (nowProg != null) {
+                 var isEpgCardFocused by remember { mutableStateOf(false) }
+-                Spacer(modifier = Modifier.height(12.dp))
++                Spacer(modifier = Modifier.height(8.dp))
+                 Box(
+                     modifier = Modifier
+                         .fillMaxWidth()
+@@ -561,7 +572,7 @@ fun TvChannelPreviewPanel(
+                             }
+                             false
+                         }
+-                        .padding(12.dp)
++                        .padding(10.dp)
+                 ) {
+                     Column {
+                         Row(
+@@ -602,7 +613,7 @@ fun TvChannelPreviewPanel(
+                                 text = nowProg.description,
+                                 style = MaterialTheme.typography.bodySmall,
+                                 color = Color.White.copy(alpha = 0.85f),
+-                                maxLines = if (isEpgCardFocused) 14 else 4,
++                                maxLines = if (isEpgCardFocused) 5 else 2,
+                                 overflow = TextOverflow.Ellipsis,
+                                 fontSize = 12.sp
+                             )
+@@ -625,7 +636,7 @@ fun TvChannelPreviewPanel(
+             // Descrição geral do canal (se houver e não for redundante)
+             if (!channel.description.isNullOrBlank() && (nowProg == null || channel.description != nowProg.description)) {
+                 var isDescFocused by remember { mutableStateOf(false) }
+-                Spacer(modifier = Modifier.height(10.dp))
++                Spacer(modifier = Modifier.height(8.dp))
+                 Box(
+                     modifier = Modifier
+                         .fillMaxWidth()
+@@ -675,7 +686,7 @@ fun TvChannelPreviewPanel(
+                             text = channel.description,
+                             style = MaterialTheme.typography.bodySmall,
+                             color = Color.White.copy(alpha = 0.85f),
+-                            maxLines = if (isDescFocused) 14 else 4,
++                            maxLines = if (isDescFocused) 4 else 2,
+                             overflow = TextOverflow.Ellipsis,
+                             fontSize = 12.sp
+                         )
+@@ -683,7 +694,6 @@ fun TvChannelPreviewPanel(
+                 }
+             }
+ 
+-            Spacer(modifier = Modifier.height(48.dp))
+         }
+     }
+ }
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
 index 94a1ba966..7d588df64 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
@@ -788,8 +1154,36 @@ index f063b6aea..f59c3aaf9 100644
                                              KeyEvent.KEYCODE_PAGE_UP,
                                              KeyEvent.KEYCODE_CHANNEL_UP,
                                              KeyEvent.KEYCODE_MENU,
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt
+index ad64da0ad..7710c5a7b 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt
+@@ -362,7 +362,7 @@ private fun Content(
+         else -> {
+             val gridState = rememberLazyGridState()
+             // Keep loading as you near the end, like an endless feed.
+-            LaunchedEffect(gridState, state.canLoadMore) {
++            LaunchedEffect(gridState, state.canLoadMore, state.grid.size) {
+                 snapshotFlow {
+                     val info = gridState.layoutInfo
+                     (info.visibleItemsInfo.lastOrNull()?.index ?: 0) >= info.totalItemsCount - 8
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeUpNext.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeUpNext.kt
+index 9aa692d3c..03551a306 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeUpNext.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeUpNext.kt
+@@ -163,6 +163,10 @@ fun BoxScope.YouTubeUpNextList(
+         }
+     }
+     LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
++    // Endless list: ask for more when the highlight gets near the end.
++    LaunchedEffect(selected, related.size, open) {
++        if (open && related.isNotEmpty() && selected >= related.size - 6) viewModel.loadMoreRelated()
++    }
+     LaunchedEffect(related.size) {
+         if (selected > related.lastIndex) selected = related.lastIndex.coerceAtLeast(0)
+     }
 diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
-index 368faf0bc..037debf63 100644
+index 368faf0bc..e45e13e31 100644
 --- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
 +++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
 @@ -23,6 +23,8 @@ import kotlinx.coroutines.delay
@@ -836,3 +1230,185 @@ index 368faf0bc..037debf63 100644
  
      private var screenOpenedBefore = false
  
+@@ -243,23 +262,61 @@ class YouTubeViewModel @Inject constructor(
+         return true
+     }
+ 
++    /**
++     * Reads the next pages of [group] until one has videos not in [have]. Pages the filters empty out are
++     * skipped instead of ending the feed. Returns the last page read (null when YouTube sent none) and the new videos.
++     */
++    private fun nextFresh(group: MediaGroup, have: MutableSet<String>): Pair<MediaGroup?, List<YtItem>> {
++        var current = group
++        repeat(4) {
++            val next = runCatching { content.continueGroupObserve(current).blockingFirst() }.getOrNull()
++                ?: return Pair(null, emptyList())
++            current = next
++            val fresh = toItems(next).filter { have.add(it.videoId ?: it.title) }
++            if (fresh.isNotEmpty() || next.nextPageKey == null) return Pair(next, fresh)
++        }
++        return Pair(current, emptyList())
++    }
++
++    /** First page of a grid tab again. YouTube answers with new picks, so a tab that ran out can go on. */
++    private fun tabGroup(tab: YtTab): MediaGroup? = runCatching {
++        when (tab) {
++            YtTab.SUBSCRIPTIONS -> content.subscriptionsObserve.blockingFirst()
++            YtTab.SHORTS -> content.shortsObserve.blockingFirst()
++            YtTab.CHANNELS -> content.subscribedChannelsObserve.blockingFirst()
++            YtTab.HISTORY -> content.historyObserve.blockingFirst()
++            YtTab.PLAYLISTS -> content.playlistsObserve.blockingFirst()
++            else -> null
++        }
++    }.getOrNull()
++
+     fun loadMore() {
+         val group = currentGroup ?: return
+         val s = _state.value
+         if (s.loading || s.loadingMore || !s.canLoadMore) return
+         _state.update { it.copy(loadingMore = true) }
++        val tab = s.tab
++        val canRefill = s.subTitle == null
+         viewModelScope.launch {
+-            val next = withContext(Dispatchers.IO) {
+-                runCatching { content.continueGroupObserve(group).blockingFirst() }.getOrNull()
++            val have = s.grid.mapTo(HashSet()) { it.videoId ?: it.title }
++            val (nextGroup, fresh, more) = withContext(Dispatchers.IO) {
++                var (next, items) = nextFresh(group, have)
++                var last: MediaGroup? = next ?: group
++                var hasMore = next != null && next.nextPageKey != null
++                if (items.isEmpty() && !hasMore && canRefill) {
++                    // The pages ran out: ask for a fresh first page, so the feed keeps going.
++                    val again = tabGroup(tab)
++                    if (again != null) {
++                        items = toItems(again).filter { have.add(it.videoId ?: it.title) }
++                        last = again
++                        hasMore = again.nextPageKey != null || items.isNotEmpty()
++                    }
++                }
++                Triple(last, items, hasMore)
+             }
+-            val more = next?.let(::toItems).orEmpty()
+-            currentGroup = next ?: group
++            currentGroup = nextGroup ?: group
+             _state.update {
+-                it.copy(
+-                    grid = it.grid + more,
+-                    loadingMore = false,
+-                    canLoadMore = next?.nextPageKey != null && more.isNotEmpty()
+-                )
++                it.copy(grid = it.grid + fresh, loadingMore = false, canLoadMore = more && (fresh.isNotEmpty() || nextGroup?.nextPageKey != null))
+             }
+             fetchDeArrow()
+         }
+@@ -332,13 +389,10 @@ class YouTubeViewModel @Inject constructor(
+         if (!row.canMore || row.loadingMore) return
+         setRow(index, row.title) { it.copy(loadingMore = true) }
+         viewModelScope.launch {
+-            val next = withContext(Dispatchers.IO) {
+-                runCatching { content.continueGroupObserve(group).blockingFirst() }.getOrNull()
++            val (next, fresh) = withContext(Dispatchers.IO) {
++                nextFresh(group, row.items.mapTo(HashSet()) { it.videoId ?: it.title })
+             }
+-            val more = next?.let(::toItems).orEmpty()
+             setRow(index, row.title) { r ->
+-                val have = r.items.mapTo(HashSet()) { it.videoId ?: it.title }
+-                val fresh = more.filter { have.add(it.videoId ?: it.title) }
+                 r.copy(
+                     items = r.items + fresh,
+                     group = next ?: r.group,
+@@ -674,16 +728,22 @@ class YouTubeViewModel @Inject constructor(
+     fun loadRelated(currentVideoId: String) {
+         if (relatedFor == currentVideoId && _related.value.isNotEmpty()) return
+         relatedFor = currentVideoId
++        relatedGroups.clear()
++        relatedSeen.clear()
++        relatedHomeDone = false
++        relatedSubs = null
+         _related.value = emptyList()
+         _relatedLoading.value = true
+         viewModelScope.launch {
+             val items = withContext(Dispatchers.IO) {
+                 runCatching {
+                     val meta = service.mediaItemService.getMetadataObserve(currentVideoId).blockingFirst()
++                    relatedGroups.addAll(meta.suggestions.orEmpty().filter { it.nextPageKey != null })
+                     (listOfNotNull(meta.nextVideo) + meta.suggestions.orEmpty().flatMap { it.mediaItems.orEmpty() })
+                         .filter(::allowed).mapNotNull(::toItem)
+                         .filter { it.kind == YtKind.VIDEO && it.videoId != currentVideoId }
+                         .distinctBy { it.videoId }
++                        .also { list -> list.forEach { relatedSeen.add(it.videoId ?: it.title) } }
+                 }.getOrDefault(emptyList())
+             }
+             if (relatedFor == currentVideoId) {
+@@ -693,6 +753,71 @@ class YouTubeViewModel @Inject constructor(
+         }
+     }
+ 
++    private val relatedGroups = ArrayDeque<MediaGroup>()
++    private val relatedSeen = HashSet<String>()
++    private var relatedHomeDone = false
++    private var relatedSubs: MediaGroup? = null
++    private var relatedMoreBusy = false
++
++    /**
++     * Adds more videos to the Up next list as you near its end: the rest of YouTube's suggestions for this
++     * video first, then your own recommendations, then new uploads from your subscriptions, so the list
++     * keeps following what your account watches.
++     */
++    fun loadMoreRelated() {
++        val current = relatedFor ?: return
++        if (relatedMoreBusy || _relatedLoading.value) return
++        relatedMoreBusy = true
++        viewModelScope.launch {
++            val fresh = withContext(Dispatchers.IO) {
++                runCatching { fetchMoreRelated(current, 0) }.getOrDefault(emptyList())
++            }
++            if (relatedFor == current && fresh.isNotEmpty()) _related.value = _related.value + fresh
++            relatedMoreBusy = false
++        }
++    }
++
++    private fun relatedFresh(items: List<YtItem>, current: String): List<YtItem> =
++        items.filter { it.kind == YtKind.VIDEO && it.videoId != current && relatedSeen.add(it.videoId ?: it.title) }
++
++    private fun fetchMoreRelated(current: String, depth: Int): List<YtItem> {
++        while (relatedGroups.isNotEmpty()) {
++            val group = relatedGroups.removeFirst()
++            if (group.nextPageKey == null) continue
++            val next = runCatching { content.continueGroupObserve(group).blockingFirst() }.getOrNull() ?: continue
++            if (next.nextPageKey != null) relatedGroups.addFirst(next)
++            val fresh = relatedFresh(toItems(next), current)
++            if (fresh.isNotEmpty()) return fresh
++        }
++        if (!relatedHomeDone) {
++            relatedHomeDone = true
++            val rows = runCatching { content.homeObserve.blockingFirst() }.getOrNull().orEmpty()
++            relatedGroups.addAll(rows.filter { it.nextPageKey != null })
++            val fresh = relatedFresh(rows.flatMap(::toItems), current)
++            if (fresh.isNotEmpty()) return fresh
++            if (relatedGroups.isNotEmpty()) return fetchMoreRelated(current, depth)
++        }
++        val subs = relatedSubs
++        if (subs == null) {
++            val first = runCatching { content.subscriptionsObserve.blockingFirst() }.getOrNull()
++            relatedSubs = first
++            val fresh = relatedFresh(first?.let(::toItems).orEmpty(), current)
++            if (fresh.isNotEmpty()) return fresh
++        } else if (subs.nextPageKey != null) {
++            val (next, fresh) = nextFresh(subs, HashSet())
++            relatedSubs = next
++            val unseen = relatedFresh(fresh, current)
++            if (unseen.isNotEmpty()) return unseen
++        }
++        // Everything was used: start over from your recommendations so the list does not end.
++        if (depth == 0) {
++            relatedHomeDone = false
++            relatedSubs = null
++            return fetchMoreRelated(current, 1)
++        }
++        return emptyList()
++    }
++
+     /** YouTube's own "up next", or the first suggestion that hasn't played yet. */
+     private fun upNext(currentVideoId: String): YtItem? {
+         val meta = service.mediaItemService.getMetadataObserve(currentVideoId).blockingFirst()
