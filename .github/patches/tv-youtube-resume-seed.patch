@@ -1,0 +1,128 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerObservers.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerObservers.kt
+index 834e90c08..8227e1c04 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerObservers.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerObservers.kt
+@@ -530,6 +530,28 @@ internal fun PlayerRuntimeController.observeSubtitleSettings() {
+     }
+ }
+ 
++/** YouTube fork: where this device (or the account, seeded on play) left a video, as a saved-progress entry. */
++private fun PlayerRuntimeController.youtubeResumeProgress(): WatchProgress? {
++    val id = contentId ?: return null
++    val (pos, dur) = com.nuvio.tv.youtube.YouTubeProgress.load(context, id) ?: return null
++    return WatchProgress(
++        contentId = id,
++        contentType = contentType ?: "youtube",
++        name = contentName ?: title,
++        poster = poster,
++        backdrop = null,
++        logo = null,
++        videoId = id,
++        season = null,
++        episode = null,
++        episodeTitle = null,
++        position = pos,
++        duration = dur,
++        lastWatched = System.currentTimeMillis(),
++        progressPercent = null
++    )
++}
++
+ internal fun PlayerRuntimeController.loadSavedProgressFor(season: Int?, episode: Int?) {
+     val isCloudLibraryPlayback = contentType.equals("cloud", ignoreCase = true)
+     val progressContentId = contentId
+@@ -537,7 +559,9 @@ internal fun PlayerRuntimeController.loadSavedProgressFor(season: Int?, episode:
+ 
+     scope.launch {
+         pendingResumeProgress = null
+-        val local = if (isCloudLibraryPlayback) {
++        val local = if (com.nuvio.tv.youtube.YouTubeProgress.isYouTubeId(progressContentId)) {
++            youtubeResumeProgress()
++        } else if (isCloudLibraryPlayback) {
+             loadCloudLibraryResumeProgress()
+         } else if (season != null && episode != null) {
+             watchProgressRepository.getEpisodeProgress(
+@@ -549,7 +573,7 @@ internal fun PlayerRuntimeController.loadSavedProgressFor(season: Int?, episode:
+         } else {
+             watchProgressRepository.getProgress(progressContentId!!, profileId).firstOrNull()
+         }
+-        val progress = newerServerProgress(local)
++        val progress = if (com.nuvio.tv.youtube.YouTubeProgress.isYouTubeId(progressContentId)) local else newerServerProgress(local)
+ 
+         progress?.let { saved ->
+ 
+@@ -587,7 +611,9 @@ internal suspend fun PlayerRuntimeController.loadSavedProgressSuspend(season: In
+     if (!isCloudLibraryPlayback && progressContentId == null) return
+ 
+     pendingResumeProgress = null
+-    val local = if (isCloudLibraryPlayback) {
++    val local = if (com.nuvio.tv.youtube.YouTubeProgress.isYouTubeId(progressContentId)) {
++        youtubeResumeProgress()
++    } else if (isCloudLibraryPlayback) {
+         loadCloudLibraryResumeProgress()
+     } else if (season != null && episode != null) {
+         watchProgressRepository.getEpisodeProgress(
+@@ -599,7 +625,7 @@ internal suspend fun PlayerRuntimeController.loadSavedProgressSuspend(season: In
+     } else {
+         watchProgressRepository.getProgress(progressContentId!!, profileId).firstOrNull()
+     }
+-    val progress = newerServerProgress(local)
++    val progress = if (com.nuvio.tv.youtube.YouTubeProgress.isYouTubeId(progressContentId)) local else newerServerProgress(local)
+ 
+     progress?.let { saved ->
+         if (saved.isInProgress()) {
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeProgress.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeProgress.kt
+index be8aaa86b..74fc3357a 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeProgress.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeProgress.kt
+@@ -55,6 +55,31 @@ object YouTubeProgress {
+         }
+     }
+ 
++    /** Where this device left the video, as (position, duration) in ms, or null if it has not played it. */
++    fun load(context: Context, contentId: String?): Pair<Long, Long>? {
++        val videoId = contentId?.removePrefix(ID_PREFIX)?.takeIf { it.isNotBlank() } ?: return null
++        val v = runCatching {
++            context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(videoId, null)
++        }.getOrNull() ?: return null
++        val parts = v.split(',')
++        val pos = parts.getOrNull(0)?.toLongOrNull() ?: return null
++        val dur = parts.getOrNull(1)?.toLongOrNull() ?: return null
++        return if (pos > 0 && dur > 0) pos to dur else null
++    }
++
++    /**
++     * Puts the account's position in the local store so the player resumes from it, but only when this device
++     * has no position of its own for the video.
++     */
++    fun seed(context: Context, contentId: String, positionMs: Long, durationMs: Long) {
++        if (load(context, contentId) != null) return
++        val videoId = contentId.removePrefix(ID_PREFIX).takeIf { it.isNotBlank() } ?: return
++        runCatching {
++            context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
++                .putString(videoId, "$positionMs,$durationMs").apply()
++        }
++    }
++
+     /** How much of the video you've watched, 0 to 100, from this device. */
+     fun localPercent(context: Context, videoId: String?): Int {
+         if (videoId == null) return 0
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
+index b3dd0aac8..75cc72af1 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
+@@ -541,10 +541,10 @@ class YouTubeViewModel @Inject constructor(
+      * from there. The player resumes from what it has saved, so put the account's position there.
+      */
+     private fun seedResume(item: YtItem) {
+-        // Fork note: upstream's fork seeds the player's own resume store here (its Live TV
+-        // recording store). This fork's player keeps YouTube progress in [YouTubeProgress]
+-        // only, so there is nothing to seed — the card bar and YouTube's own history carry
+-        // the position.
++        val id = item.videoId ?: return
++        val durationMs = item.source.durationMs
++        if (item.isLive || durationMs <= 0 || item.percentWatched !in 3..94) return
++        YouTubeProgress.seed(context, YouTubeProgress.ID_PREFIX + id, durationMs * item.percentWatched / 100, durationMs)
+     }
+ 
+     /** Plays a video, or opens a channel or playlist. [onReady] runs on the main thread. */
