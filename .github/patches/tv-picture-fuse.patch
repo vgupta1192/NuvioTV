@@ -1,0 +1,170 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
+index aba001b91..25079d6ad 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
+@@ -16,11 +16,9 @@ import androidx.media3.common.util.GlProgram
+ import androidx.media3.common.util.GlUtil
+ import androidx.media3.common.util.Size
+ import androidx.media3.effect.BaseGlShaderProgram
+-import androidx.media3.effect.Brightness
+-import androidx.media3.effect.Contrast
+ import androidx.media3.effect.GlEffect
+ import androidx.media3.effect.GlShaderProgram
+-import androidx.media3.effect.HslAdjustment
++import androidx.media3.effect.Presentation
+ import androidx.media3.exoplayer.ExoPlayer
+ import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Box
+@@ -199,6 +197,7 @@ internal class ExoPictureEffects(private val player: ExoPlayer) : Player.Listene
+     private var state = PictureState()
+     private var shaderBroken = false
+     private var dxBroken = false
++    private var scaledDown = false
+     private var released = false
+ 
+     init {
+@@ -214,33 +213,43 @@ internal class ExoPictureEffects(private val player: ExoPlayer) : Player.Listene
+         if (released) return
+         val effects = ArrayList<Effect>()
+         val current = state
+-        if (!shaderBroken && current.usesShader) {
++        val dxKind = if (dxBroken) DxEnhanceKind.NONE else DxEnhance.currentKind() // dx.bi picture enhance hook
++        val brightness = (current.brightness / 100f + if (current.smartEnhance) 0.01f else 0f).coerceIn(-1f, 1f)
++        val contrast = (current.contrast / 100f + if (current.smartEnhance) 0.05f else 0f).coerceIn(-1f, 1f)
++        val saturation = (current.saturation.toFloat() + if (current.smartEnhance) 6f else 0f).coerceIn(-100f, 100f)
++        val colourActive = abs(brightness) > 0.001f || abs(contrast) > 0.001f || abs(saturation) > 0.5f
++        val fused = !shaderBroken && (current.usesShader || dxKind != DxEnhanceKind.NONE || colourActive)
++        if (fused) {
++            // Every GL effect is one full-frame pass, so the whole panel runs as a single shader. Above 1080p the
++            // frame is scaled down first, which keeps the pass inside what a TV box GPU can do at 24 to 60 fps.
++            if (player.videoSize.height > MAX_EFFECT_HEIGHT) effects += Presentation.createForHeight(MAX_EFFECT_HEIGHT)
+             effects += PictureShaderEffect(
+                 sharpen = current.sharpen * 0.4f,
+                 denoise = current.denoise / 3f * 0.85f,
+                 deband = if (current.deband) 0.9f else 0f,
+                 gamma = 1f / (1f + current.gamma / 100f),
++                brightness = brightness,
++                contrast = contrast,
++                saturation = saturation / 100f,
++                thin = if (dxKind == DxEnhanceKind.ANIME) 0.55f else 0f,
++                dxSharpen = when (dxKind) {
++                    DxEnhanceKind.ANIME -> 0.6f
++                    DxEnhanceKind.SHARPEN -> 0.45f
++                    else -> 0f
++                },
+             )
+         }
+-        val dxKind = DxEnhance.currentKind() // dx.bi picture enhance hook
+-        if (!dxBroken && dxKind != DxEnhanceKind.NONE) effects += DxEnhanceEffect(dxKind == DxEnhanceKind.ANIME)
+-        val brightness = current.brightness / 100f + if (current.smartEnhance) 0.01f else 0f
+-        val contrast = current.contrast / 100f + if (current.smartEnhance) 0.05f else 0f
+-        val saturation = current.saturation.toFloat() + if (current.smartEnhance) 6f else 0f
+-        if (abs(brightness) > 0.001f) effects += Brightness(brightness.coerceIn(-1f, 1f))
+-        if (abs(contrast) > 0.001f) effects += Contrast(contrast.coerceIn(-1f, 1f))
+-        if (abs(saturation) > 0.5f || current.smartEnhance) {
+-            effects += HslAdjustment.Builder()
+-                .adjustSaturation(saturation.coerceIn(-100f, 100f))
+-                .adjustLightness(0f)
+-                .build()
+-        }
+         runCatching { player.setVideoEffects(effects) }
+             .onFailure { Log.w(FX_TAG, "Picture effects could not be applied", it) }
+     }
+ 
+     override fun onVideoSizeChanged(videoSize: VideoSize) {
+         PlayerEffects.maybeAutoEnhance(videoSize.height, player.videoFormat?.bitrate)
++        val tooBig = videoSize.height > MAX_EFFECT_HEIGHT
++        if (tooBig != scaledDown) {
++            scaledDown = tooBig
++            push()
++        }
+     }
+ 
+     override fun onPlayerError(error: PlaybackException) {
+@@ -269,17 +278,30 @@ internal class PictureShaderEffect(
+     private val denoise: Float,
+     private val deband: Float,
+     private val gamma: Float,
++    private val brightness: Float = 0f,
++    private val contrast: Float = 0f,
++    private val saturation: Float = 0f,
++    private val thin: Float = 0f,
++    private val dxSharpen: Float = 0f,
+ ) : GlEffect {
+     override fun toGlShaderProgram(context: Context, useHdr: Boolean): GlShaderProgram =
+-        PictureShaderProgram(useHdr, sharpen, denoise, deband, gamma)
++        PictureShaderProgram(useHdr, sharpen, denoise, deband, gamma, brightness, contrast, saturation, thin, dxSharpen)
+ }
+ 
++/** Tallest frame the fused picture shader runs on; taller video is scaled down to this first. */
++private const val MAX_EFFECT_HEIGHT = 1080
++
+ private class PictureShaderProgram(
+     useHdr: Boolean,
+     private val sharpen: Float,
+     private val denoise: Float,
+     private val deband: Float,
+     private val gamma: Float,
++    private val brightness: Float,
++    private val contrast: Float,
++    private val saturation: Float,
++    private val thin: Float,
++    private val dxSharpen: Float,
+ ) : BaseGlShaderProgram(useHdr, 1) {
+     private val glProgram: GlProgram
+ 
+@@ -309,6 +331,11 @@ private class PictureShaderProgram(
+             glProgram.setFloatUniform("uDenoise", denoise)
+             glProgram.setFloatUniform("uDeband", deband)
+             glProgram.setFloatUniform("uGamma", gamma)
++            glProgram.setFloatUniform("uBrightness", brightness)
++            glProgram.setFloatUniform("uContrast", contrast)
++            glProgram.setFloatUniform("uSaturation", saturation)
++            glProgram.setFloatUniform("uThin", thin)
++            glProgram.setFloatUniform("uDxSharpen", dxSharpen)
+             glProgram.bindAttributesAndUniforms()
+             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+         } catch (e: GlUtil.GlException) {
+@@ -347,6 +374,11 @@ uniform float uSharpen;
+ uniform float uDenoise;
+ uniform float uDeband;
+ uniform float uGamma;
++uniform float uBrightness;
++uniform float uContrast;
++uniform float uSaturation;
++uniform float uThin;
++uniform float uDxSharpen;
+ varying vec2 vTexSamplingCoord;
+ 
+ float noise(vec2 p) {
+@@ -402,9 +434,30 @@ void main() {
+     ) * 0.25;
+     col += (col - blur) * uSharpen;
+   }
++  if (uThin > 0.0 || uDxSharpen > 0.0) {
++    vec3 n = texture2D(uTexSampler, uv + vec2(0.0, uTexel.y)).rgb;
++    vec3 s = texture2D(uTexSampler, uv - vec2(0.0, uTexel.y)).rgb;
++    vec3 e = texture2D(uTexSampler, uv + vec2(uTexel.x, 0.0)).rgb;
++    vec3 w = texture2D(uTexSampler, uv - vec2(uTexel.x, 0.0)).rgb;
++    if (uThin > 0.0) {
++      vec3 darkest = n;
++      if (dot(s, vec3(0.299, 0.587, 0.114)) < dot(darkest, vec3(0.299, 0.587, 0.114))) { darkest = s; }
++      if (dot(e, vec3(0.299, 0.587, 0.114)) < dot(darkest, vec3(0.299, 0.587, 0.114))) { darkest = e; }
++      if (dot(w, vec3(0.299, 0.587, 0.114)) < dot(darkest, vec3(0.299, 0.587, 0.114))) { darkest = w; }
++      float edge = smoothstep(0.04, 0.25, dot(col, vec3(0.299, 0.587, 0.114)) - dot(darkest, vec3(0.299, 0.587, 0.114)));
++      col = mix(col, darkest, edge * uThin);
++    }
++    if (uDxSharpen > 0.0) {
++      col += (col - (n + s + e + w) * 0.25) * uDxSharpen;
++    }
++  }
+   if (uGamma != 1.0) {
+     col = pow(max(col, vec3(0.0)), vec3(uGamma));
+   }
++  col += uBrightness;
++  col = (col - 0.5) * max(1.0 + uContrast, 0.0) + 0.5;
++  float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
++  col = mix(vec3(lum), col, 1.0 + uSaturation);
+   gl_FragColor = vec4(clamp(col, 0.0, 1.0), src.a);
+ }
+ """
