@@ -1,0 +1,92 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
+index f2dbe1a7d..de73cda12 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
+@@ -78,6 +78,9 @@ import com.nuvio.tv.domain.model.MetaCastMember
+ import com.nuvio.tv.domain.model.toMeta
+ import com.nuvio.tv.ui.components.LoadingIndicator
+ import com.nuvio.tv.ui.screens.detail.CastSection
++import com.nuvio.tv.ui.screens.detail.UserRatingDialog
++import com.nuvio.tv.ui.screens.detail.UserRatingViewModel
++import com.nuvio.tv.ui.screens.detail.ratingImdbId
+ import com.nuvio.tv.ui.screens.detail.EpisodeRatingsSection
+ import com.nuvio.tv.ui.screens.detail.MoreLikeThisSection
+ import com.nuvio.tv.ui.screens.detail.SharedTrailerOverlay
+@@ -110,6 +113,10 @@ fun JellyfinDetailsScreen(
+     val ratings by ratingsViewModel.state.collectAsStateWithLifecycle()
+     val castScope = rememberCoroutineScope()
+     val backFocus = remember { FocusRequester() }
++    val userRatingViewModel: UserRatingViewModel = hiltViewModel()
++    val userRatings by userRatingViewModel.ratings.collectAsStateWithLifecycle()
++    val ratingContext = androidx.compose.ui.platform.LocalContext.current
++    var showUserRatingDialog by remember { mutableStateOf(false) }
+     LaunchedEffect(itemId) {
+         JellyfinRepository.selectItemById(itemId)
+     }
+@@ -191,6 +198,7 @@ fun JellyfinDetailsScreen(
+             } else null
+         }
+ 
++        val ratedImdbId = remember(item.id, meta.imdbId) { ratingImdbId(item.id, meta.imdbId) }
+         val playFocusRequester = remember { FocusRequester() }
+         LaunchedEffect(item.id) {
+             withFrameNanos { }
+@@ -262,9 +270,11 @@ fun JellyfinDetailsScreen(
+         Column(
+             modifier = Modifier
+                 .fillMaxSize()
+-                .verticalScroll(rememberScrollState())
+-                .focusProperties { up = backFocus },
++                .verticalScroll(rememberScrollState()),
+         ) {
++            // Only the hero actions jump up to Back; lower sections use normal focus search,
++            // so Up from cast or episodes walks back through the episodes and the Play button first.
++            Box(modifier = Modifier.focusProperties { up = backFocus }) {
+             HeroContentSection(
+                 meta = richMeta,
+                 nextEpisode = null,
+@@ -281,12 +291,16 @@ fun JellyfinDetailsScreen(
+                 isMovieWatchedPending = false,
+                 onToggleMovieWatched = {},
+                 playButtonFocusRequester = playFocusRequester,
++                rateAvailable = ratedImdbId != null && userRatingViewModel.canRate(),
++                userRating = ratedImdbId?.let { userRatings[it] },
++                onRateClick = { showUserRatingDialog = true },
+                 trailerAvailable = ratings.trailers.any { !it.ytId.isNullOrBlank() },
+                 onTrailerClick = {
+                     ratings.trailers.firstOrNull { !it.ytId.isNullOrBlank() }
+                         ?.let { ratingsViewModel.playTrailer(it, richMeta.name, trailerYear) }
+                 },
+             )
++            }
+             JellyfinMediaBadgesRow(item = item)
+             if (item.isSeries && state.seasons.isNotEmpty()) {
+                 JellyfinSeasonsChips(
+@@ -374,6 +388,27 @@ fun JellyfinDetailsScreen(
+             Spacer(Modifier.height(NuvioTheme.spacing.xxl))
+         }
+ 
++        if (showUserRatingDialog && ratedImdbId != null) {
++            UserRatingDialog(
++                current = userRatings[ratedImdbId],
++                onDismiss = { showUserRatingDialog = false },
++                onSelect = { rating ->
++                    showUserRatingDialog = false
++                    userRatingViewModel.rate(ratedImdbId, !item.isSeries, rating) { saved ->
++                        android.widget.Toast.makeText(
++                            ratingContext,
++                            when {
++                                !saved -> com.nuvio.tv.R.string.user_rating_failed
++                                rating == null -> com.nuvio.tv.R.string.user_rating_removed
++                                else -> com.nuvio.tv.R.string.user_rating_saved
++                            },
++                            android.widget.Toast.LENGTH_SHORT,
++                        ).show()
++                    }
++                },
++            )
++        }
++
+         ratings.trailerOverlay?.let { overlay ->
+             SharedTrailerOverlay(
+                 title = overlay.trailer.name?.takeIf { it.isNotBlank() }
