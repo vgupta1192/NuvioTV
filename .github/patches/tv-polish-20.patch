@@ -650,10 +650,10 @@ index b0210c348..02d85e2be 100644
          SettingsToggleRow(
              title = stringResource(R.string.layout_fullscreen_hero_backdrop),
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
-index f5b6be7a6..fa5847e27 100644
+index f5b6be7a6..62fcfed10 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
-@@ -330,6 +330,21 @@ fun TvChannelsScreen(
+@@ -330,6 +330,30 @@ fun TvChannelsScreen(
          }
      }
  
@@ -665,6 +665,15 @@ index f5b6be7a6..fa5847e27 100644
 +            wasFullscreen = true
 +        } else if (wasFullscreen) {
 +            wasFullscreen = false
++            // The channel may have been changed in the player: bring the list to it.
++            val key = state.previewChannel?.stableKey()
++            val idx = state.filteredChannels.indexOfFirst { it.stableKey() == key }
++            if (idx >= 0) {
++                lastFocusedChannelIndex = idx
++                if (listState.layoutInfo.visibleItemsInfo.none { it.index == idx }) {
++                    runCatching { listState.scrollToItem((idx - 1).coerceAtLeast(0)) }
++                }
++            }
 +            repeat(15) {
 +                kotlinx.coroutines.delay(80L)
 +                if (runCatching { previewPanelFocusRequester.requestFocus() }.isSuccess) return@LaunchedEffect
@@ -675,7 +684,7 @@ index f5b6be7a6..fa5847e27 100644
      // YouTube videos are ordinary videos, not live channels: open them in the main player
      // (seek, quality, audio boost) instead of the live-TV fullscreen.
      val youTubeChannel = state.previewChannel?.takeIf { it.type.equals("youtube", ignoreCase = true) }
-@@ -1069,6 +1084,11 @@ fun TvChannelsScreen(
+@@ -1069,6 +1093,11 @@ fun TvChannelsScreen(
  
              Spacer(modifier = Modifier.height(12.dp))
  
@@ -687,7 +696,7 @@ index f5b6be7a6..fa5847e27 100644
              // Linha 4: Área Split-Screen: Lista à Esquerda e Pré-visualizador à Direita
              Row(
                  modifier = Modifier
-@@ -1079,7 +1099,7 @@ fun TvChannelsScreen(
+@@ -1079,7 +1108,7 @@ fun TvChannelsScreen(
                  // Coluna da Esquerda: Lista de Canais
                  Box(
                      modifier = Modifier
@@ -696,7 +705,7 @@ index f5b6be7a6..fa5847e27 100644
                          .fillMaxHeight()
                  ) {
                      when {
-@@ -1229,6 +1249,7 @@ fun TvChannelsScreen(
+@@ -1229,6 +1258,7 @@ fun TvChannelsScreen(
                                              channel = channel,
                                              isSelected = isSelected,
                                              isPlaying = isPlaying,
@@ -704,7 +713,7 @@ index f5b6be7a6..fa5847e27 100644
                                              modifier = itemModifier,
                                              onFocused = onItemFocused,
                                              onClick = onItemClick,
-@@ -1276,10 +1297,11 @@ fun TvChannelsScreen(
+@@ -1276,10 +1306,11 @@ fun TvChannelsScreen(
                      onStreamSelected = { idx ->
                          viewModel.selectStreamIndex(idx)
                      },
@@ -1499,19 +1508,27 @@ index f063b6aea..f59c3aaf9 100644
                                              KeyEvent.KEYCODE_CHANNEL_UP,
                                              KeyEvent.KEYCODE_MENU,
 diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt
-index ad64da0ad..426d291f9 100644
+index ad64da0ad..901b8aded 100644
 --- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt
-@@ -334,6 +334,9 @@ private fun Content(
+@@ -334,13 +334,16 @@ private fun Content(
  
          state.rows.isNotEmpty() -> LazyColumn(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(20.dp)) {
              itemsIndexed(state.rows) { rowIndex, row ->
-+                LaunchedEffect(rowIndex, state.rows.size, state.tab) {
++                LaunchedEffect(rowIndex, state.rows.size, state.tab, state.loadingRows) {
 +                    if (rowIndex >= state.rows.size - 3) viewModel.loadMoreRows()
 +                }
                  Column {
                      if (row.title.isNotBlank()) {
                          Text(row.title, color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+                     }
+                     val rowState = rememberLazyListState()
+                     // Keep loading more videos into this row as you near its end.
+-                    LaunchedEffect(rowState, row.canMore, row.items.size) {
++                    LaunchedEffect(rowState, row.canMore, row.items.size, row.loadingMore) {
+                         snapshotFlow {
+                             val info = rowState.layoutInfo
+                             (info.visibleItemsInfo.lastOrNull()?.index ?: 0) >= info.totalItemsCount - 4
 @@ -362,7 +365,7 @@ private fun Content(
          else -> {
              val gridState = rememberLazyGridState()
@@ -1537,7 +1554,7 @@ index 9aa692d3c..03551a306 100644
          if (selected > related.lastIndex) selected = related.lastIndex.coerceAtLeast(0)
      }
 diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
-index 368faf0bc..462fbbf80 100644
+index 368faf0bc..cdc1b16d0 100644
 --- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
 +++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
 @@ -23,6 +23,8 @@ import kotlinx.coroutines.delay
@@ -1549,7 +1566,27 @@ index 368faf0bc..462fbbf80 100644
  import kotlinx.coroutines.flow.update
  import kotlinx.coroutines.isActive
  import kotlinx.coroutines.launch
-@@ -117,12 +119,16 @@ class YouTubeViewModel @Inject constructor(
+@@ -57,7 +59,9 @@ data class YtRow(
+     /** Where this row continues from, when YouTube has more videos for it. */
+     internal val group: MediaGroup? = null,
+     val canMore: Boolean = false,
+-    val loadingMore: Boolean = false
++    val loadingMore: Boolean = false,
++    /** Failed or empty continuation requests in a row; the row gives up after a few. */
++    val misses: Int = 0
+ )
+ 
+ /** The feeds along the top. Grid feeds are one long list; the others are rows of videos. */
+@@ -85,6 +89,8 @@ data class YtUiState(
+     val rows: List<YtRow> = emptyList(),
+     val grid: List<YtItem> = emptyList(),
+     val canLoadMore: Boolean = false,
++    /** True while the list is asking YouTube for more rows. */
++    val loadingRows: Boolean = false,
+     /** Set while looking at a channel, playlist or search opened from a feed; Back returns to the feed. */
+     val subTitle: String? = null
+ ) {
+@@ -117,12 +123,16 @@ class YouTubeViewModel @Inject constructor(
          const val TAG = "YouTubeVM"
          const val MAX_CLIENT_SWITCHES = 8
          const val PREFETCH_DELAY_MS = 100L
@@ -1568,7 +1605,7 @@ index 368faf0bc..462fbbf80 100644
      }
  
      private val _state = MutableStateFlow(YtUiState())
-@@ -146,7 +152,22 @@ class YouTubeViewModel @Inject constructor(
+@@ -146,7 +156,22 @@ class YouTubeViewModel @Inject constructor(
  
      val canGoBack: Boolean get() = backStack.isNotEmpty()
  
@@ -1592,7 +1629,7 @@ index 368faf0bc..462fbbf80 100644
  
      private var screenOpenedBefore = false
  
-@@ -178,7 +199,12 @@ class YouTubeViewModel @Inject constructor(
+@@ -178,7 +203,12 @@ class YouTubeViewModel @Inject constructor(
                  YtTab.NEWS -> rowStream(content.newsObserve)
                  YtTab.SPORTS -> rowStream(content.sportsObserve)
                  YtTab.SUBSCRIPTIONS -> grid(content.subscriptionsObserve.blockingFirst())
@@ -1606,7 +1643,7 @@ index 368faf0bc..462fbbf80 100644
                  YtTab.CHANNELS -> grid(content.subscribedChannelsObserve.blockingFirst())
                  YtTab.HISTORY -> grid(content.historyObserve.blockingFirst())
                  YtTab.PLAYLISTS -> grid(content.playlistsObserve.blockingFirst())
-@@ -243,22 +269,92 @@ class YouTubeViewModel @Inject constructor(
+@@ -243,22 +273,95 @@ class YouTubeViewModel @Inject constructor(
          return true
      }
  
@@ -1641,8 +1678,11 @@ index 368faf0bc..462fbbf80 100644
 +    /** More shorts when YouTube's own pages ran out: what it suggests after some shown ones, then searches. */
 +    private fun shortsFallback(grid: List<YtItem>, have: MutableSet<String>): List<YtItem> {
 +        val out = ArrayList<YtItem>()
-+        fun add(items: List<YtItem>) {
-+            out += items.filter { it.isShort }.filter { have.add(it.videoId ?: it.title) }
++        fun add(items: List<YtItem>, strict: Boolean = true) {
++            // Search results are not always marked as shorts, so those also pass on a "short" in the title.
++            out += items.filter { it.kind == YtKind.VIDEO && !it.isLive }
++                .filter { it.isShort || (!strict && it.title.contains("short", ignoreCase = true)) }
++                .filter { have.add(it.videoId ?: it.title) }
 +        }
 +        val seeds = (grid.takeLast(2) + grid.shuffled().take(2)).mapNotNull { it.videoId }.distinct()
 +        seeds.forEach { id ->
@@ -1652,7 +1692,7 @@ index 368faf0bc..462fbbf80 100644
 +        if (out.size < 8) {
 +            SHORTS_QUERIES.shuffled().take(2).forEach { q ->
 +                runCatching { content.getSearchObserve(q).blockingFirst() }.getOrNull()
-+                    .orEmpty().forEach { add(toItems(it)) }
++                    .orEmpty().forEach { add(toItems(it), strict = false) }
 +            }
 +        }
 +        return out
@@ -1706,7 +1746,7 @@ index 368faf0bc..462fbbf80 100644
                  )
              }
              fetchDeArrow()
-@@ -307,6 +403,50 @@ class YouTubeViewModel @Inject constructor(
+@@ -307,18 +410,103 @@ class YouTubeViewModel @Inject constructor(
      }
  
      private var restJob: Job? = null
@@ -1723,41 +1763,87 @@ index 368faf0bc..462fbbf80 100644
 +        else -> null
 +    }
 +
-+    /** When every row YouTube had is shown, asks for a fresh set and adds the rows that have new videos. */
++    private val rowTopicIndex = HashMap<YtTab, Int>()
++
++    private fun rowTopics(tab: YtTab): List<String> = when (tab) {
++        YtTab.MUSIC -> listOf("top hits", "new music videos", "live concerts", "bollywood songs", "punjabi songs", "lofi beats",
++            "hip hop", "pop hits", "rock classics", "acoustic covers", "edm mix", "old hindi songs", "tamil songs", "k-pop")
++        YtTab.GAMING -> listOf("gameplay", "minecraft", "gta 5", "valorant", "bgmi", "free fire", "call of duty", "fortnite",
++            "game trailers", "speedruns", "retro games", "ps5 games", "indie games", "esports highlights")
++        YtTab.LIVE -> listOf("live music", "live news", "live gaming", "live sports", "live radio", "live cooking")
++        YtTab.NEWS -> listOf("india news", "world news", "business news", "tech news", "politics", "weather")
++        YtTab.SPORTS -> listOf("cricket highlights", "football highlights", "ipl", "tennis", "formula 1", "kabaddi", "wwe")
++        else -> listOf("trending", "documentaries", "comedy", "science", "travel", "food", "movies trailers", "podcasts")
++    }
++
++    /**
++     * When every row YouTube had is shown, asks for a fresh set and adds the rows that have new videos.
++     * If YouTube sends nothing new, rows come from searches on topics of the tab instead, so the list never ends.
++     */
 +    fun loadMoreRows() {
 +        val s = _state.value
-+        if (!restDone || rowsRefilling || s.loading || s.subTitle != null || s.rows.isEmpty()) return
++        if (!restDone || s.loadingRows || s.loading || s.subTitle != null || s.rows.isEmpty()) return
 +        val source = rowSource(s.tab) ?: return
-+        rowsRefilling = true
 +        val tab = s.tab
++        _state.update { it.copy(loadingRows = true) }
 +        viewModelScope.launch {
-+            val fresh = withContext(Dispatchers.IO) {
-+                runCatching {
-+                    val iterator = source.blockingIterable().iterator()
-+                    val first = toRows(iterator.next())
-+                    Pair(first, iterator)
-+                }.getOrNull()
-+            }
-+            rowsRefilling = false
-+            if (fresh == null || _state.value.tab != tab || _state.value.subTitle != null) {
-+                (fresh?.second as? Disposable)?.dispose()
-+                return@launch
-+            }
 +            val have = _state.value.rows.flatMapTo(HashSet()) { r -> r.items.map { it.videoId ?: it.title } }
-+            val added = fresh.first.mapNotNull { r ->
++            fun newRows(rows: List<YtRow>, topic: String? = null): List<YtRow> = rows.mapNotNull { r ->
 +                val items = r.items.filter { have.add(it.videoId ?: it.title) }
-+                if (items.size >= 3) r.copy(items = items) else null
++                if (items.size >= 3) r.copy(items = items, title = r.title.ifBlank { topic.orEmpty() }) else null
 +            }
-+            if (added.isNotEmpty()) _state.update { it.copy(rows = it.rows + added) }
-+            restDone = false
-+            streamRest(fresh.second)
-+            fetchDeArrow()
++            var iterator: Iterator<List<MediaGroup>>? = null
++            val added = withContext(Dispatchers.IO) {
++                val out = ArrayList<YtRow>()
++                runCatching {
++                    val it2 = source.blockingIterable().iterator()
++                    out += newRows(toRows(it2.next()))
++                    iterator = it2
++                }
++                if (out.isEmpty()) {
++                    (iterator as? Disposable)?.dispose()
++                    iterator = null
++                    val topics = rowTopics(tab)
++                    for (attempt in 0 until 3) {
++                        val n = rowTopicIndex.getOrDefault(tab, 0)
++                        rowTopicIndex[tab] = n + 1
++                        val base = topics[n % topics.size]
++                        val rows = runCatching { toRows(content.getSearchObserve(base).blockingFirst()) }.getOrNull().orEmpty()
++                        // A search is long: keep a few of its rows, titled by the topic when YouTube gives none.
++                        out += newRows(rows.take(3), base)
++                        if (out.isNotEmpty()) break
++                    }
++                }
++                out
++            }
++            if (added.isEmpty()) kotlinx.coroutines.delay(1500L)
++            if (_state.value.tab == tab && _state.value.subTitle == null) {
++                _state.update { it.copy(rows = it.rows + added, loadingRows = false) }
++                iterator?.let {
++                    restDone = false
++                    streamRest(it)
++                }
++                fetchDeArrow()
++            } else {
++                (iterator as? Disposable)?.dispose()
++            }
 +        }
 +    }
  
      private fun streamRest(rest: Iterator<List<MediaGroup>>) {
          restJob = viewModelScope.launch(Dispatchers.IO) {
-@@ -319,6 +459,7 @@ class YouTubeViewModel @Inject constructor(
+             try {
+                 while (isActive && _state.value.rows.size < MAX_ROWS && runCatching { rest.hasNext() }.getOrDefault(false)) {
+-                    val more = toRows(runCatching { rest.next() }.getOrNull() ?: break)
++                    val seen = _state.value.rows.flatMapTo(HashSet()) { r -> r.items.map { it.videoId ?: it.title } }
++                    val more = toRows(runCatching { rest.next() }.getOrNull() ?: break).mapNotNull { r ->
++                        // Rows YouTube sends again, or that hold only shown videos, are skipped.
++                        val items = r.items.filter { seen.add(it.videoId ?: it.title) }
++                        if (items.size == r.items.size || items.size >= 3) r.copy(items = items) else null
++                    }
+                     if (!isActive) break
+                     if (more.isNotEmpty()) {
+                         _state.update { it.copy(rows = it.rows + more) }
                          fetchDeArrow()
                      }
                  }
@@ -1765,7 +1851,7 @@ index 368faf0bc..462fbbf80 100644
              } finally {
                  (rest as? Disposable)?.dispose()
              }
-@@ -332,13 +473,10 @@ class YouTubeViewModel @Inject constructor(
+@@ -332,18 +520,19 @@ class YouTubeViewModel @Inject constructor(
          if (!row.canMore || row.loadingMore) return
          setRow(index, row.title) { it.copy(loadingMore = true) }
          viewModelScope.launch {
@@ -1775,13 +1861,24 @@ index 368faf0bc..462fbbf80 100644
 +                nextFresh(group, row.items.mapTo(HashSet()) { it.videoId ?: it.title })
              }
 -            val more = next?.let(::toItems).orEmpty()
++            // No answer is a failure, not the end: try again a few times before giving up on the row.
++            if (next == null) kotlinx.coroutines.delay(1200L)
              setRow(index, row.title) { r ->
 -                val have = r.items.mapTo(HashSet()) { it.videoId ?: it.title }
 -                val fresh = more.filter { have.add(it.videoId ?: it.title) }
++                val misses = if (next == null) r.misses + 1 else 0
                  r.copy(
                      items = r.items + fresh,
                      group = next ?: r.group,
-@@ -396,6 +534,7 @@ class YouTubeViewModel @Inject constructor(
+-                    canMore = next?.nextPageKey != null && fresh.isNotEmpty(),
+-                    loadingMore = false
++                    canMore = if (next == null) misses < 3 else next.nextPageKey != null,
++                    loadingMore = false,
++                    misses = misses
+                 )
+             }
+             fetchDeArrow()
+@@ -396,6 +585,7 @@ class YouTubeViewModel @Inject constructor(
          refreshHidden()
          loadJob?.cancel()
          restJob?.cancel()
@@ -1789,7 +1886,7 @@ index 368faf0bc..462fbbf80 100644
          currentGroup = null
          loadJob = viewModelScope.launch {
              val result = withContext(Dispatchers.IO) { runCatching { fetch() } }
-@@ -412,7 +551,7 @@ class YouTubeViewModel @Inject constructor(
+@@ -412,7 +602,7 @@ class YouTubeViewModel @Inject constructor(
                              feed.rest?.let { streamRest(it) }
                          }
                          is Feed.Items -> _state.update {
@@ -1798,7 +1895,7 @@ index 368faf0bc..462fbbf80 100644
                          }
                          is Feed.Grid -> {
                              currentGroup = feed.group
-@@ -421,7 +560,7 @@ class YouTubeViewModel @Inject constructor(
+@@ -421,7 +611,7 @@ class YouTubeViewModel @Inject constructor(
                                      loading = false,
                                      rows = emptyList(),
                                      grid = unseenFirst(toItems(feed.group)),
@@ -1807,7 +1904,7 @@ index 368faf0bc..462fbbf80 100644
                                  )
                              }
                          }
-@@ -674,16 +813,22 @@ class YouTubeViewModel @Inject constructor(
+@@ -674,16 +864,22 @@ class YouTubeViewModel @Inject constructor(
      fun loadRelated(currentVideoId: String) {
          if (relatedFor == currentVideoId && _related.value.isNotEmpty()) return
          relatedFor = currentVideoId
@@ -1830,7 +1927,7 @@ index 368faf0bc..462fbbf80 100644
                  }.getOrDefault(emptyList())
              }
              if (relatedFor == currentVideoId) {
-@@ -693,6 +838,71 @@ class YouTubeViewModel @Inject constructor(
+@@ -693,6 +889,71 @@ class YouTubeViewModel @Inject constructor(
          }
      }
  
