@@ -1,0 +1,254 @@
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeUpNext.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeUpNext.kt
+index 228287c80..9ff5cfa18 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeUpNext.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeUpNext.kt
+@@ -13,6 +13,10 @@ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.height
+ import androidx.compose.foundation.focusable
+ import androidx.compose.foundation.lazy.LazyRow
++import androidx.compose.foundation.lazy.grid.GridCells
++import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
++import androidx.compose.foundation.lazy.grid.itemsIndexed as gridItemsIndexed
++import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+ import androidx.compose.foundation.layout.PaddingValues
+ import androidx.compose.ui.graphics.Brush
+ import androidx.compose.foundation.lazy.itemsIndexed
+@@ -128,9 +132,10 @@ fun BoxScope.YouTubeUpNext(
+ }
+ 
+ /**
+- * The suggested videos, opened with the Down key while a video plays. Shown as a row of large cards along the
+- * bottom of the screen, like the YouTube TV app. Left and Right move the highlight, OK plays the highlighted
+- * video. Back is handled by the player's key hook, which closes the row.
++ * The suggested videos, opened with the Down key while a video plays, like the YouTube TV app. First a row of
++ * large cards along the bottom with "Up next" above it. Down from the row opens a grid of more suggestions;
++ * Up from the top of the grid returns to the row. OK plays the highlighted video. Back is handled by the
++ * player's key hook, which closes everything.
+  */
+ @Composable
+ fun BoxScope.YouTubeUpNextList(
+@@ -142,28 +147,92 @@ fun BoxScope.YouTubeUpNextList(
+     val loading by viewModel.relatedLoading.collectAsState()
+     LaunchedEffect(videoId) { viewModel.loadRelated(videoId) }
+ 
+-    val listState = rememberLazyListState()
++    val rowState = rememberLazyListState()
++    val gridState = rememberLazyGridState()
+     val focus = remember { FocusRequester() }
+     var selected by remember { mutableIntStateOf(0) }
++    var gridMode by remember { mutableStateOf(false) }
+     LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
+     LaunchedEffect(related.size) {
+         if (selected > related.lastIndex) selected = related.lastIndex.coerceAtLeast(0)
+     }
+     // Keep the highlighted card in view, only scrolling when it is not fully visible.
+-    LaunchedEffect(selected, related.size) {
++    LaunchedEffect(selected, related.size, gridMode) {
+         if (related.isEmpty()) return@LaunchedEffect
+-        val info = listState.layoutInfo
+-        val card = info.visibleItemsInfo.firstOrNull { it.index == selected }
+-        val fullyVisible = card != null && card.offset >= 0 && card.offset + card.size <= info.viewportEndOffset
+-        if (!fullyVisible) listState.animateScrollToItem(selected)
++        if (gridMode) {
++            val info = gridState.layoutInfo
++            val cell = info.visibleItemsInfo.firstOrNull { it.index == selected }
++            val fullyVisible = cell != null && cell.offset.y >= 0 && cell.offset.y + cell.size.height <= info.viewportEndOffset
++            if (!fullyVisible) gridState.animateScrollToItem(selected)
++        } else {
++            val info = rowState.layoutInfo
++            val card = info.visibleItemsInfo.firstOrNull { it.index == selected }
++            val fullyVisible = card != null && card.offset >= 0 && card.offset + card.size <= info.viewportEndOffset
++            if (!fullyVisible) rowState.animateScrollToItem(selected)
++        }
++    }
++
++    @Composable
++    fun SuggestionCard(index: Int, item: YtItem, modifier: Modifier) {
++        val isSelected = index == selected
++        Column(
++            modifier
++                .clip(RoundedCornerShape(12.dp))
++                .background(if (isSelected) Color(0xFF2A2A2E) else Color(0xCC1B1B1F))
++                .border(3.dp, if (isSelected) Color.White else Color.Transparent, RoundedCornerShape(12.dp))
++                .padding(6.dp),
++            verticalArrangement = Arrangement.spacedBy(6.dp)
++        ) {
++            Box(Modifier.fillMaxWidth().aspectRatio(16f / 9f).clip(RoundedCornerShape(8.dp))) {
++                AsyncImage(
++                    model = item.thumbnail,
++                    contentDescription = null,
++                    contentScale = ContentScale.Crop,
++                    modifier = Modifier.fillMaxSize()
++                )
++                item.badge?.takeIf { it.isNotBlank() }?.let { badge ->
++                    Text(
++                        badge,
++                        color = Color.White,
++                        fontSize = 12.sp,
++                        modifier = Modifier
++                            .align(Alignment.BottomEnd)
++                            .padding(6.dp)
++                            .background(Color(0xCC000000), RoundedCornerShape(4.dp))
++                            .padding(horizontal = 5.dp, vertical = 1.dp)
++                    )
++                }
++            }
++            Text(
++                item.title,
++                color = Color.White,
++                fontSize = 14.sp,
++                fontWeight = FontWeight.Medium,
++                maxLines = 2,
++                overflow = TextOverflow.Ellipsis,
++                modifier = Modifier.padding(horizontal = 4.dp)
++            )
++            Text(
++                item.subtitle ?: item.author.orEmpty(),
++                color = Color(0xFFAAAAAA),
++                fontSize = 12.sp,
++                maxLines = 2,
++                overflow = TextOverflow.Ellipsis,
++                modifier = Modifier.padding(horizontal = 4.dp)
++            )
++        }
+     }
+ 
+     Column(
+         Modifier
+             .align(Alignment.BottomCenter)
+             .fillMaxWidth()
+-            .background(Brush.verticalGradient(listOf(Color.Transparent, Color(0xF0000000))))
+-            .padding(top = 48.dp, bottom = 24.dp)
++            .then(if (gridMode) Modifier.fillMaxHeight(0.78f) else Modifier)
++            .background(
++                if (gridMode) Brush.verticalGradient(listOf(Color(0xF2111114), Color(0xF2111114)))
++                else Brush.verticalGradient(listOf(Color.Transparent, Color(0xF0000000)))
++            )
++            .padding(top = if (gridMode) 20.dp else 48.dp, bottom = 24.dp)
+             .focusRequester(focus)
+             .focusable()
+             .onPreviewKeyEvent { e ->
+@@ -176,6 +245,16 @@ fun BoxScope.YouTubeUpNextList(
+                     when (e.key) {
+                         Key.DirectionRight -> if (selected < related.lastIndex) selected += 1
+                         Key.DirectionLeft -> if (selected > 0) selected -= 1
++                        Key.DirectionDown ->
++                            if (!gridMode) {
++                                if (related.isNotEmpty()) gridMode = true
++                            } else if (selected + GRID_COLUMNS <= related.lastIndex) {
++                                selected += GRID_COLUMNS
++                            }
++                        Key.DirectionUp ->
++                            if (gridMode) {
++                                if (selected >= GRID_COLUMNS) selected -= GRID_COLUMNS else gridMode = false
++                            }
+                         Key.DirectionCenter, Key.Enter, Key.NumPadEnter ->
+                             related.getOrNull(selected)?.let { onPlay(it, related) }
+                         else -> Unit
+@@ -197,64 +276,32 @@ fun BoxScope.YouTubeUpNextList(
+                 if (loading) CircularProgressIndicator(color = Color.White)
+                 else Text("No suggestions for this video.", color = Color(0xFFBBBBBB), fontSize = 14.sp)
+             }
++        } else if (gridMode) {
++            LazyVerticalGrid(
++                columns = GridCells.Fixed(GRID_COLUMNS),
++                state = gridState,
++                modifier = Modifier.fillMaxWidth().weight(1f),
++                contentPadding = PaddingValues(horizontal = 48.dp, vertical = 6.dp),
++                horizontalArrangement = Arrangement.spacedBy(16.dp),
++                verticalArrangement = Arrangement.spacedBy(16.dp)
++            ) {
++                gridItemsIndexed(related, key = { _, item -> item.videoId ?: item.title }) { index, item ->
++                    SuggestionCard(index, item, Modifier.fillMaxWidth())
++                }
++            }
+         } else {
+             LazyRow(
+-                state = listState,
++                state = rowState,
+                 modifier = Modifier.fillMaxWidth(),
+                 contentPadding = PaddingValues(horizontal = 48.dp, vertical = 6.dp),
+                 horizontalArrangement = Arrangement.spacedBy(16.dp)
+             ) {
+                 itemsIndexed(related, key = { _, item -> item.videoId ?: item.title }) { index, item ->
+-                    val isSelected = index == selected
+-                    Column(
+-                        Modifier
+-                            .width(280.dp)
+-                            .clip(RoundedCornerShape(12.dp))
+-                            .background(if (isSelected) Color(0xFF2A2A2E) else Color(0xCC1B1B1F))
+-                            .border(3.dp, if (isSelected) Color.White else Color.Transparent, RoundedCornerShape(12.dp))
+-                            .padding(6.dp),
+-                        verticalArrangement = Arrangement.spacedBy(6.dp)
+-                    ) {
+-                        Box(Modifier.fillMaxWidth().aspectRatio(16f / 9f).clip(RoundedCornerShape(8.dp))) {
+-                            AsyncImage(
+-                                model = item.thumbnail,
+-                                contentDescription = null,
+-                                contentScale = ContentScale.Crop,
+-                                modifier = Modifier.fillMaxSize()
+-                            )
+-                            item.badge?.takeIf { it.isNotBlank() }?.let { badge ->
+-                                Text(
+-                                    badge,
+-                                    color = Color.White,
+-                                    fontSize = 12.sp,
+-                                    modifier = Modifier
+-                                        .align(Alignment.BottomEnd)
+-                                        .padding(6.dp)
+-                                        .background(Color(0xCC000000), RoundedCornerShape(4.dp))
+-                                        .padding(horizontal = 5.dp, vertical = 1.dp)
+-                                )
+-                            }
+-                        }
+-                        Text(
+-                            item.title,
+-                            color = Color.White,
+-                            fontSize = 14.sp,
+-                            fontWeight = FontWeight.Medium,
+-                            maxLines = 2,
+-                            overflow = TextOverflow.Ellipsis,
+-                            modifier = Modifier.padding(horizontal = 4.dp)
+-                        )
+-                        Text(
+-                            item.author.orEmpty(),
+-                            color = Color(0xFFAAAAAA),
+-                            fontSize = 12.sp,
+-                            maxLines = 1,
+-                            overflow = TextOverflow.Ellipsis,
+-                            modifier = Modifier.padding(horizontal = 4.dp)
+-                        )
+-                    }
++                    SuggestionCard(index, item, Modifier.width(280.dp))
+                 }
+             }
+         }
+     }
+ }
++
++private const val GRID_COLUMNS = 4
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
+index 07f4aa9cc..c22a6445e 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
+@@ -43,7 +43,9 @@ data class YtItem(
+     val channelId: String?,
+     /** How much YouTube says you've watched (0-100), from your account. */
+     val percentWatched: Int,
+-    internal val source: MediaItem
++    internal val source: MediaItem,
++    /** YouTube's second line for the card: channel, views and age, when it gives them. */
++    val subtitle: String? = null
+ ) {
+     /** A vertical short, which opens in the Shorts player. */
+     val isShort: Boolean get() = kind == YtKind.VIDEO && source.isShorts
+@@ -515,7 +517,8 @@ class YouTubeViewModel @Inject constructor(
+             isLive = i.isLive,
+             channelId = i.channelId,
+             percentWatched = i.percentWatched.coerceIn(0, 100),
+-            source = i
++            source = i,
++            subtitle = i.secondTitle?.toString()?.takeIf { it.isNotBlank() }
+         )
+         return deArrowCached(base)
+     }
