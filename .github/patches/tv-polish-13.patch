@@ -1,0 +1,311 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/components/CatalogRowSection.kt b/app/src/main/java/com/nuvio/tv/ui/components/CatalogRowSection.kt
+index b467a0018..494b1e9ae 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/components/CatalogRowSection.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/components/CatalogRowSection.kt
+@@ -419,11 +419,14 @@ fun CatalogRowSection(
+                         } else {
+                             restorerFocusedIndex
+                         }
++                        // Row not measured yet (first entry, or items just swapped in): take the
++                        // first item rather than letting the focus search pick one mid-row.
+                         val idx = preferredIndex.takeIf { it in visibleIndices }
+                             ?: visibleIndices.firstOrNull()
++                            ?: 0.takeIf { catalogRow.items.isNotEmpty() }
+                         idx?.let { visibleIndex ->
+                             catalogRow.items.getOrNull(visibleIndex)?.let { item ->
+-                                itemFocusRequestersByKey[rowItemFocusKey(visibleIndex, item)]
++                                itemFocusRequestersByKey.getOrPut(rowItemFocusKey(visibleIndex, item)) { FocusRequester() }
+                             }
+                         }
+                             ?: FocusRequester.Default
+diff --git a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
+index 0529f6f48..1e5f67d6e 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
+@@ -990,6 +990,7 @@ private fun PlaybackNavHost(
+                 }
+             }
+ 
++            val upNextListOpen = androidx.compose.runtime.remember(upNextVideoId) { androidx.compose.runtime.mutableStateOf(false) }
+             val upNextCardShown = androidx.compose.runtime.remember(upNextVideoId) { androidx.compose.runtime.mutableStateOf(false) }
+             val playUpNextNow: () -> Unit = {
+                 val ytId = upNextVideoId
+@@ -1009,6 +1010,21 @@ private fun PlaybackNavHost(
+             PlayerScreen(
+                 previewKeyHook = hook@{ e ->
+                     val key = e.key
++                    // The suggestions list owns the remote while it is open; Back closes it.
++                    if (upNextListOpen.value) {
++                        if (key == androidx.compose.ui.input.key.Key.Back || key == androidx.compose.ui.input.key.Key.Escape) {
++                            if (e.type == androidx.compose.ui.input.key.KeyEventType.KeyUp) upNextListOpen.value = false
++                            return@hook true
++                        }
++                        return@hook false
++                    }
++                    // Down with the controls hidden opens the suggestions, like the list under a YouTube video.
++                    if (key == androidx.compose.ui.input.key.Key.DirectionDown && upNextVideoId != null && youtubeVm != null &&
++                        !upNextPlayerVm.uiState.value.showControls && !upNextPlayerVm.uiState.value.showYouTubePanel
++                    ) {
++                        if (e.type == androidx.compose.ui.input.key.KeyEventType.KeyDown) upNextListOpen.value = true
++                        return@hook true
++                    }
+                     val confirm = key == androidx.compose.ui.input.key.Key.DirectionCenter ||
+                         key == androidx.compose.ui.input.key.Key.Enter ||
+                         key == androidx.compose.ui.input.key.Key.NumPadEnter
+@@ -1076,6 +1092,20 @@ private fun PlaybackNavHost(
+                             onVisibleChange = { upNextCardShown.value = it }
+                         )
+                         SponsorSkipCard()
++                        if (upNextListOpen.value) {
++                            com.nuvio.tv.youtube.YouTubeUpNextList(
++                                videoId = upNextVideoId,
++                                viewModel = youtubeVm,
++                                onPlay = { item, list ->
++                                    upNextListOpen.value = false
++                                    youtubeVm.activate(item, list) { v ->
++                                        navController.navigate(youtubePlayerRoute(v)) {
++                                            popUpTo(backStackEntry.destination.id) { inclusive = true }
++                                        }
++                                    }
++                                }
++                            )
++                        }
+                         if (chatOn.value) YouTubeChatOverlay(ytPlayerVm)
+                         if (playerUi.showYouTubePanel) {
+                             YouTubePlayerPanel(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
+index 4da0e4730..30ee71dd6 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
+@@ -548,7 +548,7 @@ fun TvChannelsScreen(
+                         shape = ButtonDefaults.shape(shape = RoundedCornerShape(22.dp)),
+                         colors = ButtonDefaults.colors(
+                             containerColor = if (isEpgGridMode) NuvioTheme.colors.Secondary else Color.White.copy(alpha = 0.10f),
+-                            contentColor = Color.White,
++                            contentColor = if (isEpgGridMode) NuvioTheme.colors.OnSecondary else Color.White,
+                             focusedContainerColor = Color.White,
+                             focusedContentColor = Color.Black
+                         )
+@@ -579,7 +579,7 @@ fun TvChannelsScreen(
+                         shape = ButtonDefaults.shape(shape = RoundedCornerShape(22.dp)),
+                         colors = ButtonDefaults.colors(
+                             containerColor = if (netflixLive) NuvioTheme.colors.Secondary else Color.White.copy(alpha = 0.10f),
+-                            contentColor = Color.White,
++                            contentColor = if (netflixLive) NuvioTheme.colors.OnSecondary else Color.White,
+                             focusedContainerColor = Color.White,
+                             focusedContentColor = Color.Black
+                         )
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelOptionsPanel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelOptionsPanel.kt
+index 7d1d52399..ca9b953e1 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelOptionsPanel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelOptionsPanel.kt
+@@ -368,7 +368,7 @@ private fun Chip(label: String, selected: Boolean, onClick: () -> Unit) {
+         colors = ClickableSurfaceDefaults.colors(
+             containerColor = if (selected) NuvioTheme.colors.Secondary else Color.White.copy(alpha = 0.08f),
+             focusedContainerColor = Color.White,
+-            contentColor = Color.White,
++            contentColor = if (selected) NuvioTheme.colors.OnSecondary else Color.White,
+             focusedContentColor = Color.Black
+         )
+     ) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvIptvSourcesSection.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvIptvSourcesSection.kt
+index e58f3f1c7..d3b52fe4f 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvIptvSourcesSection.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvIptvSourcesSection.kt
+@@ -239,6 +239,7 @@ internal fun TvIptvAddDialog(onDismiss: () -> Unit, onAdd: (IptvSource) -> Unit)
+                     shape = ButtonDefaults.shape(shape = RoundedCornerShape(8.dp)),
+                     colors = ButtonDefaults.colors(
+                         containerColor = if (option == kind) NuvioTheme.colors.Secondary else Color.White.copy(alpha = 0.10f),
++                        contentColor = if (option == kind) NuvioTheme.colors.OnSecondary else Color.White,
+                         focusedContainerColor = Color.White,
+                         focusedContentColor = Color.Black,
+                     ),
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeUpNext.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeUpNext.kt
+index d3f8c7cb9..1eca54ec4 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeUpNext.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeUpNext.kt
+@@ -5,7 +5,25 @@ import androidx.compose.foundation.border
+ import androidx.compose.foundation.clickable
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.BoxScope
++import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxHeight
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.focusable
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.itemsIndexed
++import androidx.compose.foundation.lazy.rememberLazyListState
++import androidx.compose.material3.CircularProgressIndicator
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.input.key.Key
++import androidx.compose.ui.input.key.KeyEventType
++import androidx.compose.ui.input.key.key
++import androidx.compose.ui.input.key.onPreviewKeyEvent
++import androidx.compose.ui.input.key.type
+ import androidx.compose.foundation.layout.aspectRatio
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.padding
+@@ -106,3 +124,118 @@ fun BoxScope.YouTubeUpNext(
+         }
+     }
+ }
++
++/**
++ * The full list of suggested videos, opened with the Down key while a video plays, like the list under a
++ * YouTube video. Up and Down move the highlight and scroll it into view, OK plays the highlighted video.
++ * Back is handled by the player's key hook, which closes the list.
++ */
++@Composable
++fun BoxScope.YouTubeUpNextList(
++    videoId: String,
++    viewModel: YouTubeViewModel,
++    onPlay: (YtItem, List<YtItem>) -> Unit
++) {
++    val related by viewModel.related.collectAsState()
++    val loading by viewModel.relatedLoading.collectAsState()
++    LaunchedEffect(videoId) { viewModel.loadRelated(videoId) }
++
++    val listState = rememberLazyListState()
++    val focus = remember { FocusRequester() }
++    var selected by remember { mutableIntStateOf(0) }
++    LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
++    LaunchedEffect(related.size) {
++        if (selected > related.lastIndex) selected = related.lastIndex.coerceAtLeast(0)
++    }
++    // Keep the highlighted row in view, only scrolling when it is not fully visible.
++    LaunchedEffect(selected, related.size) {
++        if (related.isEmpty()) return@LaunchedEffect
++        val info = listState.layoutInfo
++        val row = info.visibleItemsInfo.firstOrNull { it.index == selected }
++        val fullyVisible = row != null && row.offset >= 0 && row.offset + row.size <= info.viewportEndOffset
++        if (!fullyVisible) listState.animateScrollToItem(selected)
++    }
++
++    Column(
++        Modifier
++            .align(Alignment.CenterEnd)
++            .fillMaxHeight()
++            .width(460.dp)
++            .background(Color(0xF2111114))
++            .padding(horizontal = 20.dp, vertical = 22.dp)
++            .focusRequester(focus)
++            .focusable()
++            .onPreviewKeyEvent { e ->
++                val handled = when (e.key) {
++                    Key.DirectionDown, Key.DirectionUp, Key.DirectionLeft, Key.DirectionRight,
++                    Key.DirectionCenter, Key.Enter, Key.NumPadEnter -> true
++                    else -> false
++                }
++                if (handled && e.type == KeyEventType.KeyDown) {
++                    when (e.key) {
++                        Key.DirectionDown -> if (selected < related.lastIndex) selected += 1
++                        Key.DirectionUp -> if (selected > 0) selected -= 1
++                        Key.DirectionCenter, Key.Enter, Key.NumPadEnter ->
++                            related.getOrNull(selected)?.let { onPlay(it, related) }
++                        else -> Unit
++                    }
++                }
++                handled
++            },
++        verticalArrangement = Arrangement.spacedBy(10.dp)
++    ) {
++        Text("Up next", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
++        if (related.isEmpty()) {
++            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
++                if (loading) CircularProgressIndicator(color = Color.White)
++                else Text("No suggestions for this video.", color = Color(0xFFBBBBBB), fontSize = 14.sp)
++            }
++        } else {
++            LazyColumn(
++                state = listState,
++                modifier = Modifier.fillMaxSize(),
++                verticalArrangement = Arrangement.spacedBy(10.dp)
++            ) {
++                itemsIndexed(related, key = { _, item -> item.videoId ?: item.title }) { index, item ->
++                    val isSelected = index == selected
++                    Row(
++                        Modifier
++                            .fillMaxWidth()
++                            .clip(RoundedCornerShape(10.dp))
++                            .background(if (isSelected) Color(0xFF2A2A2E) else Color(0xFF1B1B1F))
++                            .border(2.dp, if (isSelected) Color.White else Color.Transparent, RoundedCornerShape(10.dp))
++                            .padding(8.dp),
++                        horizontalArrangement = Arrangement.spacedBy(12.dp)
++                    ) {
++                        Box(Modifier.width(168.dp).aspectRatio(16f / 9f).clip(RoundedCornerShape(6.dp))) {
++                            AsyncImage(
++                                model = item.thumbnail,
++                                contentDescription = null,
++                                contentScale = ContentScale.Crop,
++                                modifier = Modifier.fillMaxSize()
++                            )
++                            item.badge?.takeIf { it.isNotBlank() }?.let { badge ->
++                                Text(
++                                    badge,
++                                    color = Color.White,
++                                    fontSize = 11.sp,
++                                    modifier = Modifier
++                                        .align(Alignment.BottomEnd)
++                                        .padding(4.dp)
++                                        .background(Color(0xCC000000), RoundedCornerShape(4.dp))
++                                        .padding(horizontal = 4.dp, vertical = 1.dp)
++                                )
++                            }
++                        }
++                        Column(Modifier.weight(1f)) {
++                            Text(item.title, color = Color.White, fontSize = 14.sp, maxLines = 3, overflow = TextOverflow.Ellipsis)
++                            item.author?.takeIf { it.isNotBlank() }?.let {
++                                Text(it, color = Color(0xFFAAAAAA), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
+index d4b3e8432..3dc1e7485 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
+@@ -634,6 +634,35 @@ class YouTubeViewModel @Inject constructor(
+         }
+     }
+ 
++    /** Videos YouTube suggests next to the one that is playing; the full list behind the Down key. */
++    private val _related = MutableStateFlow<List<YtItem>>(emptyList())
++    val related: StateFlow<List<YtItem>> = _related.asStateFlow()
++    private val _relatedLoading = MutableStateFlow(false)
++    val relatedLoading: StateFlow<Boolean> = _relatedLoading.asStateFlow()
++    private var relatedFor: String? = null
++
++    fun loadRelated(currentVideoId: String) {
++        if (relatedFor == currentVideoId && _related.value.isNotEmpty()) return
++        relatedFor = currentVideoId
++        _related.value = emptyList()
++        _relatedLoading.value = true
++        viewModelScope.launch {
++            val items = withContext(Dispatchers.IO) {
++                runCatching {
++                    val meta = service.mediaItemService.getMetadataObserve(currentVideoId).blockingFirst()
++                    (listOfNotNull(meta.nextVideo) + meta.suggestions.orEmpty().flatMap { it.mediaItems.orEmpty() })
++                        .filter(::allowed).mapNotNull(::toItem)
++                        .filter { it.kind == YtKind.VIDEO && it.videoId != currentVideoId }
++                        .distinctBy { it.videoId }
++                }.getOrDefault(emptyList())
++            }
++            if (relatedFor == currentVideoId) {
++                _related.value = items
++                _relatedLoading.value = false
++            }
++        }
++    }
++
+     /** YouTube's own "up next", or the first suggestion that hasn't played yet. */
+     private fun upNext(currentVideoId: String): YtItem? {
+         val meta = service.mediaItemService.getMetadataObserve(currentVideoId).blockingFirst()
