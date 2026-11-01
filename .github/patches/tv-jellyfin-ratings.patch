@@ -1,0 +1,339 @@
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt
+index a7ee0e657..f6bc41ac6 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt
+@@ -69,7 +69,7 @@ object JellyfinRepository {
+     private const val SEARCH_DEBOUNCE_MS = 350L
+     private val VIDEO_LIBRARY_TYPES = setOf("movies", "tvshows", "mixed")
+     private const val LIST_FIELDS =
+-        "Overview,Genres,ProductionYear,CommunityRating,OfficialRating,RunTimeTicks,Container,UserData,SeriesId,SeriesName"
++        "Overview,Genres,ProductionYear,CommunityRating,OfficialRating,RunTimeTicks,Container,UserData,SeriesId,SeriesName,ProviderIds"
+ 
+     private val json = Json { ignoreUnknownKeys = true }
+     private val client by lazy {
+@@ -411,6 +411,12 @@ object JellyfinRepository {
+             cast = people.filter { !it.isDirector },
+             mediaInfo = parseMediaInfo(obj),
+             logoTag = imageTags?.string("Logo"),
++            imdbId = (obj["ProviderIds"] as? JsonObject)?.let { ids ->
++                ids.string("Imdb") ?: ids.string("imdb")
++            }?.takeIf { it.startsWith("tt") },
++            tmdbId = (obj["ProviderIds"] as? JsonObject)?.let { ids ->
++                ids.string("Tmdb") ?: ids.string("tmdb")
++            }?.takeIf { it.isNotBlank() },
+         )
+     }
+ 
+@@ -889,7 +895,7 @@ object JellyfinRepository {
+                         mapOf(
+                             "userId" to session.userId,
+                             "seasonId" to seasonId,
+-                            "Fields" to "Overview,CommunityRating,RunTimeTicks,Container,UserData,SeriesId,SeriesName",
++                            "Fields" to "Overview,CommunityRating,RunTimeTicks,Container,UserData,SeriesId,SeriesName,ProviderIds",
+                             "ImageTypeLimit" to "1",
+                             "EnableImageTypes" to "Primary,Thumb",
+                         ),
+diff --git a/app/src/main/java/com/nuvio/tv/domain/model/JellyfinModels.kt b/app/src/main/java/com/nuvio/tv/domain/model/JellyfinModels.kt
+index fa24b7ae2..db82d591b 100644
+--- a/app/src/main/java/com/nuvio/tv/domain/model/JellyfinModels.kt
++++ b/app/src/main/java/com/nuvio/tv/domain/model/JellyfinModels.kt
+@@ -57,6 +57,8 @@ data class JellyfinItem(
+     val cast: List<JellyfinPerson> = emptyList(),
+     val mediaInfo: JellyfinMediaInfo? = null,
+     val logoTag: String? = null,
++    val imdbId: String? = null,
++    val tmdbId: String? = null,
+ ) {
+     val isSeries: Boolean get() = type.equals("Series", ignoreCase = true)
+     val isEpisode: Boolean get() = type.equals("Episode", ignoreCase = true)
+@@ -180,7 +182,7 @@ fun JellyfinItem.toMeta(
+     logo = logo,
+     description = overview,
+     releaseInfo = productionYear?.toString(),
+-    imdbRating = communityRating?.toFloat(),
++    imdbRating = null,
+     genres = genres,
+     runtime = runtimeLabel,
+     director = director,
+@@ -195,4 +197,5 @@ fun JellyfinItem.toMeta(
+     awards = null,
+     language = null,
+     links = emptyList(),
++    imdbId = imdbId,
+ )
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
+index c76fc95b0..e57c770f6 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
+@@ -65,6 +65,13 @@ import androidx.tv.material3.MaterialTheme
+ import androidx.tv.material3.Surface
+ import androidx.tv.material3.Text
+ import coil3.compose.AsyncImage
++import androidx.compose.runtime.CompositionLocalProvider
++import androidx.hilt.navigation.compose.hiltViewModel
++import com.nuvio.tv.domain.model.NextToWatch
++import com.nuvio.tv.ui.components.ImdbRatingSourceLabel
++import com.nuvio.tv.ui.screens.detail.ForkEpisodeSourceRating
++import com.nuvio.tv.ui.screens.detail.LocalForkExtraEpisodeRatings
++import com.nuvio.tv.ui.screens.detail.LocalForkTmdbEpisodeRatings
+ import com.nuvio.tv.data.repository.JellyfinRepository
+ import com.nuvio.tv.domain.model.JellyfinItem
+ import com.nuvio.tv.domain.model.MetaCastMember
+@@ -86,8 +93,10 @@ fun JellyfinDetailsScreen(
+     onPlay: (JellyfinItem) -> Unit,
+     onBack: () -> Unit,
+     onNavigateToCastDetail: (Int, String, Boolean) -> Unit = { _, _, _ -> },
++    ratingsViewModel: JellyfinRatingsViewModel = hiltViewModel(),
+ ) {
+     val state by JellyfinRepository.uiState.collectAsStateWithLifecycle()
++    val ratings by ratingsViewModel.state.collectAsStateWithLifecycle()
+     val castScope = rememberCoroutineScope()
+     val backFocus = remember { FocusRequester() }
+     LaunchedEffect(itemId) {
+@@ -138,6 +147,32 @@ fun JellyfinDetailsScreen(
+             else -> null
+         }
+ 
++        val seasonNumbers = remember(state.seasons) {
++            state.seasons.mapNotNull { it.indexNumber }.filter { it > 0 }
++        }
++        LaunchedEffect(item.id, meta.imdbId, seasonNumbers) {
++            ratingsViewModel.load(item, meta, seasonNumbers)
++        }
++        // Same "Play S1E2" / "Resume S1E2" wording the addon detail page shows.
++        val nextToWatch = remember(playable, item.id) {
++            val target = playable
++            if (target != null && item.isSeries && target.isEpisode) {
++                val season = target.parentIndexNumber
++                val number = target.indexNumber
++                if (season != null && number != null) {
++                    val resume = target.resumePositionMs > 0
++                    NextToWatch(
++                        watchProgress = null,
++                        isResume = resume,
++                        nextVideoId = target.id,
++                        nextSeason = season,
++                        nextEpisode = number,
++                        displayText = (if (resume) "Resume " else "Play ") + "S${season}E$number",
++                    )
++                } else null
++            } else null
++        }
++
+         val playFocusRequester = remember { FocusRequester() }
+         LaunchedEffect(item.id) {
+             withFrameNanos { }
+@@ -191,7 +226,10 @@ fun JellyfinDetailsScreen(
+             HeroContentSection(
+                 meta = meta,
+                 nextEpisode = null,
+-                nextToWatch = null,
++                nextToWatch = nextToWatch,
++                mdbListRatings = ratings.mdbListRatings,
++                mdbListRatingOrder = ratings.mdbListRatingOrder,
++                tmdbRating = ratings.tmdbRating,
+                 onPlayClick = { playable?.let(onPlay) },
+                 isPlayEnabled = playable != null,
+                 isInLibrary = false,
+@@ -228,11 +266,17 @@ fun JellyfinDetailsScreen(
+                 )
+             }
+             if (item.isSeries || item.isFolder) {
+-                JellyfinDetailEpisodes(
+-                    state = state,
+-                    onPlay = onPlay,
+-                    modifier = Modifier.padding(top = NuvioTheme.spacing.sm),
+-                )
++                CompositionLocalProvider(
++                    LocalForkTmdbEpisodeRatings provides ratings.episodeTmdbRatings,
++                    LocalForkExtraEpisodeRatings provides ratings.episodeExtraRatings,
++                ) {
++                    JellyfinDetailEpisodes(
++                        state = state,
++                        imdbEpisodeRatings = ratings.episodeImdbRatings,
++                        onPlay = onPlay,
++                        modifier = Modifier.padding(top = NuvioTheme.spacing.sm),
++                    )
++                }
+             }
+             Spacer(Modifier.height(NuvioTheme.spacing.xxl))
+         }
+@@ -362,6 +406,7 @@ internal fun JellyfinPillChip(
+ @Composable
+ private fun JellyfinDetailEpisodes(
+     state: com.nuvio.tv.domain.model.JellyfinUiState,
++    imdbEpisodeRatings: Map<Pair<Int, Int>, Double>,
+     onPlay: (JellyfinItem) -> Unit,
+     modifier: Modifier = Modifier,
+ ) {
+@@ -395,7 +440,7 @@ private fun JellyfinDetailEpisodes(
+                     if (state.selectedDetail?.isFolder == true) {
+                         JellyfinFileRow(episode = episode, onPlay = onPlay)
+                     } else {
+-                        JellyfinEpisodeCard(episode = episode, onPlay = onPlay)
++                        JellyfinEpisodeCard(episode = episode, imdbRatings = imdbEpisodeRatings, onPlay = onPlay)
+                     }
+                 }
+             }
+@@ -404,7 +449,17 @@ private fun JellyfinDetailEpisodes(
+ }
+ 
+ @Composable
+-private fun JellyfinEpisodeCard(episode: JellyfinItem, onPlay: (JellyfinItem) -> Unit) {
++private fun JellyfinEpisodeCard(
++    episode: JellyfinItem,
++    imdbRatings: Map<Pair<Int, Int>, Double>,
++    onPlay: (JellyfinItem) -> Unit,
++) {
++    val key = episode.parentIndexNumber?.let { s -> episode.indexNumber?.let { e -> s to e } }
++    val imdb = key?.let { imdbRatings[it] }?.takeIf { it > 0.0 }
++    val tmdb = key?.let { LocalForkTmdbEpisodeRatings.current[it] }?.takeIf { it > 0.0 }
++    val extra = key?.let { k ->
++        LocalForkExtraEpisodeRatings.current.mapNotNull { (name, map) -> map[k]?.takeIf { it > 0.0 }?.let { name to it } }
++    }.orEmpty()
+     var focused by remember { mutableStateOf(false) }
+     val cardShape = RoundedCornerShape(NuvioTheme.radii.md)
+     val thumbnailUrl = remember(episode.id, episode.imageTag) {
+@@ -485,6 +540,31 @@ private fun JellyfinEpisodeCard(episode: JellyfinItem, onPlay: (JellyfinItem) ->
+                 maxLines = 1,
+                 overflow = TextOverflow.Ellipsis,
+             )
++            if (imdb != null || tmdb != null || extra.isNotEmpty()) {
++                val ratingStyle = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold)
++                Row(
++                    horizontalArrangement = Arrangement.spacedBy(10.dp),
++                    verticalAlignment = Alignment.CenterVertically,
++                    modifier = Modifier.padding(bottom = 2.dp),
++                ) {
++                    if (imdb != null) {
++                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
++                            ImdbRatingSourceLabel(
++                                logoModifier = Modifier.width(24.dp).height(12.dp),
++                                textStyle = ratingStyle,
++                                textColor = NuvioTheme.colors.TextSecondary,
++                            )
++                            Text(
++                                text = String.format(java.util.Locale.US, "%.1f", imdb),
++                                style = ratingStyle,
++                                color = NuvioTheme.colors.TextPrimary,
++                            )
++                        }
++                    }
++                    if (tmdb != null) ForkEpisodeSourceRating("TMDB", tmdb, 14.dp, 14.dp, ratingStyle)
++                    extra.forEach { (name, value) -> ForkEpisodeSourceRating(name, value, 14.dp, 14.dp, ratingStyle) }
++                }
++            }
+             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                 episode.runTimeMinutes?.let { minutes ->
+                     Text(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinRatingsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinRatingsViewModel.kt
+new file mode 100644
+index 000000000..a081e8f21
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinRatingsViewModel.kt
+@@ -0,0 +1,105 @@
++package com.nuvio.tv.ui.screens.jellyfin
++
++import androidx.lifecycle.ViewModel
++import androidx.lifecycle.viewModelScope
++import com.nuvio.tv.core.tmdb.TmdbMetadataService
++import com.nuvio.tv.core.tmdb.TmdbService
++import com.nuvio.tv.data.local.MDBListSettingsDataStore
++import com.nuvio.tv.data.repository.ImdbEpisodeRatingsRepository
++import com.nuvio.tv.data.repository.MDBListRepository
++import com.nuvio.tv.domain.model.ContentType
++import com.nuvio.tv.domain.model.JellyfinItem
++import com.nuvio.tv.domain.model.MDBListRatings
++import com.nuvio.tv.domain.model.MDBListSettings
++import com.nuvio.tv.domain.model.Meta
++import com.nuvio.tv.ui.screens.detail.ForkTvExtraEpisodeRatings
++import dagger.hilt.android.lifecycle.HiltViewModel
++import javax.inject.Inject
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.flow.update
++import kotlinx.coroutines.launch
++
++/** Title and per-episode ratings for a Jellyfin item, looked up through its IMDb/TMDB provider ids. */
++data class JellyfinRatingsState(
++    val mdbListRatings: MDBListRatings? = null,
++    val mdbListRatingOrder: List<String> = MDBListSettings.DEFAULT_RATING_ORDER,
++    val tmdbRating: Float? = null,
++    val episodeImdbRatings: Map<Pair<Int, Int>, Double> = emptyMap(),
++    val episodeTmdbRatings: Map<Pair<Int, Int>, Double> = emptyMap(),
++    val episodeExtraRatings: Map<String, Map<Pair<Int, Int>, Double>> = emptyMap(),
++)
++
++@HiltViewModel
++class JellyfinRatingsViewModel @Inject constructor(
++    private val mdbListRepository: MDBListRepository,
++    private val mdbListSettingsDataStore: MDBListSettingsDataStore,
++    private val tmdbService: TmdbService,
++    private val tmdbMetadataService: TmdbMetadataService,
++    private val imdbEpisodeRatingsRepository: ImdbEpisodeRatingsRepository,
++    private val forkExtraEpisodeRatings: ForkTvExtraEpisodeRatings,
++) : ViewModel() {
++
++    private val _state = MutableStateFlow(JellyfinRatingsState())
++    val state: StateFlow<JellyfinRatingsState> = _state.asStateFlow()
++
++    private var loadedKey: String? = null
++    private var job: Job? = null
++
++    fun load(item: JellyfinItem, meta: Meta, seasonNumbers: List<Int>) {
++        val imdbId = item.imdbId
++        val tmdbHint = item.tmdbId
++        if (imdbId == null && tmdbHint == null) return
++        val key = "${item.id}:${seasonNumbers.joinToString(",")}"
++        if (key == loadedKey) return
++        if (loadedKey?.substringBefore(':') != item.id) _state.value = JellyfinRatingsState()
++        loadedKey = key
++        job?.cancel()
++        job = viewModelScope.launch {
++            try {
++                val type = if (item.isSeries) ContentType.SERIES else ContentType.MOVIE
++                val apiType = type.toApiString()
++                val tmdbId = (tmdbHint ?: imdbId?.let { tmdbService.ensureTmdbId(it, apiType, fallbackImdbId = it) })
++                    ?.toIntOrNull()
++
++                val settings = mdbListSettingsDataStore.settings.first()
++                val mdb = runCatching {
++                    mdbListRepository.getRatingsForMeta(meta, fallbackItemId = imdbId ?: item.id, fallbackItemType = apiType)
++                }.getOrNull()
++                _state.update {
++                    it.copy(mdbListRatings = mdb?.ratings, mdbListRatingOrder = settings.enabledRatingOrder())
++                }
++
++                if (tmdbId != null) {
++                    val rating = runCatching {
++                        tmdbMetadataService.fetchEnrichment(tmdbId = tmdbId.toString(), contentType = type, language = "en")
++                    }.getOrNull()?.rating
++                    if (rating != null) _state.update { it.copy(tmdbRating = rating.toFloat()) }
++                }
++
++                if (item.isSeries) {
++                    val imdb = runCatching {
++                        imdbEpisodeRatingsRepository.getEpisodeRatings(imdbId = imdbId, tmdbId = tmdbId)
++                    }.getOrDefault(emptyMap())
++                    if (imdb.isNotEmpty()) _state.update { it.copy(episodeImdbRatings = imdb) }
++                    if (tmdbId != null && seasonNumbers.isNotEmpty()) {
++                        val votes = runCatching {
++                            tmdbMetadataService.fetchEpisodeVoteAverages(tmdbId, seasonNumbers.filter { it > 0 })
++                        }.getOrDefault(emptyMap())
++                        if (votes.isNotEmpty()) _state.update { it.copy(episodeTmdbRatings = votes) }
++                    }
++                    if (imdbId != null) {
++                        val extra = runCatching { forkExtraEpisodeRatings.fetch(imdbId) }.getOrDefault(emptyMap())
++                        if (extra.isNotEmpty()) _state.update { it.copy(episodeExtraRatings = extra) }
++                    }
++                }
++            } catch (cancelled: CancellationException) {
++                throw cancelled
++            }
++        }
++    }
++}
