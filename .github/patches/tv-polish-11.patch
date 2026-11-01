@@ -1,0 +1,210 @@
+diff --git a/app/src/main/java/com/nuvio/tv/MainActivity.kt b/app/src/main/java/com/nuvio/tv/MainActivity.kt
+index d9c6ca7c6..7414d3da6 100644
+--- a/app/src/main/java/com/nuvio/tv/MainActivity.kt
++++ b/app/src/main/java/com/nuvio/tv/MainActivity.kt
+@@ -221,6 +221,11 @@ import kotlinx.coroutines.flow.combine
+ import kotlinx.coroutines.flow.map
+ import kotlinx.coroutines.launch
+ 
++/** True while the Live TV fullscreen player is on screen; the navigation sidebar stays hidden then. */
++object LiveTvPlayerSidebarGate {
++    var playerActive by androidx.compose.runtime.mutableStateOf(false)
++}
++
+ val LocalSidebarExpanded = compositionLocalOf { false }
+ val LocalContentFocusRequester = compositionLocalOf { FocusRequester.Default }
+ 
+@@ -1497,7 +1502,7 @@ private fun LegacySidebarScaffold(
+     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
+     val drawerItemFocusRequesters = rememberDrawerItemFocusRequesters(drawerItems)
+     val keyboardController = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
+-    val showSidebar = currentRoute in rootRoutes
++    val showSidebar = currentRoute in rootRoutes && !LiveTvPlayerSidebarGate.playerActive
+ 
+     LaunchedEffect(currentRoute) {
+         longPressBackHeld.value = false
+@@ -1898,7 +1903,7 @@ private fun ModernSidebarScaffold(
+     onNavigate: (String) -> Unit,
+     onExitApp: () -> Unit
+ ) {
+-    val showSidebar = currentRoute in rootRoutes
++    val showSidebar = currentRoute in rootRoutes && !LiveTvPlayerSidebarGate.playerActive
+     val sidebarTokens = NuvioComponents.tokens.sidebar
+     val collapsedSidebarWidth = if (sidebarCollapsed) NuvioTheme.spacing.none else sidebarTokens.collapsedWidth
+     val openSidebarWidth = sidebarTokens.expandedWidth
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
+index de73cda12..133ff65ea 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
+@@ -50,6 +50,7 @@ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.draw.clip
+ import androidx.compose.ui.focus.FocusRequester
+ import androidx.compose.ui.focus.focusRequester
++import androidx.compose.foundation.focusGroup
+ import androidx.compose.ui.focus.onFocusChanged
+ import androidx.compose.ui.graphics.Brush
+ import androidx.compose.ui.graphics.Color
+@@ -112,7 +113,6 @@ fun JellyfinDetailsScreen(
+     val state by JellyfinRepository.uiState.collectAsStateWithLifecycle()
+     val ratings by ratingsViewModel.state.collectAsStateWithLifecycle()
+     val castScope = rememberCoroutineScope()
+-    val backFocus = remember { FocusRequester() }
+     val userRatingViewModel: UserRatingViewModel = hiltViewModel()
+     val userRatings by userRatingViewModel.ratings.collectAsStateWithLifecycle()
+     val ratingContext = androidx.compose.ui.platform.LocalContext.current
+@@ -272,9 +272,6 @@ fun JellyfinDetailsScreen(
+                 .fillMaxSize()
+                 .verticalScroll(rememberScrollState()),
+         ) {
+-            // Only the hero actions jump up to Back; lower sections use normal focus search,
+-            // so Up from cast or episodes walks back through the episodes and the Play button first.
+-            Box(modifier = Modifier.focusProperties { up = backFocus }) {
+             HeroContentSection(
+                 meta = richMeta,
+                 nextEpisode = null,
+@@ -300,7 +297,6 @@ fun JellyfinDetailsScreen(
+                         ?.let { ratingsViewModel.playTrailer(it, richMeta.name, trailerYear) }
+                 },
+             )
+-            }
+             JellyfinMediaBadgesRow(item = item)
+             if (item.isSeries && state.seasons.isNotEmpty()) {
+                 JellyfinSeasonsChips(
+@@ -421,34 +417,6 @@ fun JellyfinDetailsScreen(
+                 onRetry = { ratingsViewModel.playTrailer(overlay.trailer, richMeta.name, trailerYear) },
+             )
+         }
+-
+-        Button(
+-            onClick = onBack,
+-            shape = ButtonDefaults.shape(shape = RoundedCornerShape(8.dp)),
+-            colors = ButtonDefaults.colors(
+-                containerColor = Color.White.copy(alpha = 0.15f),
+-                focusedContainerColor = Color.White,
+-                focusedContentColor = Color.Black,
+-            ),
+-            modifier = Modifier
+-                .align(Alignment.TopStart)
+-                .padding(24.dp)
+-                .focusRequester(backFocus)
+-                .focusProperties { down = playFocusRequester },
+-        ) {
+-            Row(verticalAlignment = Alignment.CenterVertically) {
+-                Icon(
+-                    Icons.AutoMirrored.Rounded.ArrowBack,
+-                    contentDescription = null,
+-                    modifier = Modifier.size(18.dp),
+-                )
+-                Text(
+-                    text = stringResource(com.nuvio.tv.R.string.action_back),
+-                    fontWeight = FontWeight.Bold,
+-                    modifier = Modifier.padding(start = 8.dp),
+-                )
+-            }
+-        }
+     }
+ }
+ 
+@@ -830,8 +798,15 @@ private fun JellyfinTabRow(
+     onSelect: (JellyfinTab) -> Unit,
+     modifier: Modifier = Modifier,
+ ) {
++    // Focus entering the row from above or below always lands on the active tab (first one by
++    // default) instead of whichever chip is geometrically nearest.
++    val requesters = remember(tabs) { tabs.associateWith { FocusRequester() } }
++    val activeRequester = requesters[active]
+     Row(
+-        modifier = modifier.padding(horizontal = NuvioTheme.spacing.xxxl),
++        modifier = modifier
++            .padding(horizontal = NuvioTheme.spacing.xxxl)
++            .focusProperties { enter = { activeRequester ?: FocusRequester.Default } }
++            .focusGroup(),
+         horizontalArrangement = Arrangement.spacedBy(10.dp),
+         verticalAlignment = Alignment.CenterVertically,
+     ) {
+@@ -839,7 +814,9 @@ private fun JellyfinTabRow(
+             val selected = tab == active
+             Surface(
+                 onClick = { onSelect(tab) },
+-                modifier = Modifier.onFocusChanged { if (it.isFocused) onSelect(tab) },
++                modifier = Modifier
++                    .focusRequester(requesters.getValue(tab))
++                    .onFocusChanged { if (it.isFocused) onSelect(tab) },
+                 shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(999.dp)),
+                 scale = ClickableSurfaceDefaults.scale(focusedScale = 1.05f),
+                 border = ClickableSurfaceDefaults.border(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
+index 24e5c31c4..4da0e4730 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
+@@ -348,6 +348,11 @@ fun TvChannelsScreen(
+     }
+ 
+     // 1. Modo Tela Cheia Integrado com Zapping D-pad e Gaveta Lateral
++    androidx.compose.runtime.DisposableEffect(state.isFullscreen) {
++        com.nuvio.tv.LiveTvPlayerSidebarGate.playerActive = state.isFullscreen
++        onDispose { com.nuvio.tv.LiveTvPlayerSidebarGate.playerActive = false }
++    }
++
+     if (state.isFullscreen) {
+         val allChannelsNow = state.allChannels
+         val hideAdultNow = state.hideAdultChannels
+@@ -543,6 +548,7 @@ fun TvChannelsScreen(
+                         shape = ButtonDefaults.shape(shape = RoundedCornerShape(22.dp)),
+                         colors = ButtonDefaults.colors(
+                             containerColor = if (isEpgGridMode) NuvioTheme.colors.Secondary else Color.White.copy(alpha = 0.10f),
++                            contentColor = Color.White,
+                             focusedContainerColor = Color.White,
+                             focusedContentColor = Color.Black
+                         )
+@@ -573,6 +579,7 @@ fun TvChannelsScreen(
+                         shape = ButtonDefaults.shape(shape = RoundedCornerShape(22.dp)),
+                         colors = ButtonDefaults.colors(
+                             containerColor = if (netflixLive) NuvioTheme.colors.Secondary else Color.White.copy(alpha = 0.10f),
++                            contentColor = Color.White,
+                             focusedContainerColor = Color.White,
+                             focusedContentColor = Color.Black
+                         )
+@@ -604,6 +611,7 @@ fun TvChannelsScreen(
+                         shape = ButtonDefaults.shape(shape = RoundedCornerShape(22.dp)),
+                         colors = ButtonDefaults.colors(
+                             containerColor = Color.White.copy(alpha = 0.10f),
++                            contentColor = Color.White,
+                             focusedContainerColor = Color.White,
+                             focusedContentColor = Color.Black
+                         )
+@@ -645,6 +653,7 @@ fun TvChannelsScreen(
+                         shape = ButtonDefaults.shape(shape = RoundedCornerShape(22.dp)),
+                         colors = ButtonDefaults.colors(
+                             containerColor = Color.White.copy(alpha = 0.10f),
++                            contentColor = Color.White,
+                             focusedContainerColor = Color.White,
+                             focusedContentColor = Color.Black
+                         )
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelZappingDrawer.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelZappingDrawer.kt
+index 5058771c4..d08e462ab 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelZappingDrawer.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelZappingDrawer.kt
+@@ -116,7 +116,7 @@ fun TvChannelZappingDrawer(
+                 .focusRequester(drawerFocusRequester)
+                 .onPreviewKeyEvent { event ->
+                     if (event.type == KeyEventType.KeyDown) {
+-                        if (event.key == Key.DirectionRight || event.key == Key.Back || event.key == Key.Escape) {
++                        if (event.key == Key.Back || event.key == Key.Escape) {
+                             onClose()
+                             true
+                         } else false
+@@ -180,7 +180,12 @@ fun TvChannelZappingDrawer(
+                             onClick = {
+                                 onCategorySelected(if (cat == allLabel) "" else cat)
+                             },
+-                            modifier = Modifier.onFocusChanged { isCatFocused = it.isFocused },
++                            modifier = Modifier
++                                .onFocusChanged { isCatFocused = it.isFocused }
++                                .onPreviewKeyEvent { ev ->
++                                    // Right on the last chip must stay in the drawer, only channels close it.
++                                    ev.type == KeyEventType.KeyDown && ev.key == Key.DirectionRight && cat == allCats.last()
++                                },
+                             shape = ButtonDefaults.shape(shape = RoundedCornerShape(16.dp)),
+                             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                             colors = ButtonDefaults.colors(
