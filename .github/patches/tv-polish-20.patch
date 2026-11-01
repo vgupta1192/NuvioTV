@@ -1,0 +1,586 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodeRatingsSection.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodeRatingsSection.kt
+index 1677945f9..71ddccee0 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodeRatingsSection.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodeRatingsSection.kt
+@@ -58,7 +58,8 @@ fun EpisodeRatingsSection(
+     upFocusRequester: FocusRequester? = null,
+     downFocusRequester: FocusRequester? = null,
+     firstItemFocusRequester: FocusRequester? = null,
+-    ratingsGridFocusRequester: FocusRequester? = null
++    ratingsGridFocusRequester: FocusRequester? = null,
++    onEpisodeClick: ((Video) -> Unit)? = null
+ ) {
+     val seasonNumbers = remember(episodes) {
+         episodes
+@@ -240,15 +241,20 @@ fun EpisodeRatingsSection(
+                     items(seasonRatings, key = { "${it.seasonNumber}:${it.episodeNumber}" }) { episodeRating ->
+                         val isFirstEpisode = episodeRating == seasonRatings.firstOrNull()
+ 
+-                        // These chips only display a rating and have no action, but their focus is
+-                        // load-bearing: the season tabs point "down" at this row and the row's
++                        // Their focus is load-bearing: the season tabs point "down" at this row and the row's
+                         // focusRestorer resolves to the first chip, so dropping them from the D-pad
+                         // order would strand the whole ratings row. Keep the stop and name it.
+                         val ratingDescription =
+                             "S${episodeRating.seasonNumber}E${episodeRating.episodeNumber}, ${episodeRating.ratingText}"
+ 
+                         Card(
+-                            onClick = { },
++                            onClick = {
++                                // A chip opens its episode, same as the episode list does.
++                                val clicked = episodes.firstOrNull {
++                                    it.season == episodeRating.seasonNumber && it.episode == episodeRating.episodeNumber
++                                }
++                                if (clicked != null) onEpisodeClick?.invoke(clicked)
++                            },
+                             modifier = Modifier
+                                 .focusProperties {
+                                     up = selectedSeasonRequester
+@@ -258,9 +264,8 @@ fun EpisodeRatingsSection(
+                                 .then(
+                                     if (isFirstEpisode) Modifier.focusRequester(firstEpisodeRatingFocusRequester) else Modifier
+                                 )
+-                                // (tv-material3's Card only has the clickable overload, so the
+-                                // empty onClick stays; clearAndSetSemantics replaces the chip's two
+-                                // Texts with one name that carries both the episode and its rating.)
++                                // (clearAndSetSemantics replaces the chip's two Texts with one name
++                                // that carries both the episode and its rating.)
+                                 .clearAndSetSemantics { contentDescription = ratingDescription },
+                             shape = CardDefaults.shape(shape = RoundedCornerShape(14.dp)),
+                             colors = CardDefaults.colors(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
+index 64a828507..e72124ab5 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
+@@ -2890,6 +2890,7 @@ private fun MetaDetailsContent(
+                                     downFocusRequester = if (shouldShowCommentsSection && canToggleEpisodeComments) commentsSelectedModeFocusRequester else null,
+                                     firstItemFocusRequester = ratingsContentFocusRequester,
+                                     ratingsGridFocusRequester = ratingsGridFocusRequester,
++                                    onEpisodeClick = episodeClick,
+                                     modifier = Modifier.heightIn(min = if (!hasItemsBelow) castSectionHeight else NuvioTheme.spacing.none)
+                                 )
+                             }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModel.kt
+index a0aa64d35..7bb7a7597 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModel.kt
+@@ -387,7 +387,7 @@ class HomeViewModel @Inject constructor(
+             observeCollections()
+             observeInstalledAddons()
+             observeManualAddonRefresh()
+-            observeSmartHighlights()
++            // Smart Highlights rail removed (needs an AI key); the picks flow stays empty.
+ 
+             // Clear CW state when profile changes so items don't leak between profiles.
+             var previousProfileId = profileManager.activeProfileId.value
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
+index a7dfcc104..b33928873 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
+@@ -263,10 +263,10 @@ fun JellyfinDetailsScreen(
+         val episodeListState = rememberLazyListState()
+         var goToEpisodeOpen by remember(item.id) { mutableStateOf(false) }
+         val episodeScope = rememberCoroutineScope()
+-        val sectionTabs = remember(richMeta.castMembers, ratings.moreLikeThis, ratings.trailers, ratings.episodeImdbRatings, item.isSeries) {
++        val sectionTabs = remember(richMeta.castMembers, ratings.moreLikeThis, ratings.trailers, ratings.episodeImdbRatings, item.isSeries, state.episodes.isNotEmpty()) {
+             buildList {
+                 if (richMeta.castMembers.isNotEmpty()) add(JellyfinTab.PEOPLE)
+-                if (item.isSeries && ratings.episodeImdbRatings.isNotEmpty()) add(JellyfinTab.RATINGS)
++                if (item.isSeries && (ratings.episodeImdbRatings.isNotEmpty() || state.episodes.isNotEmpty())) add(JellyfinTab.RATINGS)
+                 if (ratings.moreLikeThis.isNotEmpty()) add(JellyfinTab.SIMILAR)
+                 if (ratings.trailers.any { !it.ytId.isNullOrBlank() }) add(JellyfinTab.TRAILER)
+             }
+@@ -372,25 +372,36 @@ fun JellyfinDetailsScreen(
+                     )
+ 
+                     JellyfinTab.RATINGS -> {
+-                        val ratingVideos = remember(ratings.episodeImdbRatings) {
+-                            ratings.episodeImdbRatings.keys.sortedWith(compareBy({ it.first }, { it.second })).map { (season, episode) ->
+-                                Video(
+-                                    id = "$season:$episode",
+-                                    title = "S${season}E$episode",
+-                                    released = null,
+-                                    thumbnail = null,
+-                                    season = season,
+-                                    episode = episode,
+-                                    overview = null,
+-                                )
++                        val ratingVideos = remember(ratings.episodeImdbRatings, state.episodes) {
++                            val fromServer = state.episodes.mapNotNull { ep ->
++                                val season = ep.parentIndexNumber ?: return@mapNotNull null
++                                val number = ep.indexNumber ?: return@mapNotNull null
++                                season to number
+                             }
++                            (fromServer + ratings.episodeImdbRatings.keys).distinct()
++                                .sortedWith(compareBy({ it.first }, { it.second })).map { (season, episode) ->
++                                    Video(
++                                        id = "$season:$episode",
++                                        title = "S${season}E$episode",
++                                        released = null,
++                                        thumbnail = null,
++                                        season = season,
++                                        episode = episode,
++                                        overview = null,
++                                    )
++                                }
+                         }
+                         EpisodeRatingsSection(
+                             episodes = ratingVideos,
+                             ratings = ratings.episodeImdbRatings,
+-                            isLoading = false,
++                            isLoading = ratings.isLoading && ratings.episodeImdbRatings.isEmpty(),
+                             error = null,
+                             title = "",
++                            onEpisodeClick = { video ->
++                                state.episodes.firstOrNull {
++                                    it.parentIndexNumber == video.season && it.indexNumber == video.episode
++                                }?.let(onPlay)
++                            },
+                         )
+                     }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
+index d6ea5c94f..3521a6c27 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
+@@ -193,13 +193,24 @@ internal class ExoAudioEffects(private val player: ExoPlayer) : Player.Listener
+  * media3's own effects, and sharpen, denoise, debanding and gamma share one small shader. If the shader ever
+  * fails to run on a device, it is switched off for the session and playback carries on without it.
+  */
+-internal class ExoPictureEffects(private val player: ExoPlayer) : Player.Listener {
++internal class ExoPictureEffects(
++    private val player: ExoPlayer,
++    private val autoEnhance: Boolean = true,
++) : Player.Listener {
+     private var state = PictureState()
+     private var shaderBroken = false
+     private var dxBroken = false
+     private var scaledDown = false
+     private var released = false
+ 
++    // The shader reads its strengths from this holder on every frame, so moving a slider or toggling Smart
++    // Enhance only updates numbers. The effect chain is rebuilt (which restarts GL and drops frames) only when
++    // its shape changes: the shader joins the chain, or the frame needs scaling down.
++    private val params = PictureShaderParams()
++    private var chainFused = false
++    private var chainScaled = false
++    private var chainSet = false
++
+     init {
+         player.addListener(this)
+     }
+@@ -211,40 +222,49 @@ internal class ExoPictureEffects(private val player: ExoPlayer) : Player.Listene
+ 
+     private fun push() {
+         if (released) return
+-        val effects = ArrayList<Effect>()
+         val current = state
+         val dxKind = if (dxBroken) DxEnhanceKind.NONE else DxEnhance.currentKind() // dx.bi picture enhance hook
+         val brightness = (current.brightness / 100f + if (current.smartEnhance) 0.01f else 0f).coerceIn(-1f, 1f)
+         val contrast = (current.contrast / 100f + if (current.smartEnhance) 0.05f else 0f).coerceIn(-1f, 1f)
+         val saturation = (current.saturation.toFloat() + if (current.smartEnhance) 6f else 0f).coerceIn(-100f, 100f)
+         val colourActive = abs(brightness) > 0.001f || abs(contrast) > 0.001f || abs(saturation) > 0.5f
+-        val fused = !shaderBroken && (current.usesShader || dxKind != DxEnhanceKind.NONE || colourActive)
++        val wantFused = !shaderBroken && (current.usesShader || dxKind != DxEnhanceKind.NONE || colourActive)
++        params.values = PictureShaderValues(
++            sharpen = current.sharpen * 0.4f,
++            denoise = current.denoise / 3f * 0.85f,
++            deband = if (current.deband) 0.9f else 0f,
++            gamma = 1f / (1f + current.gamma / 100f),
++            brightness = brightness,
++            contrast = contrast,
++            saturation = saturation / 100f,
++            thin = if (dxKind == DxEnhanceKind.ANIME) 0.55f else 0f,
++            dxSharpen = when (dxKind) {
++                DxEnhanceKind.ANIME -> 0.6f
++                DxEnhanceKind.SHARPEN -> 0.45f
++                else -> 0f
++            },
++        )
++        // Once the shader is in the chain it stays, with neutral numbers, until the player is released:
++        // taking it out again would be one more rebuild and one more burst of dropped frames.
++        val fused = wantFused || (chainFused && !shaderBroken)
++        val scaled = fused && player.videoSize.height > MAX_EFFECT_HEIGHT
++        if (chainSet && fused == chainFused && scaled == chainScaled) return
++        val effects = ArrayList<Effect>()
+         if (fused) {
+             // Every GL effect is one full-frame pass, so the whole panel runs as a single shader. Above 1080p the
+             // frame is scaled down first, which keeps the pass inside what a TV box GPU can do at 24 to 60 fps.
+-            if (player.videoSize.height > MAX_EFFECT_HEIGHT) effects += Presentation.createForHeight(MAX_EFFECT_HEIGHT)
+-            effects += PictureShaderEffect(
+-                sharpen = current.sharpen * 0.4f,
+-                denoise = current.denoise / 3f * 0.85f,
+-                deband = if (current.deband) 0.9f else 0f,
+-                gamma = 1f / (1f + current.gamma / 100f),
+-                brightness = brightness,
+-                contrast = contrast,
+-                saturation = saturation / 100f,
+-                thin = if (dxKind == DxEnhanceKind.ANIME) 0.55f else 0f,
+-                dxSharpen = when (dxKind) {
+-                    DxEnhanceKind.ANIME -> 0.6f
+-                    DxEnhanceKind.SHARPEN -> 0.45f
+-                    else -> 0f
+-                },
+-            )
++            if (scaled) effects += Presentation.createForHeight(MAX_EFFECT_HEIGHT)
++            effects += PictureShaderEffect(params)
+         }
++        chainSet = true
++        chainFused = fused
++        chainScaled = scaled
+         runCatching { player.setVideoEffects(effects) }
+             .onFailure { Log.w(FX_TAG, "Picture effects could not be applied", it) }
+     }
+ 
+     override fun onVideoSizeChanged(videoSize: VideoSize) {
+-        PlayerEffects.maybeAutoEnhance(videoSize.height, player.videoFormat?.bitrate)
++        if (autoEnhance) PlayerEffects.maybeAutoEnhance(videoSize.height, player.videoFormat?.bitrate)
+         val tooBig = videoSize.height > MAX_EFFECT_HEIGHT
+         if (tooBig != scaledDown) {
+             scaledDown = tooBig
+@@ -256,11 +276,13 @@ internal class ExoPictureEffects(private val player: ExoPlayer) : Player.Listene
+         if (error.errorCode == PlaybackException.ERROR_CODE_VIDEO_FRAME_PROCESSING_FAILED && !dxBroken && DxEnhance.currentKind() != DxEnhanceKind.NONE) {
+             Log.w(FX_TAG, "dx.bi enhance shader failed, turning it off", error) // dx.bi picture enhance hook
+             dxBroken = true
++            chainSet = false
+             push()
+             runCatching { player.prepare() }
+         } else if (error.errorCode == PlaybackException.ERROR_CODE_VIDEO_FRAME_PROCESSING_FAILED && !shaderBroken) {
+             Log.w(FX_TAG, "Picture shader failed, turning it off", error)
+             shaderBroken = true
++            chainSet = false
+             push()
+             runCatching { player.prepare() }
+         }
+@@ -272,20 +294,29 @@ internal class ExoPictureEffects(private val player: ExoPlayer) : Player.Listene
+     }
+ }
+ 
+-/** Sharpen, denoise, deband and gamma in one pass. Strengths of 0 skip that step. */
+-internal class PictureShaderEffect(
+-    private val sharpen: Float,
+-    private val denoise: Float,
+-    private val deband: Float,
+-    private val gamma: Float,
+-    private val brightness: Float = 0f,
+-    private val contrast: Float = 0f,
+-    private val saturation: Float = 0f,
+-    private val thin: Float = 0f,
+-    private val dxSharpen: Float = 0f,
+-) : GlEffect {
++/** One set of strengths for the picture shader. Strengths of 0 skip that step. */
++internal data class PictureShaderValues(
++    val sharpen: Float = 0f,
++    val denoise: Float = 0f,
++    val deband: Float = 0f,
++    val gamma: Float = 1f,
++    val brightness: Float = 0f,
++    val contrast: Float = 0f,
++    val saturation: Float = 0f,
++    val thin: Float = 0f,
++    val dxSharpen: Float = 0f,
++)
++
++/** Shared between [ExoPictureEffects] (writes) and the GL thread (reads every frame). */
++internal class PictureShaderParams {
++    @Volatile
++    var values: PictureShaderValues = PictureShaderValues()
++}
++
++/** Sharpen, denoise, deband and gamma in one pass. The strengths come live from [params]. */
++internal class PictureShaderEffect(private val params: PictureShaderParams) : GlEffect {
+     override fun toGlShaderProgram(context: Context, useHdr: Boolean): GlShaderProgram =
+-        PictureShaderProgram(useHdr, sharpen, denoise, deband, gamma, brightness, contrast, saturation, thin, dxSharpen)
++        PictureShaderProgram(useHdr, params)
+ }
+ 
+ /** Tallest frame the fused picture shader runs on; taller video is scaled down to this first. */
+@@ -293,15 +324,7 @@ private const val MAX_EFFECT_HEIGHT = 1080
+ 
+ private class PictureShaderProgram(
+     useHdr: Boolean,
+-    private val sharpen: Float,
+-    private val denoise: Float,
+-    private val deband: Float,
+-    private val gamma: Float,
+-    private val brightness: Float,
+-    private val contrast: Float,
+-    private val saturation: Float,
+-    private val thin: Float,
+-    private val dxSharpen: Float,
++    private val params: PictureShaderParams,
+ ) : BaseGlShaderProgram(useHdr, 1) {
+     private val glProgram: GlProgram
+ 
+@@ -327,15 +350,16 @@ private class PictureShaderProgram(
+         try {
+             glProgram.use()
+             glProgram.setSamplerTexIdUniform("uTexSampler", inputTexId, 0)
+-            glProgram.setFloatUniform("uSharpen", sharpen)
+-            glProgram.setFloatUniform("uDenoise", denoise)
+-            glProgram.setFloatUniform("uDeband", deband)
+-            glProgram.setFloatUniform("uGamma", gamma)
+-            glProgram.setFloatUniform("uBrightness", brightness)
+-            glProgram.setFloatUniform("uContrast", contrast)
+-            glProgram.setFloatUniform("uSaturation", saturation)
+-            glProgram.setFloatUniform("uThin", thin)
+-            glProgram.setFloatUniform("uDxSharpen", dxSharpen)
++            val v = params.values
++            glProgram.setFloatUniform("uSharpen", v.sharpen)
++            glProgram.setFloatUniform("uDenoise", v.denoise)
++            glProgram.setFloatUniform("uDeband", v.deband)
++            glProgram.setFloatUniform("uGamma", v.gamma)
++            glProgram.setFloatUniform("uBrightness", v.brightness)
++            glProgram.setFloatUniform("uContrast", v.contrast)
++            glProgram.setFloatUniform("uSaturation", v.saturation)
++            glProgram.setFloatUniform("uThin", v.thin)
++            glProgram.setFloatUniform("uDxSharpen", v.dxSharpen)
+             glProgram.bindAttributesAndUniforms()
+             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+         } catch (e: GlUtil.GlException) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutomaticSubtitleSync.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutomaticSubtitleSync.kt
+index 27031a5ee..58b11269c 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutomaticSubtitleSync.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutomaticSubtitleSync.kt
+@@ -1,11 +1,14 @@
+ package com.nuvio.tv.ui.screens.player.autosync
+ 
++import android.os.Process
+ import android.os.SystemClock
+ import androidx.media3.common.C
+ import com.nuvio.tv.ui.screens.player.SubtitleSyncCue
+ import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.CoroutineDispatcher
+ import kotlinx.coroutines.Deferred
+ import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.asCoroutineDispatcher
+ import kotlinx.coroutines.async
+ import kotlinx.coroutines.awaitAll
+ import kotlinx.coroutines.currentCoroutineContext
+@@ -17,6 +20,7 @@ import kotlinx.coroutines.sync.Semaphore
+ import kotlinx.coroutines.sync.withPermit
+ import kotlinx.coroutines.withContext
+ import kotlinx.coroutines.withTimeoutOrNull
++import java.util.concurrent.Executors
+ import kotlin.math.abs
+ import kotlin.math.exp
+ import kotlin.math.roundToLong
+@@ -30,7 +34,14 @@ import kotlin.math.roundToLong
+  * transform and runs cue/group DP retiming.
+  */
+ internal object AutomaticSubtitleSync {
+-    internal val autoSyncDispatcher = Dispatchers.Default.limitedParallelism(2)
++    // Matching runs on two background-priority threads, so it never competes with the video decoder, the GL
++    // picture effects or the UI thread for CPU time while a title plays.
++    internal val autoSyncDispatcher: CoroutineDispatcher = Executors.newFixedThreadPool(2) { task ->
++        Thread({
++            runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND) }
++            task.run()
++        }, "auto-sync").apply { isDaemon = true }
++    }.asCoroutineDispatcher()
+ 
+     private const val MIN_SELECTED_CUES = 1
+     private const val MAX_LOGGED_CUE_SAMPLES = 20
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutHomeSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutHomeSettings.kt
+index b0210c348..02d85e2be 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutHomeSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutHomeSettings.kt
+@@ -90,16 +90,6 @@ internal fun LayoutHomeLayoutSection(
+         }
+     )
+ 
+-    // Nuvio fork: Smart Highlights rail on home (auto-hides when it has nothing to show).
+-    SettingsToggleRow(
+-        title = stringResource(R.string.layout_smart_highlights),
+-        subtitle = stringResource(R.string.layout_smart_highlights_sub),
+-        checked = uiState.smartHighlightsEnabled,
+-        onToggle = {
+-            onEvent(LayoutSettingsEvent.SetSmartHighlightsEnabled(!uiState.smartHighlightsEnabled))
+-        }
+-    )
+-
+     if (uiState.selectedLayout == HomeLayout.MODERN) {
+         SettingsToggleRow(
+             title = stringResource(R.string.layout_fullscreen_hero_backdrop),
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/LiveTvSubtitleStyle.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/LiveTvSubtitleStyle.kt
+new file mode 100644
+index 000000000..67fab2e5b
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/LiveTvSubtitleStyle.kt
+@@ -0,0 +1,88 @@
++package com.nuvio.tv.ui.screens.tvchannels.components
++
++import android.content.Context
++import android.graphics.Color as AndroidColor
++import android.graphics.Typeface
++import android.util.TypedValue
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.State
++import androidx.compose.runtime.produceState
++import androidx.compose.ui.platform.LocalContext
++import androidx.media3.ui.CaptionStyleCompat
++import androidx.media3.ui.PlayerView
++import com.nuvio.tv.data.local.PlayerSettingsDataStore
++import com.nuvio.tv.data.local.SubtitleStyleSettings
++import com.nuvio.tv.reshaped.subtitlefont.SubtitleFontStore
++import com.nuvio.tv.ui.screens.player.TvForkPlayerPrefs
++import dagger.hilt.EntryPoint
++import dagger.hilt.InstallIn
++import dagger.hilt.android.EntryPointAccessors
++import dagger.hilt.components.SingletonComponent
++
++/**
++ * Live TV subtitles follow the main player's subtitle settings (size, font, colours, outline or shadow,
++ * background, position), so a channel's captions look the same as a movie's instead of ExoPlayer's
++ * default white text on a black box.
++ */
++@EntryPoint
++@InstallIn(SingletonComponent::class)
++internal interface LiveTvSubtitleStyleEntryPoint {
++    fun playerSettingsDataStore(): PlayerSettingsDataStore
++}
++
++/** Subtitle style from the main player settings, updated live; null until the first read. */
++@Composable
++internal fun rememberLiveTvSubtitleStyle(): State<SubtitleStyleSettings?> {
++    val context = LocalContext.current.applicationContext
++    return produceState<SubtitleStyleSettings?>(initialValue = null, context) {
++        val store = runCatching {
++            EntryPointAccessors.fromApplication(context, LiveTvSubtitleStyleEntryPoint::class.java)
++                .playerSettingsDataStore()
++        }.getOrNull() ?: return@produceState
++        store.playerSettings.collect { value = it.subtitleStyle }
++    }
++}
++
++private const val LIVE_TV_SUBTITLE_BASE_SP = 24f
++
++internal fun PlayerView.applyLiveTvSubtitleStyle(style: SubtitleStyleSettings) {
++    val subView = subtitleView ?: return
++    subView.apply {
++        setFixedTextSize(TypedValue.COMPLEX_UNIT_SP, LIVE_TV_SUBTITLE_BASE_SP * (style.size / 100f))
++        setApplyEmbeddedFontSizes(false)
++        setApplyEmbeddedStyles(true)
++
++        val typeface = SubtitleFontStore.exoTypeface(context, style.bold)
++            ?: if (style.bold) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
++
++        val shadow = if (style.outlineEnabled) 0 else TvForkPlayerPrefs.subtitleShadow
++        val edgeType = when {
++            style.outlineEnabled -> CaptionStyleCompat.EDGE_TYPE_OUTLINE
++            shadow > 0 -> CaptionStyleCompat.EDGE_TYPE_DROP_SHADOW
++            else -> CaptionStyleCompat.EDGE_TYPE_NONE
++        }
++        val edgeColor = when (shadow) {
++            1 -> AndroidColor.argb(140, 0, 0, 0)
++            2 -> AndroidColor.BLACK
++            else -> style.outlineColor
++        }
++        setStyle(
++            CaptionStyleCompat(
++                style.textColor,
++                style.backgroundColor,
++                AndroidColor.TRANSPARENT,
++                edgeType,
++                edgeColor,
++                typeface,
++            )
++        )
++
++        val bottomPaddingFraction = (0.06f + (style.verticalOffset / 250f)).coerceIn(0f, 0.4f)
++        val applyPosition = {
++            val extraPadding = (height * (style.verticalOffset / 400f)).toInt().coerceAtLeast(0)
++            setPadding(paddingLeft, paddingTop, paddingRight, extraPadding)
++            setBottomPaddingFraction(bottomPaddingFraction)
++        }
++        if (height > 0) applyPosition() else post { applyPosition() }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
+index 94a1ba966..84a544474 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
+@@ -42,6 +42,8 @@ import com.nuvio.tv.core.player.TvLiveMediaSourceFactory
+ import com.nuvio.tv.ui.components.LoadingIndicator
+ import com.nuvio.tv.ui.screens.player.AspectMode
+ import com.nuvio.tv.ui.screens.player.BlackBarTracker
++import com.nuvio.tv.ui.screens.player.ExoPictureEffects
++import com.nuvio.tv.ui.screens.player.PictureState
+ import com.nuvio.tv.ui.screens.player.CustomStretchMemory
+ import com.nuvio.tv.ui.screens.player.VideoContentRect
+ import com.nuvio.tv.ui.screens.player.addExoAspectLayoutChangeListener
+@@ -95,6 +97,26 @@ fun TvChannelPreviewPlayer(
+     }
+     var playerView by remember { mutableStateOf<PlayerView?>(null) }
+ 
++    // Subtitles use the main player's subtitle settings, kept in sync while the settings change.
++    val subtitleStyle by rememberLiveTvSubtitleStyle()
++    LaunchedEffect(playerView, subtitleStyle) {
++        val view = playerView ?: return@LaunchedEffect
++        val style = subtitleStyle ?: return@LaunchedEffect
++        runCatching { view.applyLiveTvSubtitleStyle(style) }
++    }
++
++    // Smart Enhance is always on for Live TV, like Custom Stretch: a light brightness, contrast and
++    // saturation lift in the shared picture shader. The manual picture panel is not used here.
++    DisposableEffect(player) {
++        val activePlayer = player ?: return@DisposableEffect onDispose {}
++        val effects = ExoPictureEffects(activePlayer, autoEnhance = false)
++        effects.apply(PictureState(smartEnhance = true))
++        onDispose {
++            effects.release()
++            runCatching { activePlayer.setVideoEffects(emptyList()) }
++        }
++    }
++
+     // Live TV always plays with Custom Stretch: the picture area (without baked-in black bars)
+     // is stretched over the whole player, in the preview and in fullscreen.
+     DisposableEffect(playerView, player) {
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
+index 368faf0bc..037debf63 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
+@@ -23,6 +23,8 @@ import kotlinx.coroutines.delay
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.flow.distinctUntilChanged
++import kotlinx.coroutines.flow.map
+ import kotlinx.coroutines.flow.update
+ import kotlinx.coroutines.isActive
+ import kotlinx.coroutines.launch
+@@ -117,7 +119,9 @@ class YouTubeViewModel @Inject constructor(
+         const val TAG = "YouTubeVM"
+         const val MAX_CLIENT_SWITCHES = 8
+         const val PREFETCH_DELAY_MS = 100L
+-        const val PREFETCH_AHEAD = 2
++        const val PREFETCH_AHEAD = 3
++        const val WARM_FIRST_VIDEOS = 2
++        const val WARM_START_DELAY_MS = 400L
+         const val MAX_CACHED = 24
+         /** How much of a video counts as watched for hiding it. */
+         const val WATCHED_PERCENT = 90
+@@ -146,7 +150,22 @@ class YouTubeViewModel @Inject constructor(
+ 
+     val canGoBack: Boolean get() = backStack.isNotEmpty()
+ 
+-    init { selectTab(YouTubeSettings.lastTab(context)) }
++    init {
++        selectTab(YouTubeSettings.lastTab(context))
++        // The first videos of every feed are the likeliest first click, so their streams are looked up as
++        // soon as the feed shows, before any card is focused. Shorts are skipped: the Shorts player does its own.
++        viewModelScope.launch {
++            _state.map { s ->
++                (s.rows.asSequence().flatMap { it.items.asSequence() } + s.grid.asSequence())
++                    .filter { it.kind == YtKind.VIDEO && !it.isLive && it.videoId != null }
++                    .take(WARM_FIRST_VIDEOS).toList()
++            }.distinctUntilChanged { a, b -> a.map { it.videoId } == b.map { it.videoId } }
++                .collect { first ->
++                    delay(WARM_START_DELAY_MS)
++                    first.forEach { v -> if (v.videoId?.let { resolved[it]?.isFresh } != true) lookup(v).await() }
++                }
++        }
++    }
+ 
+     private var screenOpenedBefore = false
+ 
