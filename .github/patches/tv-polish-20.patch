@@ -1,3 +1,50 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/TvChannelPreviewPlayerPool.kt b/app/src/main/java/com/nuvio/tv/core/player/TvChannelPreviewPlayerPool.kt
+index 7448fe351..c0cf4254c 100644
+--- a/app/src/main/java/com/nuvio/tv/core/player/TvChannelPreviewPlayerPool.kt
++++ b/app/src/main/java/com/nuvio/tv/core/player/TvChannelPreviewPlayerPool.kt
+@@ -42,7 +42,25 @@ class TvChannelPreviewPlayerPool @Inject constructor(
+     private val yielded = AtomicBoolean(false)
+     private val released = AtomicBoolean(false)
+ 
++    /** Stream key of the media now loaded in the shared player; lets the panel and fullscreen reuse it. */
++    @Volatile
++    var loadedKey: String? = null
++
++    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
++    private val deferredStop = Runnable { stop() }
++
++    /** Stop shortly later: a panel/fullscreen switch re-acquires the player first and cancels this. */
++    fun stopDeferred() {
++        mainHandler.removeCallbacks(deferredStop)
++        mainHandler.postDelayed(deferredStop, 1500L)
++    }
++
++    fun cancelDeferredStop() {
++        mainHandler.removeCallbacks(deferredStop)
++    }
++
+     fun acquire(): ExoPlayer? {
++        mainHandler.removeCallbacks(deferredStop)
+         if (released.get()) return null
+         if (yielded.get()) {
+             reclaim()
+@@ -51,6 +69,8 @@ class TvChannelPreviewPlayerPool @Inject constructor(
+     }
+ 
+     fun stop() {
++        mainHandler.removeCallbacks(deferredStop)
++        loadedKey = null
+         ForkStability.note("live tv player stop")
+         _player?.let { player ->
+             runCatching {
+@@ -65,6 +85,7 @@ class TvChannelPreviewPlayerPool @Inject constructor(
+         if (yielded.compareAndSet(false, true)) {
+             Log.d(TAG, "Yielding TV preview player to free hardware decoders")
+             ForkStability.note("live tv player yield")
++            loadedKey = null
+             _player?.let { player ->
+                 runCatching { player.stop() }
+                 runCatching { player.clearMediaItems() }
 diff --git a/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt
 index ba392256a..0e3b613cb 100644
 --- a/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt
@@ -650,7 +697,7 @@ index b0210c348..02d85e2be 100644
          SettingsToggleRow(
              title = stringResource(R.string.layout_fullscreen_hero_backdrop),
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
-index f5b6be7a6..3ea84b0ea 100644
+index f5b6be7a6..51443154e 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
 @@ -74,6 +74,7 @@ import androidx.compose.runtime.rememberCoroutineScope
@@ -661,29 +708,25 @@ index f5b6be7a6..3ea84b0ea 100644
  import kotlinx.coroutines.launch
  import androidx.compose.ui.Alignment
  import androidx.compose.ui.Modifier
-@@ -330,6 +331,33 @@ fun TvChannelsScreen(
+@@ -330,6 +331,29 @@ fun TvChannelsScreen(
          }
      }
  
 +    // Leaving the fullscreen player disposes the whole list screen, so focus would fall back to the
 +    // first control (the mic). Put it back on the preview video once the panel is composed again.
 +    var wasFullscreen by remember { mutableStateOf(false) }
++    var pendingScrollKey by rememberSaveable { mutableStateOf<String?>(null) }
 +    LaunchedEffect(state.isFullscreen) {
 +        if (state.isFullscreen) {
 +            wasFullscreen = true
 +        } else if (wasFullscreen) {
 +            wasFullscreen = false
-+            // The channel may have been changed in the player: bring the list to it.
++            // The channel may have been changed in the player: bring the list to it. A channel outside
++            // the current category switches the list to "All"; the scroll runs inside the composed list.
 +            val key = state.previewChannel?.stableKey()
-+            val idx = state.filteredChannels.indexOfFirst { it.stableKey() == key }
-+            if (idx >= 0) {
-+                lastFocusedChannelIndex = idx
-+                // The list is only measured again once the screen is back: wait for it, then scroll.
-+                kotlinx.coroutines.withTimeoutOrNull(2000L) {
-+                    androidx.compose.runtime.snapshotFlow { listState.layoutInfo.totalItemsCount }
-+                        .first { it > 0 }
-+                }
-+                runCatching { listState.scrollToItem((idx - 1).coerceAtLeast(0)) }
++            if (key != null) {
++                if (state.filteredChannels.none { it.stableKey() == key }) viewModel.selectCategory("All")
++                pendingScrollKey = key
 +            }
 +            repeat(15) {
 +                kotlinx.coroutines.delay(80L)
@@ -695,7 +738,7 @@ index f5b6be7a6..3ea84b0ea 100644
      // YouTube videos are ordinary videos, not live channels: open them in the main player
      // (seek, quality, audio boost) instead of the live-TV fullscreen.
      val youTubeChannel = state.previewChannel?.takeIf { it.type.equals("youtube", ignoreCase = true) }
-@@ -1069,6 +1097,11 @@ fun TvChannelsScreen(
+@@ -1069,6 +1093,11 @@ fun TvChannelsScreen(
  
              Spacer(modifier = Modifier.height(12.dp))
  
@@ -707,7 +750,7 @@ index f5b6be7a6..3ea84b0ea 100644
              // Linha 4: Área Split-Screen: Lista à Esquerda e Pré-visualizador à Direita
              Row(
                  modifier = Modifier
-@@ -1079,7 +1112,7 @@ fun TvChannelsScreen(
+@@ -1079,7 +1108,7 @@ fun TvChannelsScreen(
                  // Coluna da Esquerda: Lista de Canais
                  Box(
                      modifier = Modifier
@@ -716,7 +759,23 @@ index f5b6be7a6..3ea84b0ea 100644
                          .fillMaxHeight()
                  ) {
                      when {
-@@ -1229,6 +1262,7 @@ fun TvChannelsScreen(
+@@ -1171,6 +1200,15 @@ fun TvChannelsScreen(
+                         }
+ 
+                         else -> {
++                            LaunchedEffect(pendingScrollKey, state.filteredChannels) {
++                                val key = pendingScrollKey ?: return@LaunchedEffect
++                                val idx = state.filteredChannels.indexOfFirst { it.stableKey() == key }
++                                if (idx < 0) return@LaunchedEffect
++                                kotlinx.coroutines.delay(120L)
++                                lastFocusedChannelIndex = idx
++                                runCatching { listState.scrollToItem((idx - 1).coerceAtLeast(0)) }
++                                pendingScrollKey = null
++                            }
+                             LazyColumn(
+                                 state = listState,
+                                 modifier = Modifier
+@@ -1229,6 +1267,7 @@ fun TvChannelsScreen(
                                              channel = channel,
                                              isSelected = isSelected,
                                              isPlaying = isPlaying,
@@ -724,7 +783,7 @@ index f5b6be7a6..3ea84b0ea 100644
                                              modifier = itemModifier,
                                              onFocused = onItemFocused,
                                              onClick = onItemClick,
-@@ -1276,10 +1310,11 @@ fun TvChannelsScreen(
+@@ -1276,10 +1315,11 @@ fun TvChannelsScreen(
                      onStreamSelected = { idx ->
                          viewModel.selectStreamIndex(idx)
                      },
@@ -1443,7 +1502,7 @@ index 1c08693a3..cc89a6dfe 100644
      }
  }
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
-index 94a1ba966..7d588df64 100644
+index 94a1ba966..01d1dce3a 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
 @@ -42,6 +42,8 @@ import com.nuvio.tv.core.player.TvLiveMediaSourceFactory
@@ -1486,7 +1545,17 @@ index 94a1ba966..7d588df64 100644
      // Live TV always plays with Custom Stretch: the picture area (without baked-in black bars)
      // is stretched over the whole player, in the preview and in fullscreen.
      DisposableEffect(playerView, player) {
-@@ -208,6 +234,7 @@ fun TvChannelPreviewPlayer(
+@@ -196,7 +222,8 @@ fun TvChannelPreviewPlayer(
+ 
+         onDispose {
+             lifecycleOwner.lifecycle.removeObserver(observer)
+-            playerPool.stop()
++            // Deferred: switching between the panel and fullscreen re-acquires the same player and keeps the stream.
++            playerPool.stopDeferred()
+         }
+     }
+ 
+@@ -208,6 +235,7 @@ fun TvChannelPreviewPlayer(
                  hasRenderedFirstFrame = true
                  isBuffering = false
                  currentOnFirstFrame()
@@ -1494,6 +1563,44 @@ index 94a1ba966..7d588df64 100644
              }
  
              override fun onPlaybackStateChanged(playbackState: Int) {
+@@ -270,6 +298,7 @@ fun TvChannelPreviewPlayer(
+ 
+     LaunchedEffect(player, streamUrl, headers, isPlaying, isMuted, retryNonce) {
+         val activePlayer = player ?: return@LaunchedEffect
++        playerPool.cancelDeferredStop()
+         if (retryNonce > 0) {
+             val wait = (1_000L * idleRetryCount).coerceIn(1_000L, 8_000L)
+             com.nuvio.tv.core.diagnostics.ForkStability.note("live tv player retry #$retryNonce in ${wait}ms")
+@@ -277,9 +306,20 @@ fun TvChannelPreviewPlayer(
+         }
+         activePlayer.volume = if (isMuted) 0f else 1f
+ 
+-        if (isPlaying && !streamUrl.isNullOrBlank()) {
++        val reusable = retryNonce == 0 && isPlaying && !streamUrl.isNullOrBlank() &&
++            playerPool.loadedKey == streamUrl && activePlayer.mediaItemCount > 0 &&
++            activePlayer.playbackState != Player.STATE_IDLE && activePlayer.playbackState != Player.STATE_ENDED
++        if (reusable) {
++            // Same channel already loaded (panel <-> fullscreen): keep playing, no new load.
++            activePlayer.playWhenReady = true
++            val ready = activePlayer.playbackState == Player.STATE_READY
++            hasRenderedFirstFrame = ready
++            isBuffering = !ready
++            if (ready) effectsArmed = true
++        } else if (isPlaying && !streamUrl.isNullOrBlank()) {
+             hasRenderedFirstFrame = false
+             isBuffering = true
++            playerPool.loadedKey = streamUrl
+             runCatching {
+                 val mediaSource = TvLiveMediaSourceFactory.createMediaSource(
+                     context = context,
+@@ -298,6 +338,7 @@ fun TvChannelPreviewPlayer(
+         } else {
+             hasRenderedFirstFrame = false
+             isBuffering = false
++            playerPool.loadedKey = null
+             activePlayer.playWhenReady = false
+             activePlayer.stop()
+             activePlayer.clearMediaItems()
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelZappingDrawer.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelZappingDrawer.kt
 index f063b6aea..f59c3aaf9 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelZappingDrawer.kt
