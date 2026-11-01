@@ -1,0 +1,153 @@
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
+index 998426356..d9a2f4eb8 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
+@@ -43,6 +43,9 @@ object ForkTvPreferences {
+     val homeUpNextTonight = ForkTvBoolPref("home_up_next_tonight", true)
+     val homeAiringWeek = ForkTvBoolPref("home_airing_week", true)
+     val homeFinishSeries = ForkTvBoolPref("home_finish_series", true)
++    val homeWatchLater = ForkTvBoolPref("home_watch_later", true)
++    val homeTop10 = ForkTvBoolPref("home_top10", true)
++    val homeBecauseWatched = ForkTvBoolPref("home_because_watched", true)
+     val nuvioRead = ForkTvBoolPref("nuvio_read", false)
+     val catalogAccentUnderline = ForkTvBoolPref("catalog_accent_underline", false)
+     val skipFeedbackPrompt = ForkTvBoolPref("skip_feedback_prompt", true)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/ForkTvP22Rows.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/ForkTvP22Rows.kt
+new file mode 100644
+index 000000000..eb62e5da8
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/ForkTvP22Rows.kt
+@@ -0,0 +1,93 @@
++package com.nuvio.tv.ui.screens.home
++
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.platform.LocalContext
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import com.nuvio.tv.core.network.NetworkResult
++import com.nuvio.tv.data.repository.ForkTvPreferences
++import com.nuvio.tv.domain.model.CatalogRow
++import com.nuvio.tv.domain.model.ContentType
++import com.nuvio.tv.domain.model.MetaPreview
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.withTimeoutOrNull
++
++private fun p22Row(id: String, name: String, type: ContentType, items: List<MetaPreview>) = CatalogRow(
++    addonId = "fork.library",
++    addonName = "Library",
++    addonBaseUrl = "fork://library",
++    catalogId = id,
++    catalogName = name,
++    type = type,
++    rawType = if (type == ContentType.SERIES) "series" else "movie",
++    items = items,
++    isLoading = false,
++    hasMore = false,
++)
++
++/**
++ * Nuvio fork: Home rows built from what is already loaded.
++ * Watch later = saved titles that were never started. Top 10 = the first ten cards of the first
++ * loaded catalog. Because you watched = cards from the loaded catalogs that share genres with the
++ * last title you finished.
++ */
++@Composable
++internal fun rememberForkP22Rows(viewModel: HomeViewModel, catalogRows: List<CatalogRow>): List<CatalogRow> {
++    val context = LocalContext.current
++    ForkTvPreferences.homeWatchLater.ensureLoaded(context)
++    ForkTvPreferences.homeTop10.ensureLoaded(context)
++    ForkTvPreferences.homeBecauseWatched.ensureLoaded(context)
++    val watchLaterOn by ForkTvPreferences.homeWatchLater.value.collectAsStateWithLifecycle()
++    val top10On by ForkTvPreferences.homeTop10.value.collectAsStateWithLifecycle()
++    val becauseOn by ForkTvPreferences.homeBecauseWatched.value.collectAsStateWithLifecycle()
++    val library by viewModel.libraryRepository.libraryItems.collectAsStateWithLifecycle(initialValue = emptyList())
++    val progress by viewModel.watchProgressRepository.allProgress.collectAsStateWithLifecycle(initialValue = emptyList())
++
++    val realRows = catalogRows.filter { !it.addonId.startsWith("fork.") && !it.isLoading && it.items.isNotEmpty() }
++
++    val watchLater = remember(library, progress, watchLaterOn) {
++        if (!watchLaterOn) return@remember emptyList<MetaPreview>()
++        val started = progress.map { it.contentId }.toSet()
++        library.filter { it.id !in started }.sortedByDescending { it.listedAt }.take(20).map { it.toMetaPreview() }
++    }
++    val top10 = remember(realRows.size, top10On) {
++        if (!top10On) null else realRows.firstOrNull { it.items.size >= 10 }
++    }
++
++    val lastDone = progress.filter { it.isCompleted() }.maxByOrNull { it.lastWatched }
++    var because by remember { mutableStateOf<List<MetaPreview>>(emptyList()) }
++    val loadedItems = realRows.sumOf { it.items.size }
++    LaunchedEffect(lastDone?.contentId, loadedItems > 0, becauseOn) {
++        if (!becauseOn || lastDone == null || realRows.isEmpty()) {
++            because = emptyList()
++            return@LaunchedEffect
++        }
++        val meta = withTimeoutOrNull(15_000L) {
++            (viewModel.metaRepository.getMetaFromPrimaryAddon(lastDone.contentType, lastDone.contentId)
++                .first { it !is NetworkResult.Loading } as? NetworkResult.Success)?.data
++        } ?: return@LaunchedEffect
++        val genres = meta.genres.map { it.lowercase() }.toSet()
++        if (genres.isEmpty()) return@LaunchedEffect
++        val seen = progress.map { it.contentId }.toSet()
++        because = realRows.flatMap { it.items }
++            .distinctBy { it.id }
++            .filter { it.id != lastDone.contentId && it.id !in seen }
++            .map { item -> item to item.genres.count { it.lowercase() in genres } }
++            .filter { it.second > 0 }
++            .sortedByDescending { it.second }
++            .take(20)
++            .map { it.first }
++    }
++
++    return buildList {
++        if (top10 != null) add(p22Row("fork_top10", "Top 10 in ${top10.catalogName}", top10.type, top10.items.take(10)))
++        if (becauseOn && because.isNotEmpty() && lastDone != null) {
++            add(p22Row("fork_because_watched", "Because you watched ${lastDone.name}", because.first().type, because))
++        }
++        if (watchLater.isNotEmpty()) add(p22Row("fork_watch_later", "Watch later", watchLater.first().type, watchLater))
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeScreen.kt
+index 37b36160f..1dda897c7 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeScreen.kt
+@@ -101,7 +101,8 @@ fun HomeScreen(
+ ) {
+     val baseUiState by viewModel.uiState.collectAsStateWithLifecycle()
+     val forkLibraryRows = rememberForkLibraryHomeRows(viewModel)
+-    val uiState = remember(baseUiState, forkLibraryRows) { baseUiState.withForkRows(forkLibraryRows) }
++    val forkP22Rows = rememberForkP22Rows(viewModel, baseUiState.catalogRows)
++    val uiState = remember(baseUiState, forkLibraryRows, forkP22Rows) { baseUiState.withForkRows(forkLibraryRows + forkP22Rows) }
+     // Nuvio fork: Smart Highlights picks — empty hides the rail everywhere.
+     val smartHighlightsPicks by viewModel.smartHighlights.collectAsStateWithLifecycle()
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
+index 8e4716227..7fe69068d 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
+@@ -118,6 +118,21 @@ internal fun forkHomeLibraryRowsRows() {
+         subtitle = "Shows you have mostly watched but not finished.",
+         pref = ForkTvPreferences.homeFinishSeries
+     )
++    forkTvToggleRow(
++        title = "Home row: Watch later",
++        subtitle = "Saved titles you have not started yet.",
++        pref = ForkTvPreferences.homeWatchLater
++    )
++    forkTvToggleRow(
++        title = "Home row: Top 10",
++        subtitle = "The first ten titles of your first catalog.",
++        pref = ForkTvPreferences.homeTop10
++    )
++    forkTvToggleRow(
++        title = "Home row: Because you watched",
++        subtitle = "Titles from your catalogs that match the last thing you finished.",
++        pref = ForkTvPreferences.homeBecauseWatched
++    )
+     forkTvToggleRow(
+         title = "Nuvio Read card",
+         subtitle = "Show credits, ratings and synopsis in a card on the detail page.",
