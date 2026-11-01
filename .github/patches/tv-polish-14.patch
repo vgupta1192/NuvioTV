@@ -1,0 +1,160 @@
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt
+index 347b0289f..395c9a594 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt
+@@ -417,6 +417,9 @@ object JellyfinRepository {
+             tmdbId = (obj["ProviderIds"] as? JsonObject)?.let { ids ->
+                 ids.string("Tmdb") ?: ids.string("tmdb")
+             }?.takeIf { it.isNotBlank() },
++            tvdbId = (obj["ProviderIds"] as? JsonObject)?.let { ids ->
++                ids.string("Tvdb") ?: ids.string("tvdb")
++            }?.takeIf { it.isNotBlank() },
+         )
+     }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/domain/model/JellyfinModels.kt b/app/src/main/java/com/nuvio/tv/domain/model/JellyfinModels.kt
+index db82d591b..02cdc24fa 100644
+--- a/app/src/main/java/com/nuvio/tv/domain/model/JellyfinModels.kt
++++ b/app/src/main/java/com/nuvio/tv/domain/model/JellyfinModels.kt
+@@ -59,6 +59,7 @@ data class JellyfinItem(
+     val logoTag: String? = null,
+     val imdbId: String? = null,
+     val tmdbId: String? = null,
++    val tvdbId: String? = null,
+ ) {
+     val isSeries: Boolean get() = type.equals("Series", ignoreCase = true)
+     val isEpisode: Boolean get() = type.equals("Episode", ignoreCase = true)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
+index 2593596ff..0e2b12ea6 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
+@@ -15,9 +15,11 @@ import androidx.compose.foundation.layout.aspectRatio
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.heightIn
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.layout.size
+ import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.lazy.LazyColumn
+ import androidx.compose.foundation.lazy.LazyRow
+ import androidx.compose.foundation.lazy.items
+ import androidx.compose.foundation.lazy.rememberLazyListState
+@@ -93,6 +95,7 @@ import com.nuvio.tv.domain.model.Video
+ import androidx.compose.foundation.lazy.LazyListState
+ import androidx.compose.ui.draw.alpha
+ import com.nuvio.tv.ui.screens.detail.HeroContentSection
++import com.nuvio.tv.ui.components.NuvioDialog
+ import com.nuvio.tv.ui.theme.NuvioTheme
+ 
+ /**
+@@ -257,6 +260,10 @@ fun JellyfinDetailsScreen(
+ 
+         var activeTab by remember(item.id) { mutableStateOf<JellyfinTab?>(null) }
+         var sortNewestFirst by remember(item.id) { mutableStateOf(false) }
++        val episodeListState = rememberLazyListState()
++        var goToEpisodeOpen by remember(item.id) { mutableStateOf(false) }
++        val uriHandler = androidx.compose.ui.platform.LocalUriHandler.current
++        val episodeScope = rememberCoroutineScope()
+         val sectionTabs = remember(richMeta.castMembers, ratings.moreLikeThis, ratings.trailers, ratings.episodeImdbRatings, item.isSeries) {
+             buildList {
+                 if (richMeta.castMembers.isNotEmpty()) add(JellyfinTab.PEOPLE)
+@@ -303,6 +310,10 @@ fun JellyfinDetailsScreen(
+                     state = state,
+                     sortNewestFirst = sortNewestFirst,
+                     onToggleSort = { sortNewestFirst = !sortNewestFirst },
++                    onGoToEpisode = { goToEpisodeOpen = true },
++                    onOpenTvdb = item.tvdbId?.let { id ->
++                        { runCatching { uriHandler.openUri("https://thetvdb.com/dereferrer/series/$id") } }
++                    },
+                     modifier = Modifier.padding(top = NuvioTheme.spacing.lg),
+                 )
+             }
+@@ -314,12 +325,32 @@ fun JellyfinDetailsScreen(
+                     JellyfinDetailEpisodes(
+                         state = state,
+                         newestFirst = sortNewestFirst,
++                        listState = episodeListState,
+                         imdbEpisodeRatings = ratings.episodeImdbRatings,
+                         onPlay = onPlay,
+                         modifier = Modifier.padding(top = NuvioTheme.spacing.sm),
+                     )
+                 }
+             }
++            if (goToEpisodeOpen) {
++                val shown = if (sortNewestFirst) state.episodes.asReversed() else state.episodes
++                NuvioDialog(onDismiss = { goToEpisodeOpen = false }, title = "Go to episode", width = 560.dp) {
++                    LazyColumn(
++                        modifier = Modifier.heightIn(max = 380.dp),
++                        verticalArrangement = Arrangement.spacedBy(8.dp),
++                    ) {
++                        items(shown.size) { index ->
++                            val ep = shown[index]
++                            val label = (ep.indexNumber?.let { "E$it" } ?: "#${index + 1}") +
++                                ep.name.takeIf { it.isNotBlank() }?.let { "  \u00b7  $it" }.orEmpty()
++                            JellyfinPillChip(label = label, isSelected = false, onClick = {
++                                goToEpisodeOpen = false
++                                episodeScope.launch { episodeListState.animateScrollToItem(index) }
++                            })
++                        }
++                    }
++                }
++            }
+             if (sectionTabs.isNotEmpty() && shownTab != null) {
+                 JellyfinTabRow(
+                     tabs = sectionTabs,
+@@ -474,6 +505,8 @@ private fun JellyfinSeasonsChips(
+     state: com.nuvio.tv.domain.model.JellyfinUiState,
+     sortNewestFirst: Boolean,
+     onToggleSort: () -> Unit,
++    onGoToEpisode: () -> Unit,
++    onOpenTvdb: (() -> Unit)?,
+     modifier: Modifier = Modifier,
+ ) {
+     Column(modifier = modifier.padding(horizontal = NuvioTheme.spacing.xxxl)) {
+@@ -495,6 +528,8 @@ private fun JellyfinSeasonsChips(
+                 isSelected = false,
+                 onClick = onToggleSort,
+             )
++            JellyfinPillChip(label = "Go to episode", isSelected = false, onClick = onGoToEpisode)
++            if (onOpenTvdb != null) JellyfinPillChip(label = "TVDB", isSelected = false, onClick = onOpenTvdb)
+         }
+     }
+ }
+@@ -528,6 +563,7 @@ internal fun JellyfinPillChip(
+ private fun JellyfinDetailEpisodes(
+     state: com.nuvio.tv.domain.model.JellyfinUiState,
+     newestFirst: Boolean,
++    listState: LazyListState,
+     imdbEpisodeRatings: Map<Pair<Int, Int>, Double>,
+     onPlay: (JellyfinItem) -> Unit,
+     modifier: Modifier = Modifier,
+@@ -556,6 +592,7 @@ private fun JellyfinDetailEpisodes(
+             )
+ 
+             else -> LazyRow(
++                state = listState,
+                 horizontalArrangement = Arrangement.spacedBy(16.dp),
+                 contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = NuvioTheme.spacing.xxxl),
+             ) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinScreen.kt
+index 128a7911a..91a5333f2 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinScreen.kt
+@@ -58,6 +58,7 @@ import androidx.compose.ui.draw.alpha
+ import androidx.compose.ui.draw.clip
+ import androidx.compose.ui.focus.FocusRequester
+ import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.focus.focusRestorer
+ import androidx.compose.ui.focus.onFocusChanged
+ import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.graphics.graphicsLayer
+@@ -856,7 +857,7 @@ private fun JellyfinBrowseColumn(
+ 
+                 else -> LazyVerticalGrid(
+                     columns = GridCells.Adaptive(minSize = 132.dp),
+-                    modifier = Modifier.fillMaxSize(),
++                    modifier = Modifier.fillMaxSize().focusRestorer(),
+                     horizontalArrangement = Arrangement.spacedBy(10.dp),
+                     verticalArrangement = Arrangement.spacedBy(12.dp),
+                 ) {
