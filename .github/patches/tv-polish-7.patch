@@ -1,0 +1,558 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
+index 04af19c61..0529f6f48 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
+@@ -1419,6 +1419,16 @@ private fun PlaybackNavHost(
+                 onBack = { navController.popBackStack() },
+                 onNavigateToCastDetail = { personId, personName, preferCrew ->
+                     navController.navigate(Screen.CastDetail.createRoute(personId, personName, preferCrew))
++                },
++                onNavigateToDetail = { itemId, itemType ->
++                    navController.navigate(
++                        Screen.Detail.createRoute(
++                            itemId = itemId,
++                            itemType = itemType,
++                            addonBaseUrl = null,
++                            heroBackdropUrl = null
++                        )
++                    )
+                 }
+             )
+         }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
+index 18eb1622f..f2dbe1a7d 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
+@@ -78,6 +78,16 @@ import com.nuvio.tv.domain.model.MetaCastMember
+ import com.nuvio.tv.domain.model.toMeta
+ import com.nuvio.tv.ui.components.LoadingIndicator
+ import com.nuvio.tv.ui.screens.detail.CastSection
++import com.nuvio.tv.ui.screens.detail.EpisodeRatingsSection
++import com.nuvio.tv.ui.screens.detail.MoreLikeThisSection
++import com.nuvio.tv.ui.screens.detail.SharedTrailerOverlay
++import com.nuvio.tv.ui.screens.detail.TrailerSection
++import com.nuvio.tv.core.tmdb.TmdbEnrichment
++import com.nuvio.tv.domain.model.Meta
++import com.nuvio.tv.domain.model.MetaTrailer
++import com.nuvio.tv.domain.model.Video
++import androidx.compose.foundation.lazy.LazyListState
++import androidx.compose.ui.draw.alpha
+ import com.nuvio.tv.ui.screens.detail.HeroContentSection
+ import com.nuvio.tv.ui.theme.NuvioTheme
+ 
+@@ -93,6 +103,7 @@ fun JellyfinDetailsScreen(
+     onPlay: (JellyfinItem) -> Unit,
+     onBack: () -> Unit,
+     onNavigateToCastDetail: (Int, String, Boolean) -> Unit = { _, _, _ -> },
++    onNavigateToDetail: (String, String) -> Unit = { _, _ -> },
+     ratingsViewModel: JellyfinRatingsViewModel = hiltViewModel(),
+ ) {
+     val state by JellyfinRepository.uiState.collectAsStateWithLifecycle()
+@@ -140,6 +151,13 @@ fun JellyfinDetailsScreen(
+                 }
+         }
+ 
++        val richMeta = remember(meta, ratings.enrichment, ratings.trailers) {
++            mergeTmdbEnrichment(meta, ratings.enrichment, ratings.trailers)
++        }
++        val trailerYear = remember(richMeta.releaseInfo) {
++            richMeta.releaseInfo?.let { Regex("""\b(19|20)\d{2}\b""").find(it)?.value }
++        }
++
+         val playable: JellyfinItem? = when {
+             item.isSeries || item.isFolder ->
+                 state.episodes.firstOrNull { it.resumePositionMs > 0 } ?: state.episodes.firstOrNull()
+@@ -217,6 +235,30 @@ fun JellyfinDetailsScreen(
+                 ),
+         )
+ 
++        Box(
++            modifier = Modifier
++                .matchParentSize()
++                .background(
++                    Brush.radialGradient(
++                        colors = listOf(NuvioTheme.colors.Secondary.copy(alpha = 0.14f), Color.Transparent),
++                        center = androidx.compose.ui.geometry.Offset(1400f, 0f),
++                        radius = 1100f,
++                    ),
++                ),
++        )
++
++        var activeTab by remember(item.id) { mutableStateOf<JellyfinTab?>(null) }
++        var sortNewestFirst by remember(item.id) { mutableStateOf(false) }
++        val sectionTabs = remember(richMeta.castMembers, ratings.moreLikeThis, ratings.trailers, ratings.episodeImdbRatings, item.isSeries) {
++            buildList {
++                if (richMeta.castMembers.isNotEmpty()) add(JellyfinTab.PEOPLE)
++                if (item.isSeries && ratings.episodeImdbRatings.isNotEmpty()) add(JellyfinTab.RATINGS)
++                if (ratings.moreLikeThis.isNotEmpty()) add(JellyfinTab.SIMILAR)
++                if (ratings.trailers.any { !it.ytId.isNullOrBlank() }) add(JellyfinTab.TRAILER)
++            }
++        }
++        val shownTab = activeTab?.takeIf { it in sectionTabs } ?: sectionTabs.firstOrNull()
++
+         Column(
+             modifier = Modifier
+                 .fillMaxSize()
+@@ -224,7 +266,7 @@ fun JellyfinDetailsScreen(
+                 .focusProperties { up = backFocus },
+         ) {
+             HeroContentSection(
+-                meta = meta,
++                meta = richMeta,
+                 nextEpisode = null,
+                 nextToWatch = nextToWatch,
+                 mdbListRatings = ratings.mdbListRatings,
+@@ -239,29 +281,18 @@ fun JellyfinDetailsScreen(
+                 isMovieWatchedPending = false,
+                 onToggleMovieWatched = {},
+                 playButtonFocusRequester = playFocusRequester,
++                trailerAvailable = ratings.trailers.any { !it.ytId.isNullOrBlank() },
++                onTrailerClick = {
++                    ratings.trailers.firstOrNull { !it.ytId.isNullOrBlank() }
++                        ?.let { ratingsViewModel.playTrailer(it, richMeta.name, trailerYear) }
++                },
+             )
+             JellyfinMediaBadgesRow(item = item)
+-            if (meta.castMembers.isNotEmpty()) {
+-                CastSection(
+-                    cast = meta.castMembers,
+-                    listState = rememberLazyListState(),
+-                    title = "People",
+-                    modifier = Modifier.padding(top = NuvioTheme.spacing.lg),
+-                    onCastMemberClick = { member ->
+-                        val preferCrew = member.character.equals("Creator", ignoreCase = true) ||
+-                            member.character.equals("Director", ignoreCase = true) ||
+-                            member.character.equals("Writer", ignoreCase = true)
+-                        castScope.launch {
+-                            val id = member.tmdbId
+-                                ?: JellyfinRepository.searchPersonId(member.name)
+-                            if (id != null) onNavigateToCastDetail(id, member.name, preferCrew)
+-                        }
+-                    },
+-                )
+-            }
+             if (item.isSeries && state.seasons.isNotEmpty()) {
+                 JellyfinSeasonsChips(
+                     state = state,
++                    sortNewestFirst = sortNewestFirst,
++                    onToggleSort = { sortNewestFirst = !sortNewestFirst },
+                     modifier = Modifier.padding(top = NuvioTheme.spacing.lg),
+                 )
+             }
+@@ -272,15 +303,90 @@ fun JellyfinDetailsScreen(
+                 ) {
+                     JellyfinDetailEpisodes(
+                         state = state,
++                        newestFirst = sortNewestFirst,
+                         imdbEpisodeRatings = ratings.episodeImdbRatings,
+                         onPlay = onPlay,
+                         modifier = Modifier.padding(top = NuvioTheme.spacing.sm),
+                     )
+                 }
+             }
++            if (sectionTabs.isNotEmpty() && shownTab != null) {
++                JellyfinTabRow(
++                    tabs = sectionTabs,
++                    active = shownTab,
++                    onSelect = { activeTab = it },
++                    modifier = Modifier.padding(top = NuvioTheme.spacing.xl),
++                )
++                when (shownTab) {
++                    JellyfinTab.PEOPLE -> CastSection(
++                        cast = richMeta.castMembers,
++                        listState = rememberLazyListState(),
++                        title = "",
++                        modifier = Modifier.padding(top = NuvioTheme.spacing.sm),
++                        onCastMemberClick = { member ->
++                            val preferCrew = member.character.equals("Creator", ignoreCase = true) ||
++                                member.character.equals("Director", ignoreCase = true) ||
++                                member.character.equals("Writer", ignoreCase = true)
++                            castScope.launch {
++                                val id = member.tmdbId ?: JellyfinRepository.searchPersonId(member.name)
++                                if (id != null) onNavigateToCastDetail(id, member.name, preferCrew)
++                            }
++                        },
++                    )
++
++                    JellyfinTab.RATINGS -> {
++                        val ratingVideos = remember(ratings.episodeImdbRatings) {
++                            ratings.episodeImdbRatings.keys.sortedWith(compareBy({ it.first }, { it.second })).map { (season, episode) ->
++                                Video(
++                                    id = "$season:$episode",
++                                    title = "S${season}E$episode",
++                                    released = null,
++                                    thumbnail = null,
++                                    season = season,
++                                    episode = episode,
++                                    overview = null,
++                                )
++                            }
++                        }
++                        EpisodeRatingsSection(
++                            episodes = ratingVideos,
++                            ratings = ratings.episodeImdbRatings,
++                            isLoading = false,
++                            error = null,
++                            title = "",
++                        )
++                    }
++
++                    JellyfinTab.SIMILAR -> MoreLikeThisSection(
++                        items = ratings.moreLikeThis,
++                        listState = rememberLazyListState(),
++                        sourceLabel = stringResource(R.string.detail_more_like_this_powered_by_tmdb),
++                        onItemClick = { similar -> onNavigateToDetail(similar.id, similar.apiType) },
++                    )
++
++                    JellyfinTab.TRAILER -> TrailerSection(
++                        trailers = ratings.trailers,
++                        listState = rememberLazyListState(),
++                        onTrailerClick = { trailer -> ratingsViewModel.playTrailer(trailer, richMeta.name, trailerYear) },
++                    )
++                }
++            }
+             Spacer(Modifier.height(NuvioTheme.spacing.xxl))
+         }
+ 
++        ratings.trailerOverlay?.let { overlay ->
++            SharedTrailerOverlay(
++                title = overlay.trailer.name?.takeIf { it.isNotBlank() }
++                    ?: stringResource(R.string.detail_tab_trailer),
++                trailerUrl = overlay.videoUrl,
++                trailerAudioUrl = overlay.audioUrl,
++                isLoading = overlay.isLoading,
++                errorMessage = overlay.error,
++                onDismiss = { ratingsViewModel.dismissTrailer() },
++                onRetry = { ratingsViewModel.playTrailer(overlay.trailer, richMeta.name, trailerYear) },
++            )
++        }
++
+         Button(
+             onClick = onBack,
+             shape = ButtonDefaults.shape(shape = RoundedCornerShape(8.dp)),
+@@ -361,10 +467,16 @@ private fun JellyfinMediaBadgesRow(item: JellyfinItem) {
+ }
+ 
+ @Composable
+-private fun JellyfinSeasonsChips(state: com.nuvio.tv.domain.model.JellyfinUiState, modifier: Modifier = Modifier) {
++private fun JellyfinSeasonsChips(
++    state: com.nuvio.tv.domain.model.JellyfinUiState,
++    sortNewestFirst: Boolean,
++    onToggleSort: () -> Unit,
++    modifier: Modifier = Modifier,
++) {
+     Column(modifier = modifier.padding(horizontal = NuvioTheme.spacing.xxxl)) {
+         Row(
+             horizontalArrangement = Arrangement.spacedBy(8.dp),
++            verticalAlignment = Alignment.CenterVertically,
+             modifier = Modifier.horizontalScroll(rememberScrollState()),
+         ) {
+             state.seasons.forEach { season ->
+@@ -374,6 +486,12 @@ private fun JellyfinSeasonsChips(state: com.nuvio.tv.domain.model.JellyfinUiStat
+                     onClick = { JellyfinRepository.selectSeason(season.id) },
+                 )
+             }
++            Spacer(Modifier.width(8.dp))
++            JellyfinPillChip(
++                label = if (sortNewestFirst) "Sort: Newest first" else "Sort: Default",
++                isSelected = false,
++                onClick = onToggleSort,
++            )
+         }
+     }
+ }
+@@ -406,6 +524,7 @@ internal fun JellyfinPillChip(
+ @Composable
+ private fun JellyfinDetailEpisodes(
+     state: com.nuvio.tv.domain.model.JellyfinUiState,
++    newestFirst: Boolean,
+     imdbEpisodeRatings: Map<Pair<Int, Int>, Double>,
+     onPlay: (JellyfinItem) -> Unit,
+     modifier: Modifier = Modifier,
+@@ -434,10 +553,10 @@ private fun JellyfinDetailEpisodes(
+             )
+ 
+             else -> LazyRow(
+-                horizontalArrangement = Arrangement.spacedBy(12.dp),
++                horizontalArrangement = Arrangement.spacedBy(16.dp),
+                 contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = NuvioTheme.spacing.xxxl),
+             ) {
+-                items(state.episodes, key = { it.id }) { episode ->
++                items(if (newestFirst) state.episodes.asReversed() else state.episodes, key = { it.id }) { episode ->
+                     if (state.selectedDetail?.isFolder == true) {
+                         JellyfinFileRow(episode = episode, onPlay = onPlay)
+                     } else {
+@@ -462,23 +581,23 @@ private fun JellyfinEpisodeCard(
+         LocalForkExtraEpisodeRatings.current.mapNotNull { (name, map) -> map[k]?.takeIf { it > 0.0 }?.let { name to it } }
+     }.orEmpty()
+     var focused by remember { mutableStateOf(false) }
+-    val cardShape = RoundedCornerShape(NuvioTheme.radii.md)
++    val cardShape = RoundedCornerShape(18.dp)
+     val thumbnailUrl = remember(episode.id, episode.imageTag) {
+         JellyfinRepository.posterUrlFor(episode, maxWidth = 480)
+     }
+     Column(
+         modifier = Modifier
+-            .width(268.dp)
++            .width(340.dp)
+             .onFocusChanged { focused = it.isFocused }
+             .graphicsLayer {
+                 scaleX = if (focused) 1.04f else 1f
+                 scaleY = if (focused) 1.04f else 1f
+             }
+             .clip(cardShape)
+-            .background(NuvioTheme.colors.BackgroundCard)
++            .background(if (focused) NuvioTheme.colors.BackgroundElevated else NuvioTheme.colors.BackgroundCard.copy(alpha = 0.86f))
+             .border(
+                 width = if (focused) 3.dp else 1.dp,
+-                color = if (focused) Color.White else NuvioTheme.colors.Border,
++                color = if (focused) Color.White else NuvioTheme.colors.Border.copy(alpha = 0.5f),
+                 shape = cardShape,
+             )
+             .clickableCard(onClick = { onPlay(episode) }),
+@@ -572,7 +691,7 @@ private fun JellyfinEpisodeCard(
+                     text = overview,
+                     style = MaterialTheme.typography.labelSmall,
+                     color = NuvioTheme.colors.TextTertiary,
+-                    maxLines = 2,
++                    maxLines = 3,
+                     overflow = TextOverflow.Ellipsis,
+                     modifier = Modifier.padding(bottom = 4.dp),
+                 )
+@@ -660,3 +779,77 @@ internal fun formatPosition(positionMs: Long): String {
+     val minutes = (totalSeconds % 3600) / 60
+     return if (hours > 0) "${hours}h ${minutes.toString().padStart(2, '0')}m" else "${minutes}m"
+ }
++
++private enum class JellyfinTab(val label: String) {
++    PEOPLE("Creator and Cast"),
++    RATINGS("Ratings"),
++    SIMILAR("More like this"),
++    TRAILER("Trailer"),
++}
++
++/** Pill tab row under the episodes; focusing a tab switches the section below it. */
++@Composable
++private fun JellyfinTabRow(
++    tabs: List<JellyfinTab>,
++    active: JellyfinTab,
++    onSelect: (JellyfinTab) -> Unit,
++    modifier: Modifier = Modifier,
++) {
++    Row(
++        modifier = modifier.padding(horizontal = NuvioTheme.spacing.xxxl),
++        horizontalArrangement = Arrangement.spacedBy(10.dp),
++        verticalAlignment = Alignment.CenterVertically,
++    ) {
++        tabs.forEach { tab ->
++            val selected = tab == active
++            Surface(
++                onClick = { onSelect(tab) },
++                modifier = Modifier.onFocusChanged { if (it.isFocused) onSelect(tab) },
++                shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(999.dp)),
++                scale = ClickableSurfaceDefaults.scale(focusedScale = 1.05f),
++                border = ClickableSurfaceDefaults.border(
++                    focusedBorder = Border(androidx.compose.foundation.BorderStroke(3.dp, Color.White)),
++                ),
++                colors = ClickableSurfaceDefaults.colors(
++                    containerColor = if (selected) NuvioTheme.colors.Secondary.copy(alpha = 0.22f) else Color.White.copy(alpha = 0.06f),
++                    contentColor = if (selected) NuvioTheme.colors.TextPrimary else NuvioTheme.colors.TextTertiary,
++                    focusedContainerColor = Color.White.copy(alpha = 0.18f),
++                    focusedContentColor = Color.White,
++                ),
++            ) {
++                Text(
++                    text = tab.label,
++                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
++                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 9.dp),
++                )
++            }
++        }
++    }
++}
++
++/** Fills the Jellyfin item's meta from TMDB the same way the addon detail page does. */
++private fun mergeTmdbEnrichment(meta: Meta, e: TmdbEnrichment?, trailers: List<MetaTrailer>): Meta {
++    if (e == null) return meta
++    val tmdbCast = e.castMembers + e.directorMembers + e.writerMembers
++    val cast = meta.castMembers.map { member ->
++        val match = tmdbCast.firstOrNull { it.name.equals(member.name, ignoreCase = true) }
++        if (match == null) member else member.copy(tmdbId = member.tmdbId ?: match.tmdbId, photo = member.photo ?: match.photo)
++    }
++    val leading = (e.directorMembers + e.writerMembers).filter { crew ->
++        cast.none { it.name.equals(crew.name, ignoreCase = true) }
++    }.distinctBy { it.name }
++    return meta.copy(
++        description = meta.description?.takeIf { it.isNotBlank() } ?: e.description,
++        genres = meta.genres.ifEmpty { e.genres },
++        status = e.status ?: meta.status,
++        country = meta.country ?: e.countries?.joinToString(", ")?.takeIf { it.isNotBlank() },
++        language = meta.language ?: e.language,
++        ageRating = meta.ageRating ?: e.ageRating,
++        director = meta.director.ifEmpty { e.director },
++        writer = meta.writer.ifEmpty { e.writer },
++        castMembers = leading + cast,
++        networks = meta.networks.ifEmpty { e.networks },
++        productionCompanies = meta.productionCompanies.ifEmpty { e.productionCompanies },
++        trailers = trailers,
++    )
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinRatingsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinRatingsViewModel.kt
+index a081e8f21..efc430775 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinRatingsViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinRatingsViewModel.kt
+@@ -5,6 +5,11 @@ import androidx.lifecycle.viewModelScope
+ import com.nuvio.tv.core.tmdb.TmdbMetadataService
+ import com.nuvio.tv.core.tmdb.TmdbService
+ import com.nuvio.tv.data.local.MDBListSettingsDataStore
++import com.nuvio.tv.data.local.TmdbSettingsDataStore
++import com.nuvio.tv.data.trailer.TrailerService
++import com.nuvio.tv.core.tmdb.TmdbEnrichment
++import com.nuvio.tv.domain.model.MetaPreview
++import com.nuvio.tv.domain.model.MetaTrailer
+ import com.nuvio.tv.data.repository.ImdbEpisodeRatingsRepository
+ import com.nuvio.tv.data.repository.MDBListRepository
+ import com.nuvio.tv.domain.model.ContentType
+@@ -32,6 +37,20 @@ data class JellyfinRatingsState(
+     val episodeImdbRatings: Map<Pair<Int, Int>, Double> = emptyMap(),
+     val episodeTmdbRatings: Map<Pair<Int, Int>, Double> = emptyMap(),
+     val episodeExtraRatings: Map<String, Map<Pair<Int, Int>, Double>> = emptyMap(),
++    /** TMDB details (status, country, language, age rating, creators, trailers) merged into the page meta. */
++    val enrichment: TmdbEnrichment? = null,
++    val trailers: List<MetaTrailer> = emptyList(),
++    val moreLikeThis: List<MetaPreview> = emptyList(),
++    val trailerOverlay: JellyfinTrailerOverlay? = null,
++)
++
++/** State of the in-page trailer player overlay. */
++data class JellyfinTrailerOverlay(
++    val trailer: MetaTrailer,
++    val isLoading: Boolean = true,
++    val videoUrl: String? = null,
++    val audioUrl: String? = null,
++    val error: String? = null,
+ )
+ 
+ @HiltViewModel
+@@ -42,6 +61,8 @@ class JellyfinRatingsViewModel @Inject constructor(
+     private val tmdbMetadataService: TmdbMetadataService,
+     private val imdbEpisodeRatingsRepository: ImdbEpisodeRatingsRepository,
+     private val forkExtraEpisodeRatings: ForkTvExtraEpisodeRatings,
++    private val tmdbSettingsDataStore: TmdbSettingsDataStore,
++    private val trailerService: TrailerService,
+ ) : ViewModel() {
+ 
+     private val _state = MutableStateFlow(JellyfinRatingsState())
+@@ -75,10 +96,31 @@ class JellyfinRatingsViewModel @Inject constructor(
+                 }
+ 
+                 if (tmdbId != null) {
+-                    val rating = runCatching {
+-                        tmdbMetadataService.fetchEnrichment(tmdbId = tmdbId.toString(), contentType = type, language = "en")
+-                    }.getOrNull()?.rating
+-                    if (rating != null) _state.update { it.copy(tmdbRating = rating.toFloat()) }
++                    val tmdbSettings = runCatching { tmdbSettingsDataStore.settings.first() }.getOrNull()
++                    val enrichment = runCatching {
++                        tmdbMetadataService.fetchEnrichment(
++                            tmdbId = tmdbId.toString(),
++                            contentType = type,
++                            language = tmdbSettings?.language ?: "en",
++                        )
++                    }.getOrNull()
++                    if (enrichment != null) {
++                        _state.update {
++                            it.copy(
++                                enrichment = enrichment,
++                                tmdbRating = enrichment.rating?.toFloat() ?: it.tmdbRating,
++                                trailers = if (tmdbSettings?.useTrailers == false) emptyList() else enrichment.trailers,
++                            )
++                        }
++                    }
++                    val similar = runCatching {
++                        tmdbMetadataService.fetchMoreLikeThis(
++                            tmdbId = tmdbId.toString(),
++                            contentType = type,
++                            language = tmdbSettings?.language ?: "en",
++                        )
++                    }.getOrDefault(emptyList())
++                    if (similar.isNotEmpty()) _state.update { it.copy(moreLikeThis = similar) }
+                 }
+ 
+                 if (item.isSeries) {
+@@ -102,4 +144,41 @@ class JellyfinRatingsViewModel @Inject constructor(
+             }
+         }
+     }
++
++    fun playTrailer(trailer: MetaTrailer, title: String?, year: String?) {
++        val ytId = trailer.ytId?.trim().orEmpty()
++        if (ytId.isBlank()) {
++            _state.update { it.copy(trailerOverlay = JellyfinTrailerOverlay(trailer, false, error = "Trailer unavailable")) }
++            return
++        }
++        _state.update { it.copy(trailerOverlay = JellyfinTrailerOverlay(trailer)) }
++        viewModelScope.launch {
++            val source = runCatching {
++                trailerService.getTrailerPlaybackSourceFromYouTubeUrl(
++                    youtubeUrl = "https://www.youtube.com/watch?v=$ytId",
++                    title = title,
++                    year = year,
++                )
++            }.getOrNull()
++            _state.update { current ->
++                val overlay = current.trailerOverlay
++                if (overlay == null || overlay.trailer.ytId != trailer.ytId) {
++                    current
++                } else {
++                    current.copy(
++                        trailerOverlay = overlay.copy(
++                            isLoading = false,
++                            videoUrl = source?.videoUrl,
++                            audioUrl = source?.audioUrl,
++                            error = if (source == null) "Trailer unavailable" else null,
++                        ),
++                    )
++                }
++            }
++        }
++    }
++
++    fun dismissTrailer() {
++        _state.update { it.copy(trailerOverlay = null) }
++    }
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinScreen.kt
+index 5e718c8be..4f5dd199e 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinScreen.kt
+@@ -150,9 +150,9 @@ private fun JellyfinHeader(session: JellyfinSession, modifier: Modifier = Modifi
+     ) {
+         Box(
+             modifier = Modifier
+-                .size(40.dp)
+-                .clip(RoundedCornerShape(NuvioTheme.radii.md))
+-                .background(accent),
++                .size(44.dp)
++                .clip(RoundedCornerShape(14.dp))
++                .background(Brush.linearGradient(listOf(accent, accent.copy(alpha = 0.55f)))),
+             contentAlignment = Alignment.Center,
+         ) {
+             Text(
+@@ -252,12 +252,11 @@ private fun JellyfinHome(
+                 session = session,
+                 modifier = Modifier
+                     .align(Alignment.TopStart)
+-                    .background(
+-                        Brush.verticalGradient(
+-                            listOf(Color.Black.copy(alpha = 0.55f), Color.Transparent),
+-                        ),
+-                    )
+-                    .padding(horizontal = 28.dp, vertical = 16.dp),
++                    .padding(horizontal = 28.dp, vertical = 16.dp)
++                    .clip(RoundedCornerShape(22.dp))
++                    .background(Color.Black.copy(alpha = 0.46f))
++                    .border(1.dp, Color.White.copy(alpha = 0.12f), RoundedCornerShape(22.dp))
++                    .padding(horizontal = 16.dp, vertical = 10.dp),
+             )
+         }
+         if (state.resumeItems.isNotEmpty()) {
