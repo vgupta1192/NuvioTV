@@ -1,3 +1,42 @@
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt
+index ba392256a..0f99719a7 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt
+@@ -69,7 +69,7 @@ object JellyfinRepository {
+     private const val SEARCH_DEBOUNCE_MS = 350L
+     private val VIDEO_LIBRARY_TYPES = setOf("movies", "tvshows", "mixed")
+     private const val LIST_FIELDS =
+-        "Overview,Genres,ProductionYear,CommunityRating,OfficialRating,RunTimeTicks,Container,UserData,SeriesId,SeriesName,ProviderIds"
++        "Overview,Genres,ProductionYear,CommunityRating,OfficialRating,RunTimeTicks,Container,UserData,SeriesId,SeriesName,ProviderIds,ChildCount,RecursiveItemCount,LocationType"
+ 
+     private val json = Json { ignoreUnknownKeys = true }
+     private val client by lazy {
+@@ -354,11 +354,24 @@ object JellyfinRepository {
+             },
+         )
+         val items = root.array("Items").orEmpty().mapNotNull { element ->
+-            (element as? JsonObject)?.let(::parseItem)
++            (element as? JsonObject)?.takeIf(::hasPlayableMedia)?.let(::parseItem)
+         }
+         return JellyfinItemPage(items = items, totalRecordCount = root.int("TotalRecordCount") ?: items.size)
+     }
+ 
++    /** Hides titles with no media on disk (empty folders, missing/virtual entries, files without a container). */
++    private fun hasPlayableMedia(obj: JsonObject): Boolean {
++        val type = obj.string("Type").orEmpty()
++        if (obj.string("LocationType").equals("Virtual", ignoreCase = true)) return false
++        return when {
++            type.equals("Movie", true) || type.equals("Video", true) || type.equals("Episode", true) ||
++                type.equals("MusicVideo", true) -> !obj.string("Container").isNullOrBlank()
++            type.equals("Series", true) || type.equals("BoxSet", true) -> (obj.int("RecursiveItemCount") ?: 1) > 0
++            type.equals("Season", true) -> (obj.int("ChildCount") ?: 1) > 0
++            else -> true
++        }
++    }
++
+     private suspend fun getItem(session: JellyfinSession, itemId: String): JellyfinItem? {
+         val root = call(session, "/Users/${session.userId}/Items/$itemId")
+         return parseItem(root)
 diff --git a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
 index ec3a2dbbb..6e657a44b 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
@@ -447,7 +486,7 @@ index b0210c348..02d85e2be 100644
          SettingsToggleRow(
              title = stringResource(R.string.layout_fullscreen_hero_backdrop),
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
-index f5b6be7a6..a7cedd770 100644
+index f5b6be7a6..68cb5109c 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
 @@ -1069,6 +1069,11 @@ fun TvChannelsScreen(
@@ -471,9 +510,12 @@ index f5b6be7a6..a7cedd770 100644
                          .fillMaxHeight()
                  ) {
                      when {
-@@ -1278,8 +1283,9 @@ fun TvChannelsScreen(
+@@ -1276,10 +1281,11 @@ fun TvChannelsScreen(
+                     onStreamSelected = { idx ->
+                         viewModel.selectStreamIndex(idx)
                      },
-                     mutePreview = netflixLive,
+-                    mutePreview = netflixLive,
++                    mutePreview = false,
                      modifier = Modifier
 -                        .weight(1.0f)
 +                        .weight(panelWeight)
@@ -577,7 +619,7 @@ index 000000000..67fab2e5b
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt
-index 321a9c050..067da3e97 100644
+index 321a9c050..4aae381b3 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt
 @@ -34,7 +34,9 @@ import androidx.compose.runtime.setValue
@@ -598,7 +640,7 @@ index 321a9c050..067da3e97 100644
  
      val activeStream = streams.getOrNull(selectedStreamIndex)
      val playableUrl = activeStream?.playableTvUrl
-@@ -163,11 +166,19 @@ fun TvChannelFullscreenHud(
+@@ -163,11 +166,23 @@ fun TvChannelFullscreenHud(
              .onPreviewKeyEvent { event ->
                  if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
                  if (isOptionsOpen) {
@@ -618,13 +660,60 @@ index 321a9c050..067da3e97 100644
 +                            if (!focusManager.moveFocus(FocusDirection.Left)) isOptionsOpen = false
 +                            true
 +                        }
++                        Key.DirectionRight -> {
++                            if (!focusManager.moveFocus(FocusDirection.Right)) isOptionsOpen = false
++                            true
++                        }
 +                        else -> false
 +                    }
                  }
                  if (!isDrawerOpen) {
                      hudVisible = true
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt
+index 1c08693a3..b3bf2bede 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt
+@@ -13,7 +13,9 @@ import androidx.compose.foundation.layout.Spacer
+ import androidx.compose.foundation.layout.aspectRatio
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.fillMaxHeight
+ import androidx.compose.foundation.layout.height
++import androidx.compose.ui.platform.LocalConfiguration
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.layout.size
+ import androidx.compose.foundation.layout.width
+@@ -126,9 +128,17 @@ fun TvChannelPreviewPanel(
+         }
+ 
+         // 1. Player de Vídeo em 16:9 ou Card de Início de Prévia
++        // Height is capped so the buttons and description below always fit; the 16:9 video is centred.
++        val playerMaxHeight = (LocalConfiguration.current.screenHeightDp * 0.34f).dp
+         Box(
+             modifier = Modifier
+                 .fillMaxWidth()
++                .height(playerMaxHeight),
++            contentAlignment = Alignment.Center
++        ) {
++        Box(
++            modifier = Modifier
++                .fillMaxHeight()
+                 .aspectRatio(16f / 9f)
+                 .clip(RoundedCornerShape(20.dp))
+                 .background(Color.Black)
+@@ -278,8 +288,9 @@ fun TvChannelPreviewPanel(
+                 }
+             }
+         }
++        }
+ 
+-        Spacer(modifier = Modifier.height(18.dp))
++        Spacer(modifier = Modifier.height(14.dp))
+ 
+         val scrollState = rememberScrollState()
+         val coroutineScope = rememberCoroutineScope()
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
-index 94a1ba966..84a544474 100644
+index 94a1ba966..7d588df64 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
 @@ -42,6 +42,8 @@ import com.nuvio.tv.core.player.TvLiveMediaSourceFactory
@@ -636,7 +725,7 @@ index 94a1ba966..84a544474 100644
  import com.nuvio.tv.ui.screens.player.CustomStretchMemory
  import com.nuvio.tv.ui.screens.player.VideoContentRect
  import com.nuvio.tv.ui.screens.player.addExoAspectLayoutChangeListener
-@@ -95,6 +97,26 @@ fun TvChannelPreviewPlayer(
+@@ -95,6 +97,30 @@ fun TvChannelPreviewPlayer(
      }
      var playerView by remember { mutableStateOf<PlayerView?>(null) }
  
@@ -650,8 +739,12 @@ index 94a1ba966..84a544474 100644
 +
 +    // Smart Enhance is always on for Live TV, like Custom Stretch: a light brightness, contrast and
 +    // saturation lift in the shared picture shader. The manual picture panel is not used here.
-+    DisposableEffect(player) {
++    // The shader is armed only after the channel has shown a first frame without it: a stream that
++    // never reaches the effects pipeline (weak GPU, odd format) then still plays instead of timing out.
++    var effectsArmed by remember(player) { mutableStateOf(false) }
++    DisposableEffect(player, effectsArmed) {
 +        val activePlayer = player ?: return@DisposableEffect onDispose {}
++        if (!effectsArmed) return@DisposableEffect onDispose {}
 +        val effects = ExoPictureEffects(activePlayer, autoEnhance = false)
 +        effects.apply(PictureState(smartEnhance = true))
 +        onDispose {
@@ -663,6 +756,14 @@ index 94a1ba966..84a544474 100644
      // Live TV always plays with Custom Stretch: the picture area (without baked-in black bars)
      // is stretched over the whole player, in the preview and in fullscreen.
      DisposableEffect(playerView, player) {
+@@ -208,6 +234,7 @@ fun TvChannelPreviewPlayer(
+                 hasRenderedFirstFrame = true
+                 isBuffering = false
+                 currentOnFirstFrame()
++                effectsArmed = true
+             }
+ 
+             override fun onPlaybackStateChanged(playbackState: Int) {
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelZappingDrawer.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelZappingDrawer.kt
 index f063b6aea..f59c3aaf9 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelZappingDrawer.kt
