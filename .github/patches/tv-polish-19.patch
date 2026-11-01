@@ -1,0 +1,406 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
+index 23b59b1f9..ec3a2dbbb 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
+@@ -1093,20 +1093,25 @@ private fun PlaybackNavHost(
+                             onVisibleChange = { upNextCardShown.value = it }
+                         )
+                         SponsorSkipCard()
+-                        if (upNextListOpen.value) {
+-                            YouTubeUpNextList(
+-                                videoId = upNextVideoId,
+-                                viewModel = youtubeVm,
+-                                onPlay = { item, list ->
+-                                    upNextListOpen.value = false
+-                                    youtubeVm.activate(item, list) { v ->
+-                                        navController.navigate(youtubePlayerRoute(v)) {
+-                                            popUpTo(backStackEntry.destination.id) { inclusive = true }
+-                                        }
++                        YouTubeUpNextList(
++                            videoId = upNextVideoId,
++                            viewModel = youtubeVm,
++                            open = upNextListOpen.value,
++                            onExitUp = {
++                                upNextListOpen.value = false
++                                if (!upNextPlayerVm.uiState.value.showControls) {
++                                    upNextPlayerVm.onEvent(com.nuvio.tv.ui.screens.player.PlayerEvent.OnToggleControls)
++                                }
++                            },
++                            onPlay = { item, list ->
++                                upNextListOpen.value = false
++                                youtubeVm.activate(item, list) { v ->
++                                    navController.navigate(youtubePlayerRoute(v)) {
++                                        popUpTo(backStackEntry.destination.id) { inclusive = true }
+                                     }
+                                 }
+-                            )
+-                        }
++                            }
++                        )
+                         if (chatOn.value) YouTubeChatOverlay(ytPlayerVm)
+                         if (playerUi.showYouTubePanel) {
+                             YouTubePlayerPanel(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
+index 30ee71dd6..f5b6be7a6 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
+@@ -1257,7 +1257,8 @@ fun TvChannelsScreen(
+                     },
+                     onWatchFullscreen = {
+                         val activeStream = state.activeStream
+-                        if (onWatchFullscreenInMainPlayer != null && state.previewChannel != null && activeStream != null) {
++                        val isYouTube = state.previewChannel?.type.equals("youtube", ignoreCase = true)
++                        if (isYouTube && onWatchFullscreenInMainPlayer != null && state.previewChannel != null && activeStream != null) {
+                             onWatchFullscreenInMainPlayer(state.previewChannel!!, activeStream)
+                         } else {
+                             if (!state.isPreviewPlaybackActive && state.previewChannel != null) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt
+index 7af6adebb..321a9c050 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt
+@@ -183,9 +183,9 @@ fun TvChannelFullscreenHud(
+                         } else false
+                     }
+                     Key.DirectionRight -> {
+-                        if (!isDrawerOpen && allChannels.isNotEmpty()) {
+-                            isDrawerOpen = true
+-                            hudVisible = false
++                        if (!isDrawerOpen) {
++                            isOptionsOpen = true
++                            hudVisible = true
+                             true
+                         } else false
+                     }
+@@ -219,7 +219,7 @@ fun TvChannelFullscreenHud(
+                     }
+                     Key.DirectionCenter, Key.Enter -> {
+                         if (!isDrawerOpen) {
+-                            if (hudVisible) isOptionsOpen = true else hudVisible = true
++                            hudVisible = true
+                             true
+                         } else false
+                     }
+@@ -329,27 +329,7 @@ fun TvChannelFullscreenHud(
+                     horizontalArrangement = Arrangement.SpaceBetween,
+                     verticalAlignment = Alignment.CenterVertically
+                 ) {
+-                    Button(
+-                        onClick = onExitFullscreen,
+-                        shape = ButtonDefaults.shape(shape = RoundedCornerShape(22.dp)),
+-                        colors = ButtonDefaults.colors(
+-                            containerColor = Color.White.copy(alpha = 0.15f),
+-                            focusedContainerColor = Color.White,
+-                            focusedContentColor = Color.Black
+-                        )
+-                    ) {
+-                        Row(
+-                            verticalAlignment = Alignment.CenterVertically,
+-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+-                        ) {
+-                            Icon(
+-                                imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
+-                                contentDescription = null,
+-                                modifier = Modifier.size(18.dp)
+-                            )
+-                            Text(text = stringResource(R.string.tv_channels_back), fontWeight = FontWeight.Bold)
+-                        }
+-                    }
++                    Spacer(modifier = Modifier.width(1.dp))
+ 
+                     Box(
+                         modifier = Modifier
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelOptionsPanel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelOptionsPanel.kt
+index ca9b953e1..7428acf81 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelOptionsPanel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelOptionsPanel.kt
+@@ -277,13 +277,6 @@ fun TvChannelOptionsPanel(
+                     onClick = onReload
+                 )
+             }
+-            item {
+-                OptionRow(
+-                    label = "Close",
+-                    selected = false,
+-                    onClick = onClose
+-                )
+-            }
+         }
+     }
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt
+index c4de40500..1c08693a3 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt
+@@ -100,7 +100,7 @@ fun TvChannelPreviewPanel(
+             .clip(RoundedCornerShape(28.dp))
+             .background(NuvioTheme.colors.BackgroundElevated.copy(alpha = 0.55f))
+             .border(1.dp, Color.White.copy(alpha = 0.12f), RoundedCornerShape(28.dp))
+-            .padding(14.dp)
++            .padding(22.dp)
+     ) {
+         if (channel == null) {
+             Box(
+@@ -279,7 +279,7 @@ fun TvChannelPreviewPanel(
+             }
+         }
+ 
+-        Spacer(modifier = Modifier.height(12.dp))
++        Spacer(modifier = Modifier.height(18.dp))
+ 
+         val scrollState = rememberScrollState()
+         val coroutineScope = rememberCoroutineScope()
+@@ -296,14 +296,14 @@ fun TvChannelPreviewPanel(
+             Row(
+                 modifier = Modifier.fillMaxWidth(),
+                 verticalAlignment = Alignment.CenterVertically,
+-                horizontalArrangement = Arrangement.spacedBy(12.dp)
++                horizontalArrangement = Arrangement.spacedBy(16.dp)
+             ) {
+                 val logoUrl = channel.displayLogo
+                 if (!logoUrl.isNullOrBlank()) {
+                     Box(
+                         modifier = Modifier
+-                            .size(48.dp)
+-                            .clip(RoundedCornerShape(8.dp))
++                            .size(60.dp)
++                            .clip(RoundedCornerShape(12.dp))
+                             .background(Color(0xFF1E1E24))
+                             .padding(4.dp),
+                         contentAlignment = Alignment.Center
+@@ -320,7 +320,7 @@ fun TvChannelPreviewPanel(
+                 Column(modifier = Modifier.weight(1f)) {
+                     Text(
+                         text = channel.name,
+-                        style = MaterialTheme.typography.titleMedium,
++                        style = MaterialTheme.typography.titleLarge,
+                         fontWeight = FontWeight.Bold,
+                         color = Color.White,
+                         maxLines = 1,
+@@ -334,19 +334,19 @@ fun TvChannelPreviewPanel(
+                 }
+             }
+ 
+-            Spacer(modifier = Modifier.height(10.dp))
++            Spacer(modifier = Modifier.height(18.dp))
+ 
+             // Botões de Ação para TV (Assistir Tela Cheia, Favoritar, Guia EPG)
+             Row(
+                 modifier = Modifier.fillMaxWidth(),
+-                horizontalArrangement = Arrangement.spacedBy(6.dp)
++                horizontalArrangement = Arrangement.spacedBy(12.dp)
+             ) {
+                 var isFullscreenFocused by remember { mutableStateOf(false) }
+ 
+                 Button(
+                     onClick = onWatchFullscreen,
+                     shape = ButtonDefaults.shape(shape = RoundedCornerShape(22.dp)),
+-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 6.dp),
++                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 12.dp),
+                     colors = ButtonDefaults.colors(
+                         containerColor = Color.White.copy(alpha = 0.12f),
+                         focusedContainerColor = Color.White,
+@@ -394,7 +394,7 @@ fun TvChannelPreviewPanel(
+                 Button(
+                     onClick = onToggleFavorite,
+                     shape = ButtonDefaults.shape(shape = RoundedCornerShape(22.dp)),
+-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 6.dp),
++                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 12.dp),
+                     colors = ButtonDefaults.colors(
+                         containerColor = if (channel.isFavorite) Color(0xFFFFD700).copy(alpha = 0.18f) else Color.White.copy(alpha = 0.12f),
+                         focusedContainerColor = Color.White,
+@@ -435,7 +435,7 @@ fun TvChannelPreviewPanel(
+                 Button(
+                     onClick = onOpenSchedule,
+                     shape = ButtonDefaults.shape(shape = RoundedCornerShape(22.dp)),
+-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 6.dp),
++                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 12.dp),
+                     colors = ButtonDefaults.colors(
+                         containerColor = Color.White.copy(alpha = 0.12f),
+                         focusedContainerColor = Color.White,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelZappingDrawer.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelZappingDrawer.kt
+index d08e462ab..f063b6aea 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelZappingDrawer.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelZappingDrawer.kt
+@@ -43,6 +43,7 @@ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.draw.clip
+ import androidx.compose.ui.focus.FocusRequester
++import kotlinx.coroutines.launch
+ import androidx.compose.ui.focus.focusRequester
+ import androidx.compose.ui.focus.onFocusChanged
+ import androidx.compose.ui.graphics.Color
+@@ -90,6 +91,8 @@ fun TvChannelZappingDrawer(
+ ) {
+     val listState = rememberLazyListState()
+     val drawerFocusRequester = remember { FocusRequester() }
++    val categoryFocusRequester = remember { FocusRequester() }
++    val scope = androidx.compose.runtime.rememberCoroutineScope()
+ 
+     LaunchedEffect(isOpen) {
+         if (isOpen) {
+@@ -148,12 +151,6 @@ fun TvChannelZappingDrawer(
+                             color = Color.White
+                         )
+                     }
+-
+-                    Text(
+-                        text = stringResource(R.string.tv_channels_back_hint),
+-                        style = MaterialTheme.typography.labelSmall,
+-                        color = Color.White.copy(alpha = 0.45f)
+-                    )
+                 }
+ 
+                 Spacer(modifier = Modifier.height(10.dp))
+@@ -181,6 +178,7 @@ fun TvChannelZappingDrawer(
+                                 onCategorySelected(if (cat == allLabel) "" else cat)
+                             },
+                             modifier = Modifier
++                                .then(if (isSelected) Modifier.focusRequester(categoryFocusRequester) else Modifier)
+                                 .onFocusChanged { isCatFocused = it.isFocused }
+                                 .onPreviewKeyEvent { ev ->
+                                     // Right on the last chip must stay in the drawer, only channels close it.
+@@ -244,6 +242,17 @@ fun TvChannelZappingDrawer(
+                                                 onClose()
+                                                 true
+                                             }
++                                            KeyEvent.KEYCODE_PAGE_UP,
++                                            KeyEvent.KEYCODE_CHANNEL_UP,
++                                            KeyEvent.KEYCODE_MENU,
++                                            KeyEvent.KEYCODE_INFO -> {
++                                                // One key to the category row without scrolling the whole list.
++                                                scope.launch {
++                                                    listState.scrollToItem(0)
++                                                    runCatching { categoryFocusRequester.requestFocus() }
++                                                }
++                                                true
++                                            }
+                                             KeyEvent.KEYCODE_DPAD_RIGHT,
+                                             KeyEvent.KEYCODE_BACK -> {
+                                                 onClose()
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt
+index 2b4723918..ad64da0ad 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt
+@@ -100,6 +100,7 @@ fun YouTubeScreen(
+         if (state.tab !in tabs) viewModel.selectTab(tabs.first())
+     }
+     LaunchedEffect(Unit) { accountViewModel.refresh() }
++    LaunchedEffect(Unit) { viewModel.onScreenOpened() }
+     LaunchedEffect(account.signedIn) {
+         if (signInStarted && account.signedIn) {
+             signInStarted = false
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeUpNext.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeUpNext.kt
+index 9ff5cfa18..9aa692d3c 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeUpNext.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeUpNext.kt
+@@ -141,17 +141,27 @@ fun BoxScope.YouTubeUpNext(
+ fun BoxScope.YouTubeUpNextList(
+     videoId: String,
+     viewModel: YouTubeViewModel,
++    /** Whether the list is showing. The list stays composed so it can fade out when it closes. */
++    open: Boolean = true,
++    /** Up from the row goes back to the player with its controls open. */
++    onExitUp: () -> Unit = {},
+     onPlay: (YtItem, List<YtItem>) -> Unit
+ ) {
+     val related by viewModel.related.collectAsState()
+     val loading by viewModel.relatedLoading.collectAsState()
+-    LaunchedEffect(videoId) { viewModel.loadRelated(videoId) }
++    LaunchedEffect(videoId, open) { if (open) viewModel.loadRelated(videoId) }
+ 
+     val rowState = rememberLazyListState()
+     val gridState = rememberLazyGridState()
+     val focus = remember { FocusRequester() }
+     var selected by remember { mutableIntStateOf(0) }
+     var gridMode by remember { mutableStateOf(false) }
++    LaunchedEffect(open) {
++        if (open) {
++            selected = 0
++            gridMode = false
++        }
++    }
+     LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
+     LaunchedEffect(related.size) {
+         if (selected > related.lastIndex) selected = related.lastIndex.coerceAtLeast(0)
+@@ -178,7 +188,7 @@ fun BoxScope.YouTubeUpNextList(
+         Column(
+             modifier
+                 .clip(RoundedCornerShape(12.dp))
+-                .background(if (isSelected) Color(0xFF2A2A2E) else Color(0xCC1B1B1F))
++                .background(if (isSelected) Color(0xFF2A2A2E) else Color(0x991B1B1F))
+                 .border(3.dp, if (isSelected) Color.White else Color.Transparent, RoundedCornerShape(12.dp))
+                 .padding(6.dp),
+             verticalArrangement = Arrangement.spacedBy(6.dp)
+@@ -223,13 +233,20 @@ fun BoxScope.YouTubeUpNextList(
+         }
+     }
+ 
++    androidx.compose.animation.AnimatedVisibility(
++        visible = open,
++        modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth(),
++        enter = androidx.compose.animation.fadeIn() + androidx.compose.animation.slideInVertically { it / 6 },
++        exit = androidx.compose.animation.fadeOut() + androidx.compose.animation.slideOutVertically { it / 6 }
++    ) {
++    LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
+     Column(
+         Modifier
+-            .align(Alignment.BottomCenter)
+             .fillMaxWidth()
+             .then(if (gridMode) Modifier.fillMaxHeight(0.78f) else Modifier)
+             .background(
+-                if (gridMode) Brush.verticalGradient(listOf(Color(0xF2111114), Color(0xF2111114)))
++                // Only a gradient over the video, like YouTube, never a solid panel.
++                if (gridMode) Brush.verticalGradient(listOf(Color.Transparent, Color(0xB3000000), Color(0xE6000000)))
+                 else Brush.verticalGradient(listOf(Color.Transparent, Color(0xF0000000)))
+             )
+             .padding(top = if (gridMode) 20.dp else 48.dp, bottom = 24.dp)
+@@ -254,7 +271,7 @@ fun BoxScope.YouTubeUpNextList(
+                         Key.DirectionUp ->
+                             if (gridMode) {
+                                 if (selected >= GRID_COLUMNS) selected -= GRID_COLUMNS else gridMode = false
+-                            }
++                            } else onExitUp()
+                         Key.DirectionCenter, Key.Enter, Key.NumPadEnter ->
+                             related.getOrNull(selected)?.let { onPlay(it, related) }
+                         else -> Unit
+@@ -302,6 +319,7 @@ fun BoxScope.YouTubeUpNextList(
+             }
+         }
+     }
++    }
+ }
+ 
+ private const val GRID_COLUMNS = 4
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
+index c22a6445e..368faf0bc 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
+@@ -148,6 +148,15 @@ class YouTubeViewModel @Inject constructor(
+ 
+     init { selectTab(YouTubeSettings.lastTab(context)) }
+ 
++    private var screenOpenedBefore = false
++
++    /** Called each time the YouTube page comes on screen: reloads the open tab so it shows fresh videos. */
++    fun onScreenOpened() {
++        if (!screenOpenedBefore) { screenOpenedBefore = true; return }
++        if (canGoBack) return
++        selectTab(_state.value.tab)
++    }
++
+     // ---- feeds ----
+ 
+     fun selectTab(tab: YtTab) {
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 97b2d741a..71306407d 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -3565,7 +3565,7 @@
+     <string name="tv_channels_back_hint">Back ➔</string>
+     <string name="tv_channels_retry">Try Again</string>
+     <string name="tv_channels_next_channel">Next Channel</string>
+-    <string name="tv_channels_hud_hint">◀ Channels | ▲/▼ Zapping | OK Options</string>
++    <string name="tv_channels_hud_hint">◀ Channels | ▲/▼ Zapping | ▶ Options</string>
+     <string name="tv_channels_stream_unavailable_desc">Stream temporarily unavailable</string>
+     <string name="tv_channels_drawer_title">TV Channels</string>
+     <string name="tv_channels_on_air_badge">ON AIR</string>
