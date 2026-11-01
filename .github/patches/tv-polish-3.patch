@@ -1,0 +1,886 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ModernSidebarBlurPanel.kt b/app/src/main/java/com/nuvio/tv/ModernSidebarBlurPanel.kt
+index cfafcc532..c6416816e 100644
+--- a/app/src/main/java/com/nuvio/tv/ModernSidebarBlurPanel.kt
++++ b/app/src/main/java/com/nuvio/tv/ModernSidebarBlurPanel.kt
+@@ -4,11 +4,14 @@ import androidx.compose.animation.animateColorAsState
+ import androidx.compose.animation.core.animateFloatAsState
+ import androidx.compose.animation.core.tween
+ import androidx.compose.foundation.background
++import com.nuvio.tv.ui.navigation.Screen
+ import androidx.compose.foundation.border
+ import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.verticalScroll
++import androidx.compose.foundation.layout.BoxWithConstraints
++import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.Spacer
+ import androidx.compose.foundation.layout.fillMaxHeight
+@@ -198,43 +201,75 @@ internal fun ModernSidebarBlurPanel(
+ 
+         Spacer(modifier = Modifier.height(30.dp))
+ 
+-        Column(
++        // Grouped like a phone launcher: browse, live, video, with Settings pinned at the bottom.
++        // The gap between rows adapts to the panel height so every tab shows without scrolling
++        // on a normal TV; a very short panel still scrolls.
++        val groupOf: (DrawerItem) -> Int = { item ->
++            when (item.route) {
++                Screen.Home.route, Screen.Discover.route, Screen.Search.route, Screen.Library.route -> 0
++                Screen.TvChannels.route, Screen.Jellyfin.route -> 1
++                Screen.Settings.route -> 3
++                else -> 2
++            }
++        }
++        val indexed = drawerItems.withIndex().toList()
++        val groups = indexed.groupBy { groupOf(it.value) }.toSortedMap().values.toList()
++        BoxWithConstraints(
+             modifier = Modifier
+                 .fillMaxWidth()
+-                .weight(1f),
+-            verticalArrangement = Arrangement.Top,
+-            horizontalAlignment = Alignment.CenterHorizontally
++                .weight(1f)
+         ) {
+-            // Fork: with the extra fork tabs the list is taller than the panel; it used to be centred
+-            // and ran up under the profile row. Now it scrolls inside the space below the profile.
++            val rowHeight = 54.dp
++            val dividerHeight = 17.dp
++            val usedByRows = rowHeight * drawerItems.size + dividerHeight * (groups.size - 1)
++            val rowGap = ((maxHeight - usedByRows) / (drawerItems.size + 1)).coerceIn(4.dp, 16.dp)
++            val dividerColor = Color.White.copy(alpha = 0.14f)
+             Column(
+                 modifier = Modifier
+-                    .weight(1f, fill = false)
++                    .fillMaxSize()
+                     .verticalScroll(androidx.compose.foundation.rememberScrollState())
+                     .padding(vertical = 6.dp),
+-                verticalArrangement = Arrangement.spacedBy(10.dp)
++                horizontalAlignment = Alignment.CenterHorizontally
+             ) {
+-                drawerItems.forEachIndexed { index, item ->
+-                    key(item.route) {
+-                        SidebarNavigationItem(
+-                            label = item.label,
+-                            iconRes = item.iconRes,
+-                            icon = item.icon,
+-                            selected = selectedDrawerRoute == item.route,
+-                            focusEnabled = keepSidebarFocusDuringCollapse,
+-                            labelAlpha = sidebarLabelAlpha,
+-                            iconScale = sidebarIconScale,
+-                            onFocusChanged = {
+-                                if (it) {
+-                                    onDrawerItemFocused(index)
+-                                }
+-                            },
+-                            onClick = { onDrawerItemClick(item.route) },
++                groups.forEachIndexed { groupIndex, group ->
++                    val isLast = groupIndex == groups.lastIndex
++                    if (isLast && groups.size > 1) Spacer(modifier = Modifier.weight(1f))
++                    if (groupIndex > 0) {
++                        Box(
+                             modifier = Modifier
+-                                .fillMaxWidth(0.92f)
+-                                .focusRequester(drawerItemFocusRequesters.getValue(item.route))
++                                .padding(vertical = 8.dp)
++                                .fillMaxWidth(0.76f)
++                                .height(1.dp)
++                                .background(dividerColor)
+                         )
+                     }
++                    Column(
++                        verticalArrangement = Arrangement.spacedBy(rowGap),
++                        horizontalAlignment = Alignment.CenterHorizontally
++                    ) {
++                        group.forEach { (index, item) ->
++                            key(item.route) {
++                                SidebarNavigationItem(
++                                    label = item.label,
++                                    iconRes = item.iconRes,
++                                    icon = item.icon,
++                                    selected = selectedDrawerRoute == item.route,
++                                    focusEnabled = keepSidebarFocusDuringCollapse,
++                                    labelAlpha = sidebarLabelAlpha,
++                                    iconScale = sidebarIconScale,
++                                    onFocusChanged = {
++                                        if (it) {
++                                            onDrawerItemFocused(index)
++                                        }
++                                    },
++                                    onClick = { onDrawerItemClick(item.route) },
++                                    modifier = Modifier
++                                        .fillMaxWidth(0.92f)
++                                        .focusRequester(drawerItemFocusRequesters.getValue(item.route))
++                                )
++                            }
++                        }
++                    }
+                 }
+             }
+         }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/reshaped/phoneentry/PhoneEntryButton.kt b/app/src/main/java/com/nuvio/tv/ui/reshaped/phoneentry/PhoneEntryButton.kt
+new file mode 100644
+index 000000000..5d5412ed7
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/reshaped/phoneentry/PhoneEntryButton.kt
+@@ -0,0 +1,103 @@
++@file:OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
++
++package com.nuvio.tv.ui.reshaped.phoneentry
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.PhoneAndroid
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.unit.dp
++import androidx.tv.material3.Button
++import androidx.tv.material3.Icon
++import androidx.tv.material3.Text
++import com.nuvio.tv.reshaped.phoneentry.PhoneEntryPage
++import com.nuvio.tv.ui.components.NuvioDialog
++import com.nuvio.tv.ui.theme.NuvioTheme
++
++/**
++ * "Type on phone" for any text field: a button that opens a QR code. The phone opens a one-field
++ * page on the TV's local network, and what is typed there arrives in [onValue]. Typing with the
++ * remote is slow for keys, addresses and passwords, so every such field offers this.
++ */
++@Composable
++fun PhoneEntryButton(
++    title: String,
++    onValue: (String) -> Unit,
++    modifier: Modifier = Modifier,
++    secret: Boolean = false,
++) {
++    var open by remember { mutableStateOf(false) }
++    Button(onClick = { open = true }, modifier = modifier) {
++        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center) {
++            Icon(imageVector = Icons.Default.PhoneAndroid, contentDescription = null, modifier = Modifier.size(18.dp))
++            Spacer(modifier = Modifier.width(NuvioTheme.spacing.sm))
++            Text("Type on phone")
++        }
++    }
++    PhoneEntryDialog(open, { open = false }, title, secret, onValue)
++}
++
++/** Compact icon-only variant that sits beside a text field. */
++@Composable
++fun PhoneEntryIconButton(
++    title: String,
++    onValue: (String) -> Unit,
++    modifier: Modifier = Modifier,
++    secret: Boolean = false,
++) {
++    var open by remember { mutableStateOf(false) }
++    Button(onClick = { open = true }, modifier = modifier) {
++        Icon(imageVector = Icons.Default.PhoneAndroid, contentDescription = "Type on phone", modifier = Modifier.size(20.dp))
++    }
++    PhoneEntryDialog(open, { open = false }, title, secret, onValue)
++}
++
++@Composable
++private fun PhoneEntryDialog(
++    visible: Boolean,
++    onClose: () -> Unit,
++    title: String,
++    secret: Boolean,
++    onValue: (String) -> Unit,
++) {
++    if (visible) {
++        val page = remember(title, secret) {
++            PhoneEntryPage(
++                title = title,
++                subtitle = "Type or paste it here, then tap Send. The TV fills it in.",
++                fieldLabel = title,
++                send = "Send to TV",
++                sending = "Sending…",
++                sent = "Sent. Look at the TV.",
++                failed = "Could not send. Keep the phone on the same Wi-Fi as the TV.",
++                secret = secret,
++            )
++        }
++        NuvioDialog(
++            onDismiss = onClose,
++            title = "Type on your phone",
++            subtitle = "Scan the code with your phone camera. The phone must be on the same Wi-Fi as this TV.",
++            width = 520.dp,
++        ) {
++            PhoneEntryQr(
++                page = page,
++                instruction = "Scan, type, send",
++                onValue = { sent ->
++                    onClose()
++                    onValue(sent)
++                },
++            )
++            Button(onClick = onClose) { Text("Cancel") }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/account/InputField.kt b/app/src/main/java/com/nuvio/tv/ui/screens/account/InputField.kt
+index 74744205f..65e62faee 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/account/InputField.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/account/InputField.kt
+@@ -2,6 +2,7 @@
+ 
+ package com.nuvio.tv.ui.screens.account
+ 
++import com.nuvio.tv.ui.reshaped.phoneentry.PhoneEntryIconButton
+ import com.nuvio.tv.ui.theme.NuvioTheme
+ 
+ import androidx.compose.foundation.BorderStroke
+@@ -47,6 +48,36 @@ internal fun InputField(
+     imeAction: ImeAction = ImeAction.Done,
+     onImeAction: () -> Unit = {},
+     modifier: Modifier = Modifier
++) {
++    androidx.compose.foundation.layout.Row(
++        modifier = Modifier.fillMaxWidth(),
++        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
++        horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(8.dp)
++    ) {
++        InputFieldRaw(
++            value = value,
++            onValueChange = onValueChange,
++            placeholder = placeholder,
++            keyboardType = keyboardType,
++            isPassword = isPassword,
++            imeAction = imeAction,
++            onImeAction = onImeAction,
++            modifier = modifier.weight(1f)
++        )
++        PhoneEntryIconButton(title = placeholder.ifBlank { "Text" }, secret = isPassword, onValue = onValueChange)
++    }
++}
++
++@Composable
++private fun InputFieldRaw(
++    value: String,
++    onValueChange: (String) -> Unit,
++    placeholder: String,
++    keyboardType: KeyboardType = KeyboardType.Text,
++    isPassword: Boolean = false,
++    imeAction: ImeAction = ImeAction.Done,
++    onImeAction: () -> Unit = {},
++    modifier: Modifier = Modifier
+ ) {
+     val textFieldFocusRequester = remember { FocusRequester() }
+     val keyboardController = LocalSoftwareKeyboardController.current
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/collection/CollectionEditorControls.kt b/app/src/main/java/com/nuvio/tv/ui/screens/collection/CollectionEditorControls.kt
+index 5fbd55e7e..2fc482d1a 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/collection/CollectionEditorControls.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/collection/CollectionEditorControls.kt
+@@ -1,5 +1,6 @@
+ package com.nuvio.tv.ui.screens.collection
+ 
++import com.nuvio.tv.ui.reshaped.phoneentry.PhoneEntryIconButton
+ import com.nuvio.tv.ui.theme.NuvioTheme
+ 
+ import androidx.compose.foundation.BorderStroke
+@@ -87,7 +88,6 @@ import androidx.compose.ui.res.stringResource
+ import androidx.compose.ui.text.style.TextDirection
+ import androidx.compose.ui.text.TextStyle
+ 
+-@OptIn(ExperimentalTvMaterial3Api::class)
+ @Composable
+ fun NuvioTextField(
+     value: String,
+@@ -95,6 +95,31 @@ fun NuvioTextField(
+     modifier: Modifier = Modifier,
+     placeholder: String = "",
+     focusRequester: FocusRequester? = null
++) {
++    Row(
++        modifier = modifier,
++        verticalAlignment = Alignment.CenterVertically,
++        horizontalArrangement = Arrangement.spacedBy(8.dp)
++    ) {
++        NuvioTextFieldRaw(
++            value = value,
++            onValueChange = onValueChange,
++            modifier = Modifier.weight(1f),
++            placeholder = placeholder,
++            focusRequester = focusRequester
++        )
++        PhoneEntryIconButton(title = placeholder.ifBlank { "Text" }, onValue = onValueChange)
++    }
++}
++
++@OptIn(ExperimentalTvMaterial3Api::class)
++@Composable
++private fun NuvioTextFieldRaw(
++    value: String,
++    onValueChange: (String) -> Unit,
++    modifier: Modifier = Modifier,
++    placeholder: String = "",
++    focusRequester: FocusRequester? = null
+ ) {
+     var isEditing by remember { mutableStateOf(false) }
+     val textFieldFocusRequester = remember { FocusRequester() }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/collection/CollectionManagementScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/collection/CollectionManagementScreen.kt
+index 4ea9a1e7e..82e2981f6 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/collection/CollectionManagementScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/collection/CollectionManagementScreen.kt
+@@ -1,5 +1,6 @@
+ package com.nuvio.tv.ui.screens.collection
+ 
++import com.nuvio.tv.ui.reshaped.phoneentry.PhoneEntryButton
+ import androidx.compose.ui.semantics.Role
+ import androidx.compose.ui.semantics.role
+ import androidx.compose.ui.semantics.selected
+@@ -432,6 +433,7 @@ private fun ImportContent(
+                     ImportMode.PASTE -> {
+                         Row(horizontalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.sm)) {
+                             NuvioButton(onClick = onPaste) { Text(stringResource(R.string.collections_paste_clipboard)) }
++                            PhoneEntryButton(title = "Collection JSON", onValue = onTextChange)
+                             if (importText.isNotBlank()) {
+                                 NuvioButton(onClick = onValidate) { Text(stringResource(R.string.collections_validate)) }
+                             }
+@@ -496,6 +498,8 @@ private fun ImportContent(
+                     }
+ 
+                     ImportMode.URL -> {
++                        PhoneEntryButton(title = "Collection address", onValue = onUrlChange)
++                        Spacer(modifier = Modifier.height(NuvioTheme.spacing.sm))
+                         Surface(
+                             shape = RoundedCornerShape(NuvioTheme.radii.md),
+                             colors = SurfaceDefaults.colors(containerColor = NuvioTheme.colors.BackgroundElevated),
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinScreen.kt
+index 5a6c67d4c..5e718c8be 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinScreen.kt
+@@ -2,6 +2,7 @@
+ 
+ package com.nuvio.tv.ui.screens.jellyfin
+ 
++import com.nuvio.tv.ui.reshaped.phoneentry.PhoneEntryIconButton
+ import androidx.compose.foundation.BorderStroke
+ import androidx.compose.foundation.background
+ import androidx.compose.foundation.border
+@@ -564,6 +565,24 @@ private fun JellyfinTvTextField(
+     onValueChange: (String) -> Unit,
+     label: String,
+     password: Boolean = false,
++) {
++    Row(
++        modifier = Modifier.fillMaxWidth(),
++        verticalAlignment = Alignment.CenterVertically,
++        horizontalArrangement = Arrangement.spacedBy(8.dp),
++    ) {
++        JellyfinTvTextFieldRaw(value, onValueChange, label, Modifier.weight(1f), password)
++        PhoneEntryIconButton(title = label, secret = password, onValue = onValueChange)
++    }
++}
++
++@Composable
++private fun JellyfinTvTextFieldRaw(
++    value: String,
++    onValueChange: (String) -> Unit,
++    label: String,
++    modifier: Modifier,
++    password: Boolean = false,
+ ) {
+     OutlinedTextField(
+         value = value,
+@@ -593,7 +612,7 @@ private fun JellyfinTvTextField(
+             focusedLabelColor = NuvioTheme.colors.Secondary,
+             unfocusedLabelColor = NuvioTheme.colors.TextTertiary,
+         ),
+-        modifier = Modifier.fillMaxWidth(),
++        modifier = modifier,
+     )
+ }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryListDialogs.kt b/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryListDialogs.kt
+index c55d0307c..e19a95b3e 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryListDialogs.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryListDialogs.kt
+@@ -1,5 +1,6 @@
+ package com.nuvio.tv.ui.screens.library
+ 
++import com.nuvio.tv.ui.reshaped.phoneentry.PhoneEntryButton
+ import android.view.KeyEvent as AndroidKeyEvent
+ import androidx.compose.foundation.background
+ import androidx.compose.foundation.layout.Arrangement
+@@ -243,6 +244,7 @@ internal fun ListEditorDialog(
+         title = if (state.mode == LibraryListEditorState.Mode.CREATE) stringResource(R.string.library_list_create_dialog_title) else stringResource(R.string.library_list_edit_dialog_title),
+         width = 560.dp
+     ) {
++        PhoneEntryButton(title = "List name", onValue = onNameChanged)
+         androidx.compose.material3.OutlinedTextField(
+             value = state.name,
+             onValueChange = onNameChanged,
+@@ -292,6 +294,7 @@ internal fun ListEditorDialog(
+         )
+ 
+         if (capabilities.supportsDescription) {
++            PhoneEntryButton(title = "List description", onValue = onDescriptionChanged)
+             androidx.compose.material3.OutlinedTextField(
+                 value = state.description,
+                 onValueChange = onDescriptionChanged,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/AnimeSkipSettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/AnimeSkipSettingsScreen.kt
+index 71a32b15e..fb51eb65d 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/AnimeSkipSettingsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/AnimeSkipSettingsScreen.kt
+@@ -50,6 +50,7 @@ import androidx.tv.material3.ExperimentalTvMaterial3Api
+ import androidx.tv.material3.MaterialTheme
+ import androidx.tv.material3.Text
+ import com.nuvio.tv.R
++import com.nuvio.tv.ui.reshaped.phoneentry.PhoneEntryButton
+ import com.nuvio.tv.ui.components.NuvioDialog
+ 
+ @Composable
+@@ -149,6 +150,7 @@ private fun AnimeSkipClientIdDialog(
+         subtitle = stringResource(R.string.animeskip_dialog_subtitle),
+         width = 700.dp
+     ) {
++            PhoneEntryButton(title = "Anime-Skip client ID", secret = true, onValue = { value = it })
+         Card(
+             onClick = { inputFocusRequester.requestFocus() },
+             modifier = Modifier.fillMaxWidth().onFocusChanged { isInputFocused = it.isFocused || it.hasFocus },
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/DebridSettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/DebridSettingsScreen.kt
+index 6a835ad1c..cb4112648 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/DebridSettingsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/DebridSettingsScreen.kt
+@@ -64,6 +64,7 @@ import androidx.tv.material3.Icon
+ import androidx.tv.material3.MaterialTheme
+ import androidx.tv.material3.Text
+ import com.nuvio.tv.R
++import com.nuvio.tv.ui.reshaped.phoneentry.PhoneEntryButton
+ import com.nuvio.tv.core.debrid.DebridDeviceAuthorization
+ import com.nuvio.tv.core.debrid.DebridDeviceAuthorizationTokenResult
+ import com.nuvio.tv.core.debrid.DebridProvider
+@@ -921,6 +922,7 @@ private fun DebridTextListDialog(
+         width = 560.dp,
+         suppressFirstKeyUp = false
+     ) {
++            PhoneEntryButton(title = "Debrid list", secret = false, onValue = { value = it })
+         Card(
+             onClick = { inputFocusRequester.requestFocus() },
+             modifier = Modifier.fillMaxWidth(),
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/GeneratedSubtitleSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/GeneratedSubtitleSettingsItems.kt
+index 545f0cf4f..b5904b274 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/GeneratedSubtitleSettingsItems.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/GeneratedSubtitleSettingsItems.kt
+@@ -67,33 +67,12 @@ internal fun generatedSubtitleSettingsRows(enabled: Boolean) {
+     val context = LocalContext.current
+     GeneratedSubtitles.ensureLoaded(context)
+     val mode by GeneratedSubtitles.mode.collectAsStateWithLifecycle()
+-    val groqKey by GeneratedSubtitles.groqKey.collectAsStateWithLifecycle()
+-    val deeplKey by GeneratedSubtitles.deeplKey.collectAsStateWithLifecycle()
+     val language by GeneratedSubtitles.spokenLanguage.collectAsStateWithLifecycle()
+     val onDevice by GeneratedSubtitles.onDevice.collectAsStateWithLifecycle()
+     val fast by GeneratedSubtitles.fastAsianModel.collectAsStateWithLifecycle()
+     val models by GeneratedSubtitles.models.collectAsStateWithLifecycle()
+     var dialog by remember { mutableStateOf<String?>(null) }
+-    val keySet = stringResource(R.string.generated_subs_key_set)
+-    val keyNotSet = stringResource(R.string.generated_subs_key_not_set)
+-    val groqUsage by GeneratedUsage.groqText.collectAsStateWithLifecycle()
+-    val deeplUsage by GeneratedUsage.deeplText.collectAsStateWithLifecycle()
+-    LaunchedEffect(deeplKey) { GeneratedUsage.refreshDeepl(deeplKey) }
+ 
+-    SettingsActionRow(
+-        title = stringResource(R.string.generated_subs_groq_title),
+-        subtitle = stringResource(R.string.generated_subs_groq_description) + if (groqKey.isBlank()) "" else "\n$groqUsage",
+-        value = if (groqKey.isBlank()) keyNotSet else keySet,
+-        onClick = { dialog = "groq" },
+-        enabled = enabled,
+-    )
+-    SettingsActionRow(
+-        title = stringResource(R.string.generated_subs_deepl_title),
+-        subtitle = stringResource(R.string.generated_subs_deepl_description) + if (deeplKey.isBlank()) "" else "\n$deeplUsage",
+-        value = if (deeplKey.isBlank()) keyNotSet else keySet,
+-        onClick = { dialog = "deepl" },
+-        enabled = enabled,
+-    )
+     SettingsActionRow(
+         title = stringResource(R.string.generated_subs_mode_title),
+         subtitle = null,
+@@ -133,6 +112,50 @@ internal fun generatedSubtitleSettingsRows(enabled: Boolean) {
+         )
+     }
+ 
++    when (dialog) {
++        "language" -> SettingsSingleChoiceDialog(
++            title = stringResource(R.string.generated_subs_language_title),
++            options = GeneratedSubtitles.spokenLanguages.map { (code, label) -> SettingsPickerOption(code, label) },
++            selectedValue = language,
++            onOptionSelected = {
++                GeneratedSubtitles.setSpokenLanguage(it)
++                dialog = null
++            },
++            onDismiss = { dialog = null },
++            width = 520.dp,
++            maxHeight = 480.dp,
++        )
++    }
++}
++
++/** Groq and DeepL keys of the generated-subtitle feature, listed under Integrations. */
++@Composable
++internal fun generatedSubtitleKeyRows(enabled: Boolean = true) {
++    val context = LocalContext.current
++    GeneratedSubtitles.ensureLoaded(context)
++    val groqKey by GeneratedSubtitles.groqKey.collectAsStateWithLifecycle()
++    val deeplKey by GeneratedSubtitles.deeplKey.collectAsStateWithLifecycle()
++    var dialog by remember { mutableStateOf<String?>(null) }
++    val keySet = stringResource(R.string.generated_subs_key_set)
++    val keyNotSet = stringResource(R.string.generated_subs_key_not_set)
++    val groqUsage by GeneratedUsage.groqText.collectAsStateWithLifecycle()
++    val deeplUsage by GeneratedUsage.deeplText.collectAsStateWithLifecycle()
++    LaunchedEffect(deeplKey) { GeneratedUsage.refreshDeepl(deeplKey) }
++
++    SettingsActionRow(
++        title = stringResource(R.string.generated_subs_groq_title),
++        subtitle = stringResource(R.string.generated_subs_groq_description) + if (groqKey.isBlank()) "" else "\n$groqUsage",
++        value = if (groqKey.isBlank()) keyNotSet else keySet,
++        onClick = { dialog = "groq" },
++        enabled = enabled,
++    )
++    SettingsActionRow(
++        title = stringResource(R.string.generated_subs_deepl_title),
++        subtitle = stringResource(R.string.generated_subs_deepl_description) + if (deeplKey.isBlank()) "" else "\n$deeplUsage",
++        value = if (deeplKey.isBlank()) keyNotSet else keySet,
++        onClick = { dialog = "deepl" },
++        enabled = enabled,
++    )
+     when (dialog) {
+         "groq" -> ForkApiKeyDialog(
+             title = stringResource(R.string.generated_subs_groq_title),
+@@ -150,18 +173,6 @@ internal fun generatedSubtitleSettingsRows(enabled: Boolean) {
+             onSave = { GeneratedSubtitles.setDeeplKey(it) },
+             onDismiss = { dialog = null },
+         )
+-        "language" -> SettingsSingleChoiceDialog(
+-            title = stringResource(R.string.generated_subs_language_title),
+-            options = GeneratedSubtitles.spokenLanguages.map { (code, label) -> SettingsPickerOption(code, label) },
+-            selectedValue = language,
+-            onOptionSelected = {
+-                GeneratedSubtitles.setSpokenLanguage(it)
+-                dialog = null
+-            },
+-            onDismiss = { dialog = null },
+-            width = 520.dp,
+-            maxHeight = 480.dp,
+-        )
+     }
+ }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/JellyfinSettingsPane.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/JellyfinSettingsPane.kt
+index f64f0c467..78d499308 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/JellyfinSettingsPane.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/JellyfinSettingsPane.kt
+@@ -2,6 +2,7 @@
+ 
+ package com.nuvio.tv.ui.screens.settings
+ 
++import com.nuvio.tv.ui.reshaped.phoneentry.PhoneEntryIconButton
+ import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.fillMaxWidth
+@@ -158,6 +159,24 @@ private fun JellyfinSettingsTextField(
+     label: String,
+     modifier: Modifier = Modifier,
+     password: Boolean = false
++) {
++    androidx.compose.foundation.layout.Row(
++        modifier = modifier,
++        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
++        horizontalArrangement = Arrangement.spacedBy(8.dp)
++    ) {
++        JellyfinSettingsTextFieldRaw(value, onValueChange, label, Modifier.weight(1f), password)
++        PhoneEntryIconButton(title = label, secret = password, onValue = onValueChange)
++    }
++}
++
++@Composable
++private fun JellyfinSettingsTextFieldRaw(
++    value: String,
++    onValueChange: (String) -> Unit,
++    label: String,
++    modifier: Modifier = Modifier,
++    password: Boolean = false
+ ) {
+     androidx.compose.material3.OutlinedTextField(
+         value = value,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/KeysSettingsContent.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/KeysSettingsContent.kt
+new file mode 100644
+index 000000000..2ae660311
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/KeysSettingsContent.kt
+@@ -0,0 +1,41 @@
++package com.nuvio.tv.ui.screens.settings
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.verticalScroll
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.unit.dp
++
++/**
++ * Integrations > API keys (Nuvio fork): every personal key in one place (OMDb, Seekr,
++ * PublicMetaDB, Groq, DeepL). The rows used to sit in Layout, Playback and Tracking.
++ */
++@Composable
++internal fun KeysSettingsContent(initialFocusRequester: FocusRequester? = null) {
++    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
++        SettingsDetailHeader(
++            title = "API keys",
++            subtitle = "Personal keys for ratings, seek previews, tracking and generated subtitles. Keys stay on this TV."
++        )
++        SettingsGroupCard(modifier = Modifier.fillMaxWidth().weight(1f)) {
++            Column(
++                modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
++                verticalArrangement = Arrangement.spacedBy(10.dp)
++            ) {
++                Box(modifier = if (initialFocusRequester != null) Modifier.focusRequester(initialFocusRequester) else Modifier) {
++                    omdbKeySettingsRow()
++                }
++                seekrKeySettingsRow(enabled = true)
++                PublicMetaDbSettingsRow()
++                generatedSubtitleKeyRows()
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutDetailSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutDetailSettings.kt
+index 572047542..a17962986 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutDetailSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutDetailSettings.kt
+@@ -50,7 +50,6 @@ internal fun LayoutDetailPageSection(
+         value = episodeRatingsVisibilityLabel(uiState.detailImdbRatingsVisibility),
+         onClick = { showRatingsDialog = true }
+     )
+-    omdbKeySettingsRow()
+     forkFillerGuideRow()
+     forkAutoAddTorboxRow()
+     forkPlayerButtonsRow()
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/MDBListSettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/MDBListSettingsScreen.kt
+index 9895b388e..ee7a43322 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/MDBListSettingsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/MDBListSettingsScreen.kt
+@@ -48,6 +48,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
+ import androidx.lifecycle.compose.collectAsStateWithLifecycle
+ import androidx.tv.material3.Border
+ import com.nuvio.tv.R
++import com.nuvio.tv.ui.reshaped.phoneentry.PhoneEntryButton
+ import androidx.tv.material3.Button
+ import androidx.tv.material3.ButtonDefaults
+ import androidx.tv.material3.Card
+@@ -202,6 +203,7 @@ private fun MDBListApiKeyDialog(
+         subtitle = stringResource(R.string.mdblist_ratings_key_override_subtitle),
+         width = 700.dp
+     ) {
++            PhoneEntryButton(title = "MDBList API key", secret = true, onValue = { value = it })
+         Card(
+             onClick = { inputFocusRequester.requestFocus() },
+             modifier = Modifier
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/OmdbKeySettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/OmdbKeySettingsItems.kt
+index 1a5962ed7..3a5afa251 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/OmdbKeySettingsItems.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/OmdbKeySettingsItems.kt
+@@ -42,6 +42,7 @@ import androidx.tv.material3.CardDefaults
+ import androidx.tv.material3.MaterialTheme
+ import androidx.tv.material3.Text
+ import com.nuvio.tv.R
++import com.nuvio.tv.ui.reshaped.phoneentry.PhoneEntryButton
+ import com.nuvio.tv.data.repository.OmdbKeyPreferences
+ import com.nuvio.tv.ui.components.NuvioDialog
+ import com.nuvio.tv.ui.theme.NuvioTheme
+@@ -80,6 +81,7 @@ private fun OmdbKeyDialog(currentValue: String, onDismiss: () -> Unit) {
+         width = 700.dp,
+         usePlatformDefaultWidth = false,
+     ) {
++            PhoneEntryButton(title = "OMDb API key", secret = true, onValue = { value = it })
+         Column(verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.lg)) {
+             Card(
+                 onClick = { inputFocusRequester.requestFocus() },
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PublicMetaDbSettingsRow.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PublicMetaDbSettingsRow.kt
+index 47ce44efd..a370dee56 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PublicMetaDbSettingsRow.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PublicMetaDbSettingsRow.kt
+@@ -36,6 +36,7 @@ import androidx.tv.material3.CardDefaults
+ import androidx.tv.material3.MaterialTheme
+ import androidx.tv.material3.Text
+ import com.nuvio.tv.R
++import com.nuvio.tv.ui.reshaped.phoneentry.PhoneEntryButton
+ import com.nuvio.tv.data.publicmetadb.PublicMetaDbService
+ import com.nuvio.tv.data.publicmetadb.PublicMetaDbUiState
+ import com.nuvio.tv.ui.components.NuvioDialog
+@@ -116,6 +117,7 @@ private fun PublicMetaDbDialog(
+         usePlatformDefaultWidth = false,
+         suppressFirstKeyUp = false
+     ) {
++            PhoneEntryButton(title = "PublicMetaDB API key", secret = true, onValue = { value = it })
+         if (!state.isConnected) {
+             Card(
+                 onClick = { inputFocusRequester.requestFocus() },
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SeekPreviewSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SeekPreviewSettingsItems.kt
+index 9daea2e47..dc74769cf 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SeekPreviewSettingsItems.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SeekPreviewSettingsItems.kt
+@@ -35,5 +35,4 @@ internal fun seekPreviewSettingsRows(enabled: Boolean) {
+         onToggle = { CloudSeekPreviewSettings.setEnabled(context, !cloudChecked) },
+         enabled = enabled,
+     )
+-    seekrKeySettingsRow(enabled = enabled)
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SeekrKeySettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SeekrKeySettingsItems.kt
+index 155f2e79f..3fffc9d62 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SeekrKeySettingsItems.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SeekrKeySettingsItems.kt
+@@ -48,6 +48,7 @@ import androidx.tv.material3.CardDefaults
+ import androidx.tv.material3.MaterialTheme
+ import androidx.tv.material3.Text
+ import com.nuvio.tv.R
++import com.nuvio.tv.ui.reshaped.phoneentry.PhoneEntryButton
+ import com.nuvio.tv.reshaped.phoneentry.PhoneEntryPage
+ import com.nuvio.tv.ui.components.NuvioDialog
+ import com.nuvio.tv.ui.reshaped.phoneentry.PhoneEntryQr
+@@ -116,6 +117,7 @@ private fun SeekrApiKeyDialog(currentValue: String, onDismiss: () -> Unit) {
+         width = 860.dp,
+         usePlatformDefaultWidth = false,
+     ) {
++            PhoneEntryButton(title = "Seekr API key", secret = true, onValue = { value = it })
+         val phonePage = PhoneEntryPage(
+             title = stringResource(R.string.settings_seekr_api_key),
+             subtitle = stringResource(R.string.settings_seekr_phone_subtitle),
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt
+index 62e751546..1e92634fe 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt
+@@ -112,7 +112,8 @@ private enum class IntegrationSettingsSection {
+     Tmdb,
+     MdbList,
+     AnimeSkip,
+-    Tvdb
++    Tvdb,
++    Keys
+ }
+ 
+ internal enum class SettingsSectionDestination {
+@@ -1118,6 +1119,7 @@ private fun IntegrationSettingsContent(
+     tvdbFocusRequester: FocusRequester,
+     autoFocusEnabled: Boolean
+ ) {
++    val keysFocusRequester = remember { FocusRequester() }
+     BackHandler(enabled = selectedSection != IntegrationSettingsSection.Hub) {
+         onSelectSection(IntegrationSettingsSection.Hub)
+     }
+@@ -1129,6 +1131,7 @@ private fun IntegrationSettingsContent(
+         IntegrationSettingsSection.MdbList -> mdbListFocusRequester
+         IntegrationSettingsSection.AnimeSkip -> animeSkipFocusRequester
+         IntegrationSettingsSection.Tvdb -> tvdbFocusRequester
++        IntegrationSettingsSection.Keys -> keysFocusRequester
+     }
+     val hubEntryTargetSection = hubReturnSection.takeIf {
+         it != IntegrationSettingsSection.Hub
+@@ -1143,6 +1146,7 @@ private fun IntegrationSettingsContent(
+             IntegrationSettingsSection.MdbList -> mdbListFocusRequester
+             IntegrationSettingsSection.AnimeSkip -> animeSkipFocusRequester
+             IntegrationSettingsSection.Tvdb -> tvdbFocusRequester
++            IntegrationSettingsSection.Keys -> keysFocusRequester
+         }
+         runCatching { requester.requestFocus() }
+     }
+@@ -1234,6 +1238,19 @@ private fun IntegrationSettingsContent(
+                                     }
+                                 )
+                             }
++                            item(key = "integration_hub_keys") {
++                                SettingsActionRow(
++                                    title = "API keys",
++                                    subtitle = "OMDb, Seekr, PublicMetaDB, Groq and DeepL keys",
++                                    leadingIcon = Icons.Default.CloudDownload,
++                                    onClick = { onSelectSection(IntegrationSettingsSection.Keys) },
++                                    modifier = if (hubEntryTargetSection == IntegrationSettingsSection.Keys) {
++                                        Modifier.focusRequester(hubEntryFocusRequester)
++                                    } else {
++                                        Modifier
++                                    }
++                                )
++                            }
+                         }
+                         SettingsVerticalScrollIndicators(state = integrationHubState)
+                     }
+@@ -1269,6 +1286,10 @@ private fun IntegrationSettingsContent(
+             TvdbSettingsContent(initialFocusRequester = tvdbFocusRequester)
+         }
+ 
++        IntegrationSettingsSection.Keys -> {
++            KeysSettingsContent(initialFocusRequester = keysFocusRequester)
++        }
++
+     }
+ }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SubtitleFontSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SubtitleFontSettingsItems.kt
+index f4d6d82cd..4df1a28e9 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SubtitleFontSettingsItems.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SubtitleFontSettingsItems.kt
+@@ -60,6 +60,7 @@ import androidx.tv.material3.CardDefaults
+ import androidx.tv.material3.MaterialTheme
+ import androidx.tv.material3.Text
+ import com.nuvio.tv.R
++import com.nuvio.tv.ui.reshaped.phoneentry.PhoneEntryButton
+ import com.nuvio.tv.core.qr.QrCodeGenerator
+ import com.nuvio.tv.reshaped.net.LanAddress
+ import com.nuvio.tv.reshaped.subtitlefont.SubtitleFontImportResult
+@@ -329,6 +330,7 @@ private fun SubtitleFontUrlDialog(onDismiss: () -> Unit, onImport: (String) -> U
+         subtitle = stringResource(R.string.subtitle_font_url_description),
+         width = 700.dp,
+     ) {
++            PhoneEntryButton(title = "Font address", secret = false, onValue = { value = it })
+         Card(
+             onClick = { inputFocusRequester.requestFocus() },
+             modifier = Modifier
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TrackingSettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TrackingSettingsScreen.kt
+index 2c2f4e7e0..7e14c854f 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TrackingSettingsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TrackingSettingsScreen.kt
+@@ -580,7 +580,6 @@ internal fun TrackingSettingsOverview(
+                                 .testTag(TrackingSettingsTestTags.MDBLIST_PROVIDER)
+                         )
+                         WeTrakrSettingsRow()
+-                        PublicMetaDbSettingsRow()
+                     }
+                 }
+                 item(key = "tracking_sources") {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvdbSettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvdbSettingsScreen.kt
+index 781cd44dd..03c6fcff3 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvdbSettingsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvdbSettingsScreen.kt
+@@ -21,6 +21,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
+ import androidx.tv.material3.Button
+ import androidx.tv.material3.MaterialTheme
+ import androidx.tv.material3.Text
++import com.nuvio.tv.ui.reshaped.phoneentry.PhoneEntryButton
+ import com.nuvio.tv.ui.components.NuvioDialog
+ 
+ @Composable
+@@ -70,6 +71,7 @@ fun TvdbSettingsContent(
+         var value by remember { mutableStateOf("") }
+         val inputFocus = remember { FocusRequester() }
+         NuvioDialog(onDismiss = { editing = false }, title = "TVDB API key", subtitle = "Enter a personal TVDB v4 API key", width = 700.dp) {
++            PhoneEntryButton(title = "TVDB API key", secret = true, onValue = { value = it })
+             BasicTextField(value = value, onValueChange = { value = it }, singleLine = true,
+                 visualTransformation = PasswordVisualTransformation(),
+                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
