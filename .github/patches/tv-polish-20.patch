@@ -650,10 +650,32 @@ index b0210c348..02d85e2be 100644
          SettingsToggleRow(
              title = stringResource(R.string.layout_fullscreen_hero_backdrop),
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
-index f5b6be7a6..d6cf95b34 100644
+index f5b6be7a6..fa5847e27 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
-@@ -1069,6 +1069,11 @@ fun TvChannelsScreen(
+@@ -330,6 +330,21 @@ fun TvChannelsScreen(
+         }
+     }
+ 
++    // Leaving the fullscreen player disposes the whole list screen, so focus would fall back to the
++    // first control (the mic). Put it back on the preview video once the panel is composed again.
++    var wasFullscreen by remember { mutableStateOf(false) }
++    LaunchedEffect(state.isFullscreen) {
++        if (state.isFullscreen) {
++            wasFullscreen = true
++        } else if (wasFullscreen) {
++            wasFullscreen = false
++            repeat(15) {
++                kotlinx.coroutines.delay(80L)
++                if (runCatching { previewPanelFocusRequester.requestFocus() }.isSuccess) return@LaunchedEffect
++            }
++        }
++    }
++
+     // YouTube videos are ordinary videos, not live channels: open them in the main player
+     // (seek, quality, audio boost) instead of the live-TV fullscreen.
+     val youTubeChannel = state.previewChannel?.takeIf { it.type.equals("youtube", ignoreCase = true) }
+@@ -1069,6 +1084,11 @@ fun TvChannelsScreen(
  
              Spacer(modifier = Modifier.height(12.dp))
  
@@ -665,7 +687,7 @@ index f5b6be7a6..d6cf95b34 100644
              // Linha 4: Área Split-Screen: Lista à Esquerda e Pré-visualizador à Direita
              Row(
                  modifier = Modifier
-@@ -1079,7 +1084,7 @@ fun TvChannelsScreen(
+@@ -1079,7 +1099,7 @@ fun TvChannelsScreen(
                  // Coluna da Esquerda: Lista de Canais
                  Box(
                      modifier = Modifier
@@ -674,7 +696,7 @@ index f5b6be7a6..d6cf95b34 100644
                          .fillMaxHeight()
                  ) {
                      when {
-@@ -1229,6 +1234,7 @@ fun TvChannelsScreen(
+@@ -1229,6 +1249,7 @@ fun TvChannelsScreen(
                                              channel = channel,
                                              isSelected = isSelected,
                                              isPlaying = isPlaying,
@@ -682,7 +704,7 @@ index f5b6be7a6..d6cf95b34 100644
                                              modifier = itemModifier,
                                              onFocused = onItemFocused,
                                              onClick = onItemClick,
-@@ -1276,10 +1282,11 @@ fun TvChannelsScreen(
+@@ -1276,10 +1297,11 @@ fun TvChannelsScreen(
                      onStreamSelected = { idx ->
                          viewModel.selectStreamIndex(idx)
                      },
@@ -918,10 +940,17 @@ index 8b016f404..327d1b904 100644
                          text = nowProgram.title,
                          style = MaterialTheme.typography.bodySmall,
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt
-index 1c08693a3..f579e8882 100644
+index 1c08693a3..83209dcd4 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt
-@@ -13,7 +13,9 @@ import androidx.compose.foundation.layout.Spacer
+@@ -7,13 +7,16 @@ import androidx.compose.foundation.clickable
+ import androidx.compose.foundation.focusable
+ import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.BoxWithConstraints
+ import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.Spacer
  import androidx.compose.foundation.layout.aspectRatio
  import androidx.compose.foundation.layout.fillMaxSize
  import androidx.compose.foundation.layout.fillMaxWidth
@@ -931,45 +960,110 @@ index 1c08693a3..f579e8882 100644
  import androidx.compose.foundation.layout.padding
  import androidx.compose.foundation.layout.size
  import androidx.compose.foundation.layout.width
-@@ -126,9 +128,17 @@ fun TvChannelPreviewPanel(
+@@ -125,16 +128,41 @@ fun TvChannelPreviewPanel(
+             return
          }
  
-         // 1. Player de Vídeo em 16:9 ou Card de Início de Prévia
-+        // Height is capped so the buttons and description below always fit; the 16:9 video is centred.
+-        // 1. Player de Vídeo em 16:9 ou Card de Início de Prévia
+-        Box(
+-            modifier = Modifier
+-                .fillMaxWidth()
+-                .aspectRatio(16f / 9f)
+-                .clip(RoundedCornerShape(20.dp))
+-                .background(Color.Black)
+-                .border(1.dp, Color.White.copy(alpha = 0.16f), RoundedCornerShape(20.dp)),
+-            contentAlignment = Alignment.Center
+-        ) {
 +        val playerMaxHeight = (LocalConfiguration.current.screenHeightDp * 0.30f).dp
-         Box(
-             modifier = Modifier
-                 .fillMaxWidth()
-+                .height(playerMaxHeight),
-+            contentAlignment = Alignment.Center
-+        ) {
-+        Box(
-+            modifier = Modifier
-+                .fillMaxHeight()
-                 .aspectRatio(16f / 9f)
-                 .clip(RoundedCornerShape(20.dp))
-                 .background(Color.Black)
-@@ -278,8 +288,9 @@ fun TvChannelPreviewPanel(
++        val scrollState = rememberScrollState()
++        val coroutineScope = rememberCoroutineScope()
++        val isLightAccent = NuvioTheme.colors.Secondary.luminance() > 0.45f
++        var videoFocused by remember { mutableStateOf(false) }
++
++        // The video box is a persistent focus target (it survives card -> player and fullscreen round trips),
++        // so focus never falls back to the top bar.
++        val videoBox: @Composable (Modifier) -> Unit = { boxModifier ->
++            Box(
++                modifier = boxModifier
++                    .clip(RoundedCornerShape(20.dp))
++                    .background(Color.Black)
++                    .border(
++                        width = if (videoFocused) 3.dp else 1.dp,
++                        color = if (videoFocused) NuvioTheme.colors.FocusRing else Color.White.copy(alpha = 0.16f),
++                        shape = RoundedCornerShape(20.dp)
++                    )
++                    .then(if (panelFocusRequester != null) Modifier.focusRequester(panelFocusRequester) else Modifier)
++                    .onFocusChanged { videoFocused = it.isFocused }
++                    .onPreviewKeyEvent { keyEvent ->
++                        if (keyEvent.nativeKeyEvent.action == KeyEvent.ACTION_DOWN &&
++                            keyEvent.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_DPAD_LEFT &&
++                            onRequestChannelListFocus != null
++                        ) {
++                            onRequestChannelListFocus()
++                            return@onPreviewKeyEvent true
++                        }
++                        false
++                    }
++                    .clickable {
++                        if (isPreviewActive && !playableUrl.isNullOrBlank()) onWatchFullscreen() else onStartPlayback()
++                    },
++                contentAlignment = Alignment.Center
++            ) {
+             if (isPreviewActive && !playableUrl.isNullOrBlank()) {
+                 TvChannelPreviewPlayer(
+                     streamUrl = playableUrl,
+@@ -169,20 +197,7 @@ fun TvChannelPreviewPanel(
+             } else {
+                 // Card de Início de Prévia (Clique Obrigatório / Autoplay desativado)
+                 Box(
+-                    modifier = Modifier
+-                        .fillMaxSize()
+-                        .clickable(onClick = onStartPlayback)
+-                        .onPreviewKeyEvent { keyEvent ->
+-                            if (keyEvent.nativeKeyEvent.action == KeyEvent.ACTION_DOWN &&
+-                                keyEvent.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_DPAD_LEFT
+-                            ) {
+-                                if (onRequestChannelListFocus != null) {
+-                                    onRequestChannelListFocus()
+-                                    return@onPreviewKeyEvent true
+-                                }
+-                            }
+-                            false
+-                        },
++                    modifier = Modifier.fillMaxSize(),
+                     contentAlignment = Alignment.Center
+                 ) {
+                     val backdropUrl = channel.poster ?: channel.logo
+@@ -277,33 +292,21 @@ fun TvChannelPreviewPanel(
+                     }
                  }
              }
++            }
          }
-+        }
  
 -        Spacer(modifier = Modifier.height(18.dp))
-+        Spacer(modifier = Modifier.height(10.dp))
- 
-         val scrollState = rememberScrollState()
-         val coroutineScope = rememberCoroutineScope()
-@@ -290,7 +301,7 @@ fun TvChannelPreviewPanel(
-             modifier = Modifier
-                 .fillMaxWidth()
-                 .weight(1f)
+-
+-        val scrollState = rememberScrollState()
+-        val coroutineScope = rememberCoroutineScope()
+-        val isLightAccent = NuvioTheme.colors.Secondary.luminance() > 0.45f
+-
+-        // 2. Metadados e Ações com scroll
+-        Column(
+-            modifier = Modifier
+-                .fillMaxWidth()
+-                .weight(1f)
 -                .verticalScroll(scrollState)
-+                .clip(androidx.compose.ui.graphics.RectangleShape)
-         ) {
-             // Cabeçalho do Canal
+-        ) {
+-            // Cabeçalho do Canal
++        val channelHeader: @Composable (Modifier) -> Unit = { headerModifier ->
              Row(
-@@ -302,8 +313,8 @@ fun TvChannelPreviewPanel(
+-                modifier = Modifier.fillMaxWidth(),
++                modifier = headerModifier,
+                 verticalAlignment = Alignment.CenterVertically,
+-                horizontalArrangement = Arrangement.spacedBy(16.dp)
++                horizontalArrangement = Arrangement.spacedBy(12.dp)
+             ) {
+                 val logoUrl = channel.displayLogo
                  if (!logoUrl.isNullOrBlank()) {
                      Box(
                          modifier = Modifier
@@ -980,44 +1074,249 @@ index 1c08693a3..f579e8882 100644
                              .background(Color(0xFF1E1E24))
                              .padding(4.dp),
                          contentAlignment = Alignment.Center
-@@ -334,7 +345,7 @@ fun TvChannelPreviewPanel(
+@@ -316,159 +319,125 @@ fun TvChannelPreviewPanel(
+                         )
+                     }
+                 }
+-
+                 Column(modifier = Modifier.weight(1f)) {
+                     Text(
+                         text = channel.name,
+-                        style = MaterialTheme.typography.titleLarge,
++                        style = MaterialTheme.typography.titleMedium,
+                         fontWeight = FontWeight.Bold,
+                         color = Color.White,
+-                        maxLines = 1,
++                        maxLines = 2,
+                         overflow = TextOverflow.Ellipsis
+                     )
+                     Text(
+                         text = "${channel.addonName} • ${channel.catalogName}",
+                         style = MaterialTheme.typography.bodySmall,
+-                        color = Color.White.copy(alpha = 0.55f)
++                        color = Color.White.copy(alpha = 0.55f),
++                        maxLines = 1,
++                        overflow = TextOverflow.Ellipsis
+                     )
                  }
              }
++        }
  
 -            Spacer(modifier = Modifier.height(18.dp))
-+            Spacer(modifier = Modifier.height(10.dp))
- 
-             // Botões de Ação para TV (Assistir Tela Cheia, Favoritar, Guia EPG)
-             Row(
-@@ -346,7 +357,7 @@ fun TvChannelPreviewPanel(
-                 Button(
+-
+-            // Botões de Ação para TV (Assistir Tela Cheia, Favoritar, Guia EPG)
+-            Row(
+-                modifier = Modifier.fillMaxWidth(),
+-                horizontalArrangement = Arrangement.spacedBy(12.dp)
+-            ) {
+-                var isFullscreenFocused by remember { mutableStateOf(false) }
+-
+-                Button(
++        val actionButtons: @Composable (Boolean, Modifier) -> Unit = { vertical, buttonsModifier ->
++            val fullscreenButton: @Composable (Modifier) -> Unit = { m ->
++                PanelActionButton(
++                    label = stringResource(R.string.tv_channels_fullscreen_button),
++                    icon = Icons.Rounded.Fullscreen,
                      onClick = onWatchFullscreen,
-                     shape = ButtonDefaults.shape(shape = RoundedCornerShape(22.dp)),
+-                    shape = ButtonDefaults.shape(shape = RoundedCornerShape(22.dp)),
 -                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 12.dp),
-+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp, vertical = 7.dp),
-                     colors = ButtonDefaults.colors(
-                         containerColor = Color.White.copy(alpha = 0.12f),
-                         focusedContainerColor = Color.White,
-@@ -394,7 +405,7 @@ fun TvChannelPreviewPanel(
-                 Button(
-                     onClick = onToggleFavorite,
-                     shape = ButtonDefaults.shape(shape = RoundedCornerShape(22.dp)),
--                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 12.dp),
-+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp, vertical = 7.dp),
-                     colors = ButtonDefaults.colors(
-                         containerColor = if (channel.isFavorite) Color(0xFFFFD700).copy(alpha = 0.18f) else Color.White.copy(alpha = 0.12f),
-                         focusedContainerColor = Color.White,
-@@ -435,7 +446,7 @@ fun TvChannelPreviewPanel(
-                 Button(
-                     onClick = onOpenSchedule,
-                     shape = ButtonDefaults.shape(shape = RoundedCornerShape(22.dp)),
--                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 12.dp),
-+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp, vertical = 7.dp),
-                     colors = ButtonDefaults.colors(
-                         containerColor = Color.White.copy(alpha = 0.12f),
-                         focusedContainerColor = Color.White,
-@@ -468,7 +479,7 @@ fun TvChannelPreviewPanel(
+-                    colors = ButtonDefaults.colors(
+-                        containerColor = Color.White.copy(alpha = 0.12f),
+-                        focusedContainerColor = Color.White,
+-                        focusedContentColor = Color.Black
+-                    ),
+-                    modifier = (if (panelFocusRequester != null) Modifier.focusRequester(panelFocusRequester) else Modifier)
+-                        .weight(1.2f)
+-                        .onFocusChanged { isFullscreenFocused = it.isFocused }
+-                        .onPreviewKeyEvent { keyEvent ->
+-                            if (keyEvent.nativeKeyEvent.action == KeyEvent.ACTION_DOWN &&
+-                                keyEvent.nativeKeyEvent.keyCode == KeyEvent.KEYCODE_DPAD_LEFT
+-                            ) {
+-                                if (onRequestChannelListFocus != null) {
+-                                    onRequestChannelListFocus()
+-                                    return@onPreviewKeyEvent true
+-                                }
+-                            }
+-                            false
++                    iconTint = { focused -> if (focused) Color.Black else Color.White },
++                    modifier = m
++                )
++            }
++            val favoriteButton: @Composable (Modifier) -> Unit = { m ->
++                PanelActionButton(
++                    label = stringResource(if (channel.isFavorite) R.string.tv_channels_favorited_button else R.string.tv_channels_favorite_button),
++                    icon = if (channel.isFavorite) Icons.Rounded.Star else Icons.Rounded.StarBorder,
++                    onClick = onToggleFavorite,
++                    containerColor = if (channel.isFavorite) Color(0xFFFFD700).copy(alpha = 0.18f) else Color.White.copy(alpha = 0.12f),
++                    iconTint = { focused ->
++                        when {
++                            focused -> if (channel.isFavorite) Color(0xFFB45309) else Color.Black
++                            channel.isFavorite -> Color(0xFFFFD700)
++                            else -> Color.White
+                         }
+-                ) {
+-                    Row(
+-                        verticalAlignment = Alignment.CenterVertically,
+-                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+-                    ) {
+-                        Icon(
+-                            imageVector = Icons.Rounded.Fullscreen,
+-                            contentDescription = null,
+-                            tint = if (isFullscreenFocused) Color.Black else Color.White,
+-                            modifier = Modifier.size(16.dp)
+-                        )
+-                        Text(
+-                            text = stringResource(R.string.tv_channels_fullscreen_button),
+-                            color = if (isFullscreenFocused) Color.Black else Color.White,
+-                            fontWeight = FontWeight.Bold,
+-                            fontSize = 11.sp,
+-                            maxLines = 1,
+-                            softWrap = false,
+-                            overflow = TextOverflow.Ellipsis
+-                        )
+-                    }
++                    },
++                    modifier = m
++                )
++            }
++            val guideButton: @Composable (Modifier) -> Unit = { m ->
++                PanelActionButton(
++                    label = stringResource(R.string.tv_channels_guide_button),
++                    icon = Icons.Rounded.CalendarMonth,
++                    onClick = onOpenSchedule,
++                    iconTint = { focused -> if (focused) Color.Black else Color.White },
++                    modifier = m
++                )
++            }
++            if (vertical) {
++                Column(modifier = buttonsModifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
++                    fullscreenButton(Modifier.fillMaxWidth())
++                    favoriteButton(Modifier.fillMaxWidth())
++                    guideButton(Modifier.fillMaxWidth())
+                 }
++            } else {
++                Row(modifier = buttonsModifier, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
++                    fullscreenButton(Modifier.weight(1.2f))
++                    favoriteButton(Modifier.weight(1f))
++                    guideButton(Modifier.weight(0.9f))
++                }
++            }
++        }
  
+-                var isFavFocused by remember { mutableStateOf(false) }
+-
+-                Button(
+-                    onClick = onToggleFavorite,
+-                    shape = ButtonDefaults.shape(shape = RoundedCornerShape(22.dp)),
+-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 12.dp),
+-                    colors = ButtonDefaults.colors(
+-                        containerColor = if (channel.isFavorite) Color(0xFFFFD700).copy(alpha = 0.18f) else Color.White.copy(alpha = 0.12f),
+-                        focusedContainerColor = Color.White,
+-                        focusedContentColor = Color.Black
+-                    ),
+-                    modifier = Modifier
+-                        .weight(1f)
+-                        .onFocusChanged { isFavFocused = it.isFocused }
+-                ) {
++        BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
++            val sideBySide = maxWidth >= 380.dp
++            Column(modifier = Modifier.fillMaxSize()) {
++                if (sideBySide) {
++                    // Video left, title and buttons right, details below both.
+                     Row(
+-                        verticalAlignment = Alignment.CenterVertically,
+-                        horizontalArrangement = Arrangement.spacedBy(4.dp)
++                        modifier = Modifier
++                            .fillMaxWidth()
++                            .height(playerMaxHeight),
++                        horizontalArrangement = Arrangement.spacedBy(16.dp)
+                     ) {
+-                        val starTint = when {
+-                            isFavFocused -> if (channel.isFavorite) Color(0xFFB45309) else Color.Black
+-                            channel.isFavorite -> Color(0xFFFFD700)
+-                            else -> Color.White
++                        videoBox(Modifier.fillMaxHeight().aspectRatio(16f / 9f))
++                        Column(
++                            modifier = Modifier
++                                .weight(1f)
++                                .fillMaxHeight(),
++                            verticalArrangement = Arrangement.SpaceBetween
++                        ) {
++                            channelHeader(Modifier.fillMaxWidth())
++                            actionButtons(true, Modifier.fillMaxWidth())
+                         }
+-                        Icon(
+-                            imageVector = if (channel.isFavorite) Icons.Rounded.Star else Icons.Rounded.StarBorder,
+-                            contentDescription = null,
+-                            tint = starTint,
+-                            modifier = Modifier.size(15.dp)
+-                        )
+-                        Text(
+-                            text = stringResource(if (channel.isFavorite) R.string.tv_channels_favorited_button else R.string.tv_channels_favorite_button),
+-                            color = if (isFavFocused) Color.Black else Color.White,
+-                            fontSize = 11.sp,
+-                            maxLines = 1,
+-                            softWrap = false,
+-                            overflow = TextOverflow.Ellipsis
+-                        )
+                     }
++                } else {
++                    Box(
++                        modifier = Modifier
++                            .fillMaxWidth()
++                            .height(playerMaxHeight),
++                        contentAlignment = Alignment.Center
++                    ) {
++                        videoBox(Modifier.fillMaxHeight().aspectRatio(16f / 9f))
++                    }
++                    Spacer(modifier = Modifier.height(8.dp))
++                    channelHeader(Modifier.fillMaxWidth())
++                    Spacer(modifier = Modifier.height(8.dp))
++                    actionButtons(false, Modifier.fillMaxWidth())
+                 }
+ 
+-                var isScheduleFocused by remember { mutableStateOf(false) }
++                Spacer(modifier = Modifier.height(10.dp))
+ 
+-                Button(
+-                    onClick = onOpenSchedule,
+-                    shape = ButtonDefaults.shape(shape = RoundedCornerShape(22.dp)),
+-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 12.dp),
+-                    colors = ButtonDefaults.colors(
+-                        containerColor = Color.White.copy(alpha = 0.12f),
+-                        focusedContainerColor = Color.White,
+-                        focusedContentColor = Color.Black
+-                    ),
++                Column(
+                     modifier = Modifier
+-                        .weight(0.9f)
+-                        .onFocusChanged { isScheduleFocused = it.isFocused }
++                        .fillMaxWidth()
++                        .weight(1f)
++                        .clip(androidx.compose.ui.graphics.RectangleShape)
++                        .verticalScroll(scrollState)
+                 ) {
+-                    Row(
+-                        verticalAlignment = Alignment.CenterVertically,
+-                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+-                    ) {
+-                        Icon(
+-                            imageVector = Icons.Rounded.CalendarMonth,
+-                            contentDescription = null,
+-                            tint = if (isScheduleFocused) Color.Black else Color.White,
+-                            modifier = Modifier.size(15.dp)
+-                        )
+-                        Text(
+-                            text = stringResource(R.string.tv_channels_guide_button),
+-                            color = if (isScheduleFocused) Color.Black else Color.White,
+-                            fontSize = 11.sp,
+-                            maxLines = 1,
+-                            softWrap = false
+-                        )
+-                    }
+-                }
+-            }
+-
              // Seletor de Transmissões / Qualidades se houver mais de 1
              if (streams.size > 1) {
 -                Spacer(modifier = Modifier.height(10.dp))
@@ -1025,7 +1324,7 @@ index 1c08693a3..f579e8882 100644
                  Text(
                      text = stringResource(R.string.tv_channels_available_sources),
                      style = MaterialTheme.typography.labelSmall,
-@@ -519,7 +530,7 @@ fun TvChannelPreviewPanel(
+@@ -519,7 +488,7 @@ fun TvChannelPreviewPanel(
              val nowProg = epg?.nowProgram
              if (nowProg != null) {
                  var isEpgCardFocused by remember { mutableStateOf(false) }
@@ -1034,7 +1333,7 @@ index 1c08693a3..f579e8882 100644
                  Box(
                      modifier = Modifier
                          .fillMaxWidth()
-@@ -561,7 +572,7 @@ fun TvChannelPreviewPanel(
+@@ -561,7 +530,7 @@ fun TvChannelPreviewPanel(
                              }
                              false
                          }
@@ -1043,16 +1342,16 @@ index 1c08693a3..f579e8882 100644
                  ) {
                      Column {
                          Row(
-@@ -602,7 +613,7 @@ fun TvChannelPreviewPanel(
+@@ -602,7 +571,7 @@ fun TvChannelPreviewPanel(
                                  text = nowProg.description,
                                  style = MaterialTheme.typography.bodySmall,
                                  color = Color.White.copy(alpha = 0.85f),
 -                                maxLines = if (isEpgCardFocused) 14 else 4,
-+                                maxLines = if (isEpgCardFocused) 5 else 2,
++                                maxLines = if (isEpgCardFocused) 8 else 4,
                                  overflow = TextOverflow.Ellipsis,
                                  fontSize = 12.sp
                              )
-@@ -625,7 +636,7 @@ fun TvChannelPreviewPanel(
+@@ -625,7 +594,7 @@ fun TvChannelPreviewPanel(
              // Descrição geral do canal (se houver e não for redundante)
              if (!channel.description.isNullOrBlank() && (nowProg == null || channel.description != nowProg.description)) {
                  var isDescFocused by remember { mutableStateOf(false) }
@@ -1061,20 +1360,68 @@ index 1c08693a3..f579e8882 100644
                  Box(
                      modifier = Modifier
                          .fillMaxWidth()
-@@ -675,7 +686,7 @@ fun TvChannelPreviewPanel(
+@@ -675,7 +644,7 @@ fun TvChannelPreviewPanel(
                              text = channel.description,
                              style = MaterialTheme.typography.bodySmall,
                              color = Color.White.copy(alpha = 0.85f),
 -                            maxLines = if (isDescFocused) 14 else 4,
-+                            maxLines = if (isDescFocused) 4 else 2,
++                            maxLines = if (isDescFocused) 8 else 3,
                              overflow = TextOverflow.Ellipsis,
                              fontSize = 12.sp
                          )
-@@ -683,7 +694,6 @@ fun TvChannelPreviewPanel(
+@@ -683,7 +652,54 @@ fun TvChannelPreviewPanel(
                  }
              }
  
 -            Spacer(modifier = Modifier.height(48.dp))
++                }
++            }
++        }
++    }
++}
++
++
++@OptIn(ExperimentalTvMaterial3Api::class)
++@Composable
++private fun PanelActionButton(
++    label: String,
++    icon: androidx.compose.ui.graphics.vector.ImageVector,
++    onClick: () -> Unit,
++    iconTint: (Boolean) -> Color,
++    modifier: Modifier = Modifier,
++    containerColor: Color = Color.White.copy(alpha = 0.12f)
++) {
++    var focused by remember { mutableStateOf(false) }
++    Button(
++        onClick = onClick,
++        shape = ButtonDefaults.shape(shape = RoundedCornerShape(22.dp)),
++        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp, vertical = 6.dp),
++        colors = ButtonDefaults.colors(
++            containerColor = containerColor,
++            focusedContainerColor = Color.White,
++            focusedContentColor = Color.Black
++        ),
++        modifier = modifier.onFocusChanged { focused = it.isFocused }
++    ) {
++        Row(
++            verticalAlignment = Alignment.CenterVertically,
++            horizontalArrangement = Arrangement.spacedBy(6.dp)
++        ) {
++            Icon(
++                imageVector = icon,
++                contentDescription = null,
++                tint = iconTint(focused),
++                modifier = Modifier.size(16.dp)
++            )
++            Text(
++                text = label,
++                color = if (focused) Color.Black else Color.White,
++                fontWeight = FontWeight.Bold,
++                fontSize = 12.sp,
++                maxLines = 1,
++                softWrap = false,
++                overflow = TextOverflow.Ellipsis
++            )
          }
      }
  }
@@ -1155,10 +1502,20 @@ index f063b6aea..f59c3aaf9 100644
                                              KeyEvent.KEYCODE_CHANNEL_UP,
                                              KeyEvent.KEYCODE_MENU,
 diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt
-index ad64da0ad..7710c5a7b 100644
+index ad64da0ad..8074e86fd 100644
 --- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt
-@@ -362,7 +362,7 @@ private fun Content(
+@@ -334,6 +334,9 @@ private fun Content(
+ 
+         state.rows.isNotEmpty() -> LazyColumn(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(20.dp)) {
+             itemsIndexed(state.rows) { rowIndex, row ->
++                LaunchedEffect(rowIndex, state.rows.size, state.tab) {
++                    if (rowIndex >= state.rows.size - 3) viewModel.loadMoreRows()
++                }
+                 Column {
+                     if (row.title.isNotBlank()) {
+                         Text(row.title, color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+@@ -362,7 +365,7 @@ private fun Content(
          else -> {
              val gridState = rememberLazyGridState()
              // Keep loading as you near the end, like an endless feed.
@@ -1183,7 +1540,7 @@ index 9aa692d3c..03551a306 100644
          if (selected > related.lastIndex) selected = related.lastIndex.coerceAtLeast(0)
      }
 diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
-index 368faf0bc..e45e13e31 100644
+index 368faf0bc..11f655fee 100644
 --- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
 +++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
 @@ -23,6 +23,8 @@ import kotlinx.coroutines.delay
@@ -1195,7 +1552,7 @@ index 368faf0bc..e45e13e31 100644
  import kotlinx.coroutines.flow.update
  import kotlinx.coroutines.isActive
  import kotlinx.coroutines.launch
-@@ -117,7 +119,9 @@ class YouTubeViewModel @Inject constructor(
+@@ -117,12 +119,14 @@ class YouTubeViewModel @Inject constructor(
          const val TAG = "YouTubeVM"
          const val MAX_CLIENT_SWITCHES = 8
          const val PREFETCH_DELAY_MS = 100L
@@ -1206,6 +1563,12 @@ index 368faf0bc..e45e13e31 100644
          const val MAX_CACHED = 24
          /** How much of a video counts as watched for hiding it. */
          const val WATCHED_PERCENT = 90
+         /** Rows stop streaming in at this many, so a feed can't grow without end in memory. */
+-        const val MAX_ROWS = 120
++        const val MAX_ROWS = 400
+     }
+ 
+     private val _state = MutableStateFlow(YtUiState())
 @@ -146,7 +150,22 @@ class YouTubeViewModel @Inject constructor(
  
      val canGoBack: Boolean get() = backStack.isNotEmpty()
@@ -1230,7 +1593,7 @@ index 368faf0bc..e45e13e31 100644
  
      private var screenOpenedBefore = false
  
-@@ -243,23 +262,61 @@ class YouTubeViewModel @Inject constructor(
+@@ -243,23 +262,82 @@ class YouTubeViewModel @Inject constructor(
          return true
      }
  
@@ -1262,6 +1625,23 @@ index 368faf0bc..e45e13e31 100644
 +        }
 +    }.getOrNull()
 +
++    /** More shorts when YouTube's own pages ran out: what it suggests after the last ones, then a search. */
++    private fun shortsFallback(grid: List<YtItem>, have: MutableSet<String>): List<YtItem> {
++        val out = ArrayList<YtItem>()
++        fun add(items: List<YtItem>) {
++            out += items.filter { it.isShort }.filter { have.add(it.videoId ?: it.title) }
++        }
++        grid.takeLast(3).mapNotNull { it.videoId }.forEach { id ->
++            runCatching { service.mediaItemService.getMetadataObserve(id).blockingFirst() }.getOrNull()
++                ?.suggestions.orEmpty().forEach { add(toItems(it)) }
++        }
++        if (out.isEmpty()) {
++            runCatching { content.getSearchObserve("#shorts").blockingFirst() }.getOrNull()
++                .orEmpty().forEach { add(toItems(it)) }
++        }
++        return out
++    }
++
      fun loadMore() {
          val group = currentGroup ?: return
          val s = _state.value
@@ -1286,6 +1666,10 @@ index 368faf0bc..e45e13e31 100644
 +                        hasMore = again.nextPageKey != null || items.isNotEmpty()
 +                    }
 +                }
++                if (items.isEmpty() && canRefill && tab == YtTab.SHORTS) {
++                    items = shortsFallback(s.grid, have)
++                    if (items.isNotEmpty()) hasMore = true
++                }
 +                Triple(last, items, hasMore)
              }
 -            val more = next?.let(::toItems).orEmpty()
@@ -1301,7 +1685,66 @@ index 368faf0bc..e45e13e31 100644
              }
              fetchDeArrow()
          }
-@@ -332,13 +389,10 @@ class YouTubeViewModel @Inject constructor(
+@@ -307,6 +385,50 @@ class YouTubeViewModel @Inject constructor(
+     }
+ 
+     private var restJob: Job? = null
++    private var restDone = false
++    private var rowsRefilling = false
++
++    private fun rowSource(tab: YtTab): Observable<List<MediaGroup>>? = when (tab) {
++        YtTab.HOME -> content.homeObserve
++        YtTab.LIVE -> content.liveObserve
++        YtTab.MUSIC -> content.musicObserve
++        YtTab.GAMING -> content.gamingObserve
++        YtTab.NEWS -> content.newsObserve
++        YtTab.SPORTS -> content.sportsObserve
++        else -> null
++    }
++
++    /** When every row YouTube had is shown, asks for a fresh set and adds the rows that have new videos. */
++    fun loadMoreRows() {
++        val s = _state.value
++        if (!restDone || rowsRefilling || s.loading || s.subTitle != null || s.rows.isEmpty()) return
++        val source = rowSource(s.tab) ?: return
++        rowsRefilling = true
++        val tab = s.tab
++        viewModelScope.launch {
++            val fresh = withContext(Dispatchers.IO) {
++                runCatching {
++                    val iterator = source.blockingIterable().iterator()
++                    val first = toRows(iterator.next())
++                    Pair(first, iterator)
++                }.getOrNull()
++            }
++            rowsRefilling = false
++            if (fresh == null || _state.value.tab != tab || _state.value.subTitle != null) {
++                (fresh?.second as? Disposable)?.dispose()
++                return@launch
++            }
++            val have = _state.value.rows.flatMapTo(HashSet()) { r -> r.items.map { it.videoId ?: it.title } }
++            val added = fresh.first.mapNotNull { r ->
++                val items = r.items.filter { have.add(it.videoId ?: it.title) }
++                if (items.size >= 3) r.copy(items = items) else null
++            }
++            if (added.isNotEmpty()) _state.update { it.copy(rows = it.rows + added) }
++            restDone = false
++            streamRest(fresh.second)
++            fetchDeArrow()
++        }
++    }
+ 
+     private fun streamRest(rest: Iterator<List<MediaGroup>>) {
+         restJob = viewModelScope.launch(Dispatchers.IO) {
+@@ -319,6 +441,7 @@ class YouTubeViewModel @Inject constructor(
+                         fetchDeArrow()
+                     }
+                 }
++                if (isActive) restDone = true
+             } finally {
+                 (rest as? Disposable)?.dispose()
+             }
+@@ -332,13 +455,10 @@ class YouTubeViewModel @Inject constructor(
          if (!row.canMore || row.loadingMore) return
          setRow(index, row.title) { it.copy(loadingMore = true) }
          viewModelScope.launch {
@@ -1317,7 +1760,24 @@ index 368faf0bc..e45e13e31 100644
                  r.copy(
                      items = r.items + fresh,
                      group = next ?: r.group,
-@@ -674,16 +728,22 @@ class YouTubeViewModel @Inject constructor(
+@@ -396,6 +516,7 @@ class YouTubeViewModel @Inject constructor(
+         refreshHidden()
+         loadJob?.cancel()
+         restJob?.cancel()
++        restDone = false
+         currentGroup = null
+         loadJob = viewModelScope.launch {
+             val result = withContext(Dispatchers.IO) { runCatching { fetch() } }
+@@ -421,7 +542,7 @@ class YouTubeViewModel @Inject constructor(
+                                     loading = false,
+                                     rows = emptyList(),
+                                     grid = unseenFirst(toItems(feed.group)),
+-                                    canLoadMore = feed.group.nextPageKey != null
++                                    canLoadMore = feed.group.nextPageKey != null || it.subTitle == null
+                                 )
+                             }
+                         }
+@@ -674,16 +795,22 @@ class YouTubeViewModel @Inject constructor(
      fun loadRelated(currentVideoId: String) {
          if (relatedFor == currentVideoId && _related.value.isNotEmpty()) return
          relatedFor = currentVideoId
@@ -1340,7 +1800,7 @@ index 368faf0bc..e45e13e31 100644
                  }.getOrDefault(emptyList())
              }
              if (relatedFor == currentVideoId) {
-@@ -693,6 +753,71 @@ class YouTubeViewModel @Inject constructor(
+@@ -693,6 +820,71 @@ class YouTubeViewModel @Inject constructor(
          }
      }
  
