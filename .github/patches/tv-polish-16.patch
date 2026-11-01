@@ -1,0 +1,134 @@
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt
+index 395c9a594..ba392256a 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt
+@@ -765,11 +765,13 @@ object JellyfinRepository {
+                 _uiState.update { it.copy(isLoadingHome = true) }
+                 val snapshot = _uiState.value
+                 val visibleLibs = snapshot.libraries.filter { library -> library.id !in snapshot.hiddenLibraryIds }
++                // Keep the rows already on screen while they reload. Emptying them disposes the
++                // focused card, which throws the D-pad ring to another row and column.
+                 _uiState.update {
+                     it.copy(
+-                        resumeItems = emptyList(),
+                         homeRows = visibleLibs.map { library ->
+-                            JellyfinLibraryRow(
++                            val existing = it.homeRows.firstOrNull { row -> row.libraryId == library.id }
++                            existing?.copy(isLoading = existing.items.isEmpty()) ?: JellyfinLibraryRow(
+                                 libraryId = library.id,
+                                 libraryName = library.name,
+                                 collectionType = library.collectionType,
+@@ -823,9 +825,9 @@ object JellyfinRepository {
+                                                 libraryId = row.libraryId,
+                                                 libraryName = row.libraryName,
+                                                 collectionType = row.collectionType,
+-                                                items = page?.items.orEmpty(),
++                                                items = page?.items ?: row.items,
+                                                 isLoading = false,
+-                                                hasMore = page != null && page.totalRecordCount > page.items.size,
++                                                hasMore = if (page != null) page.totalRecordCount > page.items.size else row.hasMore,
+                                             )
+                                         }
+                                     },
+diff --git a/app/src/main/java/com/nuvio/tv/ui/components/HeroCarousel.kt b/app/src/main/java/com/nuvio/tv/ui/components/HeroCarousel.kt
+index 1716c5ede..71eab26ba 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/components/HeroCarousel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/components/HeroCarousel.kt
+@@ -99,6 +99,8 @@ fun HeroCarousel(
+     initialActiveIndex: Int = 0,
+     mdbListShowOnHero: Boolean = false,
+     mdbListRatingOrder: List<String> = com.nuvio.tv.domain.model.MDBListSettings.DEFAULT_RATING_ORDER,
++    /** False while the hero is scrolled out of view, so slides do not advance unseen. */
++    autoAdvance: Boolean = true,
+     modifier: Modifier = Modifier
+ ) {
+     if (items.isEmpty()) return
+@@ -123,7 +125,8 @@ fun HeroCarousel(
+     val heroContext = androidx.compose.ui.platform.LocalContext.current
+     DxHeroRotation.ensureLoaded(heroContext)
+     val rotationMs by DxHeroRotation.intervalMs.collectAsStateWithLifecycle()
+-    LaunchedEffect(isFocused, items.size, rotationMs) {
++    LaunchedEffect(isFocused, items.size, rotationMs, autoAdvance) {
++        if (!autoAdvance) return@LaunchedEffect
+         if (items.size <= 1 || rotationMs <= 0L) return@LaunchedEffect
+         delay(rotationMs + 5000L) // first advance waits a little longer so the initial GPU load settles
+         while (true) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
+index 0e2b12ea6..a7dfcc104 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
+@@ -262,7 +262,6 @@ fun JellyfinDetailsScreen(
+         var sortNewestFirst by remember(item.id) { mutableStateOf(false) }
+         val episodeListState = rememberLazyListState()
+         var goToEpisodeOpen by remember(item.id) { mutableStateOf(false) }
+-        val uriHandler = androidx.compose.ui.platform.LocalUriHandler.current
+         val episodeScope = rememberCoroutineScope()
+         val sectionTabs = remember(richMeta.castMembers, ratings.moreLikeThis, ratings.trailers, ratings.episodeImdbRatings, item.isSeries) {
+             buildList {
+@@ -311,9 +310,6 @@ fun JellyfinDetailsScreen(
+                     sortNewestFirst = sortNewestFirst,
+                     onToggleSort = { sortNewestFirst = !sortNewestFirst },
+                     onGoToEpisode = { goToEpisodeOpen = true },
+-                    onOpenTvdb = item.tvdbId?.let { id ->
+-                        { runCatching { uriHandler.openUri("https://thetvdb.com/dereferrer/series/$id") } }
+-                    },
+                     modifier = Modifier.padding(top = NuvioTheme.spacing.lg),
+                 )
+             }
+@@ -506,7 +502,6 @@ private fun JellyfinSeasonsChips(
+     sortNewestFirst: Boolean,
+     onToggleSort: () -> Unit,
+     onGoToEpisode: () -> Unit,
+-    onOpenTvdb: (() -> Unit)?,
+     modifier: Modifier = Modifier,
+ ) {
+     Column(modifier = modifier.padding(horizontal = NuvioTheme.spacing.xxxl)) {
+@@ -529,7 +524,6 @@ private fun JellyfinSeasonsChips(
+                 onClick = onToggleSort,
+             )
+             JellyfinPillChip(label = "Go to episode", isSelected = false, onClick = onGoToEpisode)
+-            if (onOpenTvdb != null) JellyfinPillChip(label = "TVDB", isSelected = false, onClick = onOpenTvdb)
+         }
+     }
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinScreen.kt
+index 91a5333f2..c3c378786 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinScreen.kt
+@@ -223,12 +223,16 @@ private fun JellyfinHome(
+                 },
+         )
+     }
+-    LaunchedEffect(heroItems.list.size) {
+-        if (heroItems.isNotEmpty()) {
++    // Focus the hero once. Rows keep loading after this, and each load changes the hero size;
++    // asking again would pull the ring back up from the row the user already moved down to.
++    var heroFocusDone by remember { mutableStateOf(false) }
++    LaunchedEffect(heroItems.isNotEmpty()) {
++        if (heroItems.isNotEmpty() && !heroFocusDone) {
+             withFrameNanos { }
+-            runCatching { heroFocusRequester.requestFocus() }
++            if (runCatching { heroFocusRequester.requestFocus() }.isSuccess) heroFocusDone = true
+         }
+     }
++    val homeScrollState = rememberScrollState()
+     if (state.isLoadingHome && state.homeRows.isEmpty()) {
+         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+             LoadingIndicator(modifier = Modifier.size(40.dp))
+@@ -238,7 +242,7 @@ private fun JellyfinHome(
+     Column(
+         modifier = Modifier
+             .fillMaxSize()
+-            .verticalScroll(rememberScrollState()),
++            .verticalScroll(homeScrollState),
+     ) {
+         // The hero runs edge to edge with nothing above or over it.
+         Box(modifier = Modifier.fillMaxWidth()) {
+@@ -247,6 +251,7 @@ private fun JellyfinHome(
+                     items = heroItems,
+                     onItemClick = { preview -> onOpenDetails(preview.id) },
+                     focusRequester = heroFocusRequester,
++                    autoAdvance = homeScrollState.value < 200,
+                 )
+             }
+         }
