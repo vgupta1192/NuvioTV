@@ -650,10 +650,18 @@ index b0210c348..02d85e2be 100644
          SettingsToggleRow(
              title = stringResource(R.string.layout_fullscreen_hero_backdrop),
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
-index f5b6be7a6..62fcfed10 100644
+index f5b6be7a6..3ea84b0ea 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
-@@ -330,6 +330,30 @@ fun TvChannelsScreen(
+@@ -74,6 +74,7 @@ import androidx.compose.runtime.rememberCoroutineScope
+ import androidx.compose.runtime.rememberUpdatedState
+ import androidx.compose.runtime.saveable.rememberSaveable
+ import androidx.compose.runtime.setValue
++import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.launch
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+@@ -330,6 +331,33 @@ fun TvChannelsScreen(
          }
      }
  
@@ -670,9 +678,12 @@ index f5b6be7a6..62fcfed10 100644
 +            val idx = state.filteredChannels.indexOfFirst { it.stableKey() == key }
 +            if (idx >= 0) {
 +                lastFocusedChannelIndex = idx
-+                if (listState.layoutInfo.visibleItemsInfo.none { it.index == idx }) {
-+                    runCatching { listState.scrollToItem((idx - 1).coerceAtLeast(0)) }
++                // The list is only measured again once the screen is back: wait for it, then scroll.
++                kotlinx.coroutines.withTimeoutOrNull(2000L) {
++                    androidx.compose.runtime.snapshotFlow { listState.layoutInfo.totalItemsCount }
++                        .first { it > 0 }
 +                }
++                runCatching { listState.scrollToItem((idx - 1).coerceAtLeast(0)) }
 +            }
 +            repeat(15) {
 +                kotlinx.coroutines.delay(80L)
@@ -684,7 +695,7 @@ index f5b6be7a6..62fcfed10 100644
      // YouTube videos are ordinary videos, not live channels: open them in the main player
      // (seek, quality, audio boost) instead of the live-TV fullscreen.
      val youTubeChannel = state.previewChannel?.takeIf { it.type.equals("youtube", ignoreCase = true) }
-@@ -1069,6 +1093,11 @@ fun TvChannelsScreen(
+@@ -1069,6 +1097,11 @@ fun TvChannelsScreen(
  
              Spacer(modifier = Modifier.height(12.dp))
  
@@ -696,7 +707,7 @@ index f5b6be7a6..62fcfed10 100644
              // Linha 4: Área Split-Screen: Lista à Esquerda e Pré-visualizador à Direita
              Row(
                  modifier = Modifier
-@@ -1079,7 +1108,7 @@ fun TvChannelsScreen(
+@@ -1079,7 +1112,7 @@ fun TvChannelsScreen(
                  // Coluna da Esquerda: Lista de Canais
                  Box(
                      modifier = Modifier
@@ -705,7 +716,7 @@ index f5b6be7a6..62fcfed10 100644
                          .fillMaxHeight()
                  ) {
                      when {
-@@ -1229,6 +1258,7 @@ fun TvChannelsScreen(
+@@ -1229,6 +1262,7 @@ fun TvChannelsScreen(
                                              channel = channel,
                                              isSelected = isSelected,
                                              isPlaying = isPlaying,
@@ -713,7 +724,7 @@ index f5b6be7a6..62fcfed10 100644
                                              modifier = itemModifier,
                                              onFocused = onItemFocused,
                                              onClick = onItemClick,
-@@ -1276,10 +1306,11 @@ fun TvChannelsScreen(
+@@ -1276,10 +1310,11 @@ fun TvChannelsScreen(
                      onStreamSelected = { idx ->
                          viewModel.selectStreamIndex(idx)
                      },
@@ -1554,7 +1565,7 @@ index 9aa692d3c..03551a306 100644
          if (selected > related.lastIndex) selected = related.lastIndex.coerceAtLeast(0)
      }
 diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
-index 368faf0bc..cdc1b16d0 100644
+index 368faf0bc..4425e54ac 100644
 --- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
 +++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
 @@ -23,6 +23,8 @@ import kotlinx.coroutines.delay
@@ -1566,18 +1577,20 @@ index 368faf0bc..cdc1b16d0 100644
  import kotlinx.coroutines.flow.update
  import kotlinx.coroutines.isActive
  import kotlinx.coroutines.launch
-@@ -57,7 +59,9 @@ data class YtRow(
+@@ -57,7 +59,11 @@ data class YtRow(
      /** Where this row continues from, when YouTube has more videos for it. */
      internal val group: MediaGroup? = null,
      val canMore: Boolean = false,
 -    val loadingMore: Boolean = false
 +    val loadingMore: Boolean = false,
 +    /** Failed or empty continuation requests in a row; the row gives up after a few. */
-+    val misses: Int = 0
++    val misses: Int = 0,
++    /** How many topic searches have already topped this row up once YouTube's own pages ran out. */
++    val searchStep: Int = 0
  )
  
  /** The feeds along the top. Grid feeds are one long list; the others are rows of videos. */
-@@ -85,6 +89,8 @@ data class YtUiState(
+@@ -85,6 +91,8 @@ data class YtUiState(
      val rows: List<YtRow> = emptyList(),
      val grid: List<YtItem> = emptyList(),
      val canLoadMore: Boolean = false,
@@ -1586,7 +1599,7 @@ index 368faf0bc..cdc1b16d0 100644
      /** Set while looking at a channel, playlist or search opened from a feed; Back returns to the feed. */
      val subTitle: String? = null
  ) {
-@@ -117,12 +123,16 @@ class YouTubeViewModel @Inject constructor(
+@@ -117,12 +125,17 @@ class YouTubeViewModel @Inject constructor(
          const val TAG = "YouTubeVM"
          const val MAX_CLIENT_SWITCHES = 8
          const val PREFETCH_DELAY_MS = 100L
@@ -1600,12 +1613,13 @@ index 368faf0bc..cdc1b16d0 100644
          /** Rows stop streaming in at this many, so a feed can't grow without end in memory. */
 -        const val MAX_ROWS = 120
 +        const val MAX_ROWS = 400
++        private val ROW_SEARCH_SUFFIXES = listOf("", "new", "best", "mix", "latest", "top", "popular")
 +        private val SHORTS_QUERIES = listOf("#shorts", "shorts funny", "shorts music", "shorts trending", "shorts food",
 +            "shorts cricket", "shorts gaming", "shorts news", "shorts travel", "shorts comedy")
      }
  
      private val _state = MutableStateFlow(YtUiState())
-@@ -146,7 +156,22 @@ class YouTubeViewModel @Inject constructor(
+@@ -146,7 +159,22 @@ class YouTubeViewModel @Inject constructor(
  
      val canGoBack: Boolean get() = backStack.isNotEmpty()
  
@@ -1629,7 +1643,7 @@ index 368faf0bc..cdc1b16d0 100644
  
      private var screenOpenedBefore = false
  
-@@ -178,7 +203,12 @@ class YouTubeViewModel @Inject constructor(
+@@ -178,7 +206,12 @@ class YouTubeViewModel @Inject constructor(
                  YtTab.NEWS -> rowStream(content.newsObserve)
                  YtTab.SPORTS -> rowStream(content.sportsObserve)
                  YtTab.SUBSCRIPTIONS -> grid(content.subscriptionsObserve.blockingFirst())
@@ -1643,7 +1657,7 @@ index 368faf0bc..cdc1b16d0 100644
                  YtTab.CHANNELS -> grid(content.subscribedChannelsObserve.blockingFirst())
                  YtTab.HISTORY -> grid(content.historyObserve.blockingFirst())
                  YtTab.PLAYLISTS -> grid(content.playlistsObserve.blockingFirst())
-@@ -243,22 +273,95 @@ class YouTubeViewModel @Inject constructor(
+@@ -243,22 +276,161 @@ class YouTubeViewModel @Inject constructor(
          return true
      }
  
@@ -1675,9 +1689,64 @@ index 368faf0bc..cdc1b16d0 100644
 +        }
 +    }.getOrNull()
 +
-+    /** More shorts when YouTube's own pages ran out: what it suggests after some shown ones, then searches. */
-+    private fun shortsFallback(grid: List<YtItem>, have: MutableSet<String>): List<YtItem> {
++    /** Shorts played this session, newest last: what the feed learns your taste from. */
++    private val shortsWatched = ArrayList<YtItem>()
++    private var historyAuthors: List<String>? = null
++    private var topicCursor = 0
++
++    private fun noteShortWatched(item: YtItem) {
++        synchronized(shortsWatched) {
++            shortsWatched.removeAll { it.videoId == item.videoId }
++            shortsWatched.add(item)
++            if (shortsWatched.size > 40) shortsWatched.removeAt(0)
++        }
++    }
++
++    /** Channels you watch most, from the shorts played now and your account's history (read once). */
++    private fun interestAuthors(): List<String> {
++        val history = historyAuthors ?: runCatching {
++            if (service.signInService.isSigned) {
++                toItems(content.historyObserve.blockingFirst()).mapNotNull { it.author?.takeIf(String::isNotBlank) }
++            } else emptyList()
++        }.getOrDefault(emptyList()).also { historyAuthors = it }
++        val counts = LinkedHashMap<String, Int>()
++        synchronized(shortsWatched) { shortsWatched.mapNotNull { it.author?.takeIf(String::isNotBlank) } }
++            .forEach { counts[it] = (counts[it] ?: 0) + 3 }
++        history.take(60).forEach { counts[it] = (counts[it] ?: 0) + 1 }
++        return counts.entries.sortedByDescending { it.value }.map { it.key }
++    }
++
++    /**
++     * Shorts picked from what you do: what YouTube suggests after the ones you played last, then
++     * searches on the channels you watch most. Different channels each time, so the feed doesn't repeat.
++     */
++    private fun personalShorts(have: MutableSet<String>): List<YtItem> {
 +        val out = ArrayList<YtItem>()
++        fun add(items: List<YtItem>, strict: Boolean) {
++            out += items.filter { it.kind == YtKind.VIDEO && !it.isLive }
++                .filter { it.isShort || (!strict && it.title.contains("short", ignoreCase = true)) }
++                .filter { have.add(it.videoId ?: it.title) }
++        }
++        val watched = synchronized(shortsWatched) { shortsWatched.toList() }
++        val seeds = (watched.takeLast(2) + watched.dropLast(2).shuffled().take(1)).mapNotNull { it.videoId }.distinct()
++        seeds.forEach { id ->
++            runCatching { service.mediaItemService.getMetadataObserve(id).blockingFirst() }.getOrNull()
++                ?.suggestions.orEmpty().forEach { add(toItems(it), strict = true) }
++        }
++        val authors = interestAuthors()
++        if (authors.isNotEmpty() && out.size < 10) {
++            repeat(2) {
++                val author = authors[topicCursor++ % authors.size]
++                runCatching { content.getSearchObserve("$author shorts").blockingFirst() }.getOrNull()
++                    .orEmpty().forEach { add(toItems(it), strict = false) }
++            }
++        }
++        return out
++    }
++
++    /** More shorts when YouTube's own pages ran out: your own taste first, then general searches. */
++    private fun shortsFallback(grid: List<YtItem>, have: MutableSet<String>): List<YtItem> {
++        val out = ArrayList(personalShorts(have))
 +        fun add(items: List<YtItem>, strict: Boolean = true) {
 +            // Search results are not always marked as shorts, so those also pass on a "short" in the title.
 +            out += items.filter { it.kind == YtKind.VIDEO && !it.isLive }
@@ -1685,7 +1754,7 @@ index 368faf0bc..cdc1b16d0 100644
 +                .filter { have.add(it.videoId ?: it.title) }
 +        }
 +        val seeds = (grid.takeLast(2) + grid.shuffled().take(2)).mapNotNull { it.videoId }.distinct()
-+        seeds.forEach { id ->
++        if (out.size < 8) seeds.forEach { id ->
 +            runCatching { service.mediaItemService.getMetadataObserve(id).blockingFirst() }.getOrNull()
 +                ?.suggestions.orEmpty().forEach { add(toItems(it)) }
 +        }
@@ -1724,6 +1793,17 @@ index 368faf0bc..cdc1b16d0 100644
 +                        hasMore = again.nextPageKey != null || items.isNotEmpty()
 +                    }
 +                }
++                if (canRefill && tab == YtTab.SHORTS) {
++                    // Your taste leads: shorts picked from what you play and watch, mixed in with YouTube's own.
++                    val mine = personalShorts(have)
++                    items = buildList {
++                        val a = mine.iterator(); val b = items.iterator()
++                        while (a.hasNext() || b.hasNext()) {
++                            if (a.hasNext()) add(a.next())
++                            if (b.hasNext()) add(b.next())
++                        }
++                    }
++                }
 +                if (items.isEmpty() && canRefill && tab == YtTab.SHORTS) {
 +                    repeat(2) { if (items.isEmpty()) items = shortsFallback(s.grid, have) }
 +                    hasMore = true
@@ -1746,7 +1826,17 @@ index 368faf0bc..cdc1b16d0 100644
                  )
              }
              fetchDeArrow()
-@@ -307,18 +410,103 @@ class YouTubeViewModel @Inject constructor(
+@@ -294,7 +466,8 @@ class YouTubeViewModel @Inject constructor(
+ 
+     private fun toRows(groups: List<MediaGroup>?): List<YtRow> =
+         groups.orEmpty().map {
+-            YtRow(it.title.orEmpty(), toItems(it), group = it, canMore = it.nextPageKey != null)
++            // Every row can go on: YouTube's own pages first, then searches on the row's topic.
++            YtRow(it.title.orEmpty(), toItems(it), group = it, canMore = true)
+         }.filter { it.items.isNotEmpty() }
+ 
+     /**
+@@ -307,18 +480,103 @@ class YouTubeViewModel @Inject constructor(
      }
  
      private var restJob: Job? = null
@@ -1851,34 +1941,63 @@ index 368faf0bc..cdc1b16d0 100644
              } finally {
                  (rest as? Disposable)?.dispose()
              }
-@@ -332,18 +520,19 @@ class YouTubeViewModel @Inject constructor(
+@@ -328,22 +586,46 @@ class YouTubeViewModel @Inject constructor(
+     /** Adds the next videos to row [index] when you scroll near its end. */
+     fun loadMoreRow(index: Int) {
+         val row = _state.value.rows.getOrNull(index) ?: return
+-        val group = row.group ?: return
          if (!row.canMore || row.loadingMore) return
++        val tabTitle = _state.value.tab.title
          setRow(index, row.title) { it.copy(loadingMore = true) }
          viewModelScope.launch {
 -            val next = withContext(Dispatchers.IO) {
 -                runCatching { content.continueGroupObserve(group).blockingFirst() }.getOrNull()
-+            val (next, fresh) = withContext(Dispatchers.IO) {
-+                nextFresh(group, row.items.mapTo(HashSet()) { it.videoId ?: it.title })
++            val have = row.items.mapTo(HashSet()) { it.videoId ?: it.title }
++            val result = withContext(Dispatchers.IO) {
++                var group = row.group
++                var fresh: List<YtItem> = emptyList()
++                var step = row.searchStep
++                var failed = false
++                if (group != null && group.nextPageKey != null) {
++                    val (next, items) = nextFresh(group, have)
++                    if (next == null) failed = true else group = next
++                    fresh = items
++                }
++                if (fresh.isEmpty() && step < ROW_SEARCH_SUFFIXES.size) {
++                    // YouTube has no more pages for this row: keep it going with searches on its topic.
++                    val query = "${row.title.ifBlank { tabTitle }} ${ROW_SEARCH_SUFFIXES[step]}".trim()
++                    step++
++                    val groups = runCatching { content.getSearchObserve(query).blockingFirst() }.getOrNull().orEmpty()
++                    fresh = groups.flatMap { toItems(it) }
++                        .filter { it.kind == YtKind.VIDEO && have.add(it.videoId ?: it.title) }
++                    groups.firstOrNull { it.nextPageKey != null }?.let { group = it }
++                    if (groups.isEmpty()) failed = true
++                }
++                Triple(group, fresh, Pair(step, failed))
              }
 -            val more = next?.let(::toItems).orEmpty()
-+            // No answer is a failure, not the end: try again a few times before giving up on the row.
-+            if (next == null) kotlinx.coroutines.delay(1200L)
++            val (group, fresh, progress) = result
++            val (step, failed) = progress
++            // No answer is a failure, not the end: wait and try again a few times before giving up on the row.
++            if (failed) kotlinx.coroutines.delay(1200L)
              setRow(index, row.title) { r ->
 -                val have = r.items.mapTo(HashSet()) { it.videoId ?: it.title }
 -                val fresh = more.filter { have.add(it.videoId ?: it.title) }
-+                val misses = if (next == null) r.misses + 1 else 0
++                val misses = if (fresh.isEmpty()) r.misses + 1 else 0
                  r.copy(
                      items = r.items + fresh,
-                     group = next ?: r.group,
+-                    group = next ?: r.group,
 -                    canMore = next?.nextPageKey != null && fresh.isNotEmpty(),
 -                    loadingMore = false
-+                    canMore = if (next == null) misses < 3 else next.nextPageKey != null,
++                    group = group,
++                    canMore = misses < 3 && (fresh.isNotEmpty() || failed || step < ROW_SEARCH_SUFFIXES.size || group?.nextPageKey != null),
 +                    loadingMore = false,
-+                    misses = misses
++                    misses = misses,
++                    searchStep = step
                  )
              }
              fetchDeArrow()
-@@ -396,6 +585,7 @@ class YouTubeViewModel @Inject constructor(
+@@ -396,6 +678,7 @@ class YouTubeViewModel @Inject constructor(
          refreshHidden()
          loadJob?.cancel()
          restJob?.cancel()
@@ -1886,7 +2005,7 @@ index 368faf0bc..cdc1b16d0 100644
          currentGroup = null
          loadJob = viewModelScope.launch {
              val result = withContext(Dispatchers.IO) { runCatching { fetch() } }
-@@ -412,7 +602,7 @@ class YouTubeViewModel @Inject constructor(
+@@ -412,7 +695,7 @@ class YouTubeViewModel @Inject constructor(
                              feed.rest?.let { streamRest(it) }
                          }
                          is Feed.Items -> _state.update {
@@ -1895,7 +2014,7 @@ index 368faf0bc..cdc1b16d0 100644
                          }
                          is Feed.Grid -> {
                              currentGroup = feed.group
-@@ -421,7 +611,7 @@ class YouTubeViewModel @Inject constructor(
+@@ -421,7 +704,7 @@ class YouTubeViewModel @Inject constructor(
                                      loading = false,
                                      rows = emptyList(),
                                      grid = unseenFirst(toItems(feed.group)),
@@ -1904,7 +2023,7 @@ index 368faf0bc..cdc1b16d0 100644
                                  )
                              }
                          }
-@@ -674,16 +864,22 @@ class YouTubeViewModel @Inject constructor(
+@@ -674,16 +957,22 @@ class YouTubeViewModel @Inject constructor(
      fun loadRelated(currentVideoId: String) {
          if (relatedFor == currentVideoId && _related.value.isNotEmpty()) return
          relatedFor = currentVideoId
@@ -1927,7 +2046,7 @@ index 368faf0bc..cdc1b16d0 100644
                  }.getOrDefault(emptyList())
              }
              if (relatedFor == currentVideoId) {
-@@ -693,6 +889,71 @@ class YouTubeViewModel @Inject constructor(
+@@ -693,6 +982,71 @@ class YouTubeViewModel @Inject constructor(
          }
      }
  
@@ -1999,3 +2118,15 @@ index 368faf0bc..cdc1b16d0 100644
      /** YouTube's own "up next", or the first suggestion that hasn't played yet. */
      private fun upNext(currentVideoId: String): YtItem? {
          val meta = service.mediaItemService.getMetadataObserve(currentVideoId).blockingFirst()
+@@ -734,7 +1088,10 @@ class YouTubeViewModel @Inject constructor(
+     }
+ 
+     /** Looks up a short's stream for the Shorts player, which does its own queueing. */
+-    suspend fun shortPlayable(item: YtItem): Result<YtPlayable> = lookup(item).await()
++    suspend fun shortPlayable(item: YtItem): Result<YtPlayable> {
++        noteShortWatched(item)
++        return lookup(item).await()
++    }
+ 
+     /** Turns YouTube's reason for refusing a video into something that says what to do. */
+     private fun friendlyReason(reason: String?): String {
