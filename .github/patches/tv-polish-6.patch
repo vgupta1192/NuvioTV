@@ -1,0 +1,75 @@
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt
+index f6bc41ac6..347b0289f 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/JellyfinRepository.kt
+@@ -779,7 +779,10 @@ object JellyfinRepository {
+                 coroutineScope {
+                     launch {
+                         val resume = try {
+-                            getResumeItems(session)
++                            getResumeItems(
++                                session,
++                                if (snapshot.hiddenLibraryIds.isEmpty()) null else visibleLibs.map { it.id },
++                            )
+                         } catch (error: CancellationException) {
+                             throw error
+                         } catch (_: Throwable) {
+@@ -834,19 +837,45 @@ object JellyfinRepository {
+         }
+     }
+ 
+-    private suspend fun getResumeItems(session: JellyfinSession): List<JellyfinItem> =
+-        call(
+-            session,
+-            "/Users/${session.userId}/Items/Resume",
+-            mapOf(
+-                "MediaTypes" to "Video",
+-                "Limit" to HOME_ROW_LIMIT.toString(),
+-                "Fields" to LIST_FIELDS,
+-                "Recursive" to "true",
+-                "EnableImageTypes" to "Primary,Backdrop,Thumb,Logo",
+-                "ImageTypeLimit" to "1",
+-            ),
+-        ).array("Items").orEmpty().mapNotNull { (it as? JsonObject)?.let(::parseItem) }
++    /**
++     * Continue Watching. With no hidden libraries the server's global resume list is used; otherwise
++     * each VISIBLE library is asked on its own (ParentId) so hidden libraries never leak titles into
++     * the strip, and the merged list is re-sorted by last played date.
++     */
++    private suspend fun getResumeItems(
++        session: JellyfinSession,
++        visibleLibraryIds: List<String>?,
++    ): List<JellyfinItem> {
++        suspend fun fetch(parentId: String?): List<Pair<JellyfinItem, String>> =
++            call(
++                session,
++                "/Users/${session.userId}/Items/Resume",
++                buildMap {
++                    put("MediaTypes", "Video")
++                    put("Limit", HOME_ROW_LIMIT.toString())
++                    put("Fields", LIST_FIELDS)
++                    put("Recursive", "true")
++                    put("EnableImageTypes", "Primary,Backdrop,Thumb,Logo")
++                    put("ImageTypeLimit", "1")
++                    if (parentId != null) put("ParentId", parentId)
++                },
++            ).array("Items").orEmpty().mapNotNull { element ->
++                val obj = element as? JsonObject ?: return@mapNotNull null
++                val item = parseItem(obj) ?: return@mapNotNull null
++                val played = ((obj["UserData"] as? JsonObject)?.get("LastPlayedDate") as? kotlinx.serialization.json.JsonPrimitive)
++                    ?.contentOrNull.orEmpty()
++                item to played
++            }
++        if (visibleLibraryIds == null) return fetch(null).map { it.first }
++        val pages = coroutineScope {
++            visibleLibraryIds.map { id -> async { runCatching { fetch(id) }.getOrDefault(emptyList()) } }.awaitAll()
++        }
++        return pages.flatten()
++            .distinctBy { it.first.id }
++            .sortedByDescending { it.second }
++            .take(HOME_ROW_LIMIT)
++            .map { it.first }
++    }
+ 
+     private fun loadSeriesDetail(seriesId: String) {
+         val session = _uiState.value.session ?: return
