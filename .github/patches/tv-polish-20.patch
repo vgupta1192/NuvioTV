@@ -74,7 +74,7 @@ index a0aa64d35..7bb7a7597 100644
              // Clear CW state when profile changes so items don't leak between profiles.
              var previousProfileId = profileManager.activeProfileId.value
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
-index a7dfcc104..b33928873 100644
+index a7dfcc104..c638fb3a1 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
 @@ -263,10 +263,10 @@ fun JellyfinDetailsScreen(
@@ -90,7 +90,7 @@ index a7dfcc104..b33928873 100644
                  if (ratings.moreLikeThis.isNotEmpty()) add(JellyfinTab.SIMILAR)
                  if (ratings.trailers.any { !it.ytId.isNullOrBlank() }) add(JellyfinTab.TRAILER)
              }
-@@ -372,25 +372,36 @@ fun JellyfinDetailsScreen(
+@@ -372,18 +372,24 @@ fun JellyfinDetailsScreen(
                      )
  
                      JellyfinTab.RATINGS -> {
@@ -126,9 +126,8 @@ index a7dfcc104..b33928873 100644
                          }
                          EpisodeRatingsSection(
                              episodes = ratingVideos,
-                             ratings = ratings.episodeImdbRatings,
--                            isLoading = false,
-+                            isLoading = ratings.isLoading && ratings.episodeImdbRatings.isEmpty(),
+@@ -391,6 +397,11 @@ fun JellyfinDetailsScreen(
+                             isLoading = false,
                              error = null,
                              title = "",
 +                            onEpisodeClick = { video ->
@@ -402,6 +401,42 @@ index b0210c348..02d85e2be 100644
      if (uiState.selectedLayout == HomeLayout.MODERN) {
          SettingsToggleRow(
              title = stringResource(R.string.layout_fullscreen_hero_backdrop),
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
+index f5b6be7a6..a7cedd770 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
+@@ -1069,6 +1069,11 @@ fun TvChannelsScreen(
+ 
+             Spacer(modifier = Modifier.height(12.dp))
+ 
++            // Preview panel grows while it holds focus so all buttons and the description fit.
++            var previewPanelHasFocus by remember { mutableStateOf(false) }
++            val panelWeight by animateFloatAsState(if (previewPanelHasFocus) 2.1f else 1.0f, label = "previewPanelWeight")
++            val listWeight by animateFloatAsState(if (previewPanelHasFocus) 0.6f else 1.15f, label = "channelListWeight")
++
+             // Linha 4: Área Split-Screen: Lista à Esquerda e Pré-visualizador à Direita
+             Row(
+                 modifier = Modifier
+@@ -1079,7 +1084,7 @@ fun TvChannelsScreen(
+                 // Coluna da Esquerda: Lista de Canais
+                 Box(
+                     modifier = Modifier
+-                        .weight(1.15f)
++                        .weight(listWeight)
+                         .fillMaxHeight()
+                 ) {
+                     when {
+@@ -1278,8 +1283,9 @@ fun TvChannelsScreen(
+                     },
+                     mutePreview = netflixLive,
+                     modifier = Modifier
+-                        .weight(1.0f)
++                        .weight(panelWeight)
+                         .fillMaxHeight()
++                        .onFocusChanged { previewPanelHasFocus = it.hasFocus }
+                 )
+             }
+         }
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/LiveTvSubtitleStyle.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/LiveTvSubtitleStyle.kt
 new file mode 100644
 index 000000000..67fab2e5b
@@ -496,6 +531,53 @@ index 000000000..67fab2e5b
 +        if (height > 0) applyPosition() else post { applyPosition() }
 +    }
 +}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt
+index 321a9c050..067da3e97 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt
+@@ -34,7 +34,9 @@ import androidx.compose.runtime.setValue
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.draw.clip
++import androidx.compose.ui.focus.FocusDirection
+ import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.platform.LocalFocusManager
+ import androidx.compose.ui.focus.focusRequester
+ import androidx.compose.ui.graphics.Brush
+ import androidx.compose.ui.graphics.Color
+@@ -94,6 +96,7 @@ fun TvChannelFullscreenHud(
+     var previousChannel by remember { mutableStateOf<TvChannelItem?>(null) }
+     val exoPlayer = remember(playerPool) { playerPool.acquire() }
+     val focusRequester = remember { FocusRequester() }
++    val focusManager = LocalFocusManager.current
+ 
+     val activeStream = streams.getOrNull(selectedStreamIndex)
+     val playableUrl = activeStream?.playableTvUrl
+@@ -163,11 +166,19 @@ fun TvChannelFullscreenHud(
+             .onPreviewKeyEvent { event ->
+                 if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                 if (isOptionsOpen) {
+-                    // The options panel owns the D-pad; only Back/Escape are handled here.
+-                    return@onPreviewKeyEvent if (event.key == Key.Back || event.key == Key.Escape) {
+-                        isOptionsOpen = false
+-                        true
+-                    } else false
++                    // The options panel owns the D-pad; Back/Escape close it, and Left closes it
++                    // once focus cannot move further left (mirror of Right closing the drawer).
++                    return@onPreviewKeyEvent when (event.key) {
++                        Key.Back, Key.Escape -> {
++                            isOptionsOpen = false
++                            true
++                        }
++                        Key.DirectionLeft -> {
++                            if (!focusManager.moveFocus(FocusDirection.Left)) isOptionsOpen = false
++                            true
++                        }
++                        else -> false
++                    }
+                 }
+                 if (!isDrawerOpen) {
+                     hudVisible = true
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
 index 94a1ba966..84a544474 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
@@ -536,6 +618,30 @@ index 94a1ba966..84a544474 100644
      // Live TV always plays with Custom Stretch: the picture area (without baked-in black bars)
      // is stretched over the whole player, in the preview and in fullscreen.
      DisposableEffect(playerView, player) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelZappingDrawer.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelZappingDrawer.kt
+index f063b6aea..f59c3aaf9 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelZappingDrawer.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelZappingDrawer.kt
+@@ -151,6 +151,11 @@ fun TvChannelZappingDrawer(
+                             color = Color.White
+                         )
+                     }
++                    Text(
++                        text = "◀ Left: categories",
++                        fontSize = 11.sp,
++                        color = Color.White.copy(alpha = 0.5f)
++                    )
+                 }
+ 
+                 Spacer(modifier = Modifier.height(10.dp))
+@@ -242,6 +247,7 @@ fun TvChannelZappingDrawer(
+                                                 onClose()
+                                                 true
+                                             }
++                                            KeyEvent.KEYCODE_DPAD_LEFT,
+                                             KeyEvent.KEYCODE_PAGE_UP,
+                                             KeyEvent.KEYCODE_CHANNEL_UP,
+                                             KeyEvent.KEYCODE_MENU,
 diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
 index 368faf0bc..037debf63 100644
 --- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
