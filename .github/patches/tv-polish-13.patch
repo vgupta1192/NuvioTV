@@ -19,10 +19,18 @@ index b467a0018..494b1e9ae 100644
                          }
                              ?: FocusRequester.Default
 diff --git a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
-index 0529f6f48..1e5f67d6e 100644
+index 0529f6f48..23b59b1f9 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
-@@ -990,6 +990,7 @@ private fun PlaybackNavHost(
+@@ -51,6 +51,7 @@ import com.nuvio.tv.youtube.SponsorSkipCard
+ import com.nuvio.tv.youtube.YouTubeChatOverlay
+ import com.nuvio.tv.youtube.YouTubePlayerPanel
+ import com.nuvio.tv.youtube.YouTubeUpNext
++import com.nuvio.tv.youtube.YouTubeUpNextList
+ import com.nuvio.tv.ui.screens.player.PostPlayRecommendation
+ import com.nuvio.tv.ui.screens.player.playerBackOpensCurrentEpisodeStreams
+ import com.nuvio.tv.ui.screens.party.PartyScreen
+@@ -990,6 +991,7 @@ private fun PlaybackNavHost(
                  }
              }
  
@@ -30,7 +38,7 @@ index 0529f6f48..1e5f67d6e 100644
              val upNextCardShown = androidx.compose.runtime.remember(upNextVideoId) { androidx.compose.runtime.mutableStateOf(false) }
              val playUpNextNow: () -> Unit = {
                  val ytId = upNextVideoId
-@@ -1009,6 +1010,21 @@ private fun PlaybackNavHost(
+@@ -1009,6 +1011,21 @@ private fun PlaybackNavHost(
              PlayerScreen(
                  previewKeyHook = hook@{ e ->
                      val key = e.key
@@ -52,12 +60,12 @@ index 0529f6f48..1e5f67d6e 100644
                      val confirm = key == androidx.compose.ui.input.key.Key.DirectionCenter ||
                          key == androidx.compose.ui.input.key.Key.Enter ||
                          key == androidx.compose.ui.input.key.Key.NumPadEnter
-@@ -1076,6 +1092,20 @@ private fun PlaybackNavHost(
+@@ -1076,6 +1093,20 @@ private fun PlaybackNavHost(
                              onVisibleChange = { upNextCardShown.value = it }
                          )
                          SponsorSkipCard()
 +                        if (upNextListOpen.value) {
-+                            com.nuvio.tv.youtube.YouTubeUpNextList(
++                            YouTubeUpNextList(
 +                                videoId = upNextVideoId,
 +                                viewModel = youtubeVm,
 +                                onPlay = { item, list ->
@@ -73,6 +81,112 @@ index 0529f6f48..1e5f67d6e 100644
                          if (chatOn.value) YouTubeChatOverlay(ytPlayerVm)
                          if (playerUi.showYouTubePanel) {
                              YouTubePlayerPanel(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
+index a2519bc63..a4ab5add3 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
+@@ -396,7 +396,7 @@ internal fun PlayerRuntimeController.dismissSourcesPanel() {
+     sourceStreamsScope = null
+     sourceStreamsJob = null
+     sourceChipErrorDismissJob?.cancel()
+-    streamRepository.setLocalPluginSearchPaused(true)
++    streamRepository.setLocalPluginSearchPaused(false)
+     _uiState.update {
+         it.copy(
+             showSourcesPanel = false,
+@@ -855,7 +855,7 @@ internal fun PlayerRuntimeController.switchToSourceStream(
+     sourceStreamsScope?.cancel()
+     sourceStreamsScope = null
+     sourceStreamsJob = null
+-    streamRepository.setLocalPluginSearchPaused(true)
++    streamRepository.setLocalPluginSearchPaused(false)
+     if (openExternalStreamInBrowser(stream = stream, fromEpisodePanel = false)) {
+         return
+     }
+@@ -1043,7 +1043,7 @@ internal fun PlayerRuntimeController.dismissEpisodesPanel() {
+     episodeStreamsScope?.cancel()
+     episodeStreamsScope = null
+     episodeStreamsJob = null
+-    streamRepository.setLocalPluginSearchPaused(true)
++    streamRepository.setLocalPluginSearchPaused(false)
+     _uiState.update {
+         it.copy(
+             showEpisodesPanel = false,
+@@ -1666,7 +1666,7 @@ private fun PlayerRuntimeController.switchToEpisodeStreamCommon(
+     nextEpisodeAutoPlayJob = null
+     stillWatchingPromptJob?.cancel()
+     stillWatchingPromptJob = null
+-    streamRepository.setLocalPluginSearchPaused(true)
++    streamRepository.setLocalPluginSearchPaused(false)
+     flushPlaybackSnapshotForSwitchOrExit()
+ 
+     val targetVideo = forcedTargetVideo
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
+index 8c58b4a53..983558118 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
+@@ -332,10 +332,8 @@ class StreamScreenViewModel @Inject constructor(
+             while (true) {
+                 delay(AUTO_REFRESH_INTERVAL_MS)
+                 val state = _uiState.value
+-                val idle = streamLoadCompleted && !autoRefreshPaused && hostInForeground.value &&
+-                    !externalPlaybackTracker.isTracking && !state.isLoading &&
+-                    state.autoPlayStream == null && state.autoPlayPlaybackInfo == null &&
+-                    !state.isDirectAutoPlayFlow && !state.showDirectAutoPlayOverlay
++                // Never paused: keeps going during playback, autoplay and external players.
++                val idle = streamLoadCompleted
+                 if (!idle) continue
+                 try {
+                     kotlinx.coroutines.withTimeoutOrNull(AUTO_REFRESH_TIMEOUT_MS) {
+@@ -346,7 +344,7 @@ class StreamScreenViewModel @Inject constructor(
+                             episode = episode,
+                             forceRefresh = true
+                         ).collect { result ->
+-                            if (result is NetworkResult.Success && !autoRefreshPaused) mergeRefreshedStreams(result.data)
++                            if (result is NetworkResult.Success) mergeRefreshedStreams(result.data)
+                         }
+                     }
+                 } catch (cancelled: CancellationException) {
+@@ -462,15 +460,11 @@ class StreamScreenViewModel @Inject constructor(
+         }
+     }
+ 
+-    fun cancelStreamsLoad() {
+-        autoRefreshPaused = true
+-        streamLoadScope?.cancel()
+-        streamLoadScope = null
+-        streamLoadJob = null
+-        streamBadgePresentationJob?.cancel()
+-        streamBadgePresentationRequestId += 1
+-        updateUiStateIfChanged { it.copy(isLoading = false) }
+-    }
++    /**
++     * Nuvio fork: picking a stream no longer stops the addons that are still loading or the auto refresh;
++     * the list keeps filling while the video plays.
++     */
++    fun cancelStreamsLoad() = Unit
+ 
+     private fun shouldUseDirectAutoPlayFlow(
+         playerPreference: PlayerPreference,
+@@ -1575,8 +1569,7 @@ class StreamScreenViewModel @Inject constructor(
+     }
+ 
+     fun onInternalPlayerLaunching() {
+-        autoRefreshPaused = true
+-        streamRepository.setLocalPluginSearchPaused(true)
++        streamRepository.setLocalPluginSearchPaused(false)
+         updateUiStateIfChanged {
+             it.copy(showDirectAutoPlayOverlay = false, directAutoPlayMessage = null)
+         }
+@@ -1801,7 +1794,7 @@ class StreamScreenViewModel @Inject constructor(
+         autoLaunch: Boolean = false,
+         context: android.content.Context
+     ) {
+-        streamRepository.setLocalPluginSearchPaused(true)
++        streamRepository.setLocalPluginSearchPaused(false)
+         externalOverlayHideJob?.cancel()
+         // Preserve the current message; blanking it made the card's Crossfade flash
+         // empty before the subtitle/skip fetch set the next one.
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
 index 4da0e4730..30ee71dd6 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
@@ -120,6 +234,102 @@ index e58f3f1c7..d3b52fe4f 100644
                          focusedContainerColor = Color.White,
                          focusedContentColor = Color.Black,
                      ),
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeShortsPlayer.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeShortsPlayer.kt
+index 1944fcb60..e05c8f42e 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeShortsPlayer.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeShortsPlayer.kt
+@@ -46,7 +46,10 @@ import androidx.compose.ui.text.style.TextOverflow
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.unit.sp
+ import androidx.compose.ui.viewinterop.AndroidView
++import androidx.media3.common.C
+ import androidx.media3.common.MediaItem
++import androidx.media3.common.TrackSelectionOverride
++import androidx.media3.common.Tracks
+ import androidx.media3.common.MimeTypes
+ import androidx.media3.common.PlaybackException
+ import androidx.media3.common.Player
+@@ -153,6 +156,43 @@ fun YouTubeShortsPlayer(
+         }
+     }
+ 
++    // Audio languages. YouTube can auto-dub a short and the player then picks the dub for the device
++    // language; start on the original track and let the Audio chip choose another one.
++    val audioPrefs = remember { context.getSharedPreferences("yt_shorts_audio", android.content.Context.MODE_PRIVATE) }
++    var audioTracks by remember { mutableStateOf<List<Tracks.Group>>(emptyList()) }
++    var audioPick by remember { mutableStateOf(audioPrefs.getString("lang", null)) }
++    fun audioName(g: Tracks.Group): String {
++        val f = g.getTrackFormat(0)
++        val lang = f.language?.takeIf { it.isNotBlank() && it != "und" }
++            ?.let { java.util.Locale.forLanguageTag(it).displayLanguage.ifBlank { it } }
++        val dub = f.roleFlags and C.ROLE_FLAG_DUB != 0
++        return (lang ?: f.label ?: "Original") + if (dub) " (dubbed)" else ""
++    }
++    fun isOriginal(g: Tracks.Group): Boolean {
++        val f = g.getTrackFormat(0)
++        return f.roleFlags and C.ROLE_FLAG_DUB == 0
++    }
++    fun chooseAudio(g: Tracks.Group) {
++        if (g.isSelected) return
++        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
++            .setOverrideForType(TrackSelectionOverride(g.mediaTrackGroup, 0)).build()
++    }
++    DisposableEffect(player) {
++        val l = object : Player.Listener {
++            override fun onTracksChanged(tracks: Tracks) {
++                val groups = tracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO && it.length > 0 }
++                audioTracks = groups
++                if (groups.size < 2) return
++                val pref = audioPick
++                val want = (if (pref != null) groups.firstOrNull { it.getTrackFormat(0).language == pref } else null)
++                    ?: groups.firstOrNull(::isOriginal) ?: groups.first()
++                chooseAudio(want)
++            }
++        }
++        player.addListener(l)
++        onDispose { player.removeListener(l) }
++    }
++
+     // Repeat the short unless auto-scroll is going to move on; keep sound and speed as chosen.
+     LaunchedEffect(autoscroll) {
+         player.repeatMode = if (autoscroll) Player.REPEAT_MODE_OFF else Player.REPEAT_MODE_ONE
+@@ -212,6 +252,8 @@ fun YouTubeShortsPlayer(
+         if (playing) "Pause" else "Play",
+         if (autoscroll) "Auto-scroll: On" else "Auto-scroll: Off",
+         if (muted) "Sound: Off" else "Sound: On",
++        audioTracks.firstOrNull { it.isSelected }?.let { "Audio: ${audioName(it)}" }
++            ?: if (audioTracks.size < 2) "Audio: Only one" else "Audio",
+         "Speed ${speedLabel(speed)}",
+         if (showInfo) "Info: On" else "Info: Off",
+         "Channel",
+@@ -230,15 +272,24 @@ fun YouTubeShortsPlayer(
+                 YouTubeSettings.setShortsMuted(context, muted)
+             }
+             3 -> {
++                if (audioTracks.size > 1) {
++                    val at = audioTracks.indexOfFirst { it.isSelected }
++                    val next = audioTracks[(at + 1).mod(audioTracks.size)]
++                    audioPick = next.getTrackFormat(0).language
++                    audioPrefs.edit().putString("lang", audioPick).apply()
++                    chooseAudio(next)
++                }
++            }
++            4 -> {
+                 speed = SPEEDS[(SPEEDS.indexOfFirst { it >= speed - 0.01f }.let { if (it < 0) 0 else it } + 1) % SPEEDS.size]
+                 YouTubeSettings.setShortsSpeed(context, speed)
+             }
+-            4 -> {
++            5 -> {
+                 showInfo = !showInfo
+                 YouTubeSettings.setShortsInfo(context, showInfo)
+             }
+-            5 -> current?.let(onOpenChannel)
+-            6 -> onClose()
++            6 -> current?.let(onOpenChannel)
++            7 -> onClose()
+         }
+     }
+ 
 diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeUpNext.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeUpNext.kt
 index d3f8c7cb9..1eca54ec4 100644
 --- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeUpNext.kt
@@ -270,10 +480,61 @@ index d3f8c7cb9..1eca54ec4 100644
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
-index d4b3e8432..3dc1e7485 100644
+index d4b3e8432..07f4aa9cc 100644
 --- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
 +++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
-@@ -634,6 +634,35 @@ class YouTubeViewModel @Inject constructor(
+@@ -364,6 +364,23 @@ class YouTubeViewModel @Inject constructor(
+         return Feed.Items(items)
+     }
+ 
++    /** Videos already shown on a tab, so opening that tab again leads with ones you haven't seen. */
++    private val seenByTab = HashMap<YtTab, MutableSet<String>>()
++
++    /**
++     * Puts videos not yet shown on this tab first and mixes the repeats, so picking a tab again gives
++     * new videos instead of the same list in the same order.
++     */
++    private fun unseenFirst(items: List<YtItem>): List<YtItem> {
++        val st = _state.value
++        if (st.subTitle != null) return items
++        val seen = seenByTab.getOrPut(st.tab) { HashSet() }
++        val (old, new) = items.partition { it.videoId != null && it.videoId in seen }
++        items.forEach { it.videoId?.let(seen::add) }
++        if (seen.size > 600) seen.clear()
++        return new + old.shuffled()
++    }
++
+     private fun load(label: String, fetch: () -> Feed) {
+         refreshHidden()
+         loadJob?.cancel()
+@@ -376,14 +393,15 @@ class YouTubeViewModel @Inject constructor(
+                     when (feed) {
+                         Feed.Nothing -> _state.update { it.copy(loading = false) }
+                         is Feed.Rows -> {
+-                            _state.update { it.copy(loading = false, rows = feed.rows, grid = emptyList(), canLoadMore = false) }
++                            val fresh = feed.rows.map { r -> r.copy(items = unseenFirst(r.items)) }
++                            _state.update { it.copy(loading = false, rows = fresh, grid = emptyList(), canLoadMore = false) }
+                             // The first lookup after the app starts is slow (YouTube's player scripts
+                             // load then), so do it now, while you're still choosing.
+                             feed.rows.firstOrNull()?.items?.firstOrNull { it.kind == YtKind.VIDEO }?.let { lookup(it) }
+                             feed.rest?.let { streamRest(it) }
+                         }
+                         is Feed.Items -> _state.update {
+-                            it.copy(loading = false, rows = emptyList(), grid = feed.items, canLoadMore = false)
++                            it.copy(loading = false, rows = emptyList(), grid = unseenFirst(feed.items), canLoadMore = false)
+                         }
+                         is Feed.Grid -> {
+                             currentGroup = feed.group
+@@ -391,7 +409,7 @@ class YouTubeViewModel @Inject constructor(
+                                 it.copy(
+                                     loading = false,
+                                     rows = emptyList(),
+-                                    grid = toItems(feed.group),
++                                    grid = unseenFirst(toItems(feed.group)),
+                                     canLoadMore = feed.group.nextPageKey != null
+                                 )
+                             }
+@@ -634,6 +652,35 @@ class YouTubeViewModel @Inject constructor(
          }
      }
  
