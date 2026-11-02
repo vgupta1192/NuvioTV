@@ -1,0 +1,71 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/search/SearchViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/search/SearchViewModel.kt
+index eb89747b9..66aae0015 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/search/SearchViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/search/SearchViewModel.kt
+@@ -66,6 +66,14 @@ class SearchViewModel @Inject constructor(
+     @ApplicationContext private val context: Context
+ ) : ViewModel() {
+ 
++    // Fork: profile in use, for the kids mode age cap (an entry point keeps the constructor unchanged).
++    private val forkProfileManager: com.nuvio.tv.core.profile.ProfileManager by lazy {
++        dagger.hilt.android.EntryPointAccessors.fromApplication(
++            context.applicationContext,
++            com.nuvio.tv.ui.screens.settings.ForkTvKidsEntryPoint::class.java
++        ).profileManager()
++    }
++
+     private val _uiState = MutableStateFlow(SearchUiState())
+     val uiState: StateFlow<SearchUiState> = _uiState.asStateFlow()
+ 
+@@ -994,9 +1002,19 @@ class SearchViewModel @Inject constructor(
+                     row.items.firstOrNull()?.id?.startsWith("__placeholder_") == true
+                 isPlaceholder || row.items.isNotEmpty()
+             }
++            // Fork: kids mode hides items rated above the age cap of the profile in use.
++            val kidsProfileId = forkProfileManager.activeProfileId.value
++            val kidsOn = com.nuvio.tv.data.repository.ForkTvKids.cap(context, kidsProfileId) != 0
++            val kidsRows = if (!kidsOn) orderedRows else orderedRows.map { row ->
++                row.copy(items = row.items.filter {
++                    com.nuvio.tv.data.repository.ForkTvKids.allows(context, kidsProfileId, it.ageRating)
++                })
++            }.filter { row ->
++                row.items.isNotEmpty() || row.isLoading
++            }
+             val filteredRows = if (hideUnreleasedContent) {
+                 val today = LocalDate.now()
+-                orderedRows.map { row ->
++                kidsRows.map { row ->
+                     if (row.isLoading && row.items.firstOrNull()?.id?.startsWith("__placeholder_") == true) {
+                         row
+                     } else {
+@@ -1004,7 +1022,7 @@ class SearchViewModel @Inject constructor(
+                     }
+                 }
+             } else {
+-                orderedRows
++                kidsRows
+             }
+             val targetKey = runQuery
+                 ?.takeIf { it == state.submittedQuery.trim() && it == activeSearchQuery }
+@@ -1251,12 +1269,20 @@ class SearchViewModel @Inject constructor(
+                         }
+                         val merged = if (reset) incoming else (existing + incoming)
+                         val rawDeduped = merged.distinctBy { "${it.apiType}:${it.id}" }
+-                        val deduped = if (hideUnreleasedContent) {
++                        val releasedDeduped = if (hideUnreleasedContent) {
+                             val today = LocalDate.now()
+                             rawDeduped.filterNot { it.isUnreleased(today) }
+                         } else {
+                             rawDeduped
+                         }
++                        val kidsProfileId = forkProfileManager.activeProfileId.value
++                        val deduped = if (com.nuvio.tv.data.repository.ForkTvKids.cap(context, kidsProfileId) == 0) {
++                            releasedDeduped
++                        } else {
++                            releasedDeduped.filter {
++                                com.nuvio.tv.data.repository.ForkTvKids.allows(context, kidsProfileId, it.ageRating)
++                            }
++                        }
+                         val shouldRevealBatch = !reset && revealBatchAfterNextDiscoverFetch
+                         val visibleLimit = if (reset) {
+                             DISCOVER_INITIAL_LIMIT
