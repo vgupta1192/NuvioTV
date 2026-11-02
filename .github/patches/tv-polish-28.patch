@@ -1,0 +1,120 @@
+diff --git a/app/src/main/baseline-prof.txt b/app/src/main/baseline-prof.txt
+index 241c9b20e..54a77f7b6 100644
+--- a/app/src/main/baseline-prof.txt
++++ b/app/src/main/baseline-prof.txt
+@@ -37828,3 +37828,11 @@ HSPLcom/nuvio/tv/ui/screens/detail/ComposableSingletons$ForkTv**;-><init>(**)V
+ Lcom/nuvio/tv/data/tracking/ForkTv**;
+ HSPLcom/nuvio/tv/data/tracking/ForkTv**;->**(**)**
+ HSPLcom/nuvio/tv/data/tracking/ForkTv**;-><init>(**)V
++Lcom/nuvio/tv/ui/screens/home/**;
++HSPLcom/nuvio/tv/ui/screens/home/**;->**(**)**
++Lcom/nuvio/tv/ui/screens/stream/**;
++HSPLcom/nuvio/tv/ui/screens/stream/**;->**(**)**
++Lcom/nuvio/tv/ui/screens/detail/**;
++HSPLcom/nuvio/tv/ui/screens/detail/**;->**(**)**
++Lcom/nuvio/tv/ui/components/**;
++HSPLcom/nuvio/tv/ui/components/**;->**(**)**
+diff --git a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
+index 4835cde53..1bf25e169 100644
+--- a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
++++ b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
+@@ -105,9 +105,15 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+         PluginRuntimeHooks.onApplicationCreate(this)
+         com.nuvio.tv.reshaped.subtitlefont.SubtitleFontStore.warmUp(this) // Nuvio fork: custom subtitle font, loaded off the main thread
+         com.nuvio.tv.ui.screens.player.PlayerEffects.ensureLoaded(this) // Nuvio fork: picture and sound effects, read by stream auto-play
+-        androidTvChannelSyncService.start()
+         serverUserStateProjection.start()
+-        releaseReminderCoordinator.start() // Nuvio fork: deliver + schedule "Remind me" notifications
++        // Nuvio fork: non-critical services start once the first frame is drawn, not during app start.
++        android.os.Looper.myQueue().addIdleHandler {
++            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
++                androidTvChannelSyncService.start()
++                releaseReminderCoordinator.start() // deliver + schedule "Remind me" notifications
++            }, 2_500)
++            false
++        }
+         // Nuvio fork: resolve addon hosts shortly after start so the first stream search skips DNS waits.
+         kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO).launch {
+             kotlinx.coroutines.delay(4_000)
+diff --git a/app/src/main/java/com/nuvio/tv/core/di/NetworkModule.kt b/app/src/main/java/com/nuvio/tv/core/di/NetworkModule.kt
+index 8c473aa98..c03ef745c 100644
+--- a/app/src/main/java/com/nuvio/tv/core/di/NetworkModule.kt
++++ b/app/src/main/java/com/nuvio/tv/core/di/NetworkModule.kt
+@@ -166,6 +166,22 @@ object NetworkModule {
+             .cache(Cache(File(context.cacheDir, "addon_http_cache"), 50L * 1024 * 1024))
+             .sslSocketFactory(sslContext.socketFactory, trustAllManager)
+             .hostnameVerifier { _, _ -> true }
++            // Nuvio fork: catalog JSON without its own cache lifetime is reused for 60 s (Home re-entry, Search).
++            .addNetworkInterceptor { chain ->
++                val response = chain.proceed(chain.request())
++                val path = chain.request().url.encodedPath
++                val cacheControl = response.header("Cache-Control").orEmpty()
++                if (response.isSuccessful && chain.request().method == "GET" && path.contains("/catalog/") &&
++                    !cacheControl.contains("max-age") && !cacheControl.contains("no-store")
++                ) {
++                    response.newBuilder()
++                        .removeHeader("Pragma")
++                        .header("Cache-Control", "public, max-age=60")
++                        .build()
++                } else {
++                    response
++                }
++            }
+             .build()
+     }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
+index aec20a557..53c147052 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
+@@ -58,7 +58,12 @@ object ForkTvLowRam {
+     const val MAX_ROW_ITEMS = 20
+     const val IMAGE_CACHE_PERCENT = 0.06
+ 
++    /** Poster decode size factor: smaller bitmaps in low-RAM mode. */
++    const val DECODE_SCALE = 0.75f
++
+     fun active(context: Context): Boolean = ForkTvPreferences.lowRamMode.current(context)
++
++    fun decodeScale(context: Context): Float = if (active(context)) DECODE_SCALE else 1f
+ }
+ 
+ object ForkTvPlayerButtons {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/components/ContentCard.kt b/app/src/main/java/com/nuvio/tv/ui/components/ContentCard.kt
+index aa87e6ee8..62bb313d1 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/components/ContentCard.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/components/ContentCard.kt
+@@ -243,11 +243,12 @@ fun ContentCard(
+         } else {
+             baseCardWidth
+         }
+-        val requestWidthPx = remember(maxRequestCardWidth, density) {
+-            with(density) { maxRequestCardWidth.roundToPx() }.coerceAtLeast(1)
++        val decodeScale = remember(context) { com.nuvio.tv.data.repository.ForkTvLowRam.decodeScale(context) }
++        val requestWidthPx = remember(maxRequestCardWidth, density, decodeScale) {
++            (with(density) { maxRequestCardWidth.roundToPx() } * decodeScale).toInt().coerceAtLeast(1)
+         }
+-        val requestHeightPx = remember(baseCardHeight, density) {
+-            with(density) { baseCardHeight.roundToPx() }.coerceAtLeast(1)
++        val requestHeightPx = remember(baseCardHeight, density, decodeScale) {
++            (with(density) { baseCardHeight.roundToPx() } * decodeScale).toInt().coerceAtLeast(1)
+         }
+ 
+         val alwaysBackdropWithLogo = LocalAlwaysBackdropWithLogo.current
+diff --git a/app/src/main/java/com/nuvio/tv/ui/components/GridContentCard.kt b/app/src/main/java/com/nuvio/tv/ui/components/GridContentCard.kt
+index edaa95106..267e08616 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/components/GridContentCard.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/components/GridContentCard.kt
+@@ -106,8 +106,10 @@ fun GridContentCard(
+     val landscapeCardWidth = if (globalLandscape && !isNativelyLandscape) posterCardStyle.height else posterCardStyle.width
+ 
+     val requestCardWidth = landscapeCardWidth
+-    val requestWidthPx = remember(density, requestCardWidth) { with(density) { requestCardWidth.roundToPx() }.coerceAtLeast(1) }
+-    val requestHeightPx = remember(density, cardHeight) { with(density) { cardHeight.roundToPx() }.coerceAtLeast(1) }
++    val scaleContext = androidx.compose.ui.platform.LocalContext.current
++    val decodeScale = remember(scaleContext) { com.nuvio.tv.data.repository.ForkTvLowRam.decodeScale(scaleContext) }
++    val requestWidthPx = remember(density, requestCardWidth, decodeScale) { (with(density) { requestCardWidth.roundToPx() } * decodeScale).toInt().coerceAtLeast(1) }
++    val requestHeightPx = remember(density, cardHeight, decodeScale) { (with(density) { cardHeight.roundToPx() } * decodeScale).toInt().coerceAtLeast(1) }
+     var isFocused by remember { mutableStateOf(false) }
+     var longPressTriggered by remember { mutableStateOf(false) }
+     val longPressKeyTracker = rememberLongPressKeyTracker()
