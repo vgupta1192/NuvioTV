@@ -1,0 +1,172 @@
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
+index 7dfca3636..3de14cb87 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
+@@ -50,6 +50,7 @@ object ForkTvPreferences {
+     val catalogAccentUnderline = ForkTvBoolPref("catalog_accent_underline", false)
+     val skipFeedbackPrompt = ForkTvBoolPref("skip_feedback_prompt", true)
+     val lowRamMode = ForkTvBoolPref("low_ram_mode", false)
++    val rateAfterWatching = ForkTvBoolPref("rate_after_watching", false)
+ }
+ 
+ /** Low-RAM mode: fewer eager Home rows, no hero trailers, smaller image memory cache, shorter rows. */
+@@ -98,7 +99,8 @@ object ForkTvPlayerButtons {
+         "speed" to "Playback speed",
+         "aspect" to "Aspect ratio",
+         "engine" to "Switch player engine",
+-        "info" to "Stream info"
++        "info" to "Stream info",
++        "rate" to "Rate title"
+     )
+ 
+     private val _hidden = MutableStateFlow<Set<String>>(emptySet())
+@@ -120,7 +122,7 @@ object ForkTvPlayerButtons {
+         }
+     }
+ 
+-    private val mainIds = listOf("next_episode", "subtitles", "audio", "quality", "chapters", "sources", "episodes")
++    private val mainIds = listOf("next_episode", "subtitles", "audio", "quality", "chapters", "sources", "episodes", "rate")
+ 
+     private val moreIds = listOf("speed", "aspect", "engine", "info")
+     private val allIds = mainIds + moreIds
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+index ff7def808..f0c1b27ba 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+@@ -295,6 +295,15 @@ fun PlayerScreen(
+     var subtitleTimingConsumeNextConfirmKeyUp by remember { mutableStateOf(false) }
+     var reportCodeVisible by remember { mutableStateOf(false) }
+     var exitDispatched by remember { mutableStateOf(false) }
++    // Nuvio fork: Your rating dialog from the toolbar and the optional prompt when a movie ends.
++    val ratingViewModel: com.nuvio.tv.ui.screens.detail.UserRatingViewModel = hiltViewModel()
++    val forkRateImdbId = com.nuvio.tv.ui.screens.detail.ratingImdbId(viewModel.controller.contentId.orEmpty(), null)
++    val forkRateIsMovie = uiState.contentType.equals("movie", ignoreCase = true)
++    val forkRateAvailable = forkRateImdbId != null && ratingViewModel.canRate()
++    var forkRateOpen by remember { mutableStateOf(false) }
++    var forkRatePromptShown by remember { mutableStateOf(false) }
++    var forkRatePausedByDialog by remember { mutableStateOf(false) }
++    val forkRatePromptPref by com.nuvio.tv.data.repository.ForkTvPreferences.rateAfterWatching.value.collectAsState()
+     var externalHandoffInProgress by remember { mutableStateOf(false) }
+     val autoPlayEnabledForBack = playerBackTreatsSkipAsAutoPlay(
+         streamAutoPlayMode = uiState.streamAutoPlayMode,
+@@ -465,21 +474,44 @@ fun PlayerScreen(
+         handleBackPress()
+     }
+ 
++    if (forkRateOpen && forkRateImdbId != null) {
++        com.nuvio.tv.ui.screens.detail.UserRatingDialog(
++            name = if (forkRateIsMovie) uiState.title else (uiState.contentName ?: uiState.title),
++            imdbId = forkRateImdbId,
++            isMovie = forkRateIsMovie,
++            onDismiss = {
++                forkRateOpen = false
++                if (forkRatePausedByDialog) {
++                    forkRatePausedByDialog = false
++                    viewModel.onEvent(PlayerEvent.OnPlayPause)
++                }
++            }
++        )
++    }
++
+     LaunchedEffect(
+         uiState.playbackEnded,
+         uiState.error,
+         uiState.pendingExitReason,
+         shouldConfirmNextEpisodeOnEnd,
+-        postPlayRecommendationState.blocksNaturalCompletion
++        postPlayRecommendationState.blocksNaturalCompletion,
++        forkRateOpen
+     ) {
+         val explicitReason = uiState.pendingExitReason
+-        val shouldDispatchNatural = uiState.playbackEnded &&
++        val naturalEnd = uiState.playbackEnded &&
+             uiState.error == null &&
+             uiState.postPlayMode?.blocksNaturalCompletion() != true &&
+             !postPlayRecommendationState.blocksNaturalCompletion &&
+             !shouldConfirmNextEpisodeOnEnd &&
+             explicitReason == null
++        val shouldDispatchNatural = naturalEnd && !forkRateOpen
++        val forkRatePromptNow = shouldDispatchNatural && forkRatePromptPref && !forkRatePromptShown &&
++            forkRateIsMovie && forkRateAvailable
+         when {
++            forkRatePromptNow -> {
++                forkRatePromptShown = true
++                forkRateOpen = true
++            }
+             explicitReason == PlayerExitReason.StillWatchingPrompt -> {
+                 viewModel.stopAndRelease()
+                 val cb = currentOnPlaybackEnded
+@@ -1678,6 +1710,15 @@ fun PlayerScreen(
+                 onSeekBackward = { viewModel.onEvent(PlayerEvent.OnSeekBackward) },
+                 onSeekTo = { viewModel.onEvent(PlayerEvent.OnSeekTo(it)) },
+                 onShowChaptersPanel = { viewModel.onEvent(PlayerEvent.OnShowChaptersPanel) },
++                onShowRate = if (forkRateAvailable) {
++                    {
++                        if (uiState.isPlaying) {
++                            viewModel.onEvent(PlayerEvent.OnPlayPause)
++                            forkRatePausedByDialog = true
++                        }
++                        forkRateOpen = true
++                    }
++                } else null,
+                 onShowEpisodesPanel = { viewModel.onEvent(PlayerEvent.OnShowEpisodesPanel) },
+                 onShowSourcesPanel = { viewModel.onEvent(PlayerEvent.OnShowSourcesPanel) },
+                 onShowYouTubePanel = { viewModel.onEvent(PlayerEvent.OnShowYouTubePanel) },
+@@ -2939,6 +2980,7 @@ private fun PlayerControlsOverlay(
+     onSeekBackward: () -> Unit,
+     onSeekTo: (Long) -> Unit,
+     onShowChaptersPanel: () -> Unit,
++    onShowRate: (() -> Unit)? = null,
+     onShowEpisodesPanel: () -> Unit,
+     onShowSourcesPanel: () -> Unit,
+     onShowPartyPanel: (() -> Unit)?,
+@@ -3329,6 +3371,19 @@ private fun PlayerControlsOverlay(
+ 
+                     }
+                     // YouTube fork: a YouTube video has no other sources to switch to.
++                    forkBtns["rate"] = {
++                    if ("rate" !in hiddenBtns && onShowRate != null) {
++                        ControlButton(
++                            icon = androidx.compose.material.icons.Icons.Default.StarBorder,
++                            contentDescription = "Rate title",
++                            onClick = onShowRate,
++                            upFocusRequester = progressUpTarget,
++                            onDownKey = onHideControls,
++                            onFocused = onResetHideTimer
++                        )
++                    }
++
++                    }
+                     forkBtns["sources"] = {
+                     if ("sources" !in hiddenBtns && !showYouTubeButton) ControlButton(
+                         icon = Icons.Default.SwapHoriz,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt
+index 385a24579..c03e5a1e6 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt
+@@ -51,6 +51,7 @@ internal fun ForkFeaturesPane(
+             SettingsGroupCard(title = "Player") {
+                 forkPlayerButtonsRow()
+                 forkAutoAddTorboxRow()
++                forkRateAfterWatchingRow()
+             }
+         }
+         item {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
+index 7831d16a0..b9cc27365 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
+@@ -40,6 +40,13 @@ internal fun forkLowRamModeRow() = forkTvToggleRow(
+     pref = ForkTvPreferences.lowRamMode
+ )
+ 
++@Composable
++internal fun forkRateAfterWatchingRow() = forkTvToggleRow(
++    title = "Ask to rate after watching",
++    subtitle = "When a movie ends, show the Your rating dialog before leaving the player. Needs Trakt, Simkl, MDBList or WeTrakr.",
++    pref = ForkTvPreferences.rateAfterWatching
++)
++
+ @Composable
+ internal fun forkFillerGuideRow() = forkTvToggleRow(
+     title = "Anime filler guide",
