@@ -1,0 +1,53 @@
+diff --git a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
+index 1bf25e169..f4674a056 100644
+--- a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
++++ b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
+@@ -111,6 +111,7 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+             android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                 androidTvChannelSyncService.start()
+                 releaseReminderCoordinator.start() // deliver + schedule "Remind me" notifications
++                com.nuvio.tv.ui.screens.player.ForkPlayerWarmup.start()
+             }, 2_500)
+             false
+         }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/ForkPlayerWarmup.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/ForkPlayerWarmup.kt
+new file mode 100644
+index 000000000..f4926ea78
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/ForkPlayerWarmup.kt
+@@ -0,0 +1,35 @@
++package com.nuvio.tv.ui.screens.player
++
++import androidx.annotation.OptIn
++import androidx.media3.common.util.UnstableApi
++import androidx.media3.exoplayer.mediacodec.MediaCodecUtil
++
++/**
++ * Nuvio fork: query the device codec list once, in the background, after app start.
++ * Media3 keeps the result in a static cache, so the first player start skips the slow codec scan.
++ * This does not keep a player alive: no ExoPlayer, surface or audio session is created here.
++ */
++internal object ForkPlayerWarmup {
++    private val mimeTypes = listOf(
++        "video/avc",
++        "video/hevc",
++        "video/x-vnd.on2.vp9",
++        "video/av01",
++        "audio/mp4a-latm",
++        "audio/ac3",
++        "audio/eac3",
++    )
++
++    @OptIn(UnstableApi::class)
++    fun start() {
++        Thread({
++            mimeTypes.forEach { mime ->
++                runCatching { MediaCodecUtil.getDecoderInfos(mime, false, false) }
++            }
++        }, "fork-codec-warmup").apply {
++            priority = Thread.MIN_PRIORITY
++            isDaemon = true
++            start()
++        }
++    }
++}
