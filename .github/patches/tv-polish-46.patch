@@ -1,0 +1,63 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt
+index a65850288..1d59311f0 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt
+@@ -75,10 +75,10 @@ internal fun PlayerRuntimeController.autoSyncExtractorsFactory(
+     url: String,
+     headers: Map<String, String>,
+ ): ExtractorsFactory {
+-    // Nuvio fork: no audio or video-keyframe copying (extra decoders and demux load cost dropped
+-    // frames on weak TVs); the extractors reach the player as in upstream.
++    // Audio is copied for the audio sync fallback (idle unless it is listening).
++    // Nuvio fork: video keyframes are no longer copied (no on-device seek preview decoder).
+     LocalPreviewSources.unregister(this)
+-    val tapped = delegate
++    val tapped = AudioSyncTaps.wrapExtractors(delegate, url)
+     AutoSyncPreferences.ensureLoaded(context)
+     if (!AutoSyncPreferences.isEnabled(context)) return tapped
+     val factory = AutoSyncExtractorsFactory(delegate = tapped, sourceKey = url)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+index 90de368ae..98afa9837 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+@@ -2303,8 +2303,7 @@ private class SubtitleOffsetRenderersFactory(
+         )
+         playbackSpeedAwareAudioSink.setInitialPlaybackSpeed(playbackSpeedProvider())
+         onPlaybackSpeedAwareAudioSinkCreated(playbackSpeedAwareAudioSink)
+-        // Nuvio fork: no PCM tap; the audio thread stays as upstream's.
+-        return playbackSpeedAwareAudioSink
++        return com.nuvio.tv.ui.screens.player.audiosync.AudioSyncTaps.wrapAudioSink(playbackSpeedAwareAudioSink) // AutoSync hook: audio sync fallback hears the playing audio
+     }
+ 
+     override fun buildAudioRenderers(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSyncSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSyncSettings.kt
+index b0f65d5f8..f954872c8 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSyncSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSyncSettings.kt
+@@ -9,7 +9,7 @@ import kotlinx.coroutines.flow.asStateFlow
+  * platform, so Nuvio's own player settings are left untouched.
+  */
+ internal object AudioSyncSettings {
+-    private val _fallbackEnabled = MutableStateFlow(false)
++    private val _fallbackEnabled = MutableStateFlow(true)
+ 
+     /** Sync to the audio when AutoSync keeps a subtitle's original timing. */
+     val fallbackEnabled: StateFlow<Boolean> = _fallbackEnabled.asStateFlow()
+@@ -28,14 +28,14 @@ internal object AudioSyncSettings {
+ 
+     fun installPersistence(load: (key: String) -> Boolean?, save: (key: String, value: Boolean) -> Unit) {
+         this.save = save
+-        // Nuvio fork: the audio sync fallback stays off (it decodes audio next to playback).
+-        _fallbackEnabled.value = false
++        _fallbackEnabled.value = load(FALLBACK_ENABLED) ?: true
+         _samplingOnMobileData.value = load(SAMPLING_ON_MOBILE_DATA) ?: false
+         _showStatistics.value = load(SHOW_STATISTICS) ?: false
+     }
+ 
+     fun setFallbackEnabled(enabled: Boolean) {
+-        _fallbackEnabled.value = false
++        _fallbackEnabled.value = enabled
++        save(FALLBACK_ENABLED, enabled)
+     }
+ 
+     fun setSamplingOnMobileData(enabled: Boolean) {
