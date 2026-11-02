@@ -1,0 +1,821 @@
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
+index 5ee69462b..8626d55f1 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
+@@ -65,7 +65,7 @@ class TvChannelsRepository @Inject constructor(
+ 
+     // Cache em memória para resposta instantânea
+     private val channelsMemoryCache = mutableMapOf<Set<String>, List<TvChannelItem>>()
+-    private val streamMemoryCache = mutableMapOf<String, List<Stream>>()
++    private val streamMemoryCache = java.util.concurrent.ConcurrentHashMap<String, List<Stream>>()
+     private var lastTvAddons: List<Addon>? = null
+     private var lastSelectedUrls: Set<String> = emptySet()
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/forklivetv/ForkLiveRecorder.kt b/app/src/main/java/com/nuvio/tv/forklivetv/ForkLiveRecorder.kt
+index e4eeea8e0..82f8705d3 100644
+--- a/app/src/main/java/com/nuvio/tv/forklivetv/ForkLiveRecorder.kt
++++ b/app/src/main/java/com/nuvio/tv/forklivetv/ForkLiveRecorder.kt
+@@ -23,8 +23,9 @@ import java.util.concurrent.TimeUnit
+ /**
+  * Nuvio fork: Live TV recording. Fully separate from the Live TV player: it opens its own HTTP connection to the
+  * stream URL, never touches the shared ExoPlayer, and writes a plain MPEG-TS file that the Recordings screen can play.
+- * Direct TS streams are copied byte for byte. HLS playlists (TS segments) are followed and appended. Encrypted or
+- * fMP4 HLS is refused with a clear message instead of writing a broken file.
++ * Direct TS streams are copied byte for byte. HLS playlists (TS segments) are followed and appended. fMP4 HLS is
++ * written as a fragmented .mp4 (init segment first). Encrypted HLS is refused with a clear message instead of
++ * writing a broken file. Every failure sets [message] so the player can show it.
+  */
+ object ForkLiveRecorder {
+     private const val TAG = "ForkLiveRecorder"
+@@ -42,6 +43,7 @@ object ForkLiveRecorder {
+ 
+     @Volatile private var stopRequested = false
+     @Volatile private var call: Call? = null
++    @Volatile private var lastError: String? = null
+ 
+     private val http: OkHttpClient = OkHttpClient.Builder()
+         .connectTimeout(20, TimeUnit.SECONDS)
+@@ -69,7 +71,7 @@ object ForkLiveRecorder {
+     }
+ 
+     fun list(context: Context): List<File> =
+-        recordingsDir(context).listFiles { f -> f.isFile && f.name.endsWith(".ts") }
++        recordingsDir(context).listFiles { f -> f.isFile && (f.name.endsWith(".ts") || f.name.endsWith(".mp4")) }
+             ?.sortedByDescending { it.lastModified() }.orEmpty()
+ 
+     fun start(context: Context, url: String, headers: Map<String, String>?, channel: String, maxMinutes: Int) {
+@@ -82,8 +84,13 @@ object ForkLiveRecorder {
+                 ForkLiveRecordingService.EXTRA_HEADERS,
+                 ArrayList(headers.orEmpty().map { "${it.key}\n${it.value}" })
+             )
+-        _message.value = null
+-        if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent) else context.startService(intent)
++        _message.value = "Starting recording…"
++        try {
++            if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent) else context.startService(intent)
++        } catch (e: Exception) {
++            Log.w(TAG, "could not start the recording service", e)
++            _message.value = "Could not start recording: ${e.message ?: e.javaClass.simpleName}"
++        }
+     }
+ 
+     fun stop() {
+@@ -94,6 +101,7 @@ object ForkLiveRecorder {
+     /** Blocking. Runs on the service's IO thread until stopped, the time limit, an error or the end of the stream. */
+     internal fun run(context: Context, rawUrl: String, rawHeaders: Map<String, String>, channel: String, maxMinutes: Int) {
+         stopRequested = false
++        lastError = null
+         // Same URL clean-up the Live TV player uses (user:pass@host becomes a Basic auth header).
+         val (url, mergedHeaders) = PlayerMediaSourceFactory.extractUserInfoAuth(rawUrl, rawHeaders)
+         val headers = PlayerMediaSourceFactory.sanitizeHeaders(mergedHeaders)
+@@ -104,6 +112,7 @@ object ForkLiveRecorder {
+         val until = if (maxMinutes > 0) now + maxMinutes * 60_000L else Long.MAX_VALUE
+         _bytes.value = 0L
+         _active.value = Active(channel, file, now, until)
++        _message.value = null
+         try {
+             FileOutputStream(file, true).use { out ->
+                 val sink = Sink(out, file, until)
+@@ -118,10 +127,14 @@ object ForkLiveRecorder {
+                     } catch (e: IOException) {
+                         if (sink.done()) break
+                         failures++
++                        lastError = e.message
+                         Log.w(TAG, "stream error: ${e.message}")
+                     }
+-                    if (failures > MAX_RECONNECTS) {
+-                        _message.value = "Recording stopped: the stream kept dropping."
++                    if (failures > MAX_RECONNECTS || (failures >= 3 && _bytes.value == 0L)) {
++                        if (_message.value == null) {
++                            val why = lastError?.let { " ($it)" }.orEmpty()
++                            _message.value = if (_bytes.value == 0L) "Could not record this channel$why." else "Recording stopped: the stream kept dropping$why."
++                        }
+                         break
+                     }
+                     Thread.sleep(2000)
+@@ -134,8 +147,11 @@ object ForkLiveRecorder {
+             _message.value = "Recording failed: ${e.message}"
+         } finally {
+             call = null
+-            if (file.exists() && file.length() < 64 * 1024) file.delete()
+-            if (_message.value == null && file.exists()) _message.value = "Saved ${file.name}"
++            val finalFile = _active.value?.file ?: file
++            if (finalFile.exists() && finalFile.length() < 64 * 1024) finalFile.delete()
++            if (_message.value == null || _message.value == "Starting recording…") {
++                _message.value = if (finalFile.exists()) "Saved ${finalFile.name}" else "Nothing was recorded."
++            }
+             _active.value = null
+         }
+     }
+@@ -143,7 +159,16 @@ object ForkLiveRecorder {
+     private class StopRecording(msg: String) : RuntimeException(msg)
+     private enum class End { FINISHED, DROPPED }
+ 
+-    private class Sink(val out: FileOutputStream, val file: File, val until: Long) {
++    private class Sink(val out: FileOutputStream, var file: File, val until: Long) {
++        /** Renames the output to .mp4 (fMP4 HLS); the open descriptor stays valid after the rename. */
++        fun useMp4() {
++            if (file.name.endsWith(".mp4")) return
++            val target = File(file.parentFile, file.nameWithoutExtension + ".mp4")
++            if (file.renameTo(target)) {
++                file = target
++                _active.value = _active.value?.copy(file = target)
++            }
++        }
+         fun done(): Boolean = stopRequested || System.currentTimeMillis() >= until
+         fun write(buf: ByteArray, len: Int) {
+             if (done()) throw StopRecording("stopped")
+@@ -216,9 +241,23 @@ object ForkLiveRecorder {
+         }
+         val seen = LinkedHashSet<String>()
+         var emptyRounds = 0
++        var initDone = false
+         while (!sink.done()) {
+-            if (text.contains("#EXT-X-MAP")) throw StopRecording("fMP4 HLS is not supported").also {
+-                _message.value = "This channel uses fMP4 HLS, which cannot be recorded yet."
++            if (!initDone) {
++                val map = Regex("#EXT-X-MAP:[^\\n]*URI=\"([^\"]+)\"").find(text)?.groupValues?.get(1)
++                if (map != null) {
++                    sink.useMp4()
++                    fetch(resolve(playlistUrl, map), headers).use { r ->
++                        val buf = ByteArray(64 * 1024)
++                        val st = r.body?.byteStream() ?: throw IOException("empty init segment")
++                        while (true) {
++                            val n = st.read(buf)
++                            if (n < 0) break
++                            sink.write(buf, n)
++                        }
++                    }
++                }
++                initDone = true
+             }
+             if (Regex("#EXT-X-KEY:.*METHOD=(?!NONE)").containsMatchIn(text)) {
+                 _message.value = "This channel is encrypted and cannot be recorded."
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
+index 87f372c8a..fbaf68a69 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
+@@ -508,6 +508,9 @@ class PlayerRuntimeController(
+     /** YouTube fork: SponsorBlock for the video playing, and whether your default quality is applied yet. */
+     internal var sponsorSession: com.nuvio.tv.youtube.SponsorBlockSession? = null
+     internal var youtubeQualityApplied = false
++    internal var youtubeDropKey: String? = null
++    internal var youtubeDropStrikes = 0
++    internal var youtubeStepDowns = 0
+     // Prevent the previous stream's end from completing the new stream.
+     internal var endDetectionArmed = false
+     // Ignore EOF until MPV has reported a non-EOF state for this stream.
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+index 1fd1edae2..98afa9837 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+@@ -1825,6 +1825,7 @@ internal fun PlayerRuntimeController.initializePlayer(
+                         elapsedMs: Long
+                     ) {
+                         playbackAnalyticsDiagnostics.onDroppedVideoFrames(eventTime, droppedFrames, elapsedMs)
++                        youtubeOnDroppedFrames(droppedFrames, elapsedMs)
+                     }
+ 
+                     override fun onVideoFrameProcessingOffset(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt
+index 2bc746a7a..fd8eeff27 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt
+@@ -30,9 +30,46 @@ import com.nuvio.tv.ui.util.languageCodeToName
+ internal fun PlayerRuntimeController.applyYouTubeCodecPreference() {
+     val player = _exoPlayer ?: return
+     val order = com.nuvio.tv.youtube.YouTubeSettings.codecMimeOrder(context)
+-    player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
++    // H.264 stops at 1080p on YouTube; in Auto keep it there so "most compatible" really plays H.264.
++    val capToAvc = com.nuvio.tv.youtube.YouTubeSettings.codecPreference(context) == "avc" &&
++        com.nuvio.tv.youtube.YouTubeSettings.preferredHeight(context) <= 0
++    val builder = player.trackSelectionParameters.buildUpon()
+         .setPreferredVideoMimeTypes(*order.toTypedArray())
+-        .build()
++    if (capToAvc) builder.setMaxVideoSize(1920, 1080) else builder.setMaxVideoSize(Int.MAX_VALUE, Int.MAX_VALUE)
++    player.trackSelectionParameters = builder.build()
++}
++
++/**
++ * YouTube fork: 1440p and 4K come only in VP9/AV1, and a box without a fast decoder drops frames there. When the
++ * player keeps dropping frames on a tall size, step down one size (twice at most per video) instead of stuttering.
++ */
++internal fun PlayerRuntimeController.youtubeOnDroppedFrames(droppedFrames: Int, elapsedMs: Long) {
++    val player = _exoPlayer ?: return
++    if (!com.nuvio.tv.youtube.YouTubeProgress.isYouTubeId(contentId)) return
++    if (youtubeDropKey != contentId) {
++        youtubeDropKey = contentId
++        youtubeDropStrikes = 0
++        youtubeStepDowns = 0
++    }
++    val current = player.videoFormat?.height ?: return
++    if (current <= 1080 || youtubeStepDowns >= 2 || elapsedMs <= 0L) return
++    val perSecond = droppedFrames * 1000f / elapsedMs
++    if (droppedFrames < 8 || perSecond < 4f) {
++        youtubeDropStrikes = 0
++        return
++    }
++    if (++youtubeDropStrikes < 2) return
++    val lower = player.currentTracks.groups
++        .filter { it.type == C.TRACK_TYPE_VIDEO }
++        .flatMap { g -> (0 until g.length).filter { g.isTrackSupported(it) }.map { g.getTrackFormat(it).height } }
++        .filter { it in 1..(current - 1) }
++        .maxOrNull() ?: return
++    youtubeDropStrikes = 0
++    youtubeStepDowns++
++    selectVideoQuality(lower)
++    android.os.Handler(android.os.Looper.getMainLooper()).post {
++        android.widget.Toast.makeText(context, "Dropping frames at ${current}p. Switched to ${lower}p.", android.widget.Toast.LENGTH_LONG).show()
++    }
+ }
+ 
+ /** Pins playback to [height] (the best supported track of that size), or back to automatic when 0. */
+@@ -40,6 +77,8 @@ internal fun PlayerRuntimeController.selectVideoQuality(height: Int) {
+     val player = _exoPlayer ?: return
+     val params = player.trackSelectionParameters.buildUpon()
+         .clearOverridesOfType(C.TRACK_TYPE_VIDEO)
++    // A size picked by hand is never held back by the H.264 1080p cap.
++    if (height > 0) params.setMaxVideoSize(Int.MAX_VALUE, Int.MAX_VALUE)
+     if (height > 0) {
+         var bestGroup: androidx.media3.common.TrackGroup? = null
+         var bestIndex = -1
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
+index 725d104dc..37037b9d4 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
+@@ -372,13 +372,12 @@ class StreamScreenViewModel @Inject constructor(
+         }
+     }
+ 
+-    /** Returns how many links were new to the list. */
++    /** Returns how many links the list grew by. */
+     private fun mergeRefreshedStreams(fresh: List<AddonStreams>): Int {
+         val current = _uiState.value
+         val byName = LinkedHashMap<String, AddonStreams>()
+         current.addonStreams.forEach { byName[it.addonName] = it }
+         var changed = false
+-        var added = 0
+         val badged = current.allStreams.filter { it.badges.isNotEmpty() }.associateBy { it.badgeMergeKey() }
+         fresh.forEach { group ->
+             if (group.streams.isEmpty()) return@forEach
+@@ -394,7 +393,6 @@ class StreamScreenViewModel @Inject constructor(
+                     }
+                 )
+                 changed = true
+-                added += newKeys.count { it !in oldKeys }
+             }
+         }
+         if (!changed) return 0
+@@ -417,7 +415,8 @@ class StreamScreenViewModel @Inject constructor(
+             )
+         }
+         scheduleStreamBadgePresentation(groups)
+-        return added
++        // Net growth of the list only: rotating link tokens must not count as new links.
++        return (allStreams.size - current.allStreams.size).coerceAtLeast(0)
+     }
+ 
+     private fun SavedStateHandle.getOptionalString(key: String): String? {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt
+index 2b4254ede..0bb24e1db 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt
+@@ -95,6 +95,10 @@ fun TvChannelFullscreenHud(
+     val forkRecContext = LocalContext.current
+     val forkRecActive by ForkLiveRecorder.active.collectAsStateWithLifecycle()
+     val forkRecBytes by ForkLiveRecorder.bytes.collectAsStateWithLifecycle()
++    val forkRecMessage by ForkLiveRecorder.message.collectAsStateWithLifecycle()
++    LaunchedEffect(forkRecMessage) {
++        forkRecMessage?.let { android.widget.Toast.makeText(forkRecContext, it, android.widget.Toast.LENGTH_LONG).show() }
++    }
+     var sleepMinutes by remember { mutableStateOf(0) }
+     var isMuted by remember { mutableStateOf(false) }
+     var isReloading by remember { mutableStateOf(false) }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvSportsHubDialog.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvSportsHubDialog.kt
+index 7c9309455..247b76dd9 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvSportsHubDialog.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvSportsHubDialog.kt
+@@ -1,54 +1,78 @@
+ package com.nuvio.tv.ui.screens.tvchannels.components
+ 
++import androidx.compose.foundation.BorderStroke
++import androidx.compose.foundation.background
+ import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.height
+ import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.width
+ import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.LazyRow
+ import androidx.compose.foundation.lazy.items
+ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableIntStateOf
+ import androidx.compose.runtime.produceState
+ import androidx.compose.runtime.remember
+-import androidx.compose.ui.focus.FocusRequester
+-import androidx.compose.ui.focus.focusRequester
+-import kotlinx.coroutines.Dispatchers
+-import kotlinx.coroutines.delay
+-import kotlinx.coroutines.withContext
++import androidx.compose.runtime.setValue
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.graphics.Brush
+ import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.layout.ContentScale
+ import androidx.compose.ui.res.stringResource
+ import androidx.compose.ui.text.font.FontWeight
+ import androidx.compose.ui.text.style.TextOverflow
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.unit.sp
+-import androidx.tv.material3.Button
+-import androidx.tv.material3.ButtonDefaults
++import androidx.tv.material3.Border
++import androidx.tv.material3.ClickableSurfaceDefaults
+ import androidx.tv.material3.ExperimentalTvMaterial3Api
+ import androidx.tv.material3.MaterialTheme
++import androidx.tv.material3.Surface
+ import androidx.tv.material3.Text
++import coil3.compose.AsyncImage
+ import com.nuvio.tv.R
+ import com.nuvio.tv.domain.model.TvChannelItem
+-import com.nuvio.tv.forklivetv.ForkLiveReminders
+ import com.nuvio.tv.ui.components.NuvioDialog
+ import com.nuvio.tv.ui.theme.NuvioTheme
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.withContext
+ import java.text.SimpleDateFormat
+ import java.util.Calendar
+ import java.util.Date
+ import java.util.Locale
+ 
+-private sealed interface HubRow {
+-    data class Header(val titleRes: Int) : HubRow
+-    data class Event(val channel: TvChannelItem, val live: Boolean) : HubRow
++private const val LIVE_WINDOW_MS = 3 * 60 * 60_000L
++private val LIVE_RED = Color(0xFFE5393B)
++
++/** Events from the user's own channels, bucketed by kickoff time. */
++private class SportsHub(
++    val live: List<TvChannelItem>,
++    val today: List<TvChannelItem>,
++    val later: List<TvChannelItem>
++) {
++    val isEmpty: Boolean get() = live.isEmpty() && today.isEmpty() && later.isEmpty()
++    val total: Int get() = live.size + today.size + later.size
+ }
+ 
+-private const val LIVE_WINDOW_MS = 3 * 60 * 60_000L
++private enum class HubFilter { ALL, LIVE, TODAY, LATER }
+ 
+-/** Live now / Today / Later events from the user's own channels (addons that list kickoff times). */
++/**
++ * Sports hub: a featured event, then Live now / Today / Later rows of event cards.
++ * OK on a live card watches it, OK on an upcoming card sets a reminder, hold OK watches at once.
++ */
+ @OptIn(ExperimentalTvMaterial3Api::class)
+ @Composable
+ fun TvSportsHubDialog(
+@@ -60,36 +84,49 @@ fun TvSportsHubDialog(
+     onDismiss: () -> Unit
+ ) {
+     if (!visible) return
+-    val built by produceState<List<HubRow>?>(initialValue = SportsHubCache.peek(channels), channels) {
++    val built by produceState<SportsHub?>(initialValue = SportsHubCache.peek(channels), channels) {
+         value = SportsHubCache.peek(channels) ?: withContext(Dispatchers.Default) {
+-            buildRows(channels).also { SportsHubCache.store(channels, it) }
++            buildHub(channels).also { SportsHubCache.store(channels, it) }
+         }
+     }
+-    val rows = built ?: emptyList()
++    val hub = built
++    var filter by remember { mutableIntStateOf(HubFilter.ALL.ordinal) }
++    val active = HubFilter.entries[filter]
+     val firstFocus = remember { FocusRequester() }
+-    val firstEventKey = rows.firstOrNull { it is HubRow.Event }?.let { (it as HubRow.Event).channel.id }
+-    LaunchedEffect(firstEventKey) {
+-        if (firstEventKey != null) {
++    val featured = hub?.let { h ->
++        when (active) {
++            HubFilter.LIVE -> h.live.firstOrNull()
++            HubFilter.TODAY -> h.today.firstOrNull()
++            HubFilter.LATER -> h.later.firstOrNull()
++            HubFilter.ALL -> h.live.firstOrNull() ?: h.today.firstOrNull() ?: h.later.firstOrNull()
++        }
++    }
++    LaunchedEffect(featured?.id, filter) {
++        if (featured != null) {
+             delay(150)
+             runCatching { firstFocus.requestFocus() }
+         }
+     }
+     val timeFormat = remember { SimpleDateFormat("EEE d MMM, HH:mm", Locale.getDefault()) }
++    val clockFormat = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
++    val onPrimary: (TvChannelItem, Boolean) -> Unit = { ch, live ->
++        if (live) onWatch(ch) else onToggleReminder(ch)
++    }
+ 
+     NuvioDialog(
+         onDismiss = onDismiss,
+         title = stringResource(R.string.sports_hub_title),
+         subtitle = stringResource(R.string.sports_hub_subtitle),
+-        width = 700.dp
++        width = 860.dp
+     ) {
+-        if (built == null) {
++        if (hub == null) {
+             Text(
+                 text = "…",
+                 style = MaterialTheme.typography.bodyMedium,
+                 color = Color.White.copy(alpha = 0.5f),
+                 modifier = Modifier.padding(vertical = 24.dp)
+             )
+-        } else if (rows.isEmpty()) {
++        } else if (hub.isEmpty) {
+             Text(
+                 text = stringResource(R.string.sports_hub_empty),
+                 style = MaterialTheme.typography.bodyMedium,
+@@ -97,84 +134,256 @@ fun TvSportsHubDialog(
+                 modifier = Modifier.padding(vertical = 24.dp)
+             )
+         } else {
++            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
++                HubChip(
++                    label = stringResource(R.string.sports_hub_all) + " · " + hub.total,
++                    selected = active == HubFilter.ALL,
++                    onClick = { filter = HubFilter.ALL.ordinal }
++                )
++                if (hub.live.isNotEmpty()) HubChip(
++                    label = stringResource(R.string.sports_hub_live) + " · " + hub.live.size,
++                    selected = active == HubFilter.LIVE,
++                    dot = LIVE_RED,
++                    onClick = { filter = HubFilter.LIVE.ordinal }
++                )
++                if (hub.today.isNotEmpty()) HubChip(
++                    label = stringResource(R.string.sports_hub_today) + " · " + hub.today.size,
++                    selected = active == HubFilter.TODAY,
++                    onClick = { filter = HubFilter.TODAY.ordinal }
++                )
++                if (hub.later.isNotEmpty()) HubChip(
++                    label = stringResource(R.string.sports_hub_later) + " · " + hub.later.size,
++                    selected = active == HubFilter.LATER,
++                    onClick = { filter = HubFilter.LATER.ordinal }
++                )
++            }
+             LazyColumn(
+-                modifier = Modifier.fillMaxWidth().height(340.dp),
+-                verticalArrangement = Arrangement.spacedBy(6.dp)
++                modifier = Modifier.fillMaxWidth().height(380.dp),
++                verticalArrangement = Arrangement.spacedBy(10.dp)
+             ) {
+-                items(rows, key = {
+-                    when (it) {
+-                        is HubRow.Header -> "h${it.titleRes}"
+-                        is HubRow.Event -> "e${it.channel.type}:${it.channel.id}"
+-                    }
+-                }) { row ->
+-                    when (row) {
+-                        is HubRow.Header -> Text(
+-                            text = stringResource(row.titleRes),
+-                            style = MaterialTheme.typography.titleSmall,
+-                            fontWeight = FontWeight.Bold,
+-                            color = NuvioTheme.colors.Secondary,
+-                            modifier = Modifier.padding(top = 8.dp, bottom = 2.dp)
++                if (featured != null) {
++                    item(key = "featured") {
++                        val live = featured in hub.live
++                        FeaturedCard(
++                            channel = featured,
++                            live = live,
++                            reminderSet = !live && isReminderSet(featured),
++                            timeText = featured.startEpochMs?.let { timeFormat.format(Date(it)) }.orEmpty(),
++                            onClick = { onPrimary(featured, live) },
++                            onLongClick = { onWatch(featured) },
++                            modifier = Modifier.focusRequester(firstFocus)
+                         )
+-                        is HubRow.Event -> {
+-                            val ch = row.channel
+-                            Row(
+-                                modifier = Modifier.fillMaxWidth(),
+-                                verticalAlignment = Alignment.CenterVertically,
+-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+-                            ) {
+-                                androidx.compose.foundation.layout.Column(modifier = Modifier.weight(1f)) {
+-                                    Text(
+-                                        text = ch.name,
+-                                        fontSize = 13.sp,
+-                                        fontWeight = FontWeight.SemiBold,
+-                                        color = Color.White,
+-                                        maxLines = 1,
+-                                        overflow = TextOverflow.Ellipsis
+-                                    )
+-                                    Text(
+-                                        text = ch.startEpochMs?.let { timeFormat.format(Date(it)) }.orEmpty(),
+-                                        fontSize = 11.sp,
+-                                        color = Color.White.copy(alpha = 0.6f)
+-                                    )
+-                                }
+-                                val isFirst = ch.id == firstEventKey
+-                                if (!row.live) {
+-                                    val set = isReminderSet(ch)
+-                                    SportsHubButton(
+-                                        label = stringResource(if (set) R.string.live_reminder_button_set else R.string.live_reminder_button),
+-                                        onClick = { onToggleReminder(ch) },
+-                                        modifier = if (isFirst) Modifier.focusRequester(firstFocus) else Modifier
++                    }
++                }
++                val sections = buildList {
++                    if (active == HubFilter.ALL || active == HubFilter.LIVE) add(Triple(R.string.sports_hub_live, hub.live, true))
++                    if (active == HubFilter.ALL || active == HubFilter.TODAY) add(Triple(R.string.sports_hub_today, hub.today, false))
++                    if (active == HubFilter.ALL || active == HubFilter.LATER) add(Triple(R.string.sports_hub_later, hub.later, false))
++                }
++                for ((titleRes, list, live) in sections) {
++                    val rest = list.filter { it !== featured }
++                    if (rest.isEmpty()) continue
++                    item(key = "s$titleRes") {
++                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
++                            Text(
++                                text = stringResource(titleRes),
++                                style = MaterialTheme.typography.titleSmall,
++                                fontWeight = FontWeight.Bold,
++                                color = if (live) LIVE_RED else NuvioTheme.colors.Secondary
++                            )
++                            LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
++                                items(rest, key = { it.type + ":" + it.id }) { ch ->
++                                    EventCard(
++                                        channel = ch,
++                                        live = live,
++                                        reminderSet = !live && isReminderSet(ch),
++                                        timeText = ch.startEpochMs?.let { (if (live) clockFormat else timeFormat).format(Date(it)) }.orEmpty(),
++                                        onClick = { onPrimary(ch, live) },
++                                        onLongClick = { onWatch(ch) }
+                                     )
+                                 }
+-                                SportsHubButton(
+-                                    label = stringResource(R.string.sports_hub_watch),
+-                                    onClick = { onWatch(ch) },
+-                                    modifier = if (isFirst && row.live) Modifier.focusRequester(firstFocus) else Modifier
+-                                )
+                             }
+                         }
+                     }
+                 }
+             }
++            Text(
++                text = stringResource(R.string.sports_hub_hint),
++                fontSize = 11.sp,
++                color = Color.White.copy(alpha = 0.5f)
++            )
+         }
+     }
+ }
+ 
+ @OptIn(ExperimentalTvMaterial3Api::class)
+ @Composable
+-private fun SportsHubButton(label: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
+-    Button(
++private fun HubChip(label: String, selected: Boolean, onClick: () -> Unit, dot: Color? = null) {
++    Surface(
+         onClick = onClick,
+-        modifier = modifier,
+-        shape = ButtonDefaults.shape(shape = RoundedCornerShape(22.dp)),
+-        colors = ButtonDefaults.colors(
+-            containerColor = Color.White.copy(alpha = 0.10f),
++        shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(20.dp)),
++        scale = ClickableSurfaceDefaults.scale(focusedScale = 1.05f),
++        colors = ClickableSurfaceDefaults.colors(
++            containerColor = if (selected) Color.White.copy(alpha = 0.22f) else Color.White.copy(alpha = 0.08f),
+             contentColor = Color.White,
+             focusedContainerColor = Color.White,
+             focusedContentColor = Color.Black
+         )
+     ) {
+-        Text(text = label, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
++        Row(
++            modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp),
++            verticalAlignment = Alignment.CenterVertically,
++            horizontalArrangement = Arrangement.spacedBy(6.dp)
++        ) {
++            if (dot != null) Box(Modifier.width(8.dp).height(8.dp).clip(RoundedCornerShape(4.dp)).background(dot))
++            Text(text = label, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
++        }
++    }
++}
++
++@Composable
++private fun LiveBadge(live: Boolean, reminderSet: Boolean) {
++    val (text, color) = when {
++        live -> stringResource(R.string.sports_hub_badge_live) to LIVE_RED
++        reminderSet -> stringResource(R.string.live_reminder_button_set) to Color(0xFF2E7D32)
++        else -> stringResource(R.string.live_reminder_button) to Color.White.copy(alpha = 0.25f)
++    }
++    Text(
++        text = text,
++        fontSize = 10.sp,
++        fontWeight = FontWeight.Bold,
++        color = Color.White,
++        modifier = Modifier.clip(RoundedCornerShape(4.dp)).background(color).padding(horizontal = 6.dp, vertical = 2.dp)
++    )
++}
++
++@OptIn(ExperimentalTvMaterial3Api::class)
++@Composable
++private fun FeaturedCard(
++    channel: TvChannelItem,
++    live: Boolean,
++    reminderSet: Boolean,
++    timeText: String,
++    onClick: () -> Unit,
++    onLongClick: () -> Unit,
++    modifier: Modifier = Modifier
++) {
++    val image = channel.poster ?: channel.logo
++    Surface(
++        onClick = onClick,
++        onLongClick = onLongClick,
++        modifier = modifier.fillMaxWidth().height(150.dp),
++        shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(16.dp)),
++        scale = ClickableSurfaceDefaults.scale(focusedScale = 1.02f),
++        border = ClickableSurfaceDefaults.border(
++            focusedBorder = Border(BorderStroke(2.dp, Color.White), shape = RoundedCornerShape(16.dp))
++        ),
++        colors = ClickableSurfaceDefaults.colors(
++            containerColor = Color(0xFF1B2433),
++            focusedContainerColor = Color(0xFF243146)
++        )
++    ) {
++        Box(Modifier.fillMaxSize()) {
++            if (image != null) {
++                AsyncImage(
++                    model = image,
++                    contentDescription = null,
++                    contentScale = ContentScale.Crop,
++                    modifier = Modifier.fillMaxSize()
++                )
++            }
++            Box(
++                Modifier.fillMaxSize().background(
++                    Brush.horizontalGradient(listOf(Color.Black.copy(alpha = 0.85f), Color.Black.copy(alpha = 0.25f)))
++                )
++            )
++            Column(
++                modifier = Modifier.fillMaxSize().padding(18.dp),
++                verticalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterVertically)
++            ) {
++                LiveBadge(live, reminderSet)
++                Text(
++                    text = channel.name,
++                    fontSize = 22.sp,
++                    fontWeight = FontWeight.Bold,
++                    color = Color.White,
++                    maxLines = 2,
++                    overflow = TextOverflow.Ellipsis
++                )
++                Text(
++                    text = listOf(timeText, channel.addonName).filter { it.isNotBlank() }.joinToString(" · "),
++                    fontSize = 12.sp,
++                    color = Color.White.copy(alpha = 0.75f),
++                    maxLines = 1,
++                    overflow = TextOverflow.Ellipsis
++                )
++            }
++        }
++    }
++}
++
++@OptIn(ExperimentalTvMaterial3Api::class)
++@Composable
++private fun EventCard(
++    channel: TvChannelItem,
++    live: Boolean,
++    reminderSet: Boolean,
++    timeText: String,
++    onClick: () -> Unit,
++    onLongClick: () -> Unit
++) {
++    val image = channel.poster ?: channel.logo
++    Surface(
++        onClick = onClick,
++        onLongClick = onLongClick,
++        modifier = Modifier.width(210.dp).height(112.dp),
++        shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(12.dp)),
++        scale = ClickableSurfaceDefaults.scale(focusedScale = 1.06f),
++        border = ClickableSurfaceDefaults.border(
++            focusedBorder = Border(BorderStroke(2.dp, Color.White), shape = RoundedCornerShape(12.dp))
++        ),
++        colors = ClickableSurfaceDefaults.colors(
++            containerColor = Color(0xFF1B2433),
++            focusedContainerColor = Color(0xFF243146)
++        )
++    ) {
++        Box(Modifier.fillMaxSize()) {
++            if (image != null) {
++                AsyncImage(
++                    model = image,
++                    contentDescription = null,
++                    contentScale = ContentScale.Crop,
++                    modifier = Modifier.fillMaxSize()
++                )
++            }
++            Box(
++                Modifier.fillMaxSize().background(
++                    Brush.verticalGradient(listOf(Color.Black.copy(alpha = 0.35f), Color.Black.copy(alpha = 0.85f)))
++                )
++            )
++            Column(
++                modifier = Modifier.fillMaxSize().padding(10.dp),
++                verticalArrangement = Arrangement.SpaceBetween
++            ) {
++                LiveBadge(live, reminderSet)
++                Column {
++                    Text(
++                        text = channel.name,
++                        fontSize = 13.sp,
++                        fontWeight = FontWeight.SemiBold,
++                        color = Color.White,
++                        maxLines = 2,
++                        overflow = TextOverflow.Ellipsis
++                    )
++                    Text(
++                        text = timeText,
++                        fontSize = 11.sp,
++                        color = Color.White.copy(alpha = 0.7f),
++                        maxLines = 1
++                    )
++                }
++            }
++        }
+     }
+ }
+ 
+@@ -186,23 +395,23 @@ private fun SportsHubButton(label: String, onClick: () -> Unit, modifier: Modifi
+ private object SportsHubCache {
+     private var source: List<TvChannelItem>? = null
+     private var builtAtMs: Long = 0L
+-    private var rows: List<HubRow> = emptyList()
++    private var hub: SportsHub? = null
+ 
+     @Synchronized
+-    fun peek(channels: List<TvChannelItem>): List<HubRow>? =
+-        if (source === channels && System.currentTimeMillis() - builtAtMs < CACHE_MS) rows else null
++    fun peek(channels: List<TvChannelItem>): SportsHub? =
++        if (source === channels && System.currentTimeMillis() - builtAtMs < CACHE_MS) hub else null
+ 
+     @Synchronized
+-    fun store(channels: List<TvChannelItem>, built: List<HubRow>) {
++    fun store(channels: List<TvChannelItem>, built: SportsHub) {
+         source = channels
+         builtAtMs = System.currentTimeMillis()
+-        rows = built
++        hub = built
+     }
+ }
+ 
+ private const val CACHE_MS = 60_000L
+ 
+-private fun buildRows(channels: List<TvChannelItem>): List<HubRow> {
++private fun buildHub(channels: List<TvChannelItem>): SportsHub {
+     val now = System.currentTimeMillis()
+     val endOfToday = Calendar.getInstance().apply {
+         set(Calendar.HOUR_OF_DAY, 23); set(Calendar.MINUTE, 59); set(Calendar.SECOND, 59); set(Calendar.MILLISECOND, 999)
+@@ -220,12 +429,9 @@ private fun buildRows(channels: List<TvChannelItem>): List<HubRow> {
+             else -> later.add(channel)
+         }
+     }
+-    live.sortBy { it.startEpochMs }
+-    today.sortBy { it.startEpochMs }
+-    later.sortBy { it.startEpochMs }
+-    return buildList {
+-        if (live.isNotEmpty()) { add(HubRow.Header(R.string.sports_hub_live)); live.forEach { add(HubRow.Event(it, true)) } }
+-        if (today.isNotEmpty()) { add(HubRow.Header(R.string.sports_hub_today)); today.forEach { add(HubRow.Event(it, false)) } }
+-        if (later.isNotEmpty()) { add(HubRow.Header(R.string.sports_hub_later)); later.take(60).forEach { add(HubRow.Event(it, false)) } }
+-    }
++    return SportsHub(
++        live = live.sortedBy { it.startEpochMs },
++        today = today.sortedBy { it.startEpochMs },
++        later = later.sortedBy { it.startEpochMs }.take(60)
++    )
+ }
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 4a3d75c88..5874158d4 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -3601,4 +3601,7 @@
+     <string name="sports_hub_later">Later</string>
+     <string name="sports_hub_empty">No timed events in your channels right now</string>
+     <string name="sports_hub_watch">Watch</string>
++    <string name="sports_hub_all">All events</string>
++    <string name="sports_hub_badge_live">LIVE NOW</string>
++    <string name="sports_hub_hint">OK: watch live or set a reminder · Hold OK: watch now · ◄ ► through a row</string>
+ </resources>
