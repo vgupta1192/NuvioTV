@@ -431,10 +431,10 @@ index f59c3aaf9..a0399308e 100644
  
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvFixChannelDialog.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvFixChannelDialog.kt
 new file mode 100644
-index 000000000..a7f9045ea
+index 000000000..bdf422733
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvFixChannelDialog.kt
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,146 @@
 +package com.nuvio.tv.ui.screens.tvchannels.components
 +
 +import androidx.compose.foundation.layout.Arrangement
@@ -448,6 +448,8 @@ index 000000000..a7f9045ea
 +import androidx.compose.foundation.shape.RoundedCornerShape
 +import androidx.compose.material3.OutlinedTextField
 +import androidx.compose.runtime.Composable
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
 +import androidx.compose.runtime.LaunchedEffect
 +import androidx.compose.runtime.getValue
 +import androidx.compose.runtime.mutableStateOf
@@ -488,9 +490,18 @@ index 000000000..a7f9045ea
 +    var query by remember(channel.id) { mutableStateOf(channel.name) }
 +    var hits by remember(channel.id) { mutableStateOf<List<GuideChannelHit>>(emptyList()) }
 +
++    val firstHitFocus = remember { FocusRequester() }
++    var focusedFirst by remember(channel.id) { mutableStateOf(false) }
++
 +    LaunchedEffect(channel.id, query) {
 +        delay(250)
 +        hits = withContext(Dispatchers.Default) { search(query) }
++        // Land on the first result once (not while the user is typing in the search field).
++        if (!focusedFirst && hits.isNotEmpty()) {
++            focusedFirst = true
++            delay(100)
++            runCatching { firstHitFocus.requestFocus() }
++        }
 +    }
 +
 +    NuvioDialog(
@@ -522,7 +533,7 @@ index 000000000..a7f9045ea
 +                    items(hits, key = { it.id }) { hit ->
 +                        Button(
 +                            onClick = { onPick(hit) },
-+                            modifier = Modifier.fillMaxWidth(),
++                            modifier = Modifier.fillMaxWidth().then(if (hit.id == hits.first().id) Modifier.focusRequester(firstHitFocus) else Modifier),
 +                            shape = ButtonDefaults.shape(shape = RoundedCornerShape(8.dp)),
 +                            colors = ButtonDefaults.colors(
 +                                containerColor = Color.White.copy(alpha = 0.06f),
@@ -572,10 +583,10 @@ index 000000000..a7f9045ea
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvSportsHubDialog.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvSportsHubDialog.kt
 new file mode 100644
-index 000000000..8376f8c4a
+index 000000000..ddb265432
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvSportsHubDialog.kt
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,181 @@
 +package com.nuvio.tv.ui.screens.tvchannels.components
 +
 +import androidx.compose.foundation.layout.Arrangement
@@ -587,7 +598,11 @@ index 000000000..8376f8c4a
 +import androidx.compose.foundation.lazy.items
 +import androidx.compose.foundation.shape.RoundedCornerShape
 +import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
 +import androidx.compose.runtime.remember
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import kotlinx.coroutines.delay
 +import androidx.compose.ui.Alignment
 +import androidx.compose.ui.Modifier
 +import androidx.compose.ui.graphics.Color
@@ -631,6 +646,14 @@ index 000000000..8376f8c4a
 +) {
 +    if (!visible) return
 +    val rows = remember(channels) { buildRows(channels) }
++    val firstFocus = remember { FocusRequester() }
++    val firstEventKey = rows.firstOrNull { it is HubRow.Event }?.let { (it as HubRow.Event).channel.id }
++    LaunchedEffect(firstEventKey) {
++        if (firstEventKey != null) {
++            delay(150)
++            runCatching { firstFocus.requestFocus() }
++        }
++    }
 +    val timeFormat = remember { SimpleDateFormat("EEE d MMM, HH:mm", Locale.getDefault()) }
 +
 +    NuvioDialog(
@@ -687,16 +710,19 @@ index 000000000..8376f8c4a
 +                                        color = Color.White.copy(alpha = 0.6f)
 +                                    )
 +                                }
++                                val isFirst = ch.id == firstEventKey
 +                                if (!row.live) {
 +                                    val set = isReminderSet(ch)
 +                                    SportsHubButton(
 +                                        label = stringResource(if (set) R.string.live_reminder_button_set else R.string.live_reminder_button),
-+                                        onClick = { onToggleReminder(ch) }
++                                        onClick = { onToggleReminder(ch) },
++                                        modifier = if (isFirst) Modifier.focusRequester(firstFocus) else Modifier
 +                                    )
 +                                }
 +                                SportsHubButton(
 +                                    label = stringResource(R.string.sports_hub_watch),
-+                                    onClick = { onWatch(ch) }
++                                    onClick = { onWatch(ch) },
++                                    modifier = if (isFirst && row.live) Modifier.focusRequester(firstFocus) else Modifier
 +                                )
 +                            }
 +                        }
@@ -709,9 +735,10 @@ index 000000000..8376f8c4a
 +
 +@OptIn(ExperimentalTvMaterial3Api::class)
 +@Composable
-+private fun SportsHubButton(label: String, onClick: () -> Unit) {
++private fun SportsHubButton(label: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
 +    Button(
 +        onClick = onClick,
++        modifier = modifier,
 +        shape = ButtonDefaults.shape(shape = RoundedCornerShape(22.dp)),
 +        colors = ButtonDefaults.colors(
 +            containerColor = Color.White.copy(alpha = 0.10f),
