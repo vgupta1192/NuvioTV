@@ -1,0 +1,105 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/stream/ForkStreamRefreshStatus.kt b/app/src/main/java/com/nuvio/tv/ui/screens/stream/ForkStreamRefreshStatus.kt
+index 51708c4fb..6c9a51111 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/stream/ForkStreamRefreshStatus.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/ForkStreamRefreshStatus.kt
+@@ -15,16 +15,16 @@ import androidx.compose.ui.unit.dp
+ import androidx.tv.material3.Text
+ import kotlinx.coroutines.delay
+ 
+-private const val SHOW_AFTER_OPEN_MS = 8_000L
+-private const val SHOW_AFTER_NEW_LINKS_MS = 6_000L
++private const val MIN_ROUNDS = 6
++private const val DRY_ROUNDS = 5
+ 
+ /**
+  * Nuvio fork: one line that shows the stream auto refresh is alive. It says whether the screen is
+  * waiting for the first load, checking the addons now, or idle, how long ago the last check ended,
+  * how many rounds ran and how many new links they added in total.
+  *
+- * The line hides itself once it has nothing to report: it shows for the first seconds after the
+- * screen opens, for a few seconds after new links arrive, and for as long as a check has timed out.
++ * The line hides itself once it has nothing to report: after at least six rounds, and then five
++ * rounds in a row that added no links. New links show it again.
+  */
+ @Composable
+ internal fun ForkStreamRefreshStatus(
+@@ -42,17 +42,20 @@ internal fun ForkStreamRefreshStatus(
+             now = System.currentTimeMillis()
+         }
+     }
+-    val openedAt = remember { System.currentTimeMillis() }
+-    var addedSeen by remember { mutableIntStateOf(added) }
+-    var addedAt by remember { mutableLongStateOf(0L) }
+-    if (added != addedSeen) {
+-        addedSeen = added
+-        addedAt = System.currentTimeMillis()
++    // Hide only after MIN_ROUNDS rounds, then DRY_ROUNDS in a row that added no links; new links bring it back.
++    var addedAtLastRound by remember { mutableIntStateOf(added) }
++    var dryRounds by remember { mutableIntStateOf(0) }
++    var roundsSeen by remember { mutableIntStateOf(rounds) }
++    if (rounds != roundsSeen) {
++        roundsSeen = rounds
++        if (added == addedAtLastRound) {
++            if (rounds > MIN_ROUNDS) dryRounds++
++        } else {
++            dryRounds = 0
++        }
++        addedAtLastRound = added
+     }
+-    val timedOut = phase == 2 && !lastOk
+-    val visible = timedOut ||
+-        now - openedAt < SHOW_AFTER_OPEN_MS ||
+-        (addedAt != 0L && now - addedAt < SHOW_AFTER_NEW_LINKS_MS)
++    val visible = rounds < MIN_ROUNDS || dryRounds < DRY_ROUNDS
+     if (!visible) return
+     val text = when {
+         manualLoading || phase == 0 -> "Auto refresh: waiting for the load to finish"
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt
+index 2b2a1d891..748f28794 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt
+@@ -276,11 +276,8 @@ fun YouTubeScreen(
+             viewModel = viewModel,
+             onNearEnd = { if (shortsFixed == null) viewModel.loadMore() },
+             onOpenChannel = { item ->
+-                val id = item.channelId
+-                if (id != null) {
+-                    shortsStart = null
+-                    viewModel.openChannel(id, item.author ?: "Channel")
+-                }
++                shortsStart = null
++                viewModel.openChannelOf(item)
+             },
+             onClose = { shortsStart = null }
+         )
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
+index 339a272f0..54ddf8337 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
+@@ -276,6 +276,26 @@ class YouTubeViewModel @Inject constructor(
+         load(name) { rowStream(content.getChannelObserve(channelId)) }
+     }
+ 
++    /**
++     * Opens the channel of [item]. Search cards often carry no channel id, so it is then read from
++     * the video's own details first.
++     */
++    fun openChannelOf(item: YtItem) {
++        val known = item.channelId
++        if (known != null) {
++            openChannel(known, item.author ?: "Channel")
++            return
++        }
++        val videoId = item.videoId ?: return
++        viewModelScope.launch {
++            val meta = withContext(Dispatchers.IO) {
++                runCatching { service.mediaItemService.getMetadataObserve(videoId).blockingFirst() }.getOrNull()
++            }
++            val id = meta?.channelId ?: return@launch
++            openChannel(id, meta.author ?: item.author ?: "Channel")
++        }
++    }
++
+     private fun pushPage() {
+         // A page that's still loading has nothing to come back to.
+         if (!_state.value.loading) backStack.addLast(Page(_state.value, currentGroup, channelBlockOn))
