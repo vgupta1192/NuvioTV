@@ -1,0 +1,1015 @@
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index ac675bef7..2afd07a53 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -90,6 +90,11 @@
+             android:exported="false"
+             android:foregroundServiceType="mediaPlayback" />
+ 
++        <service
++            android:name=".forklivetv.ForkLiveRecordingService"
++            android:exported="false"
++            android:foregroundServiceType="mediaPlayback" />
++
+         <activity
+             android:name=".MainActivity"
+             android:exported="true"
+diff --git a/app/src/main/java/com/nuvio/tv/forklivetv/ForkDriveBackup.kt b/app/src/main/java/com/nuvio/tv/forklivetv/ForkDriveBackup.kt
+new file mode 100644
+index 000000000..10cf4ac2a
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/forklivetv/ForkDriveBackup.kt
+@@ -0,0 +1,230 @@
++package com.nuvio.tv.forklivetv
++
++import android.content.Context
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.withContext
++import okhttp3.FormBody
++import okhttp3.MediaType.Companion.toMediaType
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.RequestBody.Companion.toRequestBody
++import org.json.JSONArray
++import org.json.JSONObject
++import java.io.IOException
++import java.util.concurrent.TimeUnit
++
++/**
++ * Nuvio fork: Google Drive backup of the IPTV sources and the fork settings. Uses Google's device-code sign-in
++ * ("TVs and limited input devices" OAuth client that the user creates once) and the hidden Drive app-data folder,
++ * so the file never shows in the user's normal Drive and the app can only see its own file.
++ * Nothing here touches the Live TV player.
++ */
++object ForkDriveBackup {
++    private const val PREFS = "fork_drive_backup"
++    private const val FILE_NAME = "nuvio-tv-backup.json"
++    private const val SCOPE = "https://www.googleapis.com/auth/drive.appdata"
++    private val JSON = "application/json; charset=utf-8".toMediaType()
++
++    private val http = OkHttpClient.Builder()
++        .connectTimeout(20, TimeUnit.SECONDS)
++        .readTimeout(60, TimeUnit.SECONDS)
++        .build()
++
++    class SignInPrompt(val userCode: String, val url: String, val deviceCode: String, val expiresAtMs: Long, val intervalSec: Int)
++
++    private fun prefs(context: Context) = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++
++    fun clientId(context: Context): String = prefs(context).getString("client_id", "").orEmpty()
++    fun clientSecret(context: Context): String = prefs(context).getString("client_secret", "").orEmpty()
++    fun isConfigured(context: Context) = clientId(context).isNotBlank() && clientSecret(context).isNotBlank()
++    fun isSignedIn(context: Context) = prefs(context).getString("refresh_token", "").orEmpty().isNotBlank()
++    fun lastBackupMs(context: Context): Long = prefs(context).getLong("last_backup", 0L)
++
++    fun saveClient(context: Context, id: String, secret: String) {
++        prefs(context).edit().putString("client_id", id.trim()).putString("client_secret", secret.trim()).apply()
++    }
++
++    fun signOut(context: Context) {
++        prefs(context).edit().remove("refresh_token").remove("last_backup").apply()
++    }
++
++    suspend fun beginSignIn(context: Context): SignInPrompt = withContext(Dispatchers.IO) {
++        val body = FormBody.Builder().add("client_id", clientId(context)).add("scope", SCOPE).build()
++        val json = post("https://oauth2.googleapis.com/device/code", body)
++        SignInPrompt(
++            userCode = json.getString("user_code"),
++            url = json.optString("verification_url").ifBlank { json.optString("verification_uri", "https://www.google.com/device") },
++            deviceCode = json.getString("device_code"),
++            expiresAtMs = System.currentTimeMillis() + json.optLong("expires_in", 900L) * 1000L,
++            intervalSec = json.optInt("interval", 5).coerceAtLeast(3),
++        )
++    }
++
++    /** Polls until the user approved the code on their phone. Returns normally once signed in, throws on denial or expiry. */
++    suspend fun finishSignIn(context: Context, prompt: SignInPrompt) {
++        while (System.currentTimeMillis() < prompt.expiresAtMs) {
++            delay(prompt.intervalSec * 1000L)
++            val result = withContext(Dispatchers.IO) {
++                val body = FormBody.Builder()
++                    .add("client_id", clientId(context))
++                    .add("client_secret", clientSecret(context))
++                    .add("device_code", prompt.deviceCode)
++                    .add("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
++                    .build()
++                postRaw("https://oauth2.googleapis.com/token", body)
++            }
++            val refresh = result.optString("refresh_token")
++            if (refresh.isNotBlank()) {
++                prefs(context).edit().putString("refresh_token", refresh).apply()
++                return
++            }
++            when (result.optString("error")) {
++                "authorization_pending", "slow_down", "" -> Unit
++                "access_denied" -> throw IOException("Sign-in was denied.")
++                "expired_token" -> throw IOException("The code expired. Try again.")
++                else -> throw IOException(result.optString("error_description").ifBlank { result.optString("error") })
++            }
++        }
++        throw IOException("The code expired. Try again.")
++    }
++
++    suspend fun backUp(context: Context): String = withContext(Dispatchers.IO) {
++        val token = accessToken(context)
++        val payload = buildPayload(context).toString().toRequestBody(JSON)
++        val existing = findFileId(token)
++        if (existing == null) {
++            val meta = JSONObject().put("name", FILE_NAME).put("parents", JSONArray().put("appDataFolder"))
++            val multipart = okhttp3.MultipartBody.Builder().setType("multipart/related".toMediaType())
++                .addPart(meta.toString().toRequestBody(JSON))
++                .addPart(payload)
++                .build()
++            val req = Request.Builder()
++                .url("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart")
++                .header("Authorization", "Bearer $token")
++                .post(multipart)
++                .build()
++            http.newCall(req).execute().use { ensureOk(it) }
++        } else {
++            val req = Request.Builder()
++                .url("https://www.googleapis.com/upload/drive/v3/files/$existing?uploadType=media")
++                .header("Authorization", "Bearer $token")
++                .patch(payload)
++                .build()
++            http.newCall(req).execute().use { ensureOk(it) }
++        }
++        prefs(context).edit().putLong("last_backup", System.currentTimeMillis()).apply()
++        "Backed up ${summary(buildPayload(context))}."
++    }
++
++    suspend fun restore(context: Context): String = withContext(Dispatchers.IO) {
++        val token = accessToken(context)
++        val id = findFileId(token) ?: throw IOException("No backup found in this Google account yet.")
++        val req = Request.Builder()
++            .url("https://www.googleapis.com/drive/v3/files/$id?alt=media")
++            .header("Authorization", "Bearer $token")
++            .build()
++        val text = http.newCall(req).execute().use { ensureOk(it); it.body?.string().orEmpty() }
++        val json = JSONObject(text)
++        apply(context, json)
++        "Restored ${summary(json)}. Restart Nuvio to apply."
++    }
++
++    private fun summary(json: JSONObject): String {
++        val sources = runCatching { JSONArray(json.optString("iptvSources", "[]")).length() }.getOrDefault(0)
++        val settings = json.optJSONObject("forkSettings")?.length() ?: 0
++        return "$sources IPTV source(s) and $settings setting(s)"
++    }
++
++    private fun buildPayload(context: Context): JSONObject {
++        val app = context.applicationContext
++        val settings = JSONObject()
++        app.getSharedPreferences("nuvio_fork_tv_settings", Context.MODE_PRIVATE).all.forEach { (k, v) ->
++            when (v) {
++                is Boolean -> settings.put(k, JSONObject().put("t", "b").put("v", v))
++                is Int -> settings.put(k, JSONObject().put("t", "i").put("v", v))
++                is Long -> settings.put(k, JSONObject().put("t", "l").put("v", v))
++                is Float -> settings.put(k, JSONObject().put("t", "f").put("v", v.toDouble()))
++                is String -> settings.put(k, JSONObject().put("t", "s").put("v", v))
++            }
++        }
++        return JSONObject()
++            .put("version", 1)
++            .put("savedAt", System.currentTimeMillis())
++            .put("iptvSources", app.getSharedPreferences("nuvio_iptv", Context.MODE_PRIVATE).getString("sources", "[]"))
++            .put("forkSettings", settings)
++    }
++
++    private fun apply(context: Context, json: JSONObject) {
++        val app = context.applicationContext
++        if (json.has("iptvSources")) {
++            app.getSharedPreferences("nuvio_iptv", Context.MODE_PRIVATE).edit()
++                .putString("sources", json.getString("iptvSources")).apply()
++        }
++        val settings = json.optJSONObject("forkSettings") ?: return
++        val edit = app.getSharedPreferences("nuvio_fork_tv_settings", Context.MODE_PRIVATE).edit()
++        settings.keys().forEach { k ->
++            val e = settings.optJSONObject(k) ?: return@forEach
++            when (e.optString("t")) {
++                "b" -> edit.putBoolean(k, e.optBoolean("v"))
++                "i" -> edit.putInt(k, e.optInt("v"))
++                "l" -> edit.putLong(k, e.optLong("v"))
++                "f" -> edit.putFloat(k, e.optDouble("v").toFloat())
++                "s" -> edit.putString(k, e.optString("v"))
++            }
++        }
++        edit.apply()
++    }
++
++    private fun accessToken(context: Context): String {
++        val refresh = prefs(context).getString("refresh_token", "").orEmpty()
++        if (refresh.isBlank()) throw IOException("Sign in to Google first.")
++        val body = FormBody.Builder()
++            .add("client_id", clientId(context))
++            .add("client_secret", clientSecret(context))
++            .add("refresh_token", refresh)
++            .add("grant_type", "refresh_token")
++            .build()
++        val json = postRaw("https://oauth2.googleapis.com/token", body)
++        val token = json.optString("access_token")
++        if (token.isBlank()) {
++            if (json.optString("error") == "invalid_grant") signOut(context)
++            throw IOException(json.optString("error_description").ifBlank { "Google sign-in expired. Sign in again." })
++        }
++        return token
++    }
++
++    private fun findFileId(token: String): String? {
++        val url = okhttp3.HttpUrl.Builder().scheme("https").host("www.googleapis.com").addPathSegments("drive/v3/files")
++            .addQueryParameter("spaces", "appDataFolder")
++            .addQueryParameter("q", "name = '$FILE_NAME'")
++            .addQueryParameter("fields", "files(id,modifiedTime)")
++            .addQueryParameter("orderBy", "modifiedTime desc")
++            .build()
++        val req = Request.Builder().url(url).header("Authorization", "Bearer $token").build()
++        val text = http.newCall(req).execute().use { ensureOk(it); it.body?.string().orEmpty() }
++        val files = JSONObject(text).optJSONArray("files") ?: return null
++        return if (files.length() > 0) files.getJSONObject(0).getString("id") else null
++    }
++
++    private fun ensureOk(r: okhttp3.Response) {
++        if (r.isSuccessful) return
++        val text = r.body?.string().orEmpty()
++        val msg = runCatching { JSONObject(text).getJSONObject("error").optString("message") }.getOrNull()
++        throw IOException(if (msg.isNullOrBlank()) "Google Drive answered HTTP ${r.code}" else "Google Drive: $msg")
++    }
++
++    private fun post(url: String, body: FormBody): JSONObject {
++        val json = postRaw(url, body)
++        if (json.has("error")) throw IOException(json.optString("error_description").ifBlank { json.optString("error") })
++        return json
++    }
++
++    private fun postRaw(url: String, body: FormBody): JSONObject {
++        val req = Request.Builder().url(url).post(body).build()
++        http.newCall(req).execute().use { r ->
++            val text = r.body?.string().orEmpty()
++            return runCatching { JSONObject(text) }.getOrElse { throw IOException("Unexpected answer (HTTP ${r.code})") }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/forklivetv/ForkLiveRecorder.kt b/app/src/main/java/com/nuvio/tv/forklivetv/ForkLiveRecorder.kt
+new file mode 100644
+index 000000000..e4eeea8e0
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/forklivetv/ForkLiveRecorder.kt
+@@ -0,0 +1,257 @@
++package com.nuvio.tv.forklivetv
++
++import android.content.Context
++import android.content.Intent
++import android.os.Build
++import android.util.Log
++import com.nuvio.tv.ui.screens.player.PlayerMediaSourceFactory
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import okhttp3.Call
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import java.io.File
++import java.io.FileOutputStream
++import java.io.IOException
++import java.net.URI
++import java.text.SimpleDateFormat
++import java.util.Date
++import java.util.Locale
++import java.util.concurrent.TimeUnit
++
++/**
++ * Nuvio fork: Live TV recording. Fully separate from the Live TV player: it opens its own HTTP connection to the
++ * stream URL, never touches the shared ExoPlayer, and writes a plain MPEG-TS file that the Recordings screen can play.
++ * Direct TS streams are copied byte for byte. HLS playlists (TS segments) are followed and appended. Encrypted or
++ * fMP4 HLS is refused with a clear message instead of writing a broken file.
++ */
++object ForkLiveRecorder {
++    private const val TAG = "ForkLiveRecorder"
++    private const val MIN_FREE_BYTES = 400L * 1024 * 1024
++    private const val MAX_RECONNECTS = 6
++
++    data class Active(val channel: String, val file: File, val startedAt: Long, val untilMs: Long)
++
++    private val _active = MutableStateFlow<Active?>(null)
++    val active: StateFlow<Active?> = _active.asStateFlow()
++    private val _bytes = MutableStateFlow(0L)
++    val bytes: StateFlow<Long> = _bytes.asStateFlow()
++    private val _message = MutableStateFlow<String?>(null)
++    val message: StateFlow<String?> = _message.asStateFlow()
++
++    @Volatile private var stopRequested = false
++    @Volatile private var call: Call? = null
++
++    private val http: OkHttpClient = OkHttpClient.Builder()
++        .connectTimeout(20, TimeUnit.SECONDS)
++        .readTimeout(25, TimeUnit.SECONDS)
++        .followRedirects(true)
++        .followSslRedirects(true)
++        .build()
++
++    private val MINUTE_CHOICES = listOf(30, 60, 120, 240, 0)
++
++    fun maxMinutes(context: Context): Int =
++        context.applicationContext.getSharedPreferences("fork_live_rec", Context.MODE_PRIVATE).getInt("max_minutes", 120)
++
++    /** Cycles 30 / 60 / 120 / 240 minutes / until stopped; returns the new value. */
++    fun cycleMaxMinutes(context: Context): Int {
++        val next = MINUTE_CHOICES[(MINUTE_CHOICES.indexOf(maxMinutes(context)) + 1).mod(MINUTE_CHOICES.size)]
++        context.applicationContext.getSharedPreferences("fork_live_rec", Context.MODE_PRIVATE).edit().putInt("max_minutes", next).apply()
++        return next
++    }
++
++    fun recordingsDir(context: Context): File {
++        val base = context.getExternalFilesDir("recordings") ?: File(context.filesDir, "recordings")
++        base.mkdirs()
++        return base
++    }
++
++    fun list(context: Context): List<File> =
++        recordingsDir(context).listFiles { f -> f.isFile && f.name.endsWith(".ts") }
++            ?.sortedByDescending { it.lastModified() }.orEmpty()
++
++    fun start(context: Context, url: String, headers: Map<String, String>?, channel: String, maxMinutes: Int) {
++        if (_active.value != null) return
++        val intent = Intent(context, ForkLiveRecordingService::class.java)
++            .putExtra(ForkLiveRecordingService.EXTRA_URL, url)
++            .putExtra(ForkLiveRecordingService.EXTRA_CHANNEL, channel)
++            .putExtra(ForkLiveRecordingService.EXTRA_MINUTES, maxMinutes)
++            .putStringArrayListExtra(
++                ForkLiveRecordingService.EXTRA_HEADERS,
++                ArrayList(headers.orEmpty().map { "${it.key}\n${it.value}" })
++            )
++        _message.value = null
++        if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent) else context.startService(intent)
++    }
++
++    fun stop() {
++        stopRequested = true
++        call?.cancel()
++    }
++
++    /** Blocking. Runs on the service's IO thread until stopped, the time limit, an error or the end of the stream. */
++    internal fun run(context: Context, rawUrl: String, rawHeaders: Map<String, String>, channel: String, maxMinutes: Int) {
++        stopRequested = false
++        // Same URL clean-up the Live TV player uses (user:pass@host becomes a Basic auth header).
++        val (url, mergedHeaders) = PlayerMediaSourceFactory.extractUserInfoAuth(rawUrl, rawHeaders)
++        val headers = PlayerMediaSourceFactory.sanitizeHeaders(mergedHeaders)
++        val stamp = SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(Date())
++        val safe = channel.replace(Regex("[^A-Za-z0-9._-]+"), "_").trim('_').take(40).ifBlank { "channel" }
++        val file = File(recordingsDir(context), "${safe}_$stamp.ts")
++        val now = System.currentTimeMillis()
++        val until = if (maxMinutes > 0) now + maxMinutes * 60_000L else Long.MAX_VALUE
++        _bytes.value = 0L
++        _active.value = Active(channel, file, now, until)
++        try {
++            FileOutputStream(file, true).use { out ->
++                val sink = Sink(out, file, until)
++                var failures = 0
++                while (!sink.done()) {
++                    try {
++                        val kind = openAndRecord(url, headers, sink)
++                        if (kind == End.FINISHED || sink.done()) break
++                        failures++
++                    } catch (e: StopRecording) {
++                        break
++                    } catch (e: IOException) {
++                        if (sink.done()) break
++                        failures++
++                        Log.w(TAG, "stream error: ${e.message}")
++                    }
++                    if (failures > MAX_RECONNECTS) {
++                        _message.value = "Recording stopped: the stream kept dropping."
++                        break
++                    }
++                    Thread.sleep(2000)
++                }
++            }
++        } catch (e: StopRecording) {
++            // fall through, keep what was recorded
++        } catch (e: Exception) {
++            Log.w(TAG, "recording failed", e)
++            _message.value = "Recording failed: ${e.message}"
++        } finally {
++            call = null
++            if (file.exists() && file.length() < 64 * 1024) file.delete()
++            if (_message.value == null && file.exists()) _message.value = "Saved ${file.name}"
++            _active.value = null
++        }
++    }
++
++    private class StopRecording(msg: String) : RuntimeException(msg)
++    private enum class End { FINISHED, DROPPED }
++
++    private class Sink(val out: FileOutputStream, val file: File, val until: Long) {
++        fun done(): Boolean = stopRequested || System.currentTimeMillis() >= until
++        fun write(buf: ByteArray, len: Int) {
++            if (done()) throw StopRecording("stopped")
++            out.write(buf, 0, len)
++            _bytes.value = _bytes.value + len
++            if (file.usableSpace < MIN_FREE_BYTES) {
++                _message.value = "Recording stopped: storage is almost full."
++                throw StopRecording("disk full")
++            }
++        }
++    }
++
++    private fun request(url: String, headers: Map<String, String>): Request {
++        val b = Request.Builder().url(url).header("User-Agent", "Mozilla/5.0").header("Accept", "*/*")
++        headers.forEach { (k, v) -> runCatching { b.header(k, v) } }
++        return b.build()
++    }
++
++    private fun openAndRecord(url: String, headers: Map<String, String>, sink: Sink): End {
++        val c = http.newCall(request(url, headers))
++        call = c
++        c.execute().use { resp ->
++            if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}")
++            val body = resp.body ?: throw IOException("empty response")
++            val type = resp.header("Content-Type").orEmpty().lowercase(Locale.US)
++            val looksHls = type.contains("mpegurl") || url.substringBefore('?').endsWith(".m3u8", true)
++            val source = body.source()
++            if (looksHls || (source.request(7) && source.peek().readUtf8(7) == "#EXTM3U")) {
++                val text = source.readUtf8()
++                return recordHls(resp.request.url.toString(), text, headers, sink)
++            }
++            val buf = ByteArray(64 * 1024)
++            val stream = body.byteStream()
++            while (true) {
++                val n = stream.read(buf)
++                if (n < 0) return End.DROPPED
++                sink.write(buf, n)
++            }
++        }
++    }
++
++    private fun fetch(url: String, headers: Map<String, String>): okhttp3.Response {
++        val c = http.newCall(request(url, headers))
++        call = c
++        val r = c.execute()
++        if (!r.isSuccessful) {
++            r.close()
++            throw IOException("HTTP ${r.code}")
++        }
++        return r
++    }
++
++    private fun resolve(base: String, ref: String): String = runCatching { URI(base).resolve(ref).toString() }.getOrDefault(ref)
++
++    private fun recordHls(firstUrl: String, firstText: String, headers: Map<String, String>, sink: Sink): End {
++        var playlistUrl = firstUrl
++        var text = firstText
++        if (text.contains("#EXT-X-STREAM-INF")) {
++            val lines = text.lines()
++            var best = -1L
++            var bestUrl: String? = null
++            for (i in lines.indices) {
++                if (!lines[i].startsWith("#EXT-X-STREAM-INF")) continue
++                val bw = Regex("BANDWIDTH=(\\d+)").find(lines[i])?.groupValues?.get(1)?.toLongOrNull() ?: 0L
++                val next = lines.drop(i + 1).firstOrNull { it.isNotBlank() && !it.startsWith("#") } ?: continue
++                if (bw > best) { best = bw; bestUrl = next.trim() }
++            }
++            playlistUrl = resolve(playlistUrl, bestUrl ?: throw IOException("playlist has no variants"))
++            text = fetch(playlistUrl, headers).use { it.body?.string().orEmpty() }
++        }
++        val seen = LinkedHashSet<String>()
++        var emptyRounds = 0
++        while (!sink.done()) {
++            if (text.contains("#EXT-X-MAP")) throw StopRecording("fMP4 HLS is not supported").also {
++                _message.value = "This channel uses fMP4 HLS, which cannot be recorded yet."
++            }
++            if (Regex("#EXT-X-KEY:.*METHOD=(?!NONE)").containsMatchIn(text)) {
++                _message.value = "This channel is encrypted and cannot be recorded."
++                throw StopRecording("encrypted")
++            }
++            val lines = text.lines()
++            val target = Regex("#EXT-X-TARGETDURATION:(\\d+)").find(text)?.groupValues?.get(1)?.toLongOrNull() ?: 6L
++            var added = 0
++            for (line in lines) {
++                if (line.isBlank() || line.startsWith("#")) continue
++                val seg = resolve(playlistUrl, line.trim())
++                if (!seen.add(seg)) continue
++                added++
++                fetch(seg, headers).use { r ->
++                    val buf = ByteArray(64 * 1024)
++                    val st = r.body?.byteStream() ?: throw IOException("empty segment")
++                    while (true) {
++                        val n = st.read(buf)
++                        if (n < 0) break
++                        sink.write(buf, n)
++                    }
++                }
++                if (seen.size > 400) seen.remove(seen.first())
++            }
++            if (text.contains("#EXT-X-ENDLIST")) return End.FINISHED
++            emptyRounds = if (added == 0) emptyRounds + 1 else 0
++            if (emptyRounds > 8) return End.DROPPED
++            var waited = 0L
++            val wait = (target * 500L).coerceIn(1000L, 5000L)
++            while (waited < wait && !sink.done()) { Thread.sleep(250); waited += 250 }
++            if (sink.done()) break
++            text = fetch(playlistUrl, headers).use { it.body?.string().orEmpty() }
++        }
++        return End.FINISHED
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/forklivetv/ForkLiveRecordingService.kt b/app/src/main/java/com/nuvio/tv/forklivetv/ForkLiveRecordingService.kt
+new file mode 100644
+index 000000000..b8cec46f8
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/forklivetv/ForkLiveRecordingService.kt
+@@ -0,0 +1,86 @@
++package com.nuvio.tv.forklivetv
++
++import android.app.Notification
++import android.app.NotificationChannel
++import android.app.NotificationManager
++import android.app.Service
++import android.content.Context
++import android.content.Intent
++import android.content.pm.ServiceInfo
++import android.os.Build
++import android.os.IBinder
++import androidx.core.app.NotificationCompat
++
++/** Nuvio fork: keeps a Live TV recording alive while the app is in the background. Stops itself when the recording ends. */
++class ForkLiveRecordingService : Service() {
++    companion object {
++        const val EXTRA_URL = "url"
++        const val EXTRA_CHANNEL = "channel"
++        const val EXTRA_MINUTES = "minutes"
++        const val EXTRA_HEADERS = "headers"
++        private const val CHANNEL_ID = "fork_live_recording"
++        private const val NOTIFICATION_ID = 7421
++    }
++
++    @Volatile private var worker: Thread? = null
++
++    override fun onBind(intent: Intent?): IBinder? = null
++
++    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
++        val url = intent?.getStringExtra(EXTRA_URL)
++        if (intent == null || url.isNullOrBlank()) {
++            stopSelf()
++            return START_NOT_STICKY
++        }
++        val channel = intent.getStringExtra(EXTRA_CHANNEL).orEmpty().ifBlank { "channel" }
++        val minutes = intent.getIntExtra(EXTRA_MINUTES, 120)
++        val headers = intent.getStringArrayListExtra(EXTRA_HEADERS).orEmpty()
++            .mapNotNull { it.split('\n', limit = 2).takeIf { p -> p.size == 2 }?.let { p -> p[0] to p[1] } }
++            .toMap()
++        startAsForeground(channel)
++        if (worker?.isAlive == true) return START_NOT_STICKY
++        val app = applicationContext
++        worker = Thread {
++            try {
++                ForkLiveRecorder.run(app, url, headers, channel, minutes)
++            } finally {
++                stopForegroundCompat()
++                stopSelf()
++            }
++        }.also {
++            it.name = "fork-live-recorder"
++            it.start()
++        }
++        return START_NOT_STICKY
++    }
++
++    override fun onDestroy() {
++        ForkLiveRecorder.stop()
++        super.onDestroy()
++    }
++
++    private fun startAsForeground(channel: String) {
++        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
++        if (Build.VERSION.SDK_INT >= 26) {
++            nm.createNotificationChannel(
++                NotificationChannel(CHANNEL_ID, "Live TV recording", NotificationManager.IMPORTANCE_LOW)
++            )
++        }
++        val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
++            .setContentTitle("Recording $channel")
++            .setContentText("Live TV recording is running")
++            .setSmallIcon(android.R.drawable.ic_menu_save)
++            .setOngoing(true)
++            .build()
++        if (Build.VERSION.SDK_INT >= 29) {
++            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
++        } else {
++            startForeground(NOTIFICATION_ID, notification)
++        }
++    }
++
++    @Suppress("DEPRECATION")
++    private fun stopForegroundCompat() {
++        if (Build.VERSION.SDK_INT >= 24) stopForeground(STOP_FOREGROUND_REMOVE) else stopForeground(true)
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt
+index c03e5a1e6..7f3596236 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt
+@@ -54,6 +54,12 @@ internal fun ForkFeaturesPane(
+                 forkRateAfterWatchingRow()
+             }
+         }
++        item {
++            SettingsGroupCard(title = "Live TV and backup") {
++                forkLiveRecordingsRow()
++                forkDriveBackupRow()
++            }
++        }
+         item {
+             SettingsGroupCard(title = "Maintenance") {
+                 forkKidsModeRow()
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkLiveTvSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkLiveTvSettingsItems.kt
+new file mode 100644
+index 000000000..f30936628
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkLiveTvSettingsItems.kt
+@@ -0,0 +1,300 @@
++@file:OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
++
++package com.nuvio.tv.ui.screens.settings
++
++import android.text.format.DateFormat
++import android.text.format.Formatter
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.items
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.viewinterop.AndroidView
++import androidx.compose.ui.window.Dialog
++import androidx.compose.ui.window.DialogProperties
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import androidx.media3.common.MediaItem
++import androidx.media3.exoplayer.ExoPlayer
++import androidx.media3.ui.PlayerView
++import androidx.tv.material3.Button
++import androidx.tv.material3.MaterialTheme
++import androidx.tv.material3.Text
++import com.nuvio.tv.forklivetv.ForkDriveBackup
++import com.nuvio.tv.forklivetv.ForkLiveRecorder
++import com.nuvio.tv.ui.components.NuvioDialog
++import com.nuvio.tv.ui.reshaped.phoneentry.PhoneEntryButton
++import com.nuvio.tv.ui.theme.NuvioTheme
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.launch
++import java.io.File
++import java.util.Date
++
++/** Nuvio fork: Settings > Features > Live TV rows (recordings list and Google Drive backup). */
++@Composable
++internal fun forkLiveRecordingsRow() {
++    val context = LocalContext.current
++    val active by ForkLiveRecorder.active.collectAsStateWithLifecycle()
++    var show by remember { mutableStateOf(false) }
++    SettingsActionRow(
++        title = "Live TV recordings",
++        subtitle = "Record from the Live TV options panel. Play, delete and set the length here.",
++        value = if (active != null) "Recording" else null,
++        onClick = { show = true },
++    )
++    if (show) ForkRecordingsDialog(onDismiss = { show = false })
++}
++
++@Composable
++private fun ForkRecordingsDialog(onDismiss: () -> Unit) {
++    val context = LocalContext.current
++    val active by ForkLiveRecorder.active.collectAsStateWithLifecycle()
++    val bytes by ForkLiveRecorder.bytes.collectAsStateWithLifecycle()
++    val message by ForkLiveRecorder.message.collectAsStateWithLifecycle()
++    var nonce by remember { mutableStateOf(0) }
++    var maxMinutes by remember { mutableStateOf(ForkLiveRecorder.maxMinutes(context)) }
++    var playing by remember { mutableStateOf<File?>(null) }
++    val files = remember(nonce, active) { ForkLiveRecorder.list(context) }
++
++    NuvioDialog(onDismiss = onDismiss, title = "Live TV recordings", width = 760.dp) {
++        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
++            val a = active
++            if (a != null) {
++                Text(
++                    text = "Recording ${a.channel}: ${Formatter.formatShortFileSize(context, bytes)}",
++                    style = MaterialTheme.typography.titleSmall,
++                    color = NuvioTheme.colors.TextPrimary,
++                )
++                Button(onClick = { ForkLiveRecorder.stop() }) { Text("Stop recording") }
++            }
++            if (!message.isNullOrBlank() && a == null) {
++                Text(message.orEmpty(), style = MaterialTheme.typography.bodyMedium, color = NuvioTheme.colors.TextSecondary)
++            }
++            LazyColumn(
++                modifier = Modifier.fillMaxWidth().heightIn(max = 300.dp),
++                verticalArrangement = Arrangement.spacedBy(6.dp),
++            ) {
++                if (files.isEmpty()) {
++                    item {
++                        Text(
++                            "No recordings yet. Open a channel, press OK for the options panel, then choose Start recording.",
++                            style = MaterialTheme.typography.bodyMedium,
++                            color = NuvioTheme.colors.TextSecondary,
++                        )
++                    }
++                }
++                items(files, key = { it.absolutePath }) { f ->
++                    val live = a?.file?.absolutePath == f.absolutePath
++                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
++                        Button(onClick = { if (!live) playing = f }, enabled = !live, modifier = Modifier.weight(1f)) {
++                            Text(
++                                text = f.nameWithoutExtension.replace('_', ' ') + "  ·  " +
++                                    Formatter.formatShortFileSize(context, f.length()) +
++                                    if (live) "  ·  recording" else "",
++                                maxLines = 1,
++                                overflow = TextOverflow.Ellipsis,
++                            )
++                        }
++                        Button(onClick = { if (!live) { f.delete(); nonce++ } }, enabled = !live) { Text("Delete") }
++                    }
++                }
++            }
++            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.padding(top = 4.dp)) {
++                Button(onClick = { maxMinutes = ForkLiveRecorder.cycleMaxMinutes(context) }) {
++                    Text("Length: " + if (maxMinutes == 0) "until stopped" else "$maxMinutes min")
++                }
++                Button(onClick = { nonce++ }) { Text("Refresh") }
++                Button(onClick = onDismiss) { Text("Close") }
++            }
++        }
++    }
++    playing?.let { ForkRecordingPlayer(file = it, onClose = { playing = null }) }
++}
++
++@Composable
++private fun ForkRecordingPlayer(file: File, onClose: () -> Unit) {
++    val context = LocalContext.current
++    val exo = remember(file) {
++        ExoPlayer.Builder(context).build().apply {
++            setMediaItem(MediaItem.fromUri(android.net.Uri.fromFile(file)))
++            prepare()
++            playWhenReady = true
++        }
++    }
++    DisposableEffect(exo) { onDispose { exo.release() } }
++    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
++        Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
++            AndroidView(
++                modifier = Modifier.fillMaxSize(),
++                factory = { ctx ->
++                    PlayerView(ctx).apply {
++                        this.player = exo
++                        useController = true
++                        controllerShowTimeoutMs = 4000
++                        isFocusable = true
++                        isFocusableInTouchMode = true
++                        requestFocus()
++                    }
++                },
++            )
++        }
++    }
++}
++
++@Composable
++internal fun forkDriveBackupRow() {
++    val context = LocalContext.current
++    var show by remember { mutableStateOf(false) }
++    var tick by remember { mutableStateOf(0) }
++    val signedIn = remember(tick, show) { ForkDriveBackup.isSignedIn(context) }
++    SettingsActionRow(
++        title = "Google Drive backup",
++        subtitle = "Back up IPTV sources and fork settings to your own Google Drive (hidden app folder), and restore them.",
++        value = if (signedIn) "Signed in" else "Off",
++        onClick = { show = true },
++    )
++    if (show) ForkDriveDialog(onDismiss = { show = false; tick++ })
++}
++
++@Composable
++private fun ForkDriveDialog(onDismiss: () -> Unit) {
++    val context = LocalContext.current
++    val scope = rememberCoroutineScope()
++    var clientId by remember { mutableStateOf(ForkDriveBackup.clientId(context)) }
++    var clientSecret by remember { mutableStateOf(ForkDriveBackup.clientSecret(context)) }
++    var configured by remember { mutableStateOf(ForkDriveBackup.isConfigured(context)) }
++    var signedIn by remember { mutableStateOf(ForkDriveBackup.isSignedIn(context)) }
++    var prompt by remember { mutableStateOf<ForkDriveBackup.SignInPrompt?>(null) }
++    var status by remember { mutableStateOf<String?>(null) }
++    var busy by remember { mutableStateOf(false) }
++    var job by remember { mutableStateOf<Job?>(null) }
++
++    fun run(label: String, block: suspend () -> String) {
++        if (busy) return
++        busy = true
++        status = label
++        job = scope.launch {
++            status = try { block() } catch (e: Exception) { e.message ?: "Failed." }
++            signedIn = ForkDriveBackup.isSignedIn(context)
++            busy = false
++        }
++    }
++
++    NuvioDialog(
++        onDismiss = { job?.cancel(); onDismiss() },
++        title = "Google Drive backup",
++        subtitle = "Saves one small file in your Drive app-data folder. Nothing else in your Drive is touched.",
++        width = 760.dp,
++    ) {
++        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
++            when {
++                !configured -> {
++                    Text(
++                        "One-time setup: in Google Cloud Console create an OAuth client of type \"TVs and limited input devices\", " +
++                            "enable the Google Drive API, then enter its client ID and secret here.",
++                        style = MaterialTheme.typography.bodyMedium,
++                        color = NuvioTheme.colors.TextSecondary,
++                    )
++                    PhoneEntryButton(title = "OAuth client ID", secret = false, onValue = { clientId = it })
++                    Text(
++                        if (clientId.isBlank()) "Client ID: not set" else "Client ID: set",
++                        style = MaterialTheme.typography.bodyMedium, color = NuvioTheme.colors.TextPrimary,
++                    )
++                    PhoneEntryButton(title = "OAuth client secret", secret = true, onValue = { clientSecret = it })
++                    Text(
++                        if (clientSecret.isBlank()) "Client secret: not set" else "Client secret: set",
++                        style = MaterialTheme.typography.bodyMedium, color = NuvioTheme.colors.TextPrimary,
++                    )
++                    Button(
++                        onClick = {
++                            ForkDriveBackup.saveClient(context, clientId, clientSecret)
++                            configured = ForkDriveBackup.isConfigured(context)
++                        },
++                        enabled = clientId.isNotBlank() && clientSecret.isNotBlank(),
++                    ) { Text("Save client") }
++                }
++                !signedIn -> {
++                    val p = prompt
++                    if (p != null) {
++                        Text(
++                            "On your phone open ${p.url} and enter the code:",
++                            style = MaterialTheme.typography.bodyMedium, color = NuvioTheme.colors.TextPrimary,
++                        )
++                        Text(p.userCode, style = MaterialTheme.typography.headlineMedium, color = NuvioTheme.colors.TextPrimary)
++                    } else {
++                        Text(
++                            "Sign in with a code shown on this TV. You approve it on your phone.",
++                            style = MaterialTheme.typography.bodyMedium, color = NuvioTheme.colors.TextSecondary,
++                        )
++                    }
++                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
++                        Button(
++                            enabled = !busy,
++                            onClick = {
++                                busy = true
++                                status = "Asking Google for a code..."
++                                job = scope.launch {
++                                    try {
++                                        val np = ForkDriveBackup.beginSignIn(context)
++                                        prompt = np
++                                        status = "Waiting for you to approve on your phone..."
++                                        ForkDriveBackup.finishSignIn(context, np)
++                                        prompt = null
++                                        signedIn = true
++                                        status = "Signed in."
++                                    } catch (e: Exception) {
++                                        prompt = null
++                                        status = e.message ?: "Sign-in failed."
++                                    }
++                                    busy = false
++                                }
++                            },
++                        ) { Text(if (prompt == null) "Sign in" else "Waiting...") }
++                        Button(onClick = {
++                            job?.cancel(); busy = false; prompt = null
++                            configured = false; signedIn = false
++                        }) { Text("Change client") }
++                    }
++                }
++                else -> {
++                    val last = ForkDriveBackup.lastBackupMs(context)
++                    Text(
++                        if (last > 0) "Last backup from this TV: " + DateFormat.format("d MMM yyyy HH:mm", Date(last))
++                        else "No backup made from this TV yet.",
++                        style = MaterialTheme.typography.bodyMedium, color = NuvioTheme.colors.TextPrimary,
++                    )
++                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
++                        Button(enabled = !busy, onClick = { run("Backing up...") { ForkDriveBackup.backUp(context) } }) { Text("Back up now") }
++                        Button(enabled = !busy, onClick = { run("Restoring...") { ForkDriveBackup.restore(context) } }) { Text("Restore") }
++                        Button(enabled = !busy, onClick = {
++                            ForkDriveBackup.signOut(context); signedIn = false; status = "Signed out."
++                        }) { Text("Sign out") }
++                    }
++                }
++            }
++            status?.let {
++                Text(it, style = MaterialTheme.typography.bodyMedium, color = NuvioTheme.colors.TextSecondary)
++            }
++            Row(modifier = Modifier.padding(top = 4.dp)) {
++                Button(onClick = { job?.cancel(); onDismiss() }) { Text("Close") }
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt
+index 4aae381b3..2b4254ede 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt
+@@ -36,7 +36,10 @@ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.draw.clip
+ import androidx.compose.ui.focus.FocusDirection
+ import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.platform.LocalContext
+ import androidx.compose.ui.platform.LocalFocusManager
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import com.nuvio.tv.forklivetv.ForkLiveRecorder
+ import androidx.compose.ui.focus.focusRequester
+ import androidx.compose.ui.graphics.Brush
+ import androidx.compose.ui.graphics.Color
+@@ -89,6 +92,9 @@ fun TvChannelFullscreenHud(
+     var drawerCategory by remember { mutableStateOf("") }
+     var userActivityTick by remember { mutableLongStateOf(0L) }
+     var isOptionsOpen by remember { mutableStateOf(false) }
++    val forkRecContext = LocalContext.current
++    val forkRecActive by ForkLiveRecorder.active.collectAsStateWithLifecycle()
++    val forkRecBytes by ForkLiveRecorder.bytes.collectAsStateWithLifecycle()
+     var sleepMinutes by remember { mutableStateOf(0) }
+     var isMuted by remember { mutableStateOf(false) }
+     var isReloading by remember { mutableStateOf(false) }
+@@ -535,7 +541,26 @@ fun TvChannelFullscreenHud(
+                     isOptionsOpen = false
+                     runCatching { focusRequester.requestFocus() }
+                 },
+-                modifier = Modifier.align(Alignment.CenterEnd)
++                modifier = Modifier.align(Alignment.CenterEnd),
++                recordingActive = forkRecActive != null,
++                recordingSize = forkRecActive?.let { android.text.format.Formatter.formatShortFileSize(forkRecContext, forkRecBytes) },
++                onRecordToggle = if (playableUrl.isNullOrBlank() && forkRecActive == null) null else {
++                    {
++                        if (forkRecActive != null) {
++                            ForkLiveRecorder.stop()
++                        } else {
++                            ForkLiveRecorder.start(
++                                forkRecContext,
++                                playableUrl.orEmpty(),
++                                streamHeaders,
++                                channel?.name ?: "channel",
++                                ForkLiveRecorder.maxMinutes(forkRecContext)
++                            )
++                        }
++                        isOptionsOpen = false
++                        runCatching { focusRequester.requestFocus() }
++                    }
++                }
+             )
+         }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelOptionsPanel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelOptionsPanel.kt
+index 7428acf81..b1364cc0d 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelOptionsPanel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelOptionsPanel.kt
+@@ -65,7 +65,10 @@ fun TvChannelOptionsPanel(
+     onMuteToggle: () -> Unit,
+     onReload: () -> Unit,
+     onClose: () -> Unit,
+-    modifier: Modifier = Modifier
++    modifier: Modifier = Modifier,
++    recordingActive: Boolean = false,
++    recordingSize: String? = null,
++    onRecordToggle: (() -> Unit)? = null
+ ) {
+     var tracks by remember(player) { mutableStateOf(player?.currentTracks ?: Tracks.EMPTY) }
+     var autoQuality by remember(player) { mutableStateOf(true) }
+@@ -270,6 +273,15 @@ fun TvChannelOptionsPanel(
+                     )
+                 }
+             }
++            if (onRecordToggle != null) {
++                item {
++                    OptionRow(
++                        label = if (recordingActive) "Stop recording" + (recordingSize?.let { " ($it)" } ?: "") else "Start recording",
++                        selected = recordingActive,
++                        onClick = onRecordToggle
++                    )
++                }
++            }
+             item {
+                 OptionRow(
+                     label = "Reload stream",
