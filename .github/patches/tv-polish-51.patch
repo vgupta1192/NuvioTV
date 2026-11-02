@@ -1,0 +1,402 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioMpvSurfaceView.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioMpvSurfaceView.kt
+index 4c222f28c..946ad1141 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioMpvSurfaceView.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioMpvSurfaceView.kt
+@@ -296,18 +296,6 @@ class NuvioMpvSurfaceView @JvmOverloads constructor(
+         }
+     }
+ 
+-    /** Nuvio fork: Smart Enhance on mpv's own colour options. All zero when it is off. */
+-    fun applyPictureState(state: PictureState) {
+-        if (!initialized) return
+-        val smart = state.smartEnhance
+-        runCatching {
+-            mpv.setPropertyString("brightness", (if (smart) 2 else 0).toString())
+-            mpv.setPropertyString("contrast", (if (smart) 8 else 0).toString())
+-            mpv.setPropertyString("saturation", (if (smart) 14 else 0).toString())
+-            mpv.setPropertyString("gamma", (if (smart) 6 else 0).toString())
+-        }.onFailure { Log.w(TAG, "Failed to apply picture colour: ${it.message}") }
+-    }
+-
+     fun applyAudioLanguagePreferences(languages: List<String>) {
+         if (!initialized) return
+         val normalized = languages
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffects.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffects.kt
+index d16c371bc..e262e1f69 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffects.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffects.kt
+@@ -2,15 +2,6 @@ package com.nuvio.tv.ui.screens.player
+ 
+ import android.content.Context
+ import android.content.SharedPreferences
+-import kotlinx.coroutines.flow.MutableStateFlow
+-import kotlinx.coroutines.flow.StateFlow
+-import kotlinx.coroutines.flow.asStateFlow
+-
+-/** Picture handed to the engine. Smart Enhance is the only picture effect left in the fork. */
+-data class PictureState(
+-    val smartEnhance: Boolean = false,
+-)
+-
+ 
+ /** Fork: why a stream label scores higher; a rough picture-quality ranking used to bias auto-play. */
+ private val QUALITY_UHD = Regex("(2160p|\\b4k\\b|\\buhd\\b)", RegexOption.IGNORE_CASE)
+@@ -42,20 +33,15 @@ internal fun streamPictureQualityScore(text: String): Int {
+ }
+ 
+ /**
+- * Fork: the Smart Enhance switch (Settings only) and the "prefer best picture" auto-play flag.
+- * Saved in SharedPreferences. Both are off by default, which leaves the original Nuvio video pipeline untouched.
++ * Fork: the "prefer best picture" auto-play flag, saved in SharedPreferences (off by default).
+  */
+ internal object PlayerEffects {
+     private const val PREFS_NAME = "nuvio_tv_player_effects"
+-    private const val KEY_SMART = "smart_enhance"
+     private const val KEY_BEST = "prefer_best_quality"
+ 
+     private val lock = Any()
+     @Volatile private var preferences: SharedPreferences? = null
+ 
+-    private val _smartEnhance = MutableStateFlow(false)
+-    val smartEnhance: StateFlow<Boolean> = _smartEnhance.asStateFlow()
+-
+     /** Read by the stream auto-play code, which runs before any player screen exists. */
+     @Volatile
+     var preferBestQuality: Boolean = false
+@@ -67,13 +53,7 @@ internal object PlayerEffects {
+             if (preferences != null) return
+             val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+             preferences = prefs
+-            _smartEnhance.value = prefs.getBoolean(KEY_SMART, false)
+             preferBestQuality = prefs.getBoolean(KEY_BEST, false)
+         }
+     }
+-
+-    fun setSmartEnhance(enabled: Boolean) {
+-        _smartEnhance.value = enabled
+-        preferences?.edit()?.putBoolean(KEY_SMART, enabled)?.apply()
+-    }
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
+index 8dc964a2a..d7bcf7d3c 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
+@@ -1,203 +1,19 @@
+ package com.nuvio.tv.ui.screens.player
+ 
+-import android.content.Context
+-import android.opengl.GLES20
+-import android.util.Log
+-import androidx.media3.common.Effect
+-import androidx.media3.common.PlaybackException
+-import androidx.media3.common.Player
+-import androidx.media3.common.VideoSize
+-import androidx.media3.common.VideoFrameProcessingException
+-import androidx.media3.common.util.GlProgram
+-import androidx.media3.common.util.GlUtil
+-import androidx.media3.common.util.Size
+-import androidx.media3.effect.BaseGlShaderProgram
+-import androidx.media3.effect.GlEffect
+-import androidx.media3.effect.GlShaderProgram
+-import androidx.media3.exoplayer.ExoPlayer
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.DisposableEffect
+-import androidx.compose.runtime.LaunchedEffect
+-import androidx.compose.runtime.getValue
+-import androidx.compose.runtime.remember
+-import androidx.compose.ui.platform.LocalContext
+-import androidx.lifecycle.compose.collectAsStateWithLifecycle
+-
+-private const val FX_TAG = "NuvioTvPlayerEffects"
+-
+-/**
+- * Smart Enhance on ExoPlayer: one small GL pass (a light brightness, contrast and saturation lift) on the decoded
+- * frames. It is the only picture effect left in the fork. While it is off nothing is added to the video pipeline.
+- * If the shader ever fails to run on a device, it is switched off for the session and playback carries on without it.
+- */
+-internal class ExoPictureEffects(private val player: ExoPlayer) : Player.Listener {
+-    private var smartEnhance = false
+-    private var shaderBroken = false
+-    private var released = false
+-    private var chainFused = false
+-    private var chainSet = false
+-
+-    init {
+-        player.addListener(this)
+-    }
+-
+-    fun apply(next: PictureState) {
+-        smartEnhance = next.smartEnhance
+-        push()
+-    }
+-
+-    private fun push() {
+-        if (released) return
+-        // Decide from the source format, never from videoSize: videoSize is the effect output, so reading it made the
+-        // chain flip on and off every second (1080p/2160p) and that dropped frames. Tall or 50/60 fps video gets no pass.
+-        val format = player.videoFormat
+-        val known = format != null && format.height > 0
+-        val tooHeavy = known && (format!!.height > MAX_EFFECT_HEIGHT || (format.frameRate.takeIf { it > 0f } ?: 0f) > 32f)
+-        val fused = smartEnhance && !shaderBroken && known && !tooHeavy
+-        if (fused == chainFused && (chainSet || !fused)) return
+-        val effects = ArrayList<Effect>()
+-        if (fused) effects += PictureShaderEffect()
+-        chainSet = true
+-        chainFused = fused
+-        runCatching { player.setVideoEffects(effects) }
+-            .onFailure { Log.w(FX_TAG, "Picture effects could not be applied", it) }
+-    }
+-
+-    override fun onVideoSizeChanged(videoSize: VideoSize) {
+-        push()
+-    }
+-
+-    override fun onTracksChanged(tracks: androidx.media3.common.Tracks) {
+-        push()
+-    }
+-
+-    override fun onPlayerError(error: PlaybackException) {
+-        if (error.errorCode == PlaybackException.ERROR_CODE_VIDEO_FRAME_PROCESSING_FAILED && !shaderBroken) {
+-            Log.w(FX_TAG, "Picture shader failed, turning it off", error)
+-            shaderBroken = true
+-            chainSet = false
+-            chainFused = false
+-            push()
+-            runCatching { player.prepare() }
+-        }
+-    }
+-
+-    fun release() {
+-        released = true
+-        player.removeListener(this)
+-    }
+-}
+-
+-/** Fixed Smart Enhance strengths: brightness +0.01, contrast +0.05, saturation +6 %. */
+-internal class PictureShaderEffect : GlEffect {
+-    override fun toGlShaderProgram(context: Context, useHdr: Boolean): GlShaderProgram =
+-        PictureShaderProgram(useHdr)
+-}
+-
+-/** Tallest source the Smart Enhance shader runs on; taller video plays untouched. */
+-private const val MAX_EFFECT_HEIGHT = 1080
+-
+-private class PictureShaderProgram(useHdr: Boolean) : BaseGlShaderProgram(useHdr, 1) {
+-    private val glProgram: GlProgram
+-
+-    init {
+-        try {
+-            glProgram = GlProgram(VERTEX_SHADER, FRAGMENT_SHADER)
+-            glProgram.setBufferAttribute(
+-                "aFramePosition",
+-                GlUtil.getNormalizedCoordinateBounds(),
+-                GlUtil.HOMOGENEOUS_COORDINATE_VECTOR_SIZE,
+-            )
+-        } catch (e: GlUtil.GlException) {
+-            throw VideoFrameProcessingException(e)
+-        }
+-    }
+-
+-    override fun configure(inputWidth: Int, inputHeight: Int): Size {
+-        return Size(inputWidth, inputHeight)
+-    }
+-
+-    override fun drawFrame(inputTexId: Int, presentationTimeUs: Long) {
+-        try {
+-            glProgram.use()
+-            glProgram.setSamplerTexIdUniform("uTexSampler", inputTexId, 0)
+-            glProgram.setFloatUniform("uBrightness", 0.01f)
+-            glProgram.setFloatUniform("uContrast", 0.05f)
+-            glProgram.setFloatUniform("uSaturation", 0.06f)
+-            glProgram.bindAttributesAndUniforms()
+-            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+-        } catch (e: GlUtil.GlException) {
+-            throw VideoFrameProcessingException(e, presentationTimeUs)
+-        }
+-    }
+-
+-    override fun release() {
+-        super.release()
+-        try {
+-            glProgram.delete()
+-        } catch (e: GlUtil.GlException) {
+-            throw VideoFrameProcessingException(e)
+-        }
+-    }
+-
+-    private companion object {
+-        const val VERTEX_SHADER = """
+-attribute vec4 aFramePosition;
+-varying vec2 vTexSamplingCoord;
+-void main() {
+-  gl_Position = aFramePosition;
+-  vTexSamplingCoord = vec2(aFramePosition.x * 0.5 + 0.5, aFramePosition.y * 0.5 + 0.5);
+-}
+-"""
+-
+-        const val FRAGMENT_SHADER = """
+-#ifdef GL_FRAGMENT_PRECISION_HIGH
+-precision highp float;
+-#else
+-precision mediump float;
+-#endif
+-uniform sampler2D uTexSampler;
+-uniform float uBrightness;
+-uniform float uContrast;
+-uniform float uSaturation;
+-varying vec2 vTexSamplingCoord;
+-
+-void main() {
+-  vec4 src = texture2D(uTexSampler, vTexSamplingCoord);
+-  vec3 col = src.rgb + uBrightness;
+-  col = (col - 0.5) * max(1.0 + uContrast, 0.0) + 0.5;
+-  float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
+-  col = mix(vec3(lum), col, 1.0 + uSaturation);
+-  gl_FragColor = vec4(clamp(col, 0.0, 1.0), src.a);
+-}
+-"""
+-    }
+-}
++import androidx.media3.exoplayer.ExoPlayer
+ 
+ /**
+- * Applies Smart Enhance to the active engine while the player screen is open (off by default, set in Settings),
+- * and restores the remembered playback speed and volume.
++ * Attaches the dropped-frame log while the player screen is open and restores the remembered playback speed and volume.
+  */
+ @Composable
+ internal fun PlayerEffectsHost(
+     exoPlayer: ExoPlayer?,
+-    mpvView: NuvioMpvSurfaceView?,
+ ) {
+-    val context = LocalContext.current
+-    PlayerEffects.ensureLoaded(context)
+-    val smartEnhance by PlayerEffects.smartEnhance.collectAsStateWithLifecycle()
+-    val exoPicture = remember(exoPlayer) { exoPlayer?.let { ExoPictureEffects(it) } }
+-    DisposableEffect(exoPicture) {
+-        onDispose { exoPicture?.release() }
+-    }
+     DisposableEffect(exoPlayer) {
+         exoPlayer?.let { PlaybackFrameLog.attach(it) }
+         onDispose { PlaybackFrameLog.detach() }
+     }
+-    LaunchedEffect(exoPicture, mpvView, smartEnhance) {
+-        val state = PictureState(smartEnhance = smartEnhance)
+-        exoPicture?.apply(state)
+-        mpvView?.applyPictureState(state)
+-    }
+     DxRememberHost() // dx.bi remember hook
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+index 4fdae687a..c8b1a9e36 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+@@ -2152,10 +2152,9 @@ fun PlayerScreen(
+ 
+         TvStallHint(isBuffering = uiState.isBuffering) // Nuvio fork: stall hint
+ 
+-        // Nuvio fork: Smart Enhance (Settings switch, off by default) and remembered speed/volume
++        // Nuvio fork: dropped-frame log and remembered speed/volume
+         PlayerEffectsHost(
+             exoPlayer = viewModel.exoPlayer,
+-            mpvView = viewModel.controller.mpvView,
+         )
+ 
+         // Nuvio fork: second subtitle language drawn at the top
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPictureSoundSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPictureSoundSettings.kt
+index fb2ebd2fb..9ecddb5bd 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPictureSoundSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPictureSoundSettings.kt
+@@ -5,28 +5,11 @@ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.setValue
+-import androidx.compose.ui.platform.LocalContext
+-import androidx.lifecycle.compose.collectAsStateWithLifecycle
+ import com.nuvio.tv.ui.reshaped.debuglog.DebugLogQrDialog
+-import com.nuvio.tv.ui.screens.player.PlayerEffects
+ 
+-/**
+- * Nuvio fork: the only picture or sound option left. Smart Enhance is off by default, which leaves the original
+- * Nuvio video pipeline untouched; it is set here and has no control in the player.
+- */
++/** Nuvio fork: playback diagnostics. */
+ @Composable
+ internal fun PlaybackPictureSoundSection() {
+-    PlayerEffects.ensureLoaded(LocalContext.current)
+-    val smartEnhance by PlayerEffects.smartEnhance.collectAsStateWithLifecycle()
+-
+-    SettingsSectionLabel(text = "Picture")
+-    SettingsToggleRow(
+-        title = "Smart Enhance",
+-        subtitle = "A light contrast and colour lift. Applies to the next video you start.",
+-        checked = smartEnhance,
+-        onToggle = { PlayerEffects.setSmartEnhance(!smartEnhance) },
+-    )
+-
+     // Dropped-frame log: scan the QR code to download it on a phone (same page as the other debug logs).
+     SettingsSectionLabel(text = "Diagnostics")
+     var showFrameLogQr by remember { mutableStateOf(false) }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
+index 7d6df1e2f..fd9f45546 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
+@@ -42,8 +42,6 @@ import com.nuvio.tv.core.player.TvLiveMediaSourceFactory
+ import com.nuvio.tv.ui.components.LoadingIndicator
+ import com.nuvio.tv.ui.screens.player.AspectMode
+ import com.nuvio.tv.ui.screens.player.BlackBarTracker
+-import com.nuvio.tv.ui.screens.player.ExoPictureEffects
+-import com.nuvio.tv.ui.screens.player.PictureState
+ import com.nuvio.tv.ui.screens.player.CustomStretchMemory
+ import com.nuvio.tv.ui.screens.player.VideoContentRect
+ import com.nuvio.tv.ui.screens.player.addExoAspectLayoutChangeListener
+@@ -105,21 +103,6 @@ fun TvChannelPreviewPlayer(
+         runCatching { view.applyLiveTvSubtitleStyle(style) }
+     }
+ 
+-    // Smart Enhance follows the Settings switch (off by default, so nothing is added to the pipeline).
+-    // The shader is armed only after the channel has shown a first frame without it: a stream that
+-    // never reaches the effects pipeline (weak GPU, odd format) then still plays instead of timing out.
+-    var effectsArmed by remember(player) { mutableStateOf(false) }
+-    DisposableEffect(player, effectsArmed) {
+-        val activePlayer = player ?: return@DisposableEffect onDispose {}
+-        if (!effectsArmed || !com.nuvio.tv.ui.screens.player.PlayerEffects.smartEnhance.value) return@DisposableEffect onDispose {}
+-        val effects = ExoPictureEffects(activePlayer)
+-        effects.apply(PictureState(smartEnhance = true))
+-        onDispose {
+-            effects.release()
+-            runCatching { activePlayer.setVideoEffects(emptyList()) }
+-        }
+-    }
+-
+     // Live TV always plays with Custom Stretch: the picture area (without baked-in black bars)
+     // is stretched over the whole player, in the preview and in fullscreen.
+     DisposableEffect(playerView, player) {
+@@ -234,7 +217,6 @@ fun TvChannelPreviewPlayer(
+                 hasRenderedFirstFrame = true
+                 isBuffering = false
+                 currentOnFirstFrame()
+-                effectsArmed = true
+             }
+ 
+             override fun onPlaybackStateChanged(playbackState: Int) {
+@@ -314,7 +296,6 @@ fun TvChannelPreviewPlayer(
+             val ready = activePlayer.playbackState == Player.STATE_READY
+             hasRenderedFirstFrame = ready
+             isBuffering = !ready
+-            if (ready) effectsArmed = true
+         } else if (isPlaying && !streamUrl.isNullOrBlank()) {
+             hasRenderedFirstFrame = false
+             isBuffering = true
+diff --git a/app/src/main/res/values/strings_picture_sound.xml b/app/src/main/res/values/strings_picture_sound.xml
+index 87e51fb32..9a8a157c3 100644
+--- a/app/src/main/res/values/strings_picture_sound.xml
++++ b/app/src/main/res/values/strings_picture_sound.xml
+@@ -1,5 +1,5 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="playback_section_picture_sound">Picture &amp; Sound</string>
+-    <string name="playback_section_picture_sound_desc">Smart Enhance, sharpen, sound modes, equalizer and dialogue boost.</string>
++    <string name="playback_section_picture_sound">Diagnostics</string>
++    <string name="playback_section_picture_sound_desc">Dropped-frame log.</string>
+ </resources>
