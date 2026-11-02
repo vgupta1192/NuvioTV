@@ -1,0 +1,236 @@
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
+index 62e66391f..6a9fb1b94 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
+@@ -26,6 +26,7 @@ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.SupervisorJob
+ import kotlinx.coroutines.async
++import kotlinx.coroutines.awaitAll
+ import kotlinx.coroutines.coroutineScope
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.StateFlow
+@@ -319,7 +320,25 @@ class TvChannelsRepository @Inject constructor(
+ 
+             val favKeys = runCatching { tvChannelsDataStore.favoriteChannelKeys.first() }.getOrDefault(_uiState.value.favoriteKeys)
+ 
+-            // Turns the catalogs that have answered so far (plus IPTV) into the channel list.
++            // Adds IPTV channels, drops duplicates and attaches favourites and the programme guide.
++            fun finish(addonChannels: List<TvChannelItem>): List<TvChannelItem> {
++                val loadedChannels = mutableListOf<TvChannelItem>()
++                val seenKeys = mutableSetOf<String>()
++                for (channel in addonChannels) {
++                    if (seenKeys.add(channel.stableKey())) loadedChannels.add(channel)
++                }
++                for (iptvChannel in iptvRepository.channels.value) {
++                    if (seenKeys.add(iptvChannel.stableKey())) loadedChannels.add(iptvChannel)
++                }
++                return loadedChannels.map { channel ->
++                    channel.copy(
++                        isFavorite = channel.isFavoritedIn(favKeys),
++                        epgInfo = tvEpgRepository.findEpgForChannel(channel)
++                    )
++                }
++            }
++
++            // Turns the catalogs that have answered so far into the addon channel list.
+             fun buildChannels(done: List<Triple<Addon, CatalogDescriptor, List<com.nuvio.tv.data.remote.dto.MetaPreviewDto>>?>): List<TvChannelItem> {
+                 val loadedChannels = mutableListOf<TvChannelItem>()
+                 val seenKeys = mutableSetOf<String>()
+@@ -358,16 +377,7 @@ class TvChannelsRepository @Inject constructor(
+                     }
+                 }
+ 
+-                for (iptvChannel in iptvRepository.channels.value) {
+-                    if (seenKeys.add(iptvChannel.stableKey())) loadedChannels.add(iptvChannel)
+-                }
+-
+-                return loadedChannels.map { channel ->
+-                    channel.copy(
+-                        isFavorite = channel.isFavoritedIn(favKeys),
+-                        epgInfo = tvEpgRepository.findEpgForChannel(channel)
+-                    )
+-                }
++                return finish(loadedChannels)
+             }
+ 
+             fun publish(enrichedChannels: List<TvChannelItem>, final: Boolean) {
+@@ -403,6 +413,15 @@ class TvChannelsRepository @Inject constructor(
+ 
+             // Nuvio fork: show the channels of each addon as soon as its catalog is in, not when the slowest one is.
+             val done = arrayOfNulls<Triple<Addon, CatalogDescriptor, List<com.nuvio.tv.data.remote.dto.MetaPreviewDto>>>(catalogTasks.size)
++
++            // Channels saved by the last full load show at once; the fresh load replaces them when it is complete.
++            val staleShown = cached == null && !forceRefresh && catalogTasks.isNotEmpty() && run {
++                val stale = withContext(Dispatchers.IO) { readDiskCache(selectedUrls) }
++                if (stale.isNullOrEmpty()) false else {
++                    publish(withContext(Dispatchers.Default) { finish(stale) }, final = false)
++                    true
++                }
++            }
+             if (catalogTasks.isEmpty()) {
+                 val channels = withContext(Dispatchers.Default) { buildChannels(emptyList()) }
+                 channelsMemoryCache[selectedUrls] = channels
+@@ -431,42 +450,54 @@ class TvChannelsRepository @Inject constructor(
+                     val last = received == catalogTasks.size - 1
+                     val now = System.currentTimeMillis()
+                     // Empty catalogs and bursts do not trigger a rebuild of thousands of channels each time.
+-                    if (last || (triple.third.isNotEmpty() && now - lastPublishMs >= 800L)) {
++                    if (last || (!staleShown && triple.third.isNotEmpty() && now - lastPublishMs >= 800L)) {
+                         lastPublishMs = now
+                         val snapshot = done.toList()
+                         val channels = withContext(Dispatchers.Default) { buildChannels(snapshot) }
+-                        if (last) channelsMemoryCache[selectedUrls] = channels
+-                        publish(channels, final = last)
++                        val hasAddonChannels = channels.any { it.iptvSourceId == null && it.directUrl == null }
++                        if (last && staleShown && !hasAddonChannels) {
++                            // Every addon failed (offline?): keep the saved channels on screen.
++                            Log.w(TAG, "Channel reload returned nothing; keeping the saved list")
++                            _uiState.update { it.copy(isLoadingChannels = false) }
++                        } else {
++                            if (last) {
++                                channelsMemoryCache[selectedUrls] = channels
++                                if (hasAddonChannels) launch(Dispatchers.IO) { writeDiskCache(selectedUrls, channels) }
++                            }
++                            publish(channels, final = last)
++                        }
+                     }
+                 }
+             }
+         }
+     }
+ 
++    private suspend fun fetchCatalogPage(
++        baseUrl: String,
++        catalog: CatalogDescriptor,
++        skip: Int
++    ): List<com.nuvio.tv.data.remote.dto.MetaPreviewDto> {
++        val url = buildCatalogUrl(baseUrl, catalog.rawType, catalog.id, skip)
++        val response = runCatching {
++            safeApiCall(context) { addonApi.getCatalog(url) }
++        }.getOrNull()
++        return when (response) {
++            is com.nuvio.tv.core.network.NetworkResult.Success -> response.data.metas.filterNotNull()
++            else -> emptyList()
++        }
++    }
++
++    // First page alone (it tells the page size), then the rest in parallel batches.
+     private suspend fun fetchAllItemsFromCatalog(
+         baseUrl: String,
+         catalog: CatalogDescriptor
+     ): List<com.nuvio.tv.data.remote.dto.MetaPreviewDto> {
+         val allItems = mutableListOf<com.nuvio.tv.data.remote.dto.MetaPreviewDto>()
+         val seenIds = mutableSetOf<String>()
+-        var currentSkip = 0
+-        var pageCount = 0
+         val maxPages = 15
++        val batchSize = 4
+ 
+-        while (pageCount < maxPages) {
+-            pageCount++
+-            val url = buildCatalogUrl(baseUrl, catalog.rawType, catalog.id, currentSkip)
+-            val response = runCatching {
+-                safeApiCall(context) { addonApi.getCatalog(url) }
+-            }.getOrNull()
+-
+-            val metas = when (response) {
+-                is com.nuvio.tv.core.network.NetworkResult.Success -> response.data.metas.filterNotNull()
+-                else -> emptyList()
+-            }
+-
+-            if (metas.isEmpty()) break
+-
++        fun add(metas: List<com.nuvio.tv.data.remote.dto.MetaPreviewDto>): Boolean {
+             var addedAny = false
+             for (item in metas) {
+                 val id = item.id ?: continue
+@@ -475,14 +506,86 @@ class TvChannelsRepository @Inject constructor(
+                     addedAny = true
+                 }
+             }
++            return addedAny
++        }
++
++        val first = fetchCatalogPage(baseUrl, catalog, 0)
++        if (first.isEmpty() || !add(first) || first.size < 50) return allItems
++        val pageSize = first.size
+ 
+-            if (!addedAny || metas.size < 50) break
+-            currentSkip += metas.size
++        var nextPage = 1
++        while (nextPage < maxPages) {
++            val pages = (nextPage until minOf(nextPage + batchSize, maxPages)).toList()
++            val results = coroutineScope {
++                pages.map { page -> async { fetchCatalogPage(baseUrl, catalog, page * pageSize) } }.awaitAll()
++            }
++            var full = true
++            for (metas in results) {
++                if (metas.isEmpty() || !add(metas) || metas.size < pageSize) {
++                    full = false
++                    break
++                }
++            }
++            if (!full) break
++            nextPage += batchSize
+         }
+ 
+         return allItems
+     }
+ 
++    private fun diskCacheFile(): java.io.File = java.io.File(context.filesDir, "tv_channels_cache.json")
++
++    // Addon channels of the last complete load, so Live TV can open with them before the addons answer.
++    private fun writeDiskCache(selectedUrls: Set<String>, channels: List<TvChannelItem>) {
++        runCatching {
++            val items = org.json.JSONArray()
++            for (c in channels) {
++                if (c.iptvSourceId != null || c.directUrl != null) continue
++                items.put(
++                    org.json.JSONObject()
++                        .put("id", c.id).put("type", c.type).put("name", c.name)
++                        .put("poster", c.poster ?: org.json.JSONObject.NULL)
++                        .put("logo", c.logo ?: org.json.JSONObject.NULL)
++                        .put("genres", org.json.JSONArray(c.genres))
++                        .put("description", c.description ?: org.json.JSONObject.NULL)
++                        .put("addonName", c.addonName).put("addonManifestUrl", c.addonManifestUrl)
++                        .put("addonLogo", c.addonLogo ?: org.json.JSONObject.NULL)
++                        .put("catalogId", c.catalogId).put("catalogName", c.catalogName)
++                        .put("startEpochMs", c.startEpochMs ?: org.json.JSONObject.NULL)
++                )
++            }
++            val root = org.json.JSONObject()
++                .put("key", selectedUrls.sorted().joinToString("|"))
++                .put("items", items)
++            val tmp = java.io.File(context.filesDir, "tv_channels_cache.tmp")
++            tmp.writeText(root.toString())
++            tmp.renameTo(diskCacheFile())
++        }.onFailure { Log.w(TAG, "Could not save channel cache: ${it.message}") }
++    }
++
++    private fun readDiskCache(selectedUrls: Set<String>): List<TvChannelItem>? = runCatching {
++        val file = diskCacheFile()
++        if (!file.exists()) return@runCatching null
++        val root = org.json.JSONObject(file.readText())
++        if (root.optString("key") != selectedUrls.sorted().joinToString("|")) return@runCatching null
++        val items = root.getJSONArray("items")
++        fun str(o: org.json.JSONObject, k: String): String? = if (o.isNull(k)) null else o.getString(k)
++        List(items.length()) { i ->
++            val o = items.getJSONObject(i)
++            val g = o.getJSONArray("genres")
++            TvChannelItem(
++                id = o.getString("id"), type = o.getString("type"), name = o.getString("name"),
++                poster = str(o, "poster"), logo = str(o, "logo"),
++                genres = List(g.length()) { g.getString(it) },
++                description = str(o, "description"),
++                addonName = o.getString("addonName"), addonManifestUrl = o.getString("addonManifestUrl"),
++                addonLogo = str(o, "addonLogo"),
++                catalogId = o.getString("catalogId"), catalogName = o.getString("catalogName"),
++                startEpochMs = if (o.isNull("startEpochMs")) null else o.getLong("startEpochMs")
++            )
++        }
++    }.onFailure { Log.w(TAG, "Could not read channel cache: ${it.message}") }.getOrNull()
++
+     private fun buildCatalogUrl(baseUrl: String, type: String, catalogId: String, skip: Int): String {
+         val trimmed = baseUrl.trimEnd('/')
+         val queryStart = trimmed.indexOf('?')
