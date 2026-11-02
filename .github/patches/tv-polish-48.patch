@@ -1,0 +1,339 @@
+diff --git a/app/src/main/java/com/nuvio/tv/reshaped/debuglog/DebugLogServer.kt b/app/src/main/java/com/nuvio/tv/reshaped/debuglog/DebugLogServer.kt
+index 01a6d0a58..d3c1b72eb 100644
+--- a/app/src/main/java/com/nuvio/tv/reshaped/debuglog/DebugLogServer.kt
++++ b/app/src/main/java/com/nuvio/tv/reshaped/debuglog/DebugLogServer.kt
+@@ -16,6 +16,7 @@ internal class DebugLogServer(
+     port: Int,
+     private val reportDir: File,
+     private val audioSyncLog: () -> String,
++    private val frameLog: () -> String = { "" },
+ ) : NanoHTTPD(port) {
+ 
+     val token: String = newToken()
+@@ -28,6 +29,7 @@ internal class DebugLogServer(
+         return when {
+             uri == pagePath || uri == "/$token" -> html(page())
+             uri == "$filePrefix$AUDIO_SYNC_LOG" -> text(AUDIO_SYNC_LOG, audioSyncLog())
++            uri == "$filePrefix$FRAME_LOG" -> text(FRAME_LOG, frameLog())
+             uri.startsWith(filePrefix) -> reports().firstOrNull { it.name == uri.removePrefix(filePrefix) }
+                 ?.let { file -> runCatching { text(file.name, file.readText()) }.getOrNull() }
+                 ?: newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Not found")
+@@ -82,6 +84,8 @@ border:1px solid rgba(255,255,255,0.14);background:rgba(255,255,255,0.04);color:
+   $rows
+   <h2>Audio sync</h2>
+   <a class="row" href="${h(filePrefix + AUDIO_SYNC_LOG)}" download="$AUDIO_SYNC_LOG"><span>Audio sync log</span></a>
++  <h2>Playback</h2>
++  <a class="row" href="${h(filePrefix + FRAME_LOG)}" download="$FRAME_LOG"><span>Dropped frames log</span></a>
+ </div>
+ </body>
+ </html>
+@@ -100,6 +104,7 @@ border:1px solid rgba(255,255,255,0.14);background:rgba(255,255,255,0.04);color:
+ 
+     companion object {
+         private const val AUDIO_SYNC_LOG = "audio-sync-log.txt"
++        private const val FRAME_LOG = "playback-frame-log.txt"
+         private const val MAX_REPORTS = 10
+         /** After the phone entry pages (8120+), so they never collide. */
+         private const val START_PORT = 8130
+@@ -111,10 +116,14 @@ border:1px solid rgba(255,255,255,0.14);background:rgba(255,255,255,0.04);color:
+             return bytes.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+         }
+ 
+-        fun startOnAvailablePort(reportDir: File, audioSyncLog: () -> String): DebugLogServer? {
++        fun startOnAvailablePort(
++            reportDir: File,
++            audioSyncLog: () -> String,
++            frameLog: () -> String = { "" },
++        ): DebugLogServer? {
+             for (port in START_PORT until START_PORT + MAX_ATTEMPTS) {
+                 try {
+-                    return DebugLogServer(port, reportDir, audioSyncLog).apply { start(SOCKET_READ_TIMEOUT, false) }
++                    return DebugLogServer(port, reportDir, audioSyncLog, frameLog).apply { start(SOCKET_READ_TIMEOUT, false) }
+                 } catch (_: Exception) {
+                 }
+             }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/reshaped/debuglog/DebugLogQrDialog.kt b/app/src/main/java/com/nuvio/tv/ui/reshaped/debuglog/DebugLogQrDialog.kt
+index e4cd11a50..7bd23e2ed 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/reshaped/debuglog/DebugLogQrDialog.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/reshaped/debuglog/DebugLogQrDialog.kt
+@@ -29,6 +29,7 @@ import com.nuvio.tv.core.qr.QrCodeGenerator
+ import com.nuvio.tv.reshaped.debuglog.DebugLogServer
+ import com.nuvio.tv.reshaped.net.LanAddress
+ import com.nuvio.tv.ui.components.NuvioDialog
++import com.nuvio.tv.ui.screens.player.PlaybackFrameLog
+ import com.nuvio.tv.ui.screens.player.audiosync.SyncLog
+ import com.nuvio.tv.ui.theme.NuvioTheme
+ import java.io.File
+@@ -55,7 +56,7 @@ internal fun DebugLogQrDialog(onDismiss: () -> Unit) {
+                     } else {
+                         // Where AutoSyncDebugLog saves its reports.
+                         val reports = File(context.cacheDir, "autosync-debug")
+-                        val server = DebugLogServer.startOnAvailablePort(reports) { SyncLog.text() }
++                        val server = DebugLogServer.startOnAvailablePort(reports, { SyncLog.text() }, { PlaybackFrameLog.text() })
+                         running = server
+                         if (server == null) {
+                             DebugLogQrState(null, null, context.getString(R.string.error_server_ports_unavailable))
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlaybackFrameLog.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlaybackFrameLog.kt
+new file mode 100644
+index 000000000..fc7de62dc
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlaybackFrameLog.kt
+@@ -0,0 +1,199 @@
++package com.nuvio.tv.ui.screens.player
++
++import android.os.Build
++import android.os.Handler
++import android.os.Looper
++import androidx.media3.common.Format
++import androidx.media3.common.PlaybackException
++import androidx.media3.common.Player
++import androidx.media3.exoplayer.ExoPlayer
++import androidx.media3.exoplayer.analytics.AnalyticsListener
++import java.text.SimpleDateFormat
++import java.util.Date
++import java.util.Locale
++
++/**
++ * Nuvio fork: a per-second record of dropped video frames while ExoPlayer plays, to find what makes a device drop
++ * frames. Each line has the playback position, frames dropped and rendered in that second, the buffer ahead and the
++ * decoder. Events that could cause a hitch (Custom Stretch frame grabs, seeks, audio underruns, state changes) are
++ * written between them, so the log shows what happened just before each drop. It lives in memory only (latest lines),
++ * holds no links or titles, and is read from Settings through the debug-log QR page.
++ */
++internal object PlaybackFrameLog {
++    private const val MAX_LINES = 2_400
++    private const val CONTEXT_EVERY_SECONDS = 10
++
++    private val lines = ArrayDeque<String>()
++    private val time = SimpleDateFormat("HH:mm:ss", Locale.US)
++    private val handler = Handler(Looper.getMainLooper())
++    @Volatile private var active = false
++
++    private var player: ExoPlayer? = null
++    private var listener: AnalyticsListener? = null
++    private var ticker: Runnable? = null
++    private var lastDropped = 0L
++    private var lastRendered = 0L
++    private var secondsSinceContext = 0
++    private var droppedTotal = 0L
++    private var videoDecoder = "?"
++    private var videoLabel = "?"
++
++    /** Starts logging for [exo]; any earlier player is detached first. Call on the main thread. */
++    fun attach(exo: ExoPlayer) {
++        detach()
++        player = exo
++        active = true
++        lastDropped = 0L
++        lastRendered = 0L
++        secondsSinceContext = 0
++        droppedTotal = 0L
++        videoDecoder = "?"
++        videoLabel = "?"
++        add("--- player attached ---")
++        val analytics = object : AnalyticsListener {
++            override fun onVideoDecoderInitialized(
++                eventTime: AnalyticsListener.EventTime,
++                decoderName: String,
++                initializedTimestampMs: Long,
++                initializationDurationMs: Long,
++            ) {
++                videoDecoder = decoderName
++                add("video decoder $decoderName (${initializationDurationMs} ms to start)")
++            }
++
++            override fun onAudioDecoderInitialized(
++                eventTime: AnalyticsListener.EventTime,
++                decoderName: String,
++                initializedTimestampMs: Long,
++                initializationDurationMs: Long,
++            ) {
++                add("audio decoder $decoderName")
++            }
++
++            override fun onVideoInputFormatChanged(
++                eventTime: AnalyticsListener.EventTime,
++                format: Format,
++                decoderReuseEvaluation: androidx.media3.exoplayer.DecoderReuseEvaluation?,
++            ) {
++                videoLabel = "${format.width}x${format.height}" +
++                    (format.frameRate.takeIf { it > 0f }?.let { " ${"%.1f".format(Locale.US, it)}fps" } ?: "") +
++                    (format.sampleMimeType?.let { " ${it.substringAfter('/')}" } ?: "")
++                add("video format $videoLabel")
++            }
++
++            override fun onPlaybackStateChanged(eventTime: AnalyticsListener.EventTime, state: Int) {
++                val name = when (state) {
++                    Player.STATE_IDLE -> "idle"
++                    Player.STATE_BUFFERING -> "buffering"
++                    Player.STATE_READY -> "ready"
++                    Player.STATE_ENDED -> "ended"
++                    else -> state.toString()
++                }
++                add("state $name at ${position(eventTime.currentPlaybackPositionMs)}")
++            }
++
++            override fun onPositionDiscontinuity(
++                eventTime: AnalyticsListener.EventTime,
++                oldPosition: Player.PositionInfo,
++                newPosition: Player.PositionInfo,
++                reason: Int,
++            ) {
++                if (reason == Player.DISCONTINUITY_REASON_SEEK || reason == Player.DISCONTINUITY_REASON_SEEK_ADJUSTMENT) {
++                    add("seek to ${position(newPosition.positionMs)}")
++                }
++            }
++
++            override fun onAudioUnderrun(
++                eventTime: AnalyticsListener.EventTime,
++                bufferSize: Int,
++                bufferSizeMs: Long,
++                elapsedSinceLastFeedMs: Long,
++            ) {
++                add("audio underrun (${elapsedSinceLastFeedMs} ms since last audio feed)")
++            }
++
++            override fun onDroppedVideoFrames(
++                eventTime: AnalyticsListener.EventTime,
++                droppedFrames: Int,
++                elapsedMs: Long,
++            ) {
++                add("DROPPED $droppedFrames frames in ${elapsedMs} ms at ${position(eventTime.currentPlaybackPositionMs)}")
++            }
++
++            override fun onPlayerError(eventTime: AnalyticsListener.EventTime, error: PlaybackException) {
++                add("player error ${error.errorCodeName}")
++            }
++        }
++        listener = analytics
++        exo.addAnalyticsListener(analytics)
++        val tick = object : Runnable {
++            override fun run() {
++                sample()
++                if (active) handler.postDelayed(this, 1_000L)
++            }
++        }
++        ticker = tick
++        handler.postDelayed(tick, 1_000L)
++    }
++
++    fun detach() {
++        if (!active && player == null) return
++        active = false
++        ticker?.let { handler.removeCallbacks(it) }
++        ticker = null
++        player?.let { exo -> listener?.let { runCatching { exo.removeAnalyticsListener(it) } } }
++        listener = null
++        player = null
++        add("--- player detached, $droppedTotal frames dropped in total ---")
++    }
++
++    /** A named moment worth lining up with drops, such as a Custom Stretch frame grab. */
++    fun mark(event: String) {
++        if (active) add(event)
++    }
++
++    private fun sample() {
++        val exo = player ?: return
++        val counters = exo.videoDecoderCounters ?: return
++        counters.ensureUpdated()
++        val dropped = (counters.droppedBufferCount + counters.skippedOutputBufferCount).toLong()
++        val rendered = counters.renderedOutputBufferCount.toLong()
++        val droppedNow = (dropped - lastDropped).coerceAtLeast(0L)
++        val renderedNow = (rendered - lastRendered).coerceAtLeast(0L)
++        lastDropped = dropped
++        lastRendered = rendered
++        droppedTotal = dropped
++        secondsSinceContext++
++        if (droppedNow > 0L || secondsSinceContext >= CONTEXT_EVERY_SECONDS) {
++            secondsSinceContext = 0
++            val bufferMs = (exo.bufferedPosition - exo.currentPosition).coerceAtLeast(0L)
++            add(
++                "${position(exo.currentPosition)} drop=$droppedNow rendered=$renderedNow " +
++                    "buffer=${bufferMs / 100 / 10.0}s playing=${exo.isPlaying} speed=${exo.playbackParameters.speed}",
++            )
++        }
++    }
++
++    private fun position(ms: Long): String {
++        val total = (ms / 1000).coerceAtLeast(0L)
++        return "%d:%02d:%02d".format(Locale.US, total / 3600, total / 60 % 60, total % 60)
++    }
++
++    private fun add(message: String) {
++        val line = "${time.format(Date())} $message"
++        synchronized(lines) {
++            lines.addLast(line)
++            while (lines.size > MAX_LINES) lines.removeFirst()
++        }
++    }
++
++    fun text(): String {
++        val header = "Nuvio playback frame log · ${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE}" +
++            "\nOne line per second that dropped frames, plus a status line every $CONTEXT_EVERY_SECONDS s. " +
++            "Lines such as 'stretch capture' mark Custom Stretch frame grabs."
++        return synchronized(lines) {
++            if (lines.isEmpty()) "$header\n\nNo video has played yet. Play something with ExoPlayer, then open this again."
++            else (listOf(header) + lines).joinToString("\n")
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerCustomStretch.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerCustomStretch.kt
+index 231876cda..f98c9df74 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerCustomStretch.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerCustomStretch.kt
+@@ -750,6 +750,7 @@ internal fun View.captureVideoLuma(
+ internal suspend fun View.captureVideoLuma(
+     maxDimension: Int = BlackBarTracker.SAMPLE_MAX_DIMENSION,
+ ): LumaFrame? = suspendCancellableCoroutine { continuation ->
++    PlaybackFrameLog.mark("stretch capture")
+     captureVideoLuma(maxDimension) { frame ->
+         if (continuation.isActive) continuation.resume(frame)
+     }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
+index 72ce8df8a..f6426b49a 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
+@@ -191,6 +191,10 @@ internal fun PlayerEffectsHost(
+     DisposableEffect(exoPicture) {
+         onDispose { exoPicture?.release() }
+     }
++    DisposableEffect(exoPlayer) {
++        exoPlayer?.let { PlaybackFrameLog.attach(it) }
++        onDispose { PlaybackFrameLog.detach() }
++    }
+     LaunchedEffect(exoPicture, mpvView, smartEnhance) {
+         val state = PictureState(smartEnhance = smartEnhance)
+         exoPicture?.apply(state)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPictureSoundSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPictureSoundSettings.kt
+index 622120315..fb2ebd2fb 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPictureSoundSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPictureSoundSettings.kt
+@@ -2,8 +2,12 @@ package com.nuvio.tv.ui.screens.settings
+ 
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
+ import androidx.compose.ui.platform.LocalContext
+ import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import com.nuvio.tv.ui.reshaped.debuglog.DebugLogQrDialog
+ import com.nuvio.tv.ui.screens.player.PlayerEffects
+ 
+ /**
+@@ -22,4 +26,14 @@ internal fun PlaybackPictureSoundSection() {
+         checked = smartEnhance,
+         onToggle = { PlayerEffects.setSmartEnhance(!smartEnhance) },
+     )
++
++    // Dropped-frame log: scan the QR code to download it on a phone (same page as the other debug logs).
++    SettingsSectionLabel(text = "Diagnostics")
++    var showFrameLogQr by remember { mutableStateOf(false) }
++    SettingsActionRow(
++        title = "Send dropped-frame log to phone",
++        subtitle = "Scan a QR code to download a per-second log of dropped video frames from the last video you played",
++        onClick = { showFrameLogQr = true },
++    )
++    if (showFrameLogQr) DebugLogQrDialog(onDismiss = { showFrameLogQr = false })
+ }
