@@ -1,0 +1,131 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffects.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffects.kt
+index 42bd712f9..83b4b4001 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffects.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffects.kt
+@@ -225,6 +225,7 @@ internal object PlayerEffects {
+     private const val KEY_SMART = "smart_enhance"
+     private const val KEY_AUTO = "auto_enhance"
+     private const val KEY_BEST = "prefer_best_quality"
++    private const val KEY_PERFORMANCE = "performance_mode"
+     private const val KEY_REMEMBER = "remember_per_title"
+     private const val KEY_TITLES = "titles"
+     private const val MAX_TITLES = 200
+@@ -249,6 +250,10 @@ internal object PlayerEffects {
+     private val _autoEnhance = MutableStateFlow(false)
+     val autoEnhance: StateFlow<Boolean> = _autoEnhance.asStateFlow()
+ 
++    private val _performance = MutableStateFlow(false)
++    /** Performance mode: every picture and sound effect is held off, whatever else is chosen. */
++    val performance: StateFlow<Boolean> = _performance.asStateFlow()
++
+     private val _rememberPerTitle = MutableStateFlow(true)
+     val rememberPerTitle: StateFlow<Boolean> = _rememberPerTitle.asStateFlow()
+ 
+@@ -278,6 +283,7 @@ internal object PlayerEffects {
+         _autoEnhance.value = prefs.getBoolean(KEY_AUTO, false)
+         preferBestQuality = prefs.getBoolean(KEY_BEST, false)
+         _rememberPerTitle.value = prefs.getBoolean(KEY_REMEMBER, true)
++        _performance.value = prefs.getBoolean(KEY_PERFORMANCE, false)
+     }
+ 
+     private fun saveGlobal() {
+@@ -288,6 +294,7 @@ internal object PlayerEffects {
+             ?.putBoolean(KEY_AUTO, _autoEnhance.value)
+             ?.putBoolean(KEY_BEST, preferBestQuality)
+             ?.putBoolean(KEY_REMEMBER, _rememberPerTitle.value)
++            ?.putBoolean(KEY_PERFORMANCE, _performance.value)
+             ?.apply()
+     }
+ 
+@@ -312,6 +319,11 @@ internal object PlayerEffects {
+         rememberTitle()
+     }
+ 
++    fun setPerformance(enabled: Boolean) {
++        _performance.value = enabled
++        saveGlobal()
++    }
++
+     fun setAutoEnhance(enabled: Boolean) {
+         _autoEnhance.value = enabled
+         saveGlobal()
+@@ -343,7 +355,7 @@ internal object PlayerEffects {
+ 
+     /** Switches Smart Enhance on for sources that look soft: under 720p, or under about 2 Mbps. */
+     fun maybeAutoEnhance(heightPx: Int?, bitrate: Int?) {
+-        if (!_autoEnhance.value || enhanceUserSet || _smartEnhance.value) return
++        if (_performance.value || !_autoEnhance.value || enhanceUserSet || _smartEnhance.value) return
+         val lowResolution = heightPx != null && heightPx in 1 until LOW_RESOLUTION_HEIGHT
+         val lowBitrate = bitrate != null && bitrate in 1 until LOW_BITRATE
+         if (lowResolution || lowBitrate) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
+index fba92f121..11e92ad13 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
+@@ -223,7 +223,8 @@ internal class ExoPictureEffects(
+     private fun push() {
+         if (released) return
+         val current = state
+-        val dxKind = if (dxBroken) DxEnhanceKind.NONE else DxEnhance.currentKind() // dx.bi picture enhance hook
++        val performance = PlayerEffects.performance.value
++        val dxKind = if (dxBroken || performance) DxEnhanceKind.NONE else DxEnhance.currentKind() // dx.bi picture enhance hook
+         val brightness = (current.brightness / 100f + if (current.smartEnhance) 0.01f else 0f).coerceIn(-1f, 1f)
+         val contrast = (current.contrast / 100f + if (current.smartEnhance) 0.05f else 0f).coerceIn(-1f, 1f)
+         val saturation = (current.saturation.toFloat() + if (current.smartEnhance) 6f else 0f).coerceIn(-100f, 100f)
+@@ -248,7 +249,7 @@ internal class ExoPictureEffects(
+         // taking it out again would be one more rebuild and one more burst of dropped frames.
+         // Tall 50/60 fps video (YouTube 1440p/4K) already strains the decoder: no extra GL pass on top of it.
+         val tooHeavy = player.videoSize.height > MAX_EFFECT_HEIGHT && (player.videoFormat?.frameRate ?: 0f) > 32f
+-        val fused = (wantFused || (chainFused && !shaderBroken)) && !tooHeavy
++        val fused = (wantFused || (chainFused && !shaderBroken)) && !tooHeavy && !performance
+         val scaled = fused && player.videoSize.height > MAX_EFFECT_HEIGHT
+         if (chainSet && fused == chainFused && scaled == chainScaled) return
+         val effects = ArrayList<Effect>()
+@@ -534,6 +535,7 @@ internal fun PlayerEffectsHost(
+     val picture by PlayerEffects.picture.collectAsStateWithLifecycle()
+     val audio by PlayerEffects.audio.collectAsStateWithLifecycle()
+     val smartEnhance by PlayerEffects.smartEnhance.collectAsStateWithLifecycle()
++    val performance by PlayerEffects.performance.collectAsStateWithLifecycle()
+     val exoAudio = remember(exoPlayer) { exoPlayer?.let { ExoAudioEffects(it) } }
+     val exoPicture = remember(exoPlayer, contentId) {
+         // YouTube starts on a small, low-bitrate size and climbs: that must not switch Smart Enhance on for good.
+@@ -555,15 +557,17 @@ internal fun PlayerEffectsHost(
+         }
+     }
+     val dxKind by DxEnhance.kind.collectAsStateWithLifecycle() // dx.bi picture enhance hook
+-    LaunchedEffect(exoPicture, mpvView, picture, smartEnhance, dxKind) {
+-        val state = picture.copy(smartEnhance = smartEnhance)
++    LaunchedEffect(exoPicture, mpvView, picture, smartEnhance, dxKind, performance) {
++        val state = if (performance) PictureState() else picture.copy(smartEnhance = smartEnhance)
+         exoPicture?.apply(state)
+         mpvView?.applyPictureState(state)
+     }
+-    val dxSound = DxSoundEffect(exoPlayer) // dx.bi sound modes hook
+-    LaunchedEffect(exoAudio, mpvView, audio, dxSound) {
+-        exoAudio?.apply(audio)
+-        mpvView?.applyAudioFilter(DxSound.mergeMpvChain(audio.mpvFilterChain(), dxSound)) // dx.bi sound modes hook
++    val dxSoundMode = DxSoundEffect(if (performance) null else exoPlayer) // dx.bi sound modes hook
++    val dxSound = if (performance) DxSoundMode.NORMAL else dxSoundMode
++    LaunchedEffect(exoAudio, mpvView, audio, dxSound, performance) {
++        val soundState = if (performance) AudioFxState() else audio
++        exoAudio?.apply(soundState)
++        mpvView?.applyAudioFilter(DxSound.mergeMpvChain(soundState.mpvFilterChain(), dxSound)) // dx.bi sound modes hook
+     }
+     SmartEnhanceBanner(modifier = Modifier.zIndex(2.7f))
+     DxRememberHost() // dx.bi remember hook
+@@ -577,7 +581,15 @@ internal fun PictureSoundBlock(rightFocusRequester: FocusRequester) {
+     val audio by PlayerEffects.audio.collectAsStateWithLifecycle()
+     val picture by PlayerEffects.picture.collectAsStateWithLifecycle()
+     val smartEnhance by PlayerEffects.smartEnhance.collectAsStateWithLifecycle()
++    val performance by PlayerEffects.performance.collectAsStateWithLifecycle()
+     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
++        BlockHeader("Performance")
++        VideoQualityCard(
++            label = if (performance) "Performance mode on: all picture and sound effects off" else "Performance mode off",
++            isSelected = performance,
++            onClick = { PlayerEffects.setPerformance(!performance) },
++            rightFocusRequester = rightFocusRequester,
++        )
+         // Sound mode and the equalizer start folded: ~25 cards fewer in the list while it is on screen, which
+         // keeps the GPU free for the filtered video behind it.
+         var soundOpen by remember { mutableStateOf(false) }
