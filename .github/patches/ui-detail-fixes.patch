@@ -1,0 +1,281 @@
+diff --git a/app/src/main/java/com/nuvio/tv/data/remote/api/ParentalGuideApi.kt b/app/src/main/java/com/nuvio/tv/data/remote/api/ParentalGuideApi.kt
+index a7fd68a8c..304cb7402 100644
+--- a/app/src/main/java/com/nuvio/tv/data/remote/api/ParentalGuideApi.kt
++++ b/app/src/main/java/com/nuvio/tv/data/remote/api/ParentalGuideApi.kt
+@@ -28,8 +28,9 @@ data class ImdbApiParentsGuideCategory(
+ 
+ @JsonClass(generateAdapter = true)
+ data class ImdbApiSeverityBreakdown(
+-    @Json(name = "severityLevel") val severityLevel: String,
+-    @Json(name = "voteCount") val voteCount: Int
++    @Json(name = "severityLevel") val severityLevel: String? = null,
++    // IMDb leaves the count out for some levels; a missing count is no votes.
++    @Json(name = "voteCount") val voteCount: Int? = null
+ )
+ 
+ @JsonClass(generateAdapter = true)
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/HostOutage.kt b/app/src/main/java/com/nuvio/tv/data/repository/HostOutage.kt
+new file mode 100644
+index 000000000..8d78fa4c2
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/repository/HostOutage.kt
+@@ -0,0 +1,36 @@
++package com.nuvio.tv.data.repository
++
++import android.util.Log
++import java.net.ConnectException
++import java.net.NoRouteToHostException
++import java.net.UnknownHostException
++
++/**
++ * Remembers that a host could not be reached, so it is not asked again on every page. When another host answered
++ * at the same time the network is fine and the host is taken as gone for [goneMs]; otherwise the box may just be
++ * offline for a moment, and it is tried again after [offlineMs].
++ */
++internal class HostOutage(
++    private val now: () -> Long = System::currentTimeMillis,
++    private val goneMs: Long = GONE_MS,
++    private val offlineMs: Long = OFFLINE_MS
++) {
++    @Volatile private var downUntilMs = 0L
++
++    fun isDown(): Boolean = now() < downUntilMs
++
++    fun markDown(networkUp: Boolean, tag: String? = null) {
++        val holdMs = if (networkUp) goneMs else offlineMs
++        downUntilMs = now() + holdMs
++        if (tag != null) Log.w(tag, "Primary episode ratings host unreachable, using the backup for ${holdMs / 60_000} min")
++    }
++
++    companion object {
++        const val GONE_MS = 24L * 60L * 60L * 1000L
++        const val OFFLINE_MS = 10L * 60L * 1000L
++
++        fun isUnreachable(error: Throwable): Boolean = generateSequence(error) { it.cause }.take(5).any {
++            it is UnknownHostException || it is ConnectException || it is NoRouteToHostException
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/ImdbEpisodeRatingsRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/ImdbEpisodeRatingsRepository.kt
+index cfd52b4a7..1c995a362 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/ImdbEpisodeRatingsRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/ImdbEpisodeRatingsRepository.kt
+@@ -1,8 +1,10 @@
+ package com.nuvio.tv.data.repository
+ 
+ import android.util.Log
++import com.nuvio.tv.BuildConfig
+ import com.nuvio.tv.data.remote.api.ImdbTapframeApi
+ import com.nuvio.tv.data.remote.api.SeriesGraphApi
++import kotlinx.coroutines.CancellationException
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.SupervisorJob
+@@ -29,6 +31,8 @@ class ImdbEpisodeRatingsRepository @Inject constructor(
+     private val inFlight = mutableMapOf<String, kotlinx.coroutines.Deferred<Map<Pair<Int, Int>, Double>>>()
+     private val inFlightMutex = Mutex()
+     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++    internal var primaryConfigured = BuildConfig.IMDB_TAPFRAME_API_BASE_URL.isNotBlank()
++    internal val primaryOutage = HostOutage()
+ 
+     suspend fun getEpisodeRatings(
+         imdbId: String?,
+@@ -81,20 +85,27 @@ class ImdbEpisodeRatingsRepository @Inject constructor(
+         imdbId: String?,
+         tmdbId: Int?
+     ): Map<Pair<Int, Int>, Double> {
+-        if (!imdbId.isNullOrBlank()) {
+-            val primary = fetchFromImdbTapframe(imdbId)
++        var primaryUnreachable = false
++        if (!imdbId.isNullOrBlank() && primaryConfigured && !primaryOutage.isDown()) {
++            val primary = fetchFromImdbTapframe(imdbId) { primaryUnreachable = true }
+             if (primary.isNotEmpty()) return primary
+-            Log.w(tag, "Primary episode ratings empty for imdbId=$imdbId, trying fallback.")
++            if (!primaryUnreachable) Log.w(tag, "Primary episode ratings empty for imdbId=$imdbId, trying fallback.")
+         }
+ 
+         if (tmdbId != null && tmdbId > 0) {
+-            return fetchFromSeriesGraph(tmdbId)
++            val fallback = fetchFromSeriesGraph(tmdbId)
++            if (primaryUnreachable) primaryOutage.markDown(networkUp = fallback.isNotEmpty(), tag = tag)
++            return fallback
+         }
+ 
++        if (primaryUnreachable) primaryOutage.markDown(networkUp = false, tag = tag)
+         return emptyMap()
+     }
+ 
+-    private suspend fun fetchFromImdbTapframe(imdbId: String): Map<Pair<Int, Int>, Double> {
++    private suspend fun fetchFromImdbTapframe(
++        imdbId: String,
++        onUnreachable: () -> Unit
++    ): Map<Pair<Int, Int>, Double> {
+         return try {
+             val response = imdbTapframeApi.getSeasonRatings(imdbId)
+             if (!response.isSuccessful) {
+@@ -102,8 +113,14 @@ class ImdbEpisodeRatingsRepository @Inject constructor(
+                 return emptyMap()
+             }
+             toRatingsMap(response.body().orEmpty())
++        } catch (e: CancellationException) {
++            throw e
+         } catch (e: Exception) {
+-            Log.w(tag, "Error fetching primary season ratings for imdbId=$imdbId", e)
++            if (HostOutage.isUnreachable(e)) {
++                onUnreachable()
++            } else {
++                Log.w(tag, "Error fetching primary season ratings for imdbId=$imdbId", e)
++            }
+             emptyMap()
+         }
+     }
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/ParentalGuideRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/ParentalGuideRepository.kt
+index 14ad4d912..f26813b4c 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/ParentalGuideRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/ParentalGuideRepository.kt
+@@ -70,16 +70,16 @@ class ParentalGuideRepository @Inject constructor(
+ 
+         // Find the severity with the most votes, excluding "none"
+         val dominant = breakdowns
+-            .filter { it.severityLevel.lowercase() != "none" }
+-            .maxByOrNull { it.voteCount }
++            .filter { !it.severityLevel.isNullOrBlank() && it.severityLevel.lowercase() != "none" }
++            .maxByOrNull { it.voteCount ?: 0 }
+ 
+         // If "none" has more votes than any other severity, treat as no concern
+         val noneVotes = breakdowns
+-            .firstOrNull { it.severityLevel.lowercase() == "none" }
++            .firstOrNull { it.severityLevel?.lowercase() == "none" }
+             ?.voteCount ?: 0
+ 
+-        if (dominant == null || dominant.voteCount <= noneVotes) return null
++        if (dominant == null || (dominant.voteCount ?: 0) <= noneVotes) return null
+ 
+-        return dominant.severityLevel.lowercase()
++        return dominant.severityLevel?.lowercase()
+     }
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/cast/CastDetailScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/cast/CastDetailScreen.kt
+index 99f0a3d71..cd1a57a6c 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/cast/CastDetailScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/cast/CastDetailScreen.kt
+@@ -20,10 +20,12 @@ import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.PaddingValues
+ import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.aspectRatio
+ import androidx.compose.foundation.layout.fillMaxHeight
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.heightIn
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.layout.size
+ import androidx.compose.foundation.layout.width
+@@ -265,7 +267,7 @@ private fun CastDetailContent(
+                             onBiographyExpandedChange(!isBiographyExpanded)
+                         }
+                     },
+-                    modifier = if (isBiographyExpanded) Modifier.weight(1f) else Modifier
++                    modifier = Modifier.weight(1f, fill = isBiographyExpanded)
+                 )
+ 
+                 AnimatedVisibility(
+@@ -344,8 +346,8 @@ private fun HeroSection(
+         Card(
+             onClick = onPortraitClick,
+             modifier = Modifier
+-                .width(160.dp)
+-                .height(240.dp)
++                .heightIn(max = 240.dp)
++                .aspectRatio(2f / 3f, matchHeightConstraintsFirst = true)
+                 .focusRequester(portraitFocusRequester)
+                 .focusProperties {
+                     canFocus = isBiographyExpanded || isBiographyTruncated
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/CompanyLogosSection.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/CompanyLogosSection.kt
+index 57aaf671b..16e063019 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/CompanyLogosSection.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/CompanyLogosSection.kt
+@@ -48,6 +48,7 @@ import androidx.compose.ui.layout.ContentScale
+ import androidx.compose.ui.layout.boundsInWindow
+ import androidx.compose.ui.layout.onGloballyPositioned
+ import androidx.compose.ui.layout.onPlaced
++import androidx.compose.ui.layout.positionInWindow
+ import androidx.compose.ui.platform.LocalContext
+ import androidx.compose.ui.platform.LocalDensity
+ import androidx.compose.ui.platform.LocalView
+@@ -110,6 +111,7 @@ fun CompanyLogosSection(
+ 
+     var holdRestoreScrollSuppress by remember { mutableStateOf(false) }
+     var revealOverflowPx by remember { mutableFloatStateOf(0f) }
++    var fullRevealOverflowPx by remember { mutableFloatStateOf(0f) }
+     val view = LocalView.current
+     val density = LocalDensity.current
+     val revealPaddingPx = remember(density) { with(density) { NuvioTheme.spacing.md.toPx() } }
+@@ -154,6 +156,12 @@ fun CompanyLogosSection(
+             .onGloballyPositioned { coords ->
+                 val bounds = coords.boundsInWindow()
+                 revealOverflowPx = (bounds.bottom - view.height + revealPaddingPx).coerceAtLeast(0f)
++                fullRevealOverflowPx = companyRowRevealOverflowPx(
++                    rowTopPx = coords.positionInWindow().y,
++                    rowHeightPx = coords.size.height,
++                    windowHeightPx = view.height,
++                    paddingPx = revealPaddingPx
++                )
+             }
+     ) {
+         Text(
+@@ -217,7 +225,13 @@ fun CompanyLogosSection(
+                         upFocusRequester = upFocusRequester,
+                         onFocused = {
+                             companyId?.let(onLastFocusedCompanyIdChange)
+-                            onCompanyFocused(if (suppressRestoreScroll) 0f else revealOverflowPx)
++                            onCompanyFocused(
++                                when {
++                                    suppressRestoreScroll -> 0f
++                                    allowPageScrollState.value() -> revealOverflowPx
++                                    else -> fullRevealOverflowPx
++                                }
++                            )
+                             if (isRestoreTarget) {
+                                 restorePending = false
+                                 onRestoreFocusHandled()
+@@ -330,3 +344,7 @@ private fun CompanyLogoCard(
+         }
+     }
+ }
++
++/** Overflow if the whole row had to come on screen, not just its first tiles. */
++internal fun companyRowRevealOverflowPx(rowTopPx: Float, rowHeightPx: Int, windowHeightPx: Int, paddingPx: Float): Float =
++    (rowTopPx + rowHeightPx - windowHeightPx + paddingPx).coerceAtLeast(0f)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt
+index 3914eba15..bcc2b31af 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt
+@@ -2227,10 +2227,10 @@ class MetaDetailsViewModel @Inject constructor(
+                 }
+                 pendingDefaultLibraryToggle = null
+                 _uiState.update { it.copy(defaultLibraryTogglePending = false) }
+-                val message = if (wasInLibrary || wasInWatchlist) {
+-                    localizedContext.getString(R.string.detail_removed_from_library)
+-                } else {
++                val message = if (result.added ?: !(wasInLibrary || wasInWatchlist)) {
+                     localizedContext.getString(R.string.detail_added_to_library)
++                } else {
++                    localizedContext.getString(R.string.detail_removed_from_library)
+                 }
+                 showMessage(message)
+             }.onFailure { error ->
+@@ -2408,7 +2408,11 @@ class MetaDetailsViewModel @Inject constructor(
+                             removalConfirmations = emptyList()
+                         )
+                     }
+-                    showMessage(localizedContext.getString(R.string.detail_removed_from_library))
++                    showMessage(
++                        localizedContext.getString(
++                            if (result.added == true) R.string.detail_added_to_library else R.string.detail_removed_from_library
++                        )
++                    )
+                 }
+             }.onFailure { error ->
+                 pendingDefaultLibraryToggle = null

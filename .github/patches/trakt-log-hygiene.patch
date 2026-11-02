@@ -1,0 +1,156 @@
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/TraktAuthService.kt b/app/src/main/java/com/nuvio/tv/data/repository/TraktAuthService.kt
+index 26bf75b8d..a041475ad 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/TraktAuthService.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/TraktAuthService.kt
+@@ -334,15 +334,33 @@ class TraktAuthService @Inject constructor(
+         return username
+     }
+ 
++    // Each kind of failure is logged once until a request succeeds again; polls repeat them every few minutes.
++    private val reportedFailures: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
++
++    @androidx.annotation.VisibleForTesting
++    internal fun reportedFailureKinds(): Set<String> = reportedFailures.toSet()
++
++    private fun reportFailure(kind: String, error: Throwable? = null) {
++        if (reportedFailures.add(kind)) Log.w("TraktAuthService", "Authorized request failed: $kind", error)
++    }
++
+     suspend fun <T> executeAuthorizedRequest(
+         call: suspend (authorizationHeader: String) -> Response<T>
+     ): Response<T>? {
+         if (isCircuitOpen()) {
+             trace("authorized request: circuit breaker is OPEN, skipping request")
++            reportFailure("circuit breaker open")
+             return null
+         }
+ 
+-        var token = getValidAccessToken() ?: return null
++        if (getCurrentAuthState().accessToken.isNullOrBlank()) {
++            reportFailure("not signed in")
++            return null
++        }
++        var token = getValidAccessToken() ?: run {
++            reportFailure("token refresh failed")
++            return null
++        }
+         var retriedAuth = false
+         var retriedRateLimit = false
+         var retriedTransient = false
+@@ -360,7 +378,7 @@ class TraktAuthService @Inject constructor(
+                     retriedNetwork = true
+                     continue
+                 }
+-                Log.w("TraktAuthService", "Network error during authorized request", e)
++                reportFailure("network ${e.javaClass.simpleName}", e)
+                 return null
+             }
+ 
+@@ -368,8 +386,10 @@ class TraktAuthService @Inject constructor(
+ 
+             if (response.isSuccessful) {
+                 resetCircuit()
++                reportedFailures.clear()
+                 return response
+             }
++            reportFailure("HTTP $code ${response.raw().request.url.encodedPath}")
+ 
+             if (code == 403) {
+                 tripCircuit("403 Forbidden (invalid API key or unapproved app) for ${responseTarget(response)}")
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/TraktProgressService.kt b/app/src/main/java/com/nuvio/tv/data/repository/TraktProgressService.kt
+index 1d9667b15..d935273ac 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/TraktProgressService.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/TraktProgressService.kt
+@@ -28,6 +28,7 @@ import com.nuvio.tv.data.remote.dto.trakt.TraktWatchedMovieItemDto
+ import com.nuvio.tv.data.remote.dto.trakt.TraktWatchedShowItemDto
+ import com.nuvio.tv.domain.model.WatchProgress
+ import com.nuvio.tv.domain.repository.MetaRepository
++import kotlinx.coroutines.CancellationException
+ import kotlinx.coroutines.CoroutineExceptionHandler
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Deferred
+@@ -45,6 +46,8 @@ import kotlinx.coroutines.flow.MutableSharedFlow
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.combine
+ import kotlinx.coroutines.flow.distinctUntilChanged
++import kotlinx.coroutines.flow.emptyFlow
++import kotlinx.coroutines.flow.flatMapLatest
+ import kotlinx.coroutines.flow.dropWhile
+ import kotlinx.coroutines.flow.filterNotNull
+ import kotlinx.coroutines.flow.first
+@@ -83,7 +86,8 @@ class TraktProgressService @Inject constructor(
+     private val layoutPreferenceDataStore: com.nuvio.tv.data.local.LayoutPreferenceDataStore,
+     private val traktEpisodeMappingService: TraktEpisodeMappingService,
+     private val profileManager: ProfileManager,
+-    private val watchedSeriesStateHolder: com.nuvio.tv.data.local.WatchedSeriesStateHolder
++    private val watchedSeriesStateHolder: com.nuvio.tv.data.local.WatchedSeriesStateHolder,
++    private val traktAuthDataStore: com.nuvio.tv.data.local.TraktAuthDataStore
+ ) {
+     companion object {
+         private const val TAG = "TraktProgressSvc"
+@@ -286,16 +290,31 @@ class TraktProgressService @Inject constructor(
+             }
+         }
+         scope.launch {
+-            refreshEvents().collectLatest {
+-                val success = try {
+-                    refreshRemoteSnapshot()
+-                    true
+-                } catch (e: Exception) {
+-                    Log.w(TAG, "Failed to refresh remote snapshot", e)
+-                    false
++            // Without a Trakt account on this profile there is nothing to poll.
++            traktAuthDataStore.state
++                .map { it.isAuthenticated }
++                .distinctUntilChanged()
++                .flatMapLatest { signedIn ->
++                    if (signedIn) {
++                        refreshEvents()
++                    } else {
++                        consecutiveRefreshFailures = 0
++                        refreshIntervalMs = baseRefreshIntervalMs
++                        emptyFlow()
++                    }
++                }
++                .collectLatest {
++                    val success = try {
++                        refreshRemoteSnapshot()
++                        true
++                    } catch (e: CancellationException) {
++                        throw e
++                    } catch (e: Exception) {
++                        logRefreshFailure("Failed to refresh remote snapshot", e)
++                        false
++                    }
++                    updateRefreshBackoff(success)
+                 }
+-                updateRefreshBackoff(success)
+-            }
+         }
+     }
+ 
+@@ -1021,6 +1040,15 @@ class TraktProgressService @Inject constructor(
+         return merge(refreshTicker(), refreshSignals).onStart { emit(Unit) }
+     }
+ 
++    // The stack trace once per run of failures; the backoff already spaces the retries out.
++    private fun logRefreshFailure(message: String, error: Exception) {
++        if (consecutiveRefreshFailures == 0) {
++            Log.w(TAG, message, error)
++        } else {
++            Log.w(TAG, "$message (${consecutiveRefreshFailures + 1} in a row): ${error.javaClass.simpleName}: ${error.message}")
++        }
++    }
++
+     private fun updateRefreshBackoff(success: Boolean) {
+         if (success) {
+             if (consecutiveRefreshFailures > 0 || refreshIntervalMs != baseRefreshIntervalMs) {
+@@ -1100,7 +1128,7 @@ class TraktProgressService @Inject constructor(
+             val snapshot = try {
+                 progressDeferred.await()
+             } catch (e: Exception) {
+-                Log.w(TAG, "fetchAllProgressSnapshot failed, keeping existing snapshot", e)
++                logRefreshFailure("fetchAllProgressSnapshot failed, keeping existing snapshot", e)
+                 null
+             }
+             watchedMoviesDeferred?.let {

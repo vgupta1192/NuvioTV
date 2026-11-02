@@ -1,0 +1,233 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/DolbyVisionBaseLayerColor.kt b/app/src/main/java/com/nuvio/tv/core/player/DolbyVisionBaseLayerColor.kt
+new file mode 100644
+index 000000000..7cc7ed38a
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/player/DolbyVisionBaseLayerColor.kt
+@@ -0,0 +1,61 @@
++package com.nuvio.tv.core.player
++
++import androidx.media3.common.C
++import androidx.media3.common.ColorInfo
++import androidx.media3.common.Format
++import androidx.media3.common.util.UnstableApi
++
++/**
++ * Colour signalling for a Dolby Vision track that is played as its HEVC base layer.
++ *
++ * The base layer's transfer follows the DV config's bl_signal_compatibility_id: profile 7 and 8.1 carry
++ * HDR10 (PQ), 8.4 carries HLG and 8.2 is SDR. Matroska files often have no Colour element, so without this
++ * the decoder is configured with no colour information at all.
++ */
++@UnstableApi
++internal object DolbyVisionBaseLayerColor {
++
++    const val COMPATIBILITY_UNKNOWN = -1
++
++    /** bl_signal_compatibility_id from a dvcC/dvvC payload (the box body, without its header). */
++    @JvmStatic
++    fun compatibilityId(dolbyVisionConfig: ByteArray?): Int {
++        if (dolbyVisionConfig == null || dolbyVisionConfig.size < 5) return COMPATIBILITY_UNKNOWN
++        return (dolbyVisionConfig[4].toInt() and 0xFF) ushr 4
++    }
++
++    /**
++     * The transfer the decoded base layer carries, or [Format.NO_VALUE] when it should not be labelled.
++     * [bitstreamTransfer] is the SPS VUI transfer, used only when the compatibility id gives no answer.
++     */
++    @JvmStatic
++    fun baseLayerTransfer(profile: Int, compatibilityId: Int, bitstreamTransfer: Int): Int = when (profile) {
++        7 -> C.COLOR_TRANSFER_ST2084
++        8 -> when (compatibilityId) {
++            1 -> C.COLOR_TRANSFER_ST2084
++            2 -> Format.NO_VALUE
++            4 -> C.COLOR_TRANSFER_HLG
++            else -> when (bitstreamTransfer) {
++                C.COLOR_TRANSFER_HLG -> C.COLOR_TRANSFER_HLG
++                C.COLOR_TRANSFER_SDR -> Format.NO_VALUE
++                else -> C.COLOR_TRANSFER_ST2084
++            }
++        }
++        else -> Format.NO_VALUE
++    }
++
++    /**
++     * [existing] with the base layer's transfer filled in. An existing PQ or HLG transfer is kept, as are any
++     * colour space, range or static metadata the container declared.
++     */
++    @JvmStatic
++    fun colorInfoFor(existing: ColorInfo?, transfer: Int): ColorInfo? {
++        if (transfer == Format.NO_VALUE) return existing
++        val existingTransfer = existing?.colorTransfer
++        if (existingTransfer == C.COLOR_TRANSFER_ST2084 || existingTransfer == C.COLOR_TRANSFER_HLG) return existing
++        val builder = existing?.buildUpon() ?: ColorInfo.Builder()
++        if (existing == null || existing.colorSpace == Format.NO_VALUE) builder.setColorSpace(C.COLOR_SPACE_BT2020)
++        if (existing == null || existing.colorRange == Format.NO_VALUE) builder.setColorRange(C.COLOR_RANGE_LIMITED)
++        return builder.setColorTransfer(transfer).build()
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/dvmkv/MatroskaExtractor.java b/app/src/main/java/com/nuvio/tv/core/player/dvmkv/MatroskaExtractor.java
+index 19be242b7..87d2dae0e 100644
+--- a/app/src/main/java/com/nuvio/tv/core/player/dvmkv/MatroskaExtractor.java
++++ b/app/src/main/java/com/nuvio/tv/core/player/dvmkv/MatroskaExtractor.java
+@@ -59,6 +59,7 @@ import androidx.media3.extractor.TrueHdSampleRechunker;
+ import androidx.media3.extractor.text.SubtitleParser;
+ import androidx.media3.extractor.text.SubtitleTranscodingExtractorOutput;
+ import com.google.common.collect.ImmutableList;
++import com.nuvio.tv.core.player.DolbyVisionBaseLayerColor;
+ import java.io.ByteArrayOutputStream;
+ import java.io.EOFException;
+ import java.io.IOException;
+@@ -3217,6 +3218,8 @@ public class MatroskaExtractor implements Extractor {
+     public float maxMasteringLuminance = Format.NO_VALUE;
+     public float minMasteringLuminance = Format.NO_VALUE;
+     public byte @MonotonicNonNull [] dolbyVisionConfigBytes;
++    public @C.ColorTransfer int bitstreamColorTransfer = Format.NO_VALUE;
++    public @C.ColorTransfer int dolbyVisionBaseLayerTransfer = Format.NO_VALUE;
+     public byte @MonotonicNonNull [] pendingDolbyVisionBlockAdditionalData;
+ 
+     // Audio elements. Initially set to their default values.
+@@ -3287,6 +3290,7 @@ public class MatroskaExtractor implements Extractor {
+           initializationData = hevcConfig.initializationData;
+           nalUnitLengthFieldLength = hevcConfig.nalUnitLengthFieldLength;
+           codecs = hevcConfig.codecs;
++          bitstreamColorTransfer = hevcConfig.colorTransfer;
+           break;
+         case CODEC_ID_FOURCC:
+           Pair<String, @NullableType List<byte[]>> pair =
+@@ -3485,6 +3489,11 @@ public class MatroskaExtractor implements Extractor {
+               if (DolbyVisionCompatibility.isHdr10BaseLayerModeActive()) {
+                 mimeType = MimeTypes.VIDEO_H265;
+                 codecs = hevcCodecsString;
++                dolbyVisionBaseLayerTransfer =
++                    DolbyVisionBaseLayerColor.baseLayerTransfer(
++                        dolbyVisionConfig.profile,
++                        DolbyVisionBaseLayerColor.compatibilityId(this.dolbyVisionConfigBytes),
++                        bitstreamColorTransfer);
+               }
+             }
+           }
+@@ -3555,6 +3564,7 @@ public class MatroskaExtractor implements Extractor {
+                   .setChromaBitdepth(bitsPerChannel)
+                   .build();
+         }
++        colorInfo = DolbyVisionBaseLayerColor.colorInfoFor(colorInfo, dolbyVisionBaseLayerTransfer);
+         int rotationDegrees = Format.NO_VALUE;
+ 
+         if (name != null && TRACK_NAME_TO_ROTATION_DEGREES.containsKey(name)) {
+diff --git a/app/src/test/java/com/nuvio/tv/core/player/DolbyVisionBaseLayerColorTest.kt b/app/src/test/java/com/nuvio/tv/core/player/DolbyVisionBaseLayerColorTest.kt
+new file mode 100644
+index 000000000..4dbab2446
+--- /dev/null
++++ b/app/src/test/java/com/nuvio/tv/core/player/DolbyVisionBaseLayerColorTest.kt
+@@ -0,0 +1,111 @@
++package com.nuvio.tv.core.player
++
++import androidx.media3.common.C
++import androidx.media3.common.ColorInfo
++import androidx.media3.common.Format
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertSame
++import org.junit.Test
++
++class DolbyVisionBaseLayerColorTest {
++
++    @Test
++    fun `compatibility id comes from the high nibble of the fifth byte`() {
++        assertEquals(1, DolbyVisionBaseLayerColor.compatibilityId(dvcc(profile = 8, compatibility = 1)))
++        assertEquals(4, DolbyVisionBaseLayerColor.compatibilityId(dvcc(profile = 8, compatibility = 4)))
++        assertEquals(6, DolbyVisionBaseLayerColor.compatibilityId(dvcc(profile = 7, compatibility = 6)))
++        assertEquals(DolbyVisionBaseLayerColor.COMPATIBILITY_UNKNOWN, DolbyVisionBaseLayerColor.compatibilityId(null))
++        assertEquals(
++            DolbyVisionBaseLayerColor.COMPATIBILITY_UNKNOWN,
++            DolbyVisionBaseLayerColor.compatibilityId(byteArrayOf(1, 0, 16, 0x35))
++        )
++    }
++
++    @Test
++    fun `profile seven and eight point one base layers are PQ`() {
++        assertEquals(C.COLOR_TRANSFER_ST2084, transfer(7, 6))
++        assertEquals(C.COLOR_TRANSFER_ST2084, transfer(7, DolbyVisionBaseLayerColor.COMPATIBILITY_UNKNOWN))
++        assertEquals(C.COLOR_TRANSFER_ST2084, transfer(8, 1))
++        assertEquals(C.COLOR_TRANSFER_ST2084, transfer(8, 1, bitstream = C.COLOR_TRANSFER_HLG))
++    }
++
++    @Test
++    fun `profile eight point four base layer is HLG, not PQ`() {
++        assertEquals(C.COLOR_TRANSFER_HLG, transfer(8, 4))
++        assertEquals(
++            C.COLOR_TRANSFER_HLG,
++            transfer(8, DolbyVisionBaseLayerColor.COMPATIBILITY_UNKNOWN, bitstream = C.COLOR_TRANSFER_HLG)
++        )
++    }
++
++    @Test
++    fun `profile eight point two and a bitstream that says SDR are left unlabelled`() {
++        assertEquals(Format.NO_VALUE, transfer(8, 2))
++        assertEquals(
++            Format.NO_VALUE,
++            transfer(8, DolbyVisionBaseLayerColor.COMPATIBILITY_UNKNOWN, bitstream = C.COLOR_TRANSFER_SDR)
++        )
++    }
++
++    @Test
++    fun `profile eight with nothing to go on keeps the PQ fallback`() {
++        assertEquals(C.COLOR_TRANSFER_ST2084, transfer(8, 0))
++        assertEquals(C.COLOR_TRANSFER_ST2084, transfer(8, DolbyVisionBaseLayerColor.COMPATIBILITY_UNKNOWN))
++    }
++
++    @Test
++    fun `profile five and plain HEVC are never labelled`() {
++        assertEquals(Format.NO_VALUE, transfer(5, 0))
++        assertEquals(Format.NO_VALUE, transfer(-1, 1))
++    }
++
++    @Test
++    fun `missing colour info becomes BT2020 limited range with the base layer transfer`() {
++        val info = DolbyVisionBaseLayerColor.colorInfoFor(null, C.COLOR_TRANSFER_HLG)!!
++        assertEquals(C.COLOR_SPACE_BT2020, info.colorSpace)
++        assertEquals(C.COLOR_RANGE_LIMITED, info.colorRange)
++        assertEquals(C.COLOR_TRANSFER_HLG, info.colorTransfer)
++    }
++
++    @Test
++    fun `declared HDR transfer is kept as it is`() {
++        val pq = ColorInfo.Builder().setColorSpace(C.COLOR_SPACE_BT2020).setColorRange(C.COLOR_RANGE_LIMITED)
++            .setColorTransfer(C.COLOR_TRANSFER_ST2084).build()
++        assertSame(pq, DolbyVisionBaseLayerColor.colorInfoFor(pq, C.COLOR_TRANSFER_HLG))
++        val hlg = pq.buildUpon().setColorTransfer(C.COLOR_TRANSFER_HLG).build()
++        assertSame(hlg, DolbyVisionBaseLayerColor.colorInfoFor(hlg, C.COLOR_TRANSFER_ST2084))
++    }
++
++    @Test
++    fun `partial container colour keeps its range and static metadata`() {
++        val staticInfo = ByteArray(25) { it.toByte() }
++        val partial = ColorInfo.Builder().setColorRange(C.COLOR_RANGE_FULL).setHdrStaticInfo(staticInfo).build()
++        val info = DolbyVisionBaseLayerColor.colorInfoFor(partial, C.COLOR_TRANSFER_ST2084)!!
++        assertEquals(C.COLOR_SPACE_BT2020, info.colorSpace)
++        assertEquals(C.COLOR_RANGE_FULL, info.colorRange)
++        assertEquals(C.COLOR_TRANSFER_ST2084, info.colorTransfer)
++        assertEquals(staticInfo.toList(), info.hdrStaticInfo!!.toList())
++    }
++
++    @Test
++    fun `no transfer to apply leaves the colour info alone`() {
++        assertNull(DolbyVisionBaseLayerColor.colorInfoFor(null, Format.NO_VALUE))
++        val sdr = ColorInfo.SDR_BT709_LIMITED
++        assertSame(sdr, DolbyVisionBaseLayerColor.colorInfoFor(sdr, Format.NO_VALUE))
++    }
++
++    private fun transfer(profile: Int, compatibility: Int, bitstream: Int = Format.NO_VALUE) =
++        DolbyVisionBaseLayerColor.baseLayerTransfer(profile, compatibility, bitstream)
++
++    companion object {
++        fun dvcc(profile: Int, compatibility: Int, level: Int = 6): ByteArray {
++            val bytes = ByteArray(24)
++            bytes[0] = 1
++            bytes[2] = ((profile shl 1) or (level shr 5)).toByte()
++            bytes[3] = (((level and 0x1F) shl 3) or 0x04 or 0x01).toByte()
++            bytes[4] = (compatibility shl 4).toByte()
++            return bytes
++        }
++    }
++}
