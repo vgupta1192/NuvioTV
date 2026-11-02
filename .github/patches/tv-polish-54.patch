@@ -1,0 +1,88 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/stream/ForkStreamRefreshStatus.kt b/app/src/main/java/com/nuvio/tv/ui/screens/stream/ForkStreamRefreshStatus.kt
+index a54beb72b..51708c4fb 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/stream/ForkStreamRefreshStatus.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/ForkStreamRefreshStatus.kt
+@@ -5,6 +5,7 @@ import androidx.tv.material3.MaterialTheme
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableIntStateOf
+ import androidx.compose.runtime.mutableLongStateOf
+ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.setValue
+@@ -14,10 +15,16 @@ import androidx.compose.ui.unit.dp
+ import androidx.tv.material3.Text
+ import kotlinx.coroutines.delay
+ 
++private const val SHOW_AFTER_OPEN_MS = 8_000L
++private const val SHOW_AFTER_NEW_LINKS_MS = 6_000L
++
+ /**
+  * Nuvio fork: one line that shows the stream auto refresh is alive. It says whether the screen is
+  * waiting for the first load, checking the addons now, or idle, how long ago the last check ended,
+  * how many rounds ran and how many new links they added in total.
++ *
++ * The line hides itself once it has nothing to report: it shows for the first seconds after the
++ * screen opens, for a few seconds after new links arrive, and for as long as a check has timed out.
+  */
+ @Composable
+ internal fun ForkStreamRefreshStatus(
+@@ -35,6 +42,18 @@ internal fun ForkStreamRefreshStatus(
+             now = System.currentTimeMillis()
+         }
+     }
++    val openedAt = remember { System.currentTimeMillis() }
++    var addedSeen by remember { mutableIntStateOf(added) }
++    var addedAt by remember { mutableLongStateOf(0L) }
++    if (added != addedSeen) {
++        addedSeen = added
++        addedAt = System.currentTimeMillis()
++    }
++    val timedOut = phase == 2 && !lastOk
++    val visible = timedOut ||
++        now - openedAt < SHOW_AFTER_OPEN_MS ||
++        (addedAt != 0L && now - addedAt < SHOW_AFTER_NEW_LINKS_MS)
++    if (!visible) return
+     val text = when {
+         manualLoading || phase == 0 -> "Auto refresh: waiting for the load to finish"
+         phase == 1 -> "Auto refresh: checking addons now · round ${rounds + 1} · +$added new links since opening"
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
+index 0d6ec3e45..339a272f0 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
+@@ -47,12 +47,19 @@ data class YtItem(
+     val percentWatched: Int,
+     internal val source: MediaItem,
+     /** YouTube's second line for the card: channel, views and age, when it gives them. */
+-    val subtitle: String? = null
++    val subtitle: String? = null,
++    /** Set when the card sits in a shelf YouTube calls Shorts. */
++    val fromShortsShelf: Boolean = false
+ ) {
+     /** A vertical short, which opens in the Shorts player. */
+-    val isShort: Boolean get() = kind == YtKind.VIDEO && !isLive && (source.isShorts || titleSaysShort || durationSeconds()?.let { it <= 60 } == true)
++    val isShort: Boolean get() = kind == YtKind.VIDEO && !isLive && (fromShortsShelf || source.isShorts || titleSaysShort || (durationSeconds() ?: source.durationMs.takeIf { it > 0 }?.let { (it / 1000).toInt() })?.let { it <= 60 } == true)
+ 
+-    private val titleSaysShort: Boolean get() = title.contains("#shorts", ignoreCase = true) || title.contains("#short ", ignoreCase = true)
++    private val titleSaysShort: Boolean get() = SHORT_TAG.containsMatchIn(title)
++
++    private companion object {
++        /** Any hashtag ending in short or shorts: #shorts, #youtubeshorts, #short. */
++        val SHORT_TAG = Regex("#\\w*shorts?\\b", RegexOption.IGNORE_CASE)
++    }
+ 
+     /** The length from the card's time badge ("0:45", "1:02:10"), when the badge is a time. */
+     private fun durationSeconds(): Int? {
+@@ -781,7 +788,11 @@ class YouTubeViewModel @Inject constructor(
+         hiddenChannelIds = YouTubeSettings.hiddenChannels(context).map { it.first }.toSet()
+     }
+ 
+-    private fun toItems(g: MediaGroup): List<YtItem> = g.mediaItems.orEmpty().filter(::allowed).mapNotNull(::toItem)
++    private fun toItems(g: MediaGroup): List<YtItem> {
++        val shelf = g.title?.contains("short", ignoreCase = true) == true
++        return g.mediaItems.orEmpty().filter(::allowed).mapNotNull(::toItem)
++            .map { if (shelf && it.kind == YtKind.VIDEO) it.copy(fromShortsShelf = true) else it }
++    }
+ 
+     /** Whether your filters in Settings let [i] through. Channels and playlists always do. */
+     private fun allowed(i: MediaItem): Boolean {
