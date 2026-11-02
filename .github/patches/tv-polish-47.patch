@@ -1,0 +1,1877 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/AudioSelectionOverlay.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/AudioSelectionOverlay.kt
+index 4bff10b4e..2a82a00a4 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/AudioSelectionOverlay.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/AudioSelectionOverlay.kt
+@@ -317,7 +317,6 @@ private fun AudioTracksContent(
+                 )
+             }
+         }
+-        item(key = "picture_sound") { PictureSoundBlock(rightFocusRequester) } // Nuvio fork: picture and sound effects
+     }
+ }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/DxEnhance.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/DxEnhance.kt
+deleted file mode 100644
+index d6545699b..000000000
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/DxEnhance.kt
++++ /dev/null
+@@ -1,274 +0,0 @@
+-package com.nuvio.tv.ui.screens.player
+-
+-import android.content.Context
+-import android.opengl.GLES20
+-import androidx.compose.foundation.layout.Column
+-import androidx.compose.foundation.layout.padding
+-import androidx.compose.runtime.Composable
+-import androidx.compose.runtime.getValue
+-import androidx.compose.ui.Modifier
+-import androidx.compose.ui.focus.FocusRequester
+-import androidx.compose.ui.graphics.Color
+-import androidx.compose.ui.platform.LocalContext
+-import androidx.lifecycle.compose.collectAsStateWithLifecycle
+-import androidx.media3.common.VideoFrameProcessingException
+-import androidx.media3.common.util.GlProgram
+-import androidx.media3.common.util.GlUtil
+-import androidx.media3.common.util.Size
+-import androidx.media3.effect.BaseGlShaderProgram
+-import androidx.media3.effect.GlEffect
+-import androidx.media3.effect.GlShaderProgram
+-import androidx.tv.material3.MaterialTheme
+-import androidx.tv.material3.Text
+-import com.nuvio.tv.ui.screens.settings.SettingsActionRow
+-import com.nuvio.tv.ui.screens.settings.SettingsToggleRow
+-import com.nuvio.tv.ui.theme.NuvioTheme
+-import kotlinx.coroutines.flow.MutableStateFlow
+-import kotlinx.coroutines.flow.StateFlow
+-import kotlinx.coroutines.flow.asStateFlow
+-
+-/** dx.bi picture enhancement choices. Auto picks [DxEnhanceKind.ANIME] for anime and [DxEnhanceKind.SHARPEN] otherwise. */
+-enum class DxEnhanceMode(val id: String, val label: String) {
+-    OFF("off", "Off"),
+-    AUTO("auto", "Auto"),
+-    ANIME("anime", "Anime"),
+-    SHARPEN("sharpen", "Sharpen");
+-
+-    companion object {
+-        fun fromId(id: String?): DxEnhanceMode = values().firstOrNull { it.id == id } ?: OFF
+-    }
+-}
+-
+-/** What the engine actually applies for a title. */
+-enum class DxEnhanceKind { NONE, SHARPEN, ANIME }
+-
+-internal object DxEnhance {
+-    private const val PREFS = "nuvio_tv_dx_enhance"
+-    private val _mode = MutableStateFlow(DxEnhanceMode.OFF)
+-    val mode: StateFlow<DxEnhanceMode> = _mode.asStateFlow()
+-    private val _enabled = MutableStateFlow(true)
+-    val enabled: StateFlow<Boolean> = _enabled.asStateFlow()
+-    private val _anime = MutableStateFlow(false)
+-    private var animeById = false
+-    private var animeByMeta = false
+-    private val _kind = MutableStateFlow(DxEnhanceKind.NONE)
+-    val kind: StateFlow<DxEnhanceKind> = _kind.asStateFlow()
+-    private var loaded = false
+-    private var appContext: Context? = null
+-
+-    fun ensureLoaded(context: Context) {
+-        if (loaded) return
+-        loaded = true
+-        val app = context.applicationContext
+-        appContext = app
+-        val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+-        _mode.value = DxEnhanceMode.fromId(prefs.getString("mode", null))
+-        _enabled.value = prefs.getBoolean("enabled", true)
+-        recompute()
+-    }
+-
+-    private fun recompute() {
+-        _kind.value = if (!_enabled.value) {
+-            DxEnhanceKind.NONE
+-        } else when (_mode.value) {
+-            DxEnhanceMode.OFF -> DxEnhanceKind.NONE
+-            DxEnhanceMode.ANIME -> DxEnhanceKind.ANIME
+-            DxEnhanceMode.SHARPEN -> DxEnhanceKind.SHARPEN
+-            DxEnhanceMode.AUTO -> if (_anime.value) DxEnhanceKind.ANIME else DxEnhanceKind.SHARPEN
+-        }
+-    }
+-
+-    fun currentKind(): DxEnhanceKind = _kind.value
+-
+-    fun setMode(next: DxEnhanceMode) {
+-        _mode.value = next
+-        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)?.edit()?.putString("mode", next.id)?.apply()
+-        recompute()
+-    }
+-
+-    fun setEnabled(on: Boolean) {
+-        _enabled.value = on
+-        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)?.edit()?.putBoolean("enabled", on)?.apply()
+-        recompute()
+-    }
+-
+-    /** Auto looks at the content id: kitsu, mal, anilist and anidb ids are anime. */
+-    fun setTitle(contentId: String?) {
+-        val id = contentId.orEmpty()
+-        animeById = listOf("kitsu:", "mal:", "anilist:", "anidb:").any { id.startsWith(it, ignoreCase = true) }
+-        animeByMeta = false
+-        _anime.value = animeById
+-        recompute()
+-    }
+-
+-    /** Title details arrive after the player opens: an anime genre, or animation from Japan, also counts as anime. */
+-    fun setAnimeMeta(genres: List<String>, country: String?) {
+-        val byMeta = genres.any { it.equals("anime", ignoreCase = true) } ||
+-            (genres.any { it.equals("animation", ignoreCase = true) } && country?.contains("Japan", ignoreCase = true) == true)
+-        if (byMeta == animeByMeta) return
+-        animeByMeta = byMeta
+-        _anime.value = animeById || animeByMeta
+-        recompute()
+-    }
+-
+-    /** libmpv `sharpen` value for the current kind (0 when off). */
+-    fun mpvSharpen(): Double = when (_kind.value) {
+-        DxEnhanceKind.NONE -> 0.0
+-        DxEnhanceKind.SHARPEN -> 0.5
+-        DxEnhanceKind.ANIME -> 0.8
+-    }
+-}
+-
+-/**
+- * dx.bi picture enhancement as one GL pass. Sharpen is an unsharp mask. Anime is a reduced take on Anime4K: it pulls
+- * line pixels toward the darkest neighbour (thinner, darker lines) and adds a stronger sharpen. There is no neural
+- * upscaling, which would be too heavy for TV boxes.
+- */
+-internal class DxEnhanceEffect(private val anime: Boolean) : GlEffect {
+-    override fun toGlShaderProgram(context: Context, useHdr: Boolean): GlShaderProgram =
+-        DxEnhanceProgram(useHdr, anime)
+-}
+-
+-private class DxEnhanceProgram(useHdr: Boolean, private val anime: Boolean) : BaseGlShaderProgram(useHdr, 1) {
+-    private val glProgram: GlProgram
+-
+-    init {
+-        try {
+-            glProgram = GlProgram(VERTEX_SHADER, FRAGMENT_SHADER)
+-            glProgram.setBufferAttribute(
+-                "aFramePosition",
+-                GlUtil.getNormalizedCoordinateBounds(),
+-                GlUtil.HOMOGENEOUS_COORDINATE_VECTOR_SIZE,
+-            )
+-        } catch (e: GlUtil.GlException) {
+-            throw VideoFrameProcessingException(e)
+-        }
+-    }
+-
+-    override fun configure(inputWidth: Int, inputHeight: Int): Size {
+-        glProgram.setFloatsUniform("uTexel", floatArrayOf(1f / inputWidth, 1f / inputHeight))
+-        return Size(inputWidth, inputHeight)
+-    }
+-
+-    override fun drawFrame(inputTexId: Int, presentationTimeUs: Long) {
+-        try {
+-            glProgram.use()
+-            glProgram.setSamplerTexIdUniform("uTexSampler", inputTexId, 0)
+-            glProgram.setFloatUniform("uThin", if (anime) 0.55f else 0f)
+-            glProgram.setFloatUniform("uSharpen", if (anime) 0.6f else 0.45f)
+-            glProgram.bindAttributesAndUniforms()
+-            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+-        } catch (e: GlUtil.GlException) {
+-            throw VideoFrameProcessingException(e, presentationTimeUs)
+-        }
+-    }
+-
+-    override fun release() {
+-        super.release()
+-        try {
+-            glProgram.delete()
+-        } catch (e: GlUtil.GlException) {
+-            throw VideoFrameProcessingException(e)
+-        }
+-    }
+-
+-    private companion object {
+-        const val VERTEX_SHADER = """
+-attribute vec4 aFramePosition;
+-varying vec2 vTexSamplingCoord;
+-void main() {
+-  gl_Position = aFramePosition;
+-  vTexSamplingCoord = vec2(aFramePosition.x * 0.5 + 0.5, aFramePosition.y * 0.5 + 0.5);
+-}
+-"""
+-
+-        const val FRAGMENT_SHADER = """
+-#ifdef GL_FRAGMENT_PRECISION_HIGH
+-precision highp float;
+-#else
+-precision mediump float;
+-#endif
+-uniform sampler2D uTexSampler;
+-uniform vec2 uTexel;
+-uniform float uThin;
+-uniform float uSharpen;
+-varying vec2 vTexSamplingCoord;
+-
+-float luma(vec3 c) {
+-  return dot(c, vec3(0.299, 0.587, 0.114));
+-}
+-
+-void main() {
+-  vec2 uv = vTexSamplingCoord;
+-  vec4 src = texture2D(uTexSampler, uv);
+-  vec3 col = src.rgb;
+-  vec3 n = texture2D(uTexSampler, uv + vec2(0.0, uTexel.y)).rgb;
+-  vec3 s = texture2D(uTexSampler, uv - vec2(0.0, uTexel.y)).rgb;
+-  vec3 e = texture2D(uTexSampler, uv + vec2(uTexel.x, 0.0)).rgb;
+-  vec3 w = texture2D(uTexSampler, uv - vec2(uTexel.x, 0.0)).rgb;
+-  if (uThin > 0.0) {
+-    vec3 darkest = n;
+-    if (luma(s) < luma(darkest)) { darkest = s; }
+-    if (luma(e) < luma(darkest)) { darkest = e; }
+-    if (luma(w) < luma(darkest)) { darkest = w; }
+-    float edge = smoothstep(0.04, 0.25, luma(col) - luma(darkest));
+-    col = mix(col, darkest, edge * uThin);
+-  }
+-  if (uSharpen > 0.0) {
+-    vec3 blur = (n + s + e + w) * 0.25;
+-    col += (col - blur) * uSharpen;
+-  }
+-  gl_FragColor = vec4(clamp(col, 0.0, 1.0), src.a);
+-}
+-"""
+-    }
+-}
+-
+-/** Off, Auto, Anime and Sharpen as D-pad cards in the audio overlay's picture block. */
+-@Composable
+-internal fun DxEnhanceCards(rightFocusRequester: FocusRequester) {
+-    DxEnhance.ensureLoaded(LocalContext.current)
+-    val enabled by DxEnhance.enabled.collectAsStateWithLifecycle()
+-    val mode by DxEnhance.mode.collectAsStateWithLifecycle()
+-    if (!enabled) return
+-    Column {
+-        Text(
+-            text = "Enhance",
+-            style = MaterialTheme.typography.titleLarge,
+-            color = Color.White,
+-            modifier = Modifier.padding(top = NuvioTheme.spacing.md, bottom = NuvioTheme.spacing.xs),
+-        )
+-        DxEnhanceMode.values().forEach { option ->
+-            VideoQualityCard(
+-                label = if (option == DxEnhanceMode.AUTO) "Auto (Anime for anime, else Sharpen)" else option.label,
+-                isSelected = mode == option,
+-                onClick = { DxEnhance.setMode(option) },
+-                rightFocusRequester = rightFocusRequester,
+-            )
+-        }
+-    }
+-}
+-
+-/** Settings rows in Playback > Picture & Sound. */
+-@Composable
+-internal fun DxEnhanceSettingsRows() {
+-    DxEnhance.ensureLoaded(LocalContext.current)
+-    val enabled by DxEnhance.enabled.collectAsStateWithLifecycle()
+-    val mode by DxEnhance.mode.collectAsStateWithLifecycle()
+-    SettingsToggleRow(
+-        title = "Anime and Sharpen enhancement",
+-        subtitle = "Adds enhance choices to the player's audio panel. Off removes them and the effect.",
+-        checked = enabled,
+-        onToggle = { DxEnhance.setEnabled(!enabled) },
+-    )
+-    SettingsActionRow(
+-        title = "Enhance mode",
+-        subtitle = "Auto uses Anime for anime and Sharpen for everything else. Press to change.",
+-        value = mode.label,
+-        enabled = enabled,
+-        onClick = {
+-            val all = DxEnhanceMode.values()
+-            DxEnhance.setMode(all[(mode.ordinal + 1) % all.size])
+-        },
+-    )
+-}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/DxSoundModes.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/DxSoundModes.kt
+deleted file mode 100644
+index 02f88f5a5..000000000
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/DxSoundModes.kt
++++ /dev/null
+@@ -1,290 +0,0 @@
+-package com.nuvio.tv.ui.screens.player
+-
+-import android.content.Context
+-import android.media.audiofx.AudioEffect
+-import android.media.audiofx.DynamicsProcessing
+-import android.media.audiofx.LoudnessEnhancer
+-import android.os.Build
+-import android.util.Log
+-import androidx.annotation.RequiresApi
+-import androidx.compose.foundation.layout.Column
+-import androidx.compose.foundation.layout.padding
+-import androidx.compose.runtime.Composable
+-import androidx.compose.runtime.DisposableEffect
+-import androidx.compose.runtime.LaunchedEffect
+-import androidx.compose.runtime.getValue
+-import androidx.compose.runtime.remember
+-import androidx.compose.ui.Modifier
+-import androidx.compose.ui.focus.FocusRequester
+-import androidx.compose.ui.graphics.Color
+-import androidx.compose.ui.platform.LocalContext
+-import androidx.lifecycle.compose.collectAsStateWithLifecycle
+-import androidx.media3.common.C
+-import androidx.media3.common.Player
+-import androidx.media3.exoplayer.ExoPlayer
+-import androidx.tv.material3.MaterialTheme
+-import androidx.tv.material3.Text
+-import com.nuvio.tv.ui.screens.settings.SettingsActionRow
+-import com.nuvio.tv.ui.screens.settings.SettingsToggleRow
+-import com.nuvio.tv.ui.theme.NuvioTheme
+-import kotlinx.coroutines.flow.MutableStateFlow
+-import kotlinx.coroutines.flow.StateFlow
+-import kotlinx.coroutines.flow.asStateFlow
+-
+-private const val DX_SOUND_TAG = "NuvioDxSound"
+-
+-/**
+- * dx.bi port: Dialogue boost and Night mode. Dialogue boost lowers booming lows, lifts the speech range and gently
+- * compresses; Night mode also evens out loud and quiet scenes more strongly. ExoPlayer applies the numbers with
+- * Android's DynamicsProcessing (API 28+) or a LoudnessEnhancer fallback; libmpv gets an ffmpeg filter chain.
+- */
+-enum class DxSoundMode(
+-    val id: String,
+-    val label: String,
+-    val hint: String,
+-    val lowDb: Float,
+-    val presenceDb: Float,
+-    val thresholdDb: Float,
+-    val ratio: Float,
+-    val makeupDb: Float,
+-    val limiter: Boolean,
+-) {
+-    NORMAL("normal", "Normal", "As the stream comes.", 0f, 0f, 0f, 1f, 0f, false),
+-    DIALOGUE(
+-        "dialogue", "Dialogue boost", "Raises voices and softens booming lows.",
+-        -3f, 5f, -26f, 3f, 3f, false,
+-    ),
+-    NIGHT(
+-        "night", "Night mode", "Evens out loud and quiet scenes so you can keep the volume down.",
+-        -6f, 4f, -42f, 8f, 7.5f, true,
+-    );
+-
+-    /** ffmpeg filter chain for libmpv; empty for [NORMAL]. */
+-    fun mpvFilters(): String = when (this) {
+-        NORMAL -> ""
+-        DIALOGUE -> "lowshelf=f=200:g=-3,equalizer=f=2500:t=q:w=1:g=5,acompressor=threshold=-26dB:ratio=3:makeup=1.4"
+-        NIGHT -> "lowshelf=f=200:g=-6,equalizer=f=2500:t=q:w=1:g=4,acompressor=threshold=-42dB:ratio=8:makeup=2.4,alimiter=limit=0.95"
+-    }
+-
+-    companion object {
+-        fun fromId(id: String?): DxSoundMode = values().firstOrNull { it.id == id } ?: NORMAL
+-    }
+-}
+-
+-internal object DxSound {
+-    private const val PREFS = "nuvio_tv_dx_sound"
+-    private val _mode = MutableStateFlow(DxSoundMode.NORMAL)
+-    val mode: StateFlow<DxSoundMode> = _mode.asStateFlow()
+-
+-    /** Feature switch: when off the player panel hides the cards and the effect is not applied. */
+-    private val _enabled = MutableStateFlow(true)
+-    val enabled: StateFlow<Boolean> = _enabled.asStateFlow()
+-
+-    private var loaded = false
+-    private var appContext: Context? = null
+-
+-    fun ensureLoaded(context: Context) {
+-        if (loaded) return
+-        loaded = true
+-        val app = context.applicationContext
+-        appContext = app
+-        val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+-        _mode.value = DxSoundMode.fromId(prefs.getString("mode", null))
+-        _enabled.value = prefs.getBoolean("enabled", true)
+-    }
+-
+-    fun setMode(next: DxSoundMode) {
+-        _mode.value = next
+-        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)?.edit()?.putString("mode", next.id)?.apply()
+-    }
+-
+-    fun setEnabled(on: Boolean) {
+-        _enabled.value = on
+-        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)?.edit()?.putBoolean("enabled", on)?.apply()
+-    }
+-
+-    /** Joins the mode's filters onto an mpv `af` value built elsewhere (`lavfi=[...]` or empty). */
+-    fun mergeMpvChain(base: String, mode: DxSoundMode): String {
+-        val extra = mode.mpvFilters()
+-        if (extra.isEmpty()) return base
+-        val inner = if (base.startsWith("lavfi=[") && base.endsWith("]")) base.removePrefix("lavfi=[").removeSuffix("]") else ""
+-        return if (inner.isEmpty()) "lavfi=[$extra]" else "lavfi=[$inner,$extra]"
+-    }
+-}
+-
+-/** Applies the saved mode to ExoPlayer for as long as the player screen is open; returns the mode in force. */
+-@Composable
+-internal fun DxSoundEffect(player: ExoPlayer?): DxSoundMode {
+-    val context = LocalContext.current
+-    DxSound.ensureLoaded(context)
+-    val mode by DxSound.mode.collectAsStateWithLifecycle()
+-    val enabled by DxSound.enabled.collectAsStateWithLifecycle()
+-    val effective = if (enabled) mode else DxSoundMode.NORMAL
+-    val fx = remember(player) { player?.let { ExoDxSound(it) } }
+-    DisposableEffect(fx) { onDispose { fx?.release() } }
+-    LaunchedEffect(fx, effective) { fx?.apply(effective) }
+-    return effective
+-}
+-
+-/**
+- * DynamicsProcessing (API 28+) on the player's audio session: a pre-equaliser (lows down, speech presence up), one
+- * compressor band with make-up gain and, for Night mode, a limiter. Where it is missing or fails, a LoudnessEnhancer
+- * adds a small gain instead. Nothing is created while the mode is Normal.
+- */
+-private class ExoDxSound(private val player: ExoPlayer) : Player.Listener {
+-    private var mode = DxSoundMode.NORMAL
+-    private var processing: AudioEffect? = null
+-    private var enhancer: LoudnessEnhancer? = null
+-    private var effectSession = C.AUDIO_SESSION_ID_UNSET
+-    private var failedSession = C.AUDIO_SESSION_ID_UNSET
+-    private var released = false
+-
+-    init {
+-        player.addListener(this)
+-    }
+-
+-    fun apply(next: DxSoundMode) {
+-        mode = next
+-        refresh()
+-    }
+-
+-    override fun onAudioSessionIdChanged(audioSessionId: Int) {
+-        refresh()
+-    }
+-
+-    private fun refresh() {
+-        if (released) return
+-        if (mode == DxSoundMode.NORMAL) {
+-            releaseEffects()
+-            return
+-        }
+-        val session = player.audioSessionId
+-        if (session == C.AUDIO_SESSION_ID_UNSET || session == failedSession) return
+-        if (session != effectSession) releaseEffects()
+-        effectSession = session
+-        if (Build.VERSION.SDK_INT >= 28 && enhancer == null && tryProcessing(session)) return
+-        applyFallback(session)
+-    }
+-
+-    @RequiresApi(28)
+-    private fun tryProcessing(session: Int): Boolean {
+-        val effect = (processing as? DynamicsProcessing) ?: createProcessing(session)?.also { processing = it }
+-            ?: return false
+-        if (runCatching { configure(effect, mode) }.isSuccess) return true
+-        releaseEffects()
+-        effectSession = session
+-        return false
+-    }
+-
+-    @RequiresApi(28)
+-    private fun createProcessing(session: Int): DynamicsProcessing? = runCatching {
+-        val config = DynamicsProcessing.Config.Builder(
+-            DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION,
+-            2,
+-            true, 4,
+-            true, 1,
+-            false, 0,
+-            true,
+-        ).build()
+-        DynamicsProcessing(0, session, config)
+-    }.onFailure { Log.w(DX_SOUND_TAG, "DynamicsProcessing unavailable: ${it.message}") }.getOrNull()
+-
+-    @RequiresApi(28)
+-    private fun configure(effect: DynamicsProcessing, mode: DxSoundMode) {
+-        // Pre-equaliser bands run up to their cutoff: lows, low-mid, speech presence, highs.
+-        effect.setPreEqBandAllChannelsTo(0, DynamicsProcessing.EqBand(true, 200f, mode.lowDb))
+-        effect.setPreEqBandAllChannelsTo(1, DynamicsProcessing.EqBand(true, 1500f, 0f))
+-        effect.setPreEqBandAllChannelsTo(2, DynamicsProcessing.EqBand(true, 4000f, mode.presenceDb))
+-        effect.setPreEqBandAllChannelsTo(3, DynamicsProcessing.EqBand(true, 20000f, 0f))
+-        effect.setMbcBandAllChannelsTo(
+-            0,
+-            DynamicsProcessing.MbcBand(
+-                true, 20000f, 10f, 250f, mode.ratio, mode.thresholdDb, 6f, -90f, 1f, 0f, mode.makeupDb,
+-            ),
+-        )
+-        effect.setLimiterAllChannelsTo(
+-            DynamicsProcessing.Limiter(true, mode.limiter, 0, 5f, 100f, 10f, -1f, 0f),
+-        )
+-        effect.setEnabled(true)
+-    }
+-
+-    private fun applyFallback(session: Int) {
+-        if (enhancer == null) {
+-            enhancer = runCatching { LoudnessEnhancer(session) }
+-                .onFailure {
+-                    failedSession = session
+-                    Log.w(DX_SOUND_TAG, "LoudnessEnhancer unavailable: ${it.message}")
+-                }
+-                .getOrNull() ?: return
+-        }
+-        enhancer?.let { effect ->
+-            runCatching {
+-                effect.setTargetGain(if (mode == DxSoundMode.NIGHT) 600 else 300)
+-                effect.setEnabled(true)
+-            }.onFailure { Log.w(DX_SOUND_TAG, "LoudnessEnhancer failed: ${it.message}") }
+-        }
+-    }
+-
+-    private fun releaseEffects() {
+-        processing?.let { runCatching { it.setEnabled(false) }; runCatching { it.release() } }
+-        enhancer?.let { runCatching { it.setEnabled(false) }; runCatching { it.release() } }
+-        processing = null
+-        enhancer = null
+-        effectSession = C.AUDIO_SESSION_ID_UNSET
+-    }
+-
+-    fun release() {
+-        released = true
+-        player.removeListener(this)
+-        releaseEffects()
+-    }
+-}
+-
+-/** Dialogue boost and Night mode as D-pad cards in the audio overlay, under the sound mode cards. */
+-@Composable
+-internal fun DxSoundCards(rightFocusRequester: FocusRequester) {
+-    DxSound.ensureLoaded(LocalContext.current)
+-    val enabled by DxSound.enabled.collectAsStateWithLifecycle()
+-    val mode by DxSound.mode.collectAsStateWithLifecycle()
+-    if (!enabled) return
+-    Column {
+-        Text(
+-            text = "Voice and night",
+-            style = MaterialTheme.typography.titleLarge,
+-            color = Color.White,
+-            modifier = Modifier.padding(top = NuvioTheme.spacing.md, bottom = NuvioTheme.spacing.xs),
+-        )
+-        DxSoundMode.values().forEach { option ->
+-            VideoQualityCard(
+-                label = option.label,
+-                isSelected = mode == option,
+-                onClick = { DxSound.setMode(option) },
+-                rightFocusRequester = rightFocusRequester,
+-            )
+-        }
+-    }
+-}
+-
+-/** Settings rows in Playback > Picture & Sound. */
+-@Composable
+-internal fun DxSoundSettingsRows() {
+-    DxSound.ensureLoaded(LocalContext.current)
+-    val enabled by DxSound.enabled.collectAsStateWithLifecycle()
+-    val mode by DxSound.mode.collectAsStateWithLifecycle()
+-    SettingsToggleRow(
+-        title = "Dialogue boost and Night mode",
+-        subtitle = "Adds voice and night choices to the player's audio panel. Off removes them and the effect.",
+-        checked = enabled,
+-        onToggle = { DxSound.setEnabled(!enabled) },
+-    )
+-    SettingsActionRow(
+-        title = "Voice and night",
+-        subtitle = mode.hint + " Press to change.",
+-        value = mode.label,
+-        enabled = enabled,
+-        onClick = {
+-            val all = DxSoundMode.values()
+-            DxSound.setMode(all[(mode.ordinal + 1) % all.size])
+-        },
+-    )
+-}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioMpvSurfaceView.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioMpvSurfaceView.kt
+index e47e3db86..4c222f28c 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioMpvSurfaceView.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioMpvSurfaceView.kt
+@@ -296,29 +296,16 @@ class NuvioMpvSurfaceView @JvmOverloads constructor(
+         }
+     }
+ 
+-    /** Nuvio fork: picture panel settings on mpv's own colour and scaling options. */
++    /** Nuvio fork: Smart Enhance on mpv's own colour options. All zero when it is off. */
+     fun applyPictureState(state: PictureState) {
+         if (!initialized) return
+         val smart = state.smartEnhance
+         runCatching {
+-            mpv.setPropertyString("brightness", (state.brightness + if (smart) 2 else 0).coerceIn(-100, 100).toString())
+-            mpv.setPropertyString("contrast", (state.contrast + if (smart) 8 else 0).coerceIn(-100, 100).toString())
+-            mpv.setPropertyString("saturation", (state.saturation + if (smart) 14 else 0).coerceIn(-100, 100).toString())
+-            mpv.setPropertyString("gamma", (state.gamma + if (smart) 6 else 0).coerceIn(-100, 100).toString())
++            mpv.setPropertyString("brightness", (if (smart) 2 else 0).toString())
++            mpv.setPropertyString("contrast", (if (smart) 8 else 0).toString())
++            mpv.setPropertyString("saturation", (if (smart) 14 else 0).toString())
++            mpv.setPropertyString("gamma", (if (smart) 6 else 0).toString())
+         }.onFailure { Log.w(TAG, "Failed to apply picture colour: ${it.message}") }
+-        // The next options only exist on some mpv builds, so each one may fail alone.
+-        runCatching { mpv.setPropertyString("deband", if (state.deband) "yes" else "no") }
+-        runCatching { mpv.setPropertyString("tone-mapping", state.toneMapping.mpv ?: "auto") }
+-        runCatching { mpv.setPropertyString("interpolation", if (state.interpolation) "yes" else "no") }
+-        runCatching { mpv.setPropertyString("video-sync", if (state.interpolation) "display-resample" else "audio") }
+-        runCatching { mpv.setPropertyString("sharpen", maxOf(state.sharpen * 0.35, DxEnhance.mpvSharpen()).toString()) }
+-    }
+-
+-    /** Nuvio fork: equaliser and dialogue compressor as one ffmpeg filter chain; empty clears it. */
+-    fun applyAudioFilter(chain: String) {
+-        if (!initialized) return
+-        runCatching { mpv.setPropertyString("af", chain) }
+-            .onFailure { Log.w(TAG, "Failed to apply audio filter: ${it.message}") }
+     }
+ 
+     fun applyAudioLanguagePreferences(languages: List<String>) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffects.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffects.kt
+index 83b4b4001..d16c371bc 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffects.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffects.kt
+@@ -2,187 +2,14 @@ package com.nuvio.tv.ui.screens.player
+ 
+ import android.content.Context
+ import android.content.SharedPreferences
+-import kotlin.math.abs
+-import kotlin.math.round
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.flow.asStateFlow
+ 
+-/** Centre frequencies of the five equaliser bands, the same layout Android's own equaliser uses. */
+-internal val EQ_BAND_FREQUENCIES_HZ = listOf(60, 230, 910, 3600, 14000)
+-private val FLAT_BANDS = listOf(0f, 0f, 0f, 0f, 0f)
+-
+-/** Fork: one-tap sound modes from the audio effect panel. Dialogue lifts the speech range and levels loud scenes. */
+-enum class AudioPreset(val id: String, val label: String, val curve: List<Float>) {
+-    ORIGINAL("original", "Original", FLAT_BANDS),
+-    CLARITY("clarity", "Clarity", listOf(-2f, -1f, 2f, 3f, 1f)),
+-    BASS_BOOST("bass", "Bass Boost", listOf(6f, 4f, 0f, 0f, 0f)),
+-    TREBLE_BOOST("treble", "Treble Boost", listOf(0f, 0f, 0f, 3f, 6f)),
+-    MOVIE("movie", "Movie", listOf(3f, 1f, 0f, 2f, 3f)),
+-    MUSIC("music", "Music", listOf(3f, 1f, -1f, 2f, 3f)),
+-    DIALOGUE("dialogue", "Dialogue", listOf(-6f, -3f, 3f, 5f, 0f));
+-
+-    companion object {
+-        fun fromId(id: String?): AudioPreset = values().firstOrNull { it.id == id } ?: ORIGINAL
+-    }
+-}
+-
+-/** Equaliser curves in dB for the five bands. [CUSTOM] has no curve of its own: the sliders hold it. */
+-enum class EqPreset(val id: String, val label: String, val bands: List<Float>?) {
+-    CUSTOM("custom", "Custom", null),
+-    NORMAL("normal", "Normal", listOf(3f, 0f, 0f, 0f, 3f)),
+-    CLASSICAL("classical", "Classical", listOf(5f, 3f, -2f, 4f, 4f)),
+-    DANCE("dance", "Dance", listOf(6f, 0f, 2f, 4f, 1f)),
+-    FLAT("flat", "Flat", FLAT_BANDS),
+-    FOLK("folk", "Folk", listOf(3f, 0f, 0f, 2f, -1f)),
+-    HEAVY_METAL("metal", "Heavy metal", listOf(4f, 1f, 9f, 3f, 0f)),
+-    HIP_HOP("hiphop", "Hip hop", listOf(5f, 3f, 0f, 1f, 3f)),
+-    JAZZ("jazz", "Jazz", listOf(4f, 2f, -2f, 2f, 5f)),
+-    POP("pop", "Pop", listOf(-1f, 2f, 5f, 1f, -2f)),
+-    ROCK("rock", "Rock", listOf(5f, 3f, -1f, 3f, 5f));
+-
+-    companion object {
+-        fun fromId(id: String?): EqPreset = values().firstOrNull { it.id == id } ?: NORMAL
+-    }
+-}
+-
+-data class AudioFxState(
+-    val preset: AudioPreset = AudioPreset.ORIGINAL,
+-    val eqEnabled: Boolean = false,
+-    val eqPreset: EqPreset = EqPreset.NORMAL,
+-    val customBands: List<Float> = FLAT_BANDS,
+-) {
+-    val eqBands: List<Float> get() = eqPreset.bands ?: customBands
+-    val isActive: Boolean get() = preset != AudioPreset.ORIGINAL || eqEnabled
+-
+-    /** Band gains in dB: the sound mode's curve plus the equaliser sliders when the equaliser is on. */
+-    fun effectiveBandsDb(): List<Float> {
+-        val eq = if (eqEnabled) eqBands else FLAT_BANDS
+-        return List(EQ_BAND_FREQUENCIES_HZ.size) { (preset.curve[it] + eq.getOrElse(it) { 0f }).coerceIn(-12f, 12f) }
+-    }
+-
+-    /** 0 to 1000, the scale of Android's BassBoost effect. */
+-    val bassBoostStrength: Int get() = if (preset == AudioPreset.BASS_BOOST) 700 else 0
+-
+-    /** 0 to 1000, the scale of Android's Virtualizer effect. */
+-    val virtualizerStrength: Int get() = if (preset == AudioPreset.MOVIE) 500 else 0
+-
+-    /** mpv audio filter chain: one equaliser per band, plus a compressor that keeps speech above loud effects. */
+-    fun mpvFilterChain(): String {
+-        if (!isActive) return ""
+-        val bands = effectiveBandsDb()
+-        val parts = ArrayList<String>()
+-        EQ_BAND_FREQUENCIES_HZ.forEachIndexed { index, hz ->
+-            val gain = bands[index]
+-            if (abs(gain) >= 0.1f) {
+-                parts += "equalizer=f=$hz:t=o:w=1:g=${round(gain * 10f) / 10f}"
+-            }
+-        }
+-        if (preset == AudioPreset.DIALOGUE) {
+-            parts += "acompressor=threshold=0.12:ratio=3:attack=10:release=250:makeup=2"
+-        }
+-        return if (parts.isEmpty()) "" else "lavfi=[${parts.joinToString(",")}]"
+-    }
+-
+-    fun encode(): String =
+-        listOf(preset.id, if (eqEnabled) "1" else "0", eqPreset.id, customBands.joinToString(",")).joinToString("|")
+-
+-    companion object {
+-        fun decode(value: String?): AudioFxState {
+-            val parts = value?.split("|") ?: return AudioFxState()
+-            if (parts.size < 4) return AudioFxState()
+-            val bands = parts[3].split(",").mapNotNull { it.toFloatOrNull() }
+-            return AudioFxState(
+-                preset = AudioPreset.fromId(parts[0]),
+-                eqEnabled = parts[1] == "1",
+-                eqPreset = EqPreset.fromId(parts[2]),
+-                customBands = if (bands.size == EQ_BAND_FREQUENCIES_HZ.size) bands else FLAT_BANDS,
+-            )
+-        }
+-    }
+-}
+-
+-enum class PicturePreset(val id: String, val label: String) {
+-    ORIGINAL("original", "Original"),
+-    VIVID("vivid", "Vivid"),
+-    CINEMA("cinema", "Cinema"),
+-    CLEAN("clean", "Clean"),
+-    ANIME("anime", "Anime"),
+-    CUSTOM("custom", "Custom");
+-
+-    companion object {
+-        fun fromId(id: String?): PicturePreset = values().firstOrNull { it.id == id } ?: ORIGINAL
+-    }
+-}
+-
+-/** HDR to SDR tone mapping curves (libmpv only). A null [mpv] leaves the engine's own choice. */
+-enum class ToneMapping(val id: String, val label: String, val mpv: String?) {
+-    AUTO("auto", "Auto", null),
+-    BT2390("bt2390", "BT.2390", "bt.2390"),
+-    HABLE("hable", "Hable", "hable"),
+-    MOBIUS("mobius", "Mobius", "mobius"),
+-    REINHARD("reinhard", "Reinhard", "reinhard");
+-
+-    companion object {
+-        fun fromId(id: String?): ToneMapping = values().firstOrNull { it.id == id } ?: AUTO
+-    }
+-}
+-
+-/**
+- * Picture controls. Sliders are in percent steps; [sharpen] and [denoise] run 0 (off) to 3 (high).
+- * [smartEnhance] is filled in when the state is handed to the engine, from the Smart Enhance button.
+- */
++/** Picture handed to the engine. Smart Enhance is the only picture effect left in the fork. */
+ data class PictureState(
+-    val preset: PicturePreset = PicturePreset.ORIGINAL,
+-    val brightness: Int = 0,
+-    val contrast: Int = 0,
+-    val saturation: Int = 0,
+-    val gamma: Int = 0,
+-    val sharpen: Int = 0,
+-    val denoise: Int = 0,
+-    val deband: Boolean = false,
+-    val toneMapping: ToneMapping = ToneMapping.AUTO,
+-    val interpolation: Boolean = false,
+-    val matchRefreshRate: Boolean = true,
+     val smartEnhance: Boolean = false,
+-) {
+-    /** True when the frame needs the custom sharpen, denoise, deband or gamma shader (ExoPlayer). */
+-    val usesShader: Boolean get() = sharpen > 0 || denoise > 0 || deband || gamma != 0
+-
+-    fun withPreset(next: PicturePreset): PictureState = when (next) {
+-        PicturePreset.ORIGINAL -> copy(preset = next, brightness = 0, contrast = 0, saturation = 0, gamma = 0, sharpen = 0, denoise = 0, deband = false)
+-        PicturePreset.VIVID -> copy(preset = next, brightness = 0, contrast = 10, saturation = 22, gamma = 0, sharpen = 1, denoise = 0, deband = false)
+-        PicturePreset.CINEMA -> copy(preset = next, brightness = -3, contrast = 8, saturation = 4, gamma = 0, sharpen = 0, denoise = 0, deband = false)
+-        PicturePreset.CLEAN -> copy(preset = next, brightness = 0, contrast = 4, saturation = 6, gamma = 0, sharpen = 1, denoise = 2, deband = true)
+-        PicturePreset.ANIME -> copy(preset = next, brightness = 0, contrast = 6, saturation = 14, gamma = 0, sharpen = 2, denoise = 0, deband = true)
+-        PicturePreset.CUSTOM -> copy(preset = next)
+-    }
+-
+-    fun encode(): String = listOf(
+-        preset.id, brightness, contrast, saturation, gamma, sharpen, denoise,
+-        if (deband) 1 else 0, toneMapping.id, if (interpolation) 1 else 0, if (matchRefreshRate) 1 else 0,
+-    ).joinToString("|")
+-
+-    companion object {
+-        fun decode(value: String?): PictureState {
+-            val p = value?.split("|") ?: return PictureState()
+-            if (p.size < 11) return PictureState()
+-            return PictureState(
+-                preset = PicturePreset.fromId(p[0]),
+-                brightness = p[1].toIntOrNull()?.coerceIn(-30, 30) ?: 0,
+-                contrast = p[2].toIntOrNull()?.coerceIn(-30, 30) ?: 0,
+-                saturation = p[3].toIntOrNull()?.coerceIn(-50, 50) ?: 0,
+-                gamma = p[4].toIntOrNull()?.coerceIn(-30, 30) ?: 0,
+-                sharpen = p[5].toIntOrNull()?.coerceIn(0, 3) ?: 0,
+-                denoise = p[6].toIntOrNull()?.coerceIn(0, 3) ?: 0,
+-                deband = p[7] == "1",
+-                toneMapping = ToneMapping.fromId(p[8]),
+-                interpolation = p[9] == "1",
+-                matchRefreshRate = p[10] != "0",
+-            )
+-        }
+-    }
+-}
++)
+ 
+ 
+ /** Fork: why a stream label scores higher; a rough picture-quality ranking used to bias auto-play. */
+@@ -215,179 +42,38 @@ internal fun streamPictureQualityScore(text: String): Int {
+ }
+ 
+ /**
+- * Fork: shared state for the picture and sound effects (Smart Enhance, sharpen, equalizer, sound modes...).
+- * Saved in SharedPreferences, remembered per title, and read by the player and the Settings section.
++ * Fork: the Smart Enhance switch (Settings only) and the "prefer best picture" auto-play flag.
++ * Saved in SharedPreferences. Both are off by default, which leaves the original Nuvio video pipeline untouched.
+  */
+ internal object PlayerEffects {
+     private const val PREFS_NAME = "nuvio_tv_player_effects"
+-    private const val KEY_AUDIO = "audio"
+-    private const val KEY_PICTURE = "picture"
+     private const val KEY_SMART = "smart_enhance"
+-    private const val KEY_AUTO = "auto_enhance"
+     private const val KEY_BEST = "prefer_best_quality"
+-    private const val KEY_PERFORMANCE = "performance_mode"
+-    private const val KEY_REMEMBER = "remember_per_title"
+-    private const val KEY_TITLES = "titles"
+-    private const val MAX_TITLES = 200
+-    private const val LOW_RESOLUTION_HEIGHT = 720
+-    private const val LOW_BITRATE = 2_000_000
+ 
+     private val lock = Any()
+     @Volatile private var preferences: SharedPreferences? = null
+ 
+-    private val _audio = MutableStateFlow(AudioFxState())
+-    val audio: StateFlow<AudioFxState> = _audio.asStateFlow()
+-
+-    private val _picture = MutableStateFlow(PictureState())
+-    val picture: StateFlow<PictureState> = _picture.asStateFlow()
+-
+     private val _smartEnhance = MutableStateFlow(false)
+     val smartEnhance: StateFlow<Boolean> = _smartEnhance.asStateFlow()
+ 
+-    private val _bannerTick = MutableStateFlow(0)
+-    val bannerTick: StateFlow<Int> = _bannerTick.asStateFlow()
+-
+-    private val _autoEnhance = MutableStateFlow(false)
+-    val autoEnhance: StateFlow<Boolean> = _autoEnhance.asStateFlow()
+-
+-    private val _performance = MutableStateFlow(false)
+-    /** Performance mode: every picture and sound effect is held off, whatever else is chosen. */
+-    val performance: StateFlow<Boolean> = _performance.asStateFlow()
+-
+-    private val _rememberPerTitle = MutableStateFlow(true)
+-    val rememberPerTitle: StateFlow<Boolean> = _rememberPerTitle.asStateFlow()
+-
+     /** Read by the stream auto-play code, which runs before any player screen exists. */
+     @Volatile
+     var preferBestQuality: Boolean = false
+         private set
+ 
+-    private var currentTitle: String? = null
+-    private var enhanceUserSet = false
+-    private var titles: LinkedHashMap<String, String>? = null
+-
+     fun ensureLoaded(context: Context) {
+         if (preferences != null) return
+         synchronized(lock) {
+             if (preferences != null) return
+             val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+             preferences = prefs
+-            loadGlobal(prefs)
+-        }
+-    }
+-
+-    private fun loadGlobal(prefs: SharedPreferences) {
+-        _audio.value = AudioFxState.decode(prefs.getString(KEY_AUDIO, null))
+-        _picture.value = PictureState.decode(prefs.getString(KEY_PICTURE, null))
+-        _smartEnhance.value = prefs.getBoolean(KEY_SMART, false)
+-        _autoEnhance.value = prefs.getBoolean(KEY_AUTO, false)
+-        preferBestQuality = prefs.getBoolean(KEY_BEST, false)
+-        _rememberPerTitle.value = prefs.getBoolean(KEY_REMEMBER, true)
+-        _performance.value = prefs.getBoolean(KEY_PERFORMANCE, false)
+-    }
+-
+-    private fun saveGlobal() {
+-        preferences?.edit()
+-            ?.putString(KEY_AUDIO, _audio.value.encode())
+-            ?.putString(KEY_PICTURE, _picture.value.encode())
+-            ?.putBoolean(KEY_SMART, _smartEnhance.value)
+-            ?.putBoolean(KEY_AUTO, _autoEnhance.value)
+-            ?.putBoolean(KEY_BEST, preferBestQuality)
+-            ?.putBoolean(KEY_REMEMBER, _rememberPerTitle.value)
+-            ?.putBoolean(KEY_PERFORMANCE, _performance.value)
+-            ?.apply()
+-    }
+-
+-    fun setPicture(next: PictureState) {
+-        _picture.value = next
+-        saveGlobal()
+-        rememberTitle()
+-    }
+-
+-    fun setAudio(next: AudioFxState) {
+-        _audio.value = next
+-        saveGlobal()
+-        rememberTitle()
+-    }
+-
+-    fun toggleSmartEnhance() {
+-        val next = !_smartEnhance.value
+-        _smartEnhance.value = next
+-        if (next) _bannerTick.value = _bannerTick.value + 1
+-        enhanceUserSet = true
+-        saveGlobal()
+-        rememberTitle()
+-    }
+-
+-    fun setPerformance(enabled: Boolean) {
+-        _performance.value = enabled
+-        saveGlobal()
+-    }
+-
+-    fun setAutoEnhance(enabled: Boolean) {
+-        _autoEnhance.value = enabled
+-        saveGlobal()
+-    }
+-
+-    fun setPreferBestQuality(enabled: Boolean) {
+-        preferBestQuality = enabled
+-        saveGlobal()
+-    }
+-
+-    fun setRememberPerTitle(enabled: Boolean) {
+-        _rememberPerTitle.value = enabled
+-        saveGlobal()
+-        if (enabled) rememberTitle()
+-    }
+-
+-    /** Called when a title starts playing: restores what was last used on it, else the last global choice. */
+-    fun enterTitle(key: String?) {
+-        val prefs = preferences ?: return
+-        currentTitle = key?.takeIf { it.isNotBlank() }
+-        enhanceUserSet = false
+-        loadGlobal(prefs)
+-        val entry = currentTitle?.takeIf { _rememberPerTitle.value }?.let { titleEntries()[it] } ?: return
+-        val parts = entry.split("\t")
+-        _picture.value = PictureState.decode(parts.getOrNull(0))
+-        _audio.value = AudioFxState.decode(parts.getOrNull(1))
+-        _smartEnhance.value = parts.getOrNull(2) == "1"
+-    }
+-
+-    /** Switches Smart Enhance on for sources that look soft: under 720p, or under about 2 Mbps. */
+-    fun maybeAutoEnhance(heightPx: Int?, bitrate: Int?) {
+-        if (_performance.value || !_autoEnhance.value || enhanceUserSet || _smartEnhance.value) return
+-        val lowResolution = heightPx != null && heightPx in 1 until LOW_RESOLUTION_HEIGHT
+-        val lowBitrate = bitrate != null && bitrate in 1 until LOW_BITRATE
+-        if (lowResolution || lowBitrate) {
+-            _smartEnhance.value = true
+-            _bannerTick.value = _bannerTick.value + 1
+-        }
+-    }
+-
+-    private fun titleEntries(): LinkedHashMap<String, String> {
+-        titles?.let { return it }
+-        val map = LinkedHashMap<String, String>()
+-        preferences?.getString(KEY_TITLES, null)?.lineSequence()?.forEach { line ->
+-            val at = line.indexOf('\t')
+-            if (at > 0) map[line.substring(0, at)] = line.substring(at + 1)
++            _smartEnhance.value = prefs.getBoolean(KEY_SMART, false)
++            preferBestQuality = prefs.getBoolean(KEY_BEST, false)
+         }
+-        titles = map
+-        return map
+     }
+ 
+-    private fun rememberTitle() {
+-        val key = currentTitle ?: return
+-        if (!_rememberPerTitle.value) return
+-        val map = titleEntries()
+-        map.remove(key)
+-        map[key] = listOf(
+-            _picture.value.encode(),
+-            _audio.value.encode(),
+-            if (_smartEnhance.value) "1" else "0",
+-        ).joinToString("\t")
+-        while (map.size > MAX_TITLES) map.remove(map.keys.first())
+-        preferences?.edit()
+-            ?.putString(KEY_TITLES, map.entries.joinToString("\n") { "${it.key}\t${it.value}" })
+-            ?.apply()
++    fun setSmartEnhance(enabled: Boolean) {
++        _smartEnhance.value = enabled
++        preferences?.edit()?.putBoolean(KEY_SMART, enabled)?.apply()
+     }
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
+index 11e92ad13..72ce8df8a 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
+@@ -1,12 +1,8 @@
+ package com.nuvio.tv.ui.screens.player
+ 
+ import android.content.Context
+-import android.media.audiofx.BassBoost
+-import android.media.audiofx.Equalizer
+-import android.media.audiofx.Virtualizer
+ import android.opengl.GLES20
+ import android.util.Log
+-import androidx.media3.common.C
+ import androidx.media3.common.Effect
+ import androidx.media3.common.PlaybackException
+ import androidx.media3.common.Player
+@@ -20,193 +16,25 @@ import androidx.media3.effect.GlEffect
+ import androidx.media3.effect.GlShaderProgram
+ import androidx.media3.effect.Presentation
+ import androidx.media3.exoplayer.ExoPlayer
+-import androidx.compose.foundation.layout.Arrangement
+-import androidx.compose.foundation.layout.Box
+-import androidx.compose.foundation.layout.Column
+-import androidx.compose.foundation.layout.fillMaxSize
+-import androidx.compose.foundation.layout.padding
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.DisposableEffect
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
+-import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+-import androidx.compose.runtime.setValue
+-import androidx.compose.ui.Alignment
+-import androidx.compose.ui.Modifier
+-import androidx.compose.ui.focus.FocusRequester
+-import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.platform.LocalContext
+-import androidx.compose.ui.unit.dp
+-import androidx.compose.ui.zIndex
+ import androidx.lifecycle.compose.collectAsStateWithLifecycle
+-import androidx.tv.material3.MaterialTheme
+-import androidx.tv.material3.Text
+-import com.nuvio.tv.ui.theme.NuvioTheme
+-import kotlinx.coroutines.delay
+-import kotlin.math.abs
+-import kotlin.math.ln
+-import kotlin.math.roundToInt
+ 
+ private const val FX_TAG = "NuvioTvPlayerEffects"
+ 
+ /**
+- * Audio effect panel on ExoPlayer: Android's equaliser, bass boost and virtualizer on the player's audio session.
+- * Effects are created on first use and switched off again when the panel is back on Original, so they cost
+- * nothing for people who never open it.
++ * Smart Enhance on ExoPlayer: one small GL pass (a light brightness, contrast and saturation lift) on the decoded
++ * frames. It is the only picture effect left in the fork. While it is off nothing is added to the video pipeline.
++ * If the shader ever fails to run on a device, it is switched off for the session and playback carries on without it.
+  */
+-internal class ExoAudioEffects(private val player: ExoPlayer) : Player.Listener {
+-    private var state = AudioFxState()
+-    private var equalizer: Equalizer? = null
+-    private var bassBoost: BassBoost? = null
+-    private var virtualizer: Virtualizer? = null
+-    private var sessionId = C.AUDIO_SESSION_ID_UNSET
+-    private var failedSessionId = C.AUDIO_SESSION_ID_UNSET
+-    private var released = false
+-
+-    init {
+-        player.addListener(this)
+-    }
+-
+-    fun apply(next: AudioFxState) {
+-        state = next
+-        refresh()
+-    }
+-
+-    override fun onAudioSessionIdChanged(audioSessionId: Int) {
+-        refresh()
+-    }
+-
+-    private fun refresh() {
+-        if (released) return
+-        if (!state.isActive) {
+-            disableAll()
+-            return
+-        }
+-        val session = player.audioSessionId
+-        if (session == C.AUDIO_SESSION_ID_UNSET || session == failedSessionId) return
+-        if (session != sessionId) {
+-            releaseEffects()
+-            createEffects(session)
+-        }
+-        applyEqualizer()
+-        applyBassBoost()
+-        applyVirtualizer()
+-    }
+-
+-    private fun createEffects(session: Int) {
+-        equalizer = runCatching { Equalizer(0, session) }
+-            .onFailure { Log.w(FX_TAG, "Equalizer unavailable: ${it.message}") }
+-            .getOrNull()
+-        bassBoost = runCatching { BassBoost(0, session) }.getOrNull()
+-        virtualizer = runCatching { Virtualizer(0, session) }.getOrNull()
+-        if (equalizer == null && bassBoost == null && virtualizer == null) {
+-            failedSessionId = session
+-            return
+-        }
+-        sessionId = session
+-    }
+-
+-    private fun applyEqualizer() {
+-        val effect = equalizer ?: return
+-        runCatching {
+-            val range = effect.bandLevelRange
+-            val minLevel = range[0].toInt()
+-            val maxLevel = range[1].toInt()
+-            val gains = state.effectiveBandsDb()
+-            for (band in 0 until effect.numberOfBands.toInt()) {
+-                val centreHz = effect.getCenterFreq(band.toShort()) / 1000
+-                val target = nearestPanelBand(centreHz)
+-                val level = (gains[target] * 100f).roundToInt().coerceIn(minLevel, maxLevel)
+-                effect.setBandLevel(band.toShort(), level.toShort())
+-            }
+-            effect.setEnabled(true)
+-        }.onFailure { Log.w(FX_TAG, "Equalizer failed: ${it.message}") }
+-    }
+-
+-    private fun applyBassBoost() {
+-        val effect = bassBoost ?: return
+-        runCatching {
+-            val strength = state.bassBoostStrength
+-            if (strength > 0 && effect.strengthSupported) {
+-                effect.setStrength(strength.toShort())
+-                effect.setEnabled(true)
+-            } else {
+-                effect.setEnabled(false)
+-            }
+-        }
+-    }
+-
+-    private fun applyVirtualizer() {
+-        val effect = virtualizer ?: return
+-        runCatching {
+-            val strength = state.virtualizerStrength
+-            if (strength > 0 && effect.strengthSupported) {
+-                effect.setStrength(strength.toShort())
+-                effect.setEnabled(true)
+-            } else {
+-                effect.setEnabled(false)
+-            }
+-        }
+-    }
+-
+-    /** The panel band whose centre is closest, on a log scale, to the device band centre. */
+-    private fun nearestPanelBand(centreHz: Int): Int {
+-        val target = ln(centreHz.coerceAtLeast(1).toDouble())
+-        var best = 0
+-        var bestDistance = Double.MAX_VALUE
+-        EQ_BAND_FREQUENCIES_HZ.forEachIndexed { index, hz ->
+-            val distance = abs(ln(hz.toDouble()) - target)
+-            if (distance < bestDistance) {
+-                bestDistance = distance
+-                best = index
+-            }
+-        }
+-        return best
+-    }
+-
+-    private fun disableAll() {
+-        equalizer?.let { runCatching { it.setEnabled(false) } }
+-        bassBoost?.let { runCatching { it.setEnabled(false) } }
+-        virtualizer?.let { runCatching { it.setEnabled(false) } }
+-    }
+-
+-    private fun releaseEffects() {
+-        equalizer?.let { runCatching { it.release() } }
+-        bassBoost?.let { runCatching { it.release() } }
+-        virtualizer?.let { runCatching { it.release() } }
+-        equalizer = null
+-        bassBoost = null
+-        virtualizer = null
+-        sessionId = C.AUDIO_SESSION_ID_UNSET
+-    }
+-
+-    fun release() {
+-        released = true
+-        player.removeListener(this)
+-        releaseEffects()
+-    }
+-}
+-
+-/**
+- * Picture panel on ExoPlayer, as GL effects on the decoded frames: brightness, contrast and saturation use
+- * media3's own effects, and sharpen, denoise, debanding and gamma share one small shader. If the shader ever
+- * fails to run on a device, it is switched off for the session and playback carries on without it.
+- */
+-internal class ExoPictureEffects(
+-    private val player: ExoPlayer,
+-    private val autoEnhance: Boolean = true,
+-) : Player.Listener {
+-    private var state = PictureState()
++internal class ExoPictureEffects(private val player: ExoPlayer) : Player.Listener {
++    private var smartEnhance = false
+     private var shaderBroken = false
+-    private var dxBroken = false
+-    private var scaledDown = false
+     private var released = false
+-
+-    // The shader reads its strengths from this holder on every frame, so moving a slider or toggling Smart
+-    // Enhance only updates numbers. The effect chain is rebuilt (which restarts GL and drops frames) only when
+-    // its shape changes: the shader joins the chain, or the frame needs scaling down.
+-    private val params = PictureShaderParams()
+     private var chainFused = false
+     private var chainScaled = false
+     private var chainSet = false
+@@ -216,48 +44,22 @@ internal class ExoPictureEffects(
+     }
+ 
+     fun apply(next: PictureState) {
+-        state = next
++        smartEnhance = next.smartEnhance
+         push()
+     }
+ 
+     private fun push() {
+         if (released) return
+-        val current = state
+-        val performance = PlayerEffects.performance.value
+-        val dxKind = if (dxBroken || performance) DxEnhanceKind.NONE else DxEnhance.currentKind() // dx.bi picture enhance hook
+-        val brightness = (current.brightness / 100f + if (current.smartEnhance) 0.01f else 0f).coerceIn(-1f, 1f)
+-        val contrast = (current.contrast / 100f + if (current.smartEnhance) 0.05f else 0f).coerceIn(-1f, 1f)
+-        val saturation = (current.saturation.toFloat() + if (current.smartEnhance) 6f else 0f).coerceIn(-100f, 100f)
+-        val colourActive = abs(brightness) > 0.001f || abs(contrast) > 0.001f || abs(saturation) > 0.5f
+-        val wantFused = !shaderBroken && (current.usesShader || dxKind != DxEnhanceKind.NONE || colourActive)
+-        params.values = PictureShaderValues(
+-            sharpen = current.sharpen * 0.4f,
+-            denoise = current.denoise / 3f * 0.85f,
+-            deband = if (current.deband) 0.9f else 0f,
+-            gamma = 1f / (1f + current.gamma / 100f),
+-            brightness = brightness,
+-            contrast = contrast,
+-            saturation = saturation / 100f,
+-            thin = if (dxKind == DxEnhanceKind.ANIME) 0.55f else 0f,
+-            dxSharpen = when (dxKind) {
+-                DxEnhanceKind.ANIME -> 0.6f
+-                DxEnhanceKind.SHARPEN -> 0.45f
+-                else -> 0f
+-            },
+-        )
+-        // Once the shader is in the chain it stays, with neutral numbers, until the player is released:
+-        // taking it out again would be one more rebuild and one more burst of dropped frames.
+         // Tall 50/60 fps video (YouTube 1440p/4K) already strains the decoder: no extra GL pass on top of it.
+         val tooHeavy = player.videoSize.height > MAX_EFFECT_HEIGHT && (player.videoFormat?.frameRate ?: 0f) > 32f
+-        val fused = (wantFused || (chainFused && !shaderBroken)) && !tooHeavy && !performance
++        val fused = smartEnhance && !shaderBroken && !tooHeavy
+         val scaled = fused && player.videoSize.height > MAX_EFFECT_HEIGHT
+-        if (chainSet && fused == chainFused && scaled == chainScaled) return
++        if (fused == chainFused && scaled == chainScaled && (chainSet || !fused)) return
+         val effects = ArrayList<Effect>()
+         if (fused) {
+-            // Every GL effect is one full-frame pass, so the whole panel runs as a single shader. Above 1080p the
+-            // frame is scaled down first, which keeps the pass inside what a TV box GPU can do at 24 to 60 fps.
++            // Above 1080p the frame is scaled down first, which keeps the pass inside what a TV box GPU can do.
+             if (scaled) effects += Presentation.createForHeight(MAX_EFFECT_HEIGHT)
+-            effects += PictureShaderEffect(params)
++            effects += PictureShaderEffect()
+         }
+         chainSet = true
+         chainFused = fused
+@@ -267,23 +69,15 @@ internal class ExoPictureEffects(
+     }
+ 
+     override fun onVideoSizeChanged(videoSize: VideoSize) {
+-        if (autoEnhance) PlayerEffects.maybeAutoEnhance(videoSize.height, player.videoFormat?.bitrate)
+-        val tooBig = videoSize.height > MAX_EFFECT_HEIGHT
+-        if (tooBig != scaledDown) scaledDown = tooBig
+         push()
+     }
+ 
+     override fun onPlayerError(error: PlaybackException) {
+-        if (error.errorCode == PlaybackException.ERROR_CODE_VIDEO_FRAME_PROCESSING_FAILED && !dxBroken && DxEnhance.currentKind() != DxEnhanceKind.NONE) {
+-            Log.w(FX_TAG, "dx.bi enhance shader failed, turning it off", error) // dx.bi picture enhance hook
+-            dxBroken = true
+-            chainSet = false
+-            push()
+-            runCatching { player.prepare() }
+-        } else if (error.errorCode == PlaybackException.ERROR_CODE_VIDEO_FRAME_PROCESSING_FAILED && !shaderBroken) {
++        if (error.errorCode == PlaybackException.ERROR_CODE_VIDEO_FRAME_PROCESSING_FAILED && !shaderBroken) {
+             Log.w(FX_TAG, "Picture shader failed, turning it off", error)
+             shaderBroken = true
+             chainSet = false
++            chainFused = false
+             push()
+             runCatching { player.prepare() }
+         }
+@@ -295,38 +89,16 @@ internal class ExoPictureEffects(
+     }
+ }
+ 
+-/** One set of strengths for the picture shader. Strengths of 0 skip that step. */
+-internal data class PictureShaderValues(
+-    val sharpen: Float = 0f,
+-    val denoise: Float = 0f,
+-    val deband: Float = 0f,
+-    val gamma: Float = 1f,
+-    val brightness: Float = 0f,
+-    val contrast: Float = 0f,
+-    val saturation: Float = 0f,
+-    val thin: Float = 0f,
+-    val dxSharpen: Float = 0f,
+-)
+-
+-/** Shared between [ExoPictureEffects] (writes) and the GL thread (reads every frame). */
+-internal class PictureShaderParams {
+-    @Volatile
+-    var values: PictureShaderValues = PictureShaderValues()
+-}
+-
+-/** Sharpen, denoise, deband and gamma in one pass. The strengths come live from [params]. */
+-internal class PictureShaderEffect(private val params: PictureShaderParams) : GlEffect {
++/** Fixed Smart Enhance strengths: brightness +0.01, contrast +0.05, saturation +6 %. */
++internal class PictureShaderEffect : GlEffect {
+     override fun toGlShaderProgram(context: Context, useHdr: Boolean): GlShaderProgram =
+-        PictureShaderProgram(useHdr, params)
++        PictureShaderProgram(useHdr)
+ }
+ 
+-/** Tallest frame the fused picture shader runs on; taller video is scaled down to this first. */
++/** Tallest frame the Smart Enhance shader runs on; taller video is scaled down to this first. */
+ private const val MAX_EFFECT_HEIGHT = 1080
+ 
+-private class PictureShaderProgram(
+-    useHdr: Boolean,
+-    private val params: PictureShaderParams,
+-) : BaseGlShaderProgram(useHdr, 1) {
++private class PictureShaderProgram(useHdr: Boolean) : BaseGlShaderProgram(useHdr, 1) {
+     private val glProgram: GlProgram
+ 
+     init {
+@@ -343,7 +115,6 @@ private class PictureShaderProgram(
+     }
+ 
+     override fun configure(inputWidth: Int, inputHeight: Int): Size {
+-        glProgram.setFloatsUniform("uTexel", floatArrayOf(1f / inputWidth, 1f / inputHeight))
+         return Size(inputWidth, inputHeight)
+     }
+ 
+@@ -351,16 +122,9 @@ private class PictureShaderProgram(
+         try {
+             glProgram.use()
+             glProgram.setSamplerTexIdUniform("uTexSampler", inputTexId, 0)
+-            val v = params.values
+-            glProgram.setFloatUniform("uSharpen", v.sharpen)
+-            glProgram.setFloatUniform("uDenoise", v.denoise)
+-            glProgram.setFloatUniform("uDeband", v.deband)
+-            glProgram.setFloatUniform("uGamma", v.gamma)
+-            glProgram.setFloatUniform("uBrightness", v.brightness)
+-            glProgram.setFloatUniform("uContrast", v.contrast)
+-            glProgram.setFloatUniform("uSaturation", v.saturation)
+-            glProgram.setFloatUniform("uThin", v.thin)
+-            glProgram.setFloatUniform("uDxSharpen", v.dxSharpen)
++            glProgram.setFloatUniform("uBrightness", 0.01f)
++            glProgram.setFloatUniform("uContrast", 0.05f)
++            glProgram.setFloatUniform("uSaturation", 0.06f)
+             glProgram.bindAttributesAndUniforms()
+             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+         } catch (e: GlUtil.GlException) {
+@@ -394,92 +158,14 @@ precision highp float;
+ precision mediump float;
+ #endif
+ uniform sampler2D uTexSampler;
+-uniform vec2 uTexel;
+-uniform float uSharpen;
+-uniform float uDenoise;
+-uniform float uDeband;
+-uniform float uGamma;
+ uniform float uBrightness;
+ uniform float uContrast;
+ uniform float uSaturation;
+-uniform float uThin;
+-uniform float uDxSharpen;
+ varying vec2 vTexSamplingCoord;
+ 
+-float noise(vec2 p) {
+-  return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+-}
+-
+ void main() {
+-  vec2 uv = vTexSamplingCoord;
+-  vec4 src = texture2D(uTexSampler, uv);
+-  vec3 col = src.rgb;
+-  if (uDenoise > 0.0) {
+-    vec3 acc = col;
+-    float weightSum = 1.0;
+-    for (int i = -1; i <= 1; i++) {
+-      for (int j = -1; j <= 1; j++) {
+-        if (i == 0 && j == 0) {
+-          continue;
+-        }
+-        vec3 s = texture2D(uTexSampler, uv + vec2(float(i), float(j)) * uTexel).rgb;
+-        vec3 d = s - col;
+-        float w = exp(-dot(d, d) * 90.0);
+-        acc += s * w;
+-        weightSum += w;
+-      }
+-    }
+-    col = mix(col, acc / weightSum, uDenoise);
+-  }
+-  if (uDeband > 0.0) {
+-    vec3 acc = col;
+-    float n = 1.0;
+-    vec2 step = uTexel * 3.0;
+-    vec3 a = texture2D(uTexSampler, uv + vec2(step.x, 0.0)).rgb;
+-    vec3 b = texture2D(uTexSampler, uv - vec2(step.x, 0.0)).rgb;
+-    vec3 c = texture2D(uTexSampler, uv + vec2(0.0, step.y)).rgb;
+-    vec3 e = texture2D(uTexSampler, uv - vec2(0.0, step.y)).rgb;
+-    vec3 da = abs(a - col);
+-    vec3 db = abs(b - col);
+-    vec3 dc = abs(c - col);
+-    vec3 de = abs(e - col);
+-    if (max(da.r, max(da.g, da.b)) < 0.03) { acc += a; n += 1.0; }
+-    if (max(db.r, max(db.g, db.b)) < 0.03) { acc += b; n += 1.0; }
+-    if (max(dc.r, max(dc.g, dc.b)) < 0.03) { acc += c; n += 1.0; }
+-    if (max(de.r, max(de.g, de.b)) < 0.03) { acc += e; n += 1.0; }
+-    col = mix(col, acc / n, uDeband);
+-    col += (noise(uv * 1000.0) - 0.5) * (1.5 / 255.0) * uDeband;
+-  }
+-  if (uSharpen > 0.0) {
+-    vec3 blur = (
+-      texture2D(uTexSampler, uv + vec2(uTexel.x, 0.0)).rgb +
+-      texture2D(uTexSampler, uv - vec2(uTexel.x, 0.0)).rgb +
+-      texture2D(uTexSampler, uv + vec2(0.0, uTexel.y)).rgb +
+-      texture2D(uTexSampler, uv - vec2(0.0, uTexel.y)).rgb
+-    ) * 0.25;
+-    col += (col - blur) * uSharpen;
+-  }
+-  if (uThin > 0.0 || uDxSharpen > 0.0) {
+-    vec3 n = texture2D(uTexSampler, uv + vec2(0.0, uTexel.y)).rgb;
+-    vec3 s = texture2D(uTexSampler, uv - vec2(0.0, uTexel.y)).rgb;
+-    vec3 e = texture2D(uTexSampler, uv + vec2(uTexel.x, 0.0)).rgb;
+-    vec3 w = texture2D(uTexSampler, uv - vec2(uTexel.x, 0.0)).rgb;
+-    if (uThin > 0.0) {
+-      vec3 darkest = n;
+-      if (dot(s, vec3(0.299, 0.587, 0.114)) < dot(darkest, vec3(0.299, 0.587, 0.114))) { darkest = s; }
+-      if (dot(e, vec3(0.299, 0.587, 0.114)) < dot(darkest, vec3(0.299, 0.587, 0.114))) { darkest = e; }
+-      if (dot(w, vec3(0.299, 0.587, 0.114)) < dot(darkest, vec3(0.299, 0.587, 0.114))) { darkest = w; }
+-      float edge = smoothstep(0.04, 0.25, dot(col, vec3(0.299, 0.587, 0.114)) - dot(darkest, vec3(0.299, 0.587, 0.114)));
+-      col = mix(col, darkest, edge * uThin);
+-    }
+-    if (uDxSharpen > 0.0) {
+-      col += (col - (n + s + e + w) * 0.25) * uDxSharpen;
+-    }
+-  }
+-  if (uGamma != 1.0) {
+-    col = pow(max(col, vec3(0.0)), vec3(uGamma));
+-  }
+-  col += uBrightness;
++  vec4 src = texture2D(uTexSampler, vTexSamplingCoord);
++  vec3 col = src.rgb + uBrightness;
+   col = (col - 0.5) * max(1.0 + uContrast, 0.0) + 0.5;
+   float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
+   col = mix(vec3(lum), col, 1.0 + uSaturation);
+@@ -489,209 +175,26 @@ void main() {
+     }
+ }
+ 
+-
+-/** Centre banner shown for a moment each time Smart Enhance is turned on. */
+-@Composable
+-internal fun SmartEnhanceBanner(modifier: Modifier = Modifier) {
+-    val tick by PlayerEffects.bannerTick.collectAsStateWithLifecycle()
+-    var visible by remember { mutableStateOf(false) }
+-    LaunchedEffect(tick) {
+-        if (tick == 0) return@LaunchedEffect
+-        visible = true
+-        delay(2_200)
+-        visible = false
+-    }
+-    if (!visible) return
+-    Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+-        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+-            Text(
+-                text = "SMART ENHANCE",
+-                style = MaterialTheme.typography.headlineLarge,
+-                color = Color.White,
+-            )
+-            Text(
+-                text = "Immersive visual experience",
+-                style = MaterialTheme.typography.titleMedium,
+-                color = Color.White,
+-            )
+-        }
+-    }
+-}
+-
+ /**
+- * Applies the picture and sound effects to the active engine while the player screen is open, and shows the
+- * Smart Enhance banner. The panels themselves live in the audio overlay (see [PictureSoundBlock]).
++ * Applies Smart Enhance to the active engine while the player screen is open (off by default, set in Settings),
++ * and restores the remembered playback speed and volume.
+  */
+ @Composable
+ internal fun PlayerEffectsHost(
+     exoPlayer: ExoPlayer?,
+     mpvView: NuvioMpvSurfaceView?,
+-    contentId: String?,
+-    animeMeta: () -> Pair<List<String>, String?> = { emptyList<String>() to null },
+ ) {
+     val context = LocalContext.current
+     PlayerEffects.ensureLoaded(context)
+-    LaunchedEffect(contentId) { PlayerEffects.enterTitle(contentId) }
+-    val picture by PlayerEffects.picture.collectAsStateWithLifecycle()
+-    val audio by PlayerEffects.audio.collectAsStateWithLifecycle()
+     val smartEnhance by PlayerEffects.smartEnhance.collectAsStateWithLifecycle()
+-    val performance by PlayerEffects.performance.collectAsStateWithLifecycle()
+-    val exoAudio = remember(exoPlayer) { exoPlayer?.let { ExoAudioEffects(it) } }
+-    val exoPicture = remember(exoPlayer, contentId) {
+-        // YouTube starts on a small, low-bitrate size and climbs: that must not switch Smart Enhance on for good.
+-        exoPlayer?.let { ExoPictureEffects(it, autoEnhance = !com.nuvio.tv.youtube.YouTubeProgress.isYouTubeId(contentId)) }
+-    }
+-    DisposableEffect(exoAudio, exoPicture) {
+-        onDispose {
+-            exoAudio?.release()
+-            exoPicture?.release()
+-        }
+-    }
+-    DxEnhance.ensureLoaded(context) // dx.bi picture enhance hook
+-    LaunchedEffect(contentId) { // dx.bi picture enhance hook
+-        DxEnhance.setTitle(contentId)
+-        repeat(20) {
+-            val (genres, country) = animeMeta()
+-            DxEnhance.setAnimeMeta(genres, country)
+-            kotlinx.coroutines.delay(1500)
+-        }
++    val exoPicture = remember(exoPlayer) { exoPlayer?.let { ExoPictureEffects(it) } }
++    DisposableEffect(exoPicture) {
++        onDispose { exoPicture?.release() }
+     }
+-    val dxKind by DxEnhance.kind.collectAsStateWithLifecycle() // dx.bi picture enhance hook
+-    LaunchedEffect(exoPicture, mpvView, picture, smartEnhance, dxKind, performance) {
+-        val state = if (performance) PictureState() else picture.copy(smartEnhance = smartEnhance)
++    LaunchedEffect(exoPicture, mpvView, smartEnhance) {
++        val state = PictureState(smartEnhance = smartEnhance)
+         exoPicture?.apply(state)
+         mpvView?.applyPictureState(state)
+     }
+-    val dxSoundMode = DxSoundEffect(if (performance) null else exoPlayer) // dx.bi sound modes hook
+-    val dxSound = if (performance) DxSoundMode.NORMAL else dxSoundMode
+-    LaunchedEffect(exoAudio, mpvView, audio, dxSound, performance) {
+-        val soundState = if (performance) AudioFxState() else audio
+-        exoAudio?.apply(soundState)
+-        mpvView?.applyAudioFilter(DxSound.mergeMpvChain(soundState.mpvFilterChain(), dxSound)) // dx.bi sound modes hook
+-    }
+-    SmartEnhanceBanner(modifier = Modifier.zIndex(2.7f))
+     DxRememberHost() // dx.bi remember hook
+ }
+-
+-private val StepNames = listOf("Off", "Low", "Medium", "High")
+-
+-/** Sound mode, equalizer and picture choices as D-pad cards, shown under the audio tracks in the audio overlay. */
+-@Composable
+-internal fun PictureSoundBlock(rightFocusRequester: FocusRequester) {
+-    val audio by PlayerEffects.audio.collectAsStateWithLifecycle()
+-    val picture by PlayerEffects.picture.collectAsStateWithLifecycle()
+-    val smartEnhance by PlayerEffects.smartEnhance.collectAsStateWithLifecycle()
+-    val performance by PlayerEffects.performance.collectAsStateWithLifecycle()
+-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+-        BlockHeader("Performance")
+-        VideoQualityCard(
+-            label = if (performance) "Performance mode on: all picture and sound effects off" else "Performance mode off",
+-            isSelected = performance,
+-            onClick = { PlayerEffects.setPerformance(!performance) },
+-            rightFocusRequester = rightFocusRequester,
+-        )
+-        // Sound mode and the equalizer start folded: ~25 cards fewer in the list while it is on screen, which
+-        // keeps the GPU free for the filtered video behind it.
+-        var soundOpen by remember { mutableStateOf(false) }
+-        var eqOpen by remember { mutableStateOf(false) }
+-        BlockHeader("Sound mode")
+-        VideoQualityCard(
+-            label = if (soundOpen) "Hide sound modes" else "Show sound modes (${audio.preset.label})",
+-            isSelected = false,
+-            onClick = { soundOpen = !soundOpen },
+-            rightFocusRequester = rightFocusRequester,
+-        )
+-        if (soundOpen) {
+-            AudioPreset.values().forEach { preset ->
+-                VideoQualityCard(
+-                    label = preset.label,
+-                    isSelected = audio.preset == preset,
+-                    onClick = { PlayerEffects.setAudio(audio.copy(preset = preset)) },
+-                    rightFocusRequester = rightFocusRequester,
+-                )
+-            }
+-            DxSoundCards(rightFocusRequester) // dx.bi sound modes hook
+-        }
+-        BlockHeader("Equalizer")
+-        VideoQualityCard(
+-            label = if (audio.eqEnabled) "Equalizer on" else "Equalizer off",
+-            isSelected = audio.eqEnabled,
+-            onClick = { PlayerEffects.setAudio(audio.copy(eqEnabled = !audio.eqEnabled)) },
+-            rightFocusRequester = rightFocusRequester,
+-        )
+-        VideoQualityCard(
+-            label = if (eqOpen) "Hide equalizer presets and bands" else "Show equalizer presets and bands",
+-            isSelected = false,
+-            onClick = { eqOpen = !eqOpen },
+-            rightFocusRequester = rightFocusRequester,
+-        )
+-        if (eqOpen) {
+-            EqPreset.values().filter { it != EqPreset.CUSTOM }.forEach { preset ->
+-                VideoQualityCard(
+-                    label = preset.label,
+-                    isSelected = audio.eqEnabled && audio.eqPreset == preset,
+-                    onClick = { PlayerEffects.setAudio(audio.copy(eqEnabled = true, eqPreset = preset)) },
+-                    rightFocusRequester = rightFocusRequester,
+-                )
+-            }
+-            EQ_BAND_FREQUENCIES_HZ.forEachIndexed { index, hz ->
+-                val gain = audio.eqBands.getOrElse(index) { 0f }
+-                val label = if (hz >= 1000) "${hz / 1000f}".removeSuffix(".0") + " kHz" else "$hz Hz"
+-                VideoQualityCard(
+-                    label = "$label: ${if (gain > 0f) "+" else ""}${gain.roundToInt()} dB",
+-                    isSelected = audio.eqEnabled && audio.eqPreset == EqPreset.CUSTOM && gain != 0f,
+-                    onClick = {
+-                        val next = if (gain >= 6f) -6f else gain + 3f
+-                        val bands = audio.eqBands.toMutableList().also { it[index] = next }
+-                        PlayerEffects.setAudio(audio.copy(eqEnabled = true, eqPreset = EqPreset.CUSTOM, customBands = bands))
+-                    },
+-                    rightFocusRequester = rightFocusRequester,
+-                )
+-            }
+-        }
+-        DxEnhanceCards(rightFocusRequester) // dx.bi picture enhance hook
+-        BlockHeader("Picture")
+-        VideoQualityCard(
+-            label = "Smart Enhance",
+-            isSelected = smartEnhance,
+-            onClick = { PlayerEffects.toggleSmartEnhance() },
+-            rightFocusRequester = rightFocusRequester,
+-        )
+-        PicturePreset.values().filter { it != PicturePreset.CUSTOM }.forEach { preset ->
+-            VideoQualityCard(
+-                label = preset.label,
+-                isSelected = picture.preset == preset,
+-                onClick = { PlayerEffects.setPicture(picture.withPreset(preset)) },
+-                rightFocusRequester = rightFocusRequester,
+-            )
+-        }
+-        VideoQualityCard(
+-            label = "Sharpen: ${StepNames[picture.sharpen.coerceIn(0, 3)]}",
+-            isSelected = picture.sharpen > 0,
+-            onClick = { PlayerEffects.setPicture(picture.copy(preset = PicturePreset.CUSTOM, sharpen = (picture.sharpen + 1) % 4)) },
+-            rightFocusRequester = rightFocusRequester,
+-        )
+-        VideoQualityCard(
+-            label = "Denoise: ${StepNames[picture.denoise.coerceIn(0, 3)]}",
+-            isSelected = picture.denoise > 0,
+-            onClick = { PlayerEffects.setPicture(picture.copy(preset = PicturePreset.CUSTOM, denoise = (picture.denoise + 1) % 4)) },
+-            rightFocusRequester = rightFocusRequester,
+-        )
+-        VideoQualityCard(
+-            label = "Remove banding",
+-            isSelected = picture.deband,
+-            onClick = { PlayerEffects.setPicture(picture.copy(preset = PicturePreset.CUSTOM, deband = !picture.deband)) },
+-            rightFocusRequester = rightFocusRequester,
+-        )
+-    }
+-}
+-
+-@Composable
+-private fun BlockHeader(text: String) {
+-    Text(
+-        text = text,
+-        style = MaterialTheme.typography.titleLarge,
+-        color = Color.White,
+-        modifier = Modifier.padding(top = NuvioTheme.spacing.md, bottom = NuvioTheme.spacing.xs),
+-    )
+-}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+index 425f62a90..4fdae687a 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+@@ -2152,12 +2152,10 @@ fun PlayerScreen(
+ 
+         TvStallHint(isBuffering = uiState.isBuffering) // Nuvio fork: stall hint
+ 
+-        // Nuvio fork: picture and sound effects (Smart Enhance, equalizer, sound modes)
++        // Nuvio fork: Smart Enhance (Settings switch, off by default) and remembered speed/volume
+         PlayerEffectsHost(
+             exoPlayer = viewModel.exoPlayer,
+             mpvView = viewModel.controller.mpvView,
+-            contentId = viewModel.controller.contentId,
+-            animeMeta = { viewModel.controller.metaGenres to viewModel.controller.metaCountry },
+         )
+ 
+         // Nuvio fork: second subtitle language drawn at the top
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPictureSoundSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPictureSoundSettings.kt
+index 6608566de..622120315 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPictureSoundSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPictureSoundSettings.kt
+@@ -2,139 +2,24 @@ package com.nuvio.tv.ui.screens.settings
+ 
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.getValue
+-import androidx.compose.runtime.mutableStateOf
+-import androidx.compose.runtime.remember
+-import androidx.compose.runtime.setValue
+ import androidx.compose.ui.platform.LocalContext
+ import androidx.lifecycle.compose.collectAsStateWithLifecycle
+-import com.nuvio.tv.ui.screens.player.AudioPreset
+-import com.nuvio.tv.ui.screens.player.EqPreset
+-import com.nuvio.tv.ui.screens.player.PicturePreset
+ import com.nuvio.tv.ui.screens.player.PlayerEffects
+ 
+-private val StepNames = listOf("Off", "Low", "Medium", "High")
+-
+-private fun <T> List<T>.after(current: T): T = this[(indexOf(current) + 1).mod(size)]
+-
+ /**
+- * Nuvio fork: Picture & Sound defaults for the player. The same choices are in the audio overlay while a video
+- * plays; here they are set up front, together with the per-title memory and auto-enhance rules.
++ * Nuvio fork: the only picture or sound option left. Smart Enhance is off by default, which leaves the original
++ * Nuvio video pipeline untouched; it is set here and has no control in the player.
+  */
+ @Composable
+ internal fun PlaybackPictureSoundSection() {
+     PlayerEffects.ensureLoaded(LocalContext.current)
+-    val picture by PlayerEffects.picture.collectAsStateWithLifecycle()
+-    val audio by PlayerEffects.audio.collectAsStateWithLifecycle()
+     val smartEnhance by PlayerEffects.smartEnhance.collectAsStateWithLifecycle()
+-    val autoEnhance by PlayerEffects.autoEnhance.collectAsStateWithLifecycle()
+-    val performance by PlayerEffects.performance.collectAsStateWithLifecycle()
+-    val rememberTitle by PlayerEffects.rememberPerTitle.collectAsStateWithLifecycle()
+-    var preferBest by remember { mutableStateOf(PlayerEffects.preferBestQuality) }
+-
+-    SettingsSectionLabel(text = "Performance")
+-    SettingsToggleRow(
+-        title = "Performance mode",
+-        subtitle = "Turns off every picture and sound effect from the first frame, for smooth 4K and 60 fps on weak TVs.",
+-        checked = performance,
+-        onToggle = { PlayerEffects.setPerformance(!performance) },
+-    )
+ 
+     SettingsSectionLabel(text = "Picture")
+     SettingsToggleRow(
+         title = "Smart Enhance",
+-        subtitle = "A contrast and colour lift for a more immersive picture.",
++        subtitle = "A light contrast and colour lift. Applies to the next video you start.",
+         checked = smartEnhance,
+-        onToggle = { PlayerEffects.toggleSmartEnhance() },
+-    )
+-    SettingsToggleRow(
+-        title = "Auto Smart Enhance",
+-        subtitle = "Turns Smart Enhance on for sources under 720p or under 2 Mbps.",
+-        checked = autoEnhance,
+-        onToggle = { PlayerEffects.setAutoEnhance(!autoEnhance) },
+-    )
+-    val presets = PicturePreset.values().filter { it != PicturePreset.CUSTOM }
+-    SettingsActionRow(
+-        title = "Picture preset",
+-        subtitle = "Brightness, contrast and colour. Press to change.",
+-        value = picture.preset.label,
+-        onClick = { PlayerEffects.setPicture(picture.withPreset(presets.after(picture.preset.takeIf { it in presets } ?: presets.first()))) },
+-    )
+-    SettingsActionRow(
+-        title = "Sharpen",
+-        subtitle = "Crisper edges on soft video. ExoPlayer and libmpv.",
+-        value = StepNames[picture.sharpen.coerceIn(0, 3)],
+-        onClick = { PlayerEffects.setPicture(picture.copy(preset = PicturePreset.CUSTOM, sharpen = (picture.sharpen + 1) % 4)) },
+-    )
+-    SettingsActionRow(
+-        title = "Denoise",
+-        subtitle = "Smooths compression noise on low bitrate streams. ExoPlayer only.",
+-        value = StepNames[picture.denoise.coerceIn(0, 3)],
+-        onClick = { PlayerEffects.setPicture(picture.copy(preset = PicturePreset.CUSTOM, denoise = (picture.denoise + 1) % 4)) },
+-    )
+-    SettingsToggleRow(
+-        title = "Remove banding",
+-        subtitle = "Smooths colour steps in skies and dark scenes.",
+-        checked = picture.deband,
+-        onToggle = { PlayerEffects.setPicture(picture.copy(preset = PicturePreset.CUSTOM, deband = !picture.deband)) },
+-    )
+-    val tones = com.nuvio.tv.ui.screens.player.ToneMapping.values().toList()
+-    SettingsActionRow(
+-        title = "HDR tone mapping",
+-        subtitle = "How HDR video is squeezed onto a standard screen. libmpv engine only.",
+-        value = picture.toneMapping.label,
+-        onClick = { PlayerEffects.setPicture(picture.copy(toneMapping = tones.after(picture.toneMapping))) },
+-    )
+-    SettingsToggleRow(
+-        title = "Smooth motion",
+-        subtitle = "Frame interpolation. Can look like a soap opera. libmpv engine only.",
+-        checked = picture.interpolation,
+-        onToggle = { PlayerEffects.setPicture(picture.copy(interpolation = !picture.interpolation)) },
+-    )
+-
+-    com.nuvio.tv.ui.screens.player.DxEnhanceSettingsRows() // dx.bi picture enhance hook
+-
+-    SettingsSectionLabel(text = "Sound")
+-    val sounds = AudioPreset.values().toList()
+-    SettingsActionRow(
+-        title = "Sound mode",
+-        subtitle = "Dialogue lifts voices and levels loud scenes so speech stays clear.",
+-        value = audio.preset.label,
+-        onClick = { PlayerEffects.setAudio(audio.copy(preset = sounds.after(audio.preset))) },
+-    )
+-    SettingsToggleRow(
+-        title = "Equalizer",
+-        subtitle = "Five bands, 60 Hz to 14 kHz.",
+-        checked = audio.eqEnabled,
+-        onToggle = { PlayerEffects.setAudio(audio.copy(eqEnabled = !audio.eqEnabled)) },
+-    )
+-    val eqPresets = EqPreset.values().filter { it != EqPreset.CUSTOM }
+-    SettingsActionRow(
+-        title = "Equalizer preset",
+-        subtitle = "Starting curve for the equalizer. Press to change.",
+-        value = audio.eqPreset.label,
+-        onClick = {
+-            PlayerEffects.setAudio(
+-                audio.copy(eqPreset = eqPresets.after(audio.eqPreset.takeIf { it in eqPresets } ?: eqPresets.first())),
+-            )
+-        },
+-    )
+-
+-    com.nuvio.tv.ui.screens.player.DxSoundSettingsRows() // dx.bi sound modes hook
+-
+-    SettingsSectionLabel(text = "Behaviour")
+-    SettingsToggleRow(
+-        title = "Remember per title",
+-        subtitle = "Keeps the picture and sound choices for each title you watch.",
+-        checked = rememberTitle,
+-        onToggle = { PlayerEffects.setRememberPerTitle(!rememberTitle) },
+-    )
+-    SettingsToggleRow(
+-        title = "Prefer best picture",
+-        subtitle = "Auto-play picks the highest resolution and best codec first.",
+-        checked = preferBest,
+-        onToggle = {
+-            preferBest = !preferBest
+-            PlayerEffects.setPreferBestQuality(preferBest)
+-        },
++        onToggle = { PlayerEffects.setSmartEnhance(!smartEnhance) },
+     )
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
+index 01d1dce3a..7d6df1e2f 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
+@@ -105,15 +105,14 @@ fun TvChannelPreviewPlayer(
+         runCatching { view.applyLiveTvSubtitleStyle(style) }
+     }
+ 
+-    // Smart Enhance is always on for Live TV, like Custom Stretch: a light brightness, contrast and
+-    // saturation lift in the shared picture shader. The manual picture panel is not used here.
++    // Smart Enhance follows the Settings switch (off by default, so nothing is added to the pipeline).
+     // The shader is armed only after the channel has shown a first frame without it: a stream that
+     // never reaches the effects pipeline (weak GPU, odd format) then still plays instead of timing out.
+     var effectsArmed by remember(player) { mutableStateOf(false) }
+     DisposableEffect(player, effectsArmed) {
+         val activePlayer = player ?: return@DisposableEffect onDispose {}
+-        if (!effectsArmed) return@DisposableEffect onDispose {}
+-        val effects = ExoPictureEffects(activePlayer, autoEnhance = false)
++        if (!effectsArmed || !com.nuvio.tv.ui.screens.player.PlayerEffects.smartEnhance.value) return@DisposableEffect onDispose {}
++        val effects = ExoPictureEffects(activePlayer)
+         effects.apply(PictureState(smartEnhance = true))
+         onDispose {
+             effects.release()
