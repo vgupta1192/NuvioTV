@@ -1,0 +1,613 @@
+diff --git a/app/src/main/java/com/nuvio/tv/MainActivity.kt b/app/src/main/java/com/nuvio/tv/MainActivity.kt
+index 121ab495b..6e0205c05 100644
+--- a/app/src/main/java/com/nuvio/tv/MainActivity.kt
++++ b/app/src/main/java/com/nuvio/tv/MainActivity.kt
+@@ -308,6 +308,9 @@ open class MainActivity : ComponentActivity() {
+     @Inject
+     lateinit var profileManager: ProfileManager
+ 
++    @Inject
++    lateinit var forkCalendarPrefs: com.nuvio.tv.data.local.ForkCalendarPrefsStore
++
+     @Inject
+     lateinit var authManager: AuthManager
+ 
+@@ -1105,7 +1108,9 @@ open class MainActivity : ComponentActivity() {
+                     val strNavLibrary = stringResource(R.string.nav_library)
+                     val strNavGenres = stringResource(R.string.nav_genres)
+                     val strNavSettings = stringResource(R.string.nav_settings)
++                    val hiddenPages by forkCalendarPrefs.hiddenPages.collectAsState(initial = emptySet())
+                     val drawerItems = remember(
++                        hiddenPages,
+                         strNavHome,
+                         strNavDiscover,
+                         strNavTvChannels,
+@@ -1116,6 +1121,10 @@ open class MainActivity : ComponentActivity() {
+                         discoverLocation
+                     ) {
+                         buildList {
++                            // Nuvio fork: per-profile hidden pages (Home and Settings are never hidden)
++                            fun addPage(item: DrawerItem) {
++                                if (item.route == Screen.Settings.route || item.route !in hiddenPages) add(item)
++                            }
+                             add(
+                                 DrawerItem(
+                                     route = Screen.Home.route,
+@@ -1124,7 +1133,7 @@ open class MainActivity : ComponentActivity() {
+                                 )
+                             )
+                             if (discoverLocation == DiscoverLocation.IN_SIDEBAR) {
+-                                add(
++                                addPage(
+                                     DrawerItem(
+                                         route = Screen.Discover.route,
+                                         label = strNavDiscover,
+@@ -1132,7 +1141,7 @@ open class MainActivity : ComponentActivity() {
+                                     )
+                                 )
+                             }
+-                            add(
++                            addPage(
+                                 DrawerItem(
+                                     route = Screen.TvChannels.route,
+                                     label = strNavTvChannels,
+@@ -1140,35 +1149,35 @@ open class MainActivity : ComponentActivity() {
+                                     iconRes = R.raw.sidebar_tv_channels
+                                 )
+                             )
+-                            add(
++                            addPage(
+                                     DrawerItem(
+                                         route = Screen.Jellyfin.route,
+                                         label = strNavJellyfin,
+                                         iconRes = R.raw.sidebar_jellyfin
+                                     )
+                             )
+-                            add(
++                            addPage(
+                                 DrawerItem(
+                                     route = Screen.Search.route,
+                                     label = strNavSearch,
+                                     iconRes = R.raw.sidebar_search
+                                 )
+                             )
+-                            add(
++                            addPage(
+                                 DrawerItem(
+                                     route = Screen.Library.route,
+                                     label = strNavLibrary,
+                                     iconRes = R.raw.sidebar_library
+                                 )
+                             )
+-                            add(
++                            addPage(
+                                 DrawerItem(
+                                     route = Screen.YouTube.route,
+                                     label = "YouTube",
+                                     icon = Icons.Default.PlayCircle
+                                 )
+                             )
+-                            add(
++                            addPage(
+                                 DrawerItem(
+                                     route = Screen.Settings.route,
+                                     label = strNavSettings,
+diff --git a/app/src/main/java/com/nuvio/tv/core/sync/ProfileSettingsSyncService.kt b/app/src/main/java/com/nuvio/tv/core/sync/ProfileSettingsSyncService.kt
+index 3a2211446..ed24b112a 100644
+--- a/app/src/main/java/com/nuvio/tv/core/sync/ProfileSettingsSyncService.kt
++++ b/app/src/main/java/com/nuvio/tv/core/sync/ProfileSettingsSyncService.kt
+@@ -214,7 +214,10 @@ class ProfileSettingsSyncService @Inject constructor(
+         "trakt_settings",
+         "debrid_settings",
+         "animeskip_settings",
+-        "track_preference"
++        "track_preference",
++        // Nuvio fork: Live TV choices (sources, favourites, guide overrides) and per-profile calendar and page choices
++        "tv_channels_settings",
++        "fork_calendar_prefs"
+     )
+ 
+     @Volatile
+diff --git a/app/src/main/java/com/nuvio/tv/data/local/ForkCalendarPrefsStore.kt b/app/src/main/java/com/nuvio/tv/data/local/ForkCalendarPrefsStore.kt
+new file mode 100644
+index 000000000..baaec7738
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/local/ForkCalendarPrefsStore.kt
+@@ -0,0 +1,68 @@
++package com.nuvio.tv.data.local
++
++import androidx.datastore.preferences.core.booleanPreferencesKey
++import androidx.datastore.preferences.core.edit
++import androidx.datastore.preferences.core.stringSetPreferencesKey
++import com.nuvio.tv.core.profile.ProfileManager
++import kotlinx.coroutines.ExperimentalCoroutinesApi
++import kotlinx.coroutines.flow.Flow
++import kotlinx.coroutines.flow.distinctUntilChanged
++import kotlinx.coroutines.flow.flatMapLatest
++import kotlinx.coroutines.flow.map
++import javax.inject.Inject
++import javax.inject.Singleton
++
++/**
++ * Nuvio fork: per-profile choices for the library release calendar and the sidebar pages.
++ * Hidden calendar titles are stored as "type:id" keys, hidden pages as nav route strings.
++ * The "fork_calendar_prefs" feature is part of the profile settings sync.
++ */
++@OptIn(ExperimentalCoroutinesApi::class)
++@Singleton
++class ForkCalendarPrefsStore @Inject constructor(
++    private val factory: ProfileDataStoreFactory,
++    private val profileManager: ProfileManager
++) {
++    companion object {
++        const val FEATURE = "fork_calendar_prefs"
++        private val HIDDEN_TITLES = stringSetPreferencesKey("hidden_calendar_titles")
++        private val HIDDEN_PAGES = stringSetPreferencesKey("hidden_sidebar_pages")
++        private val CALENDAR_OFF = booleanPreferencesKey("library_calendar_off")
++    }
++
++    private fun store() = factory.get(profileManager.activeProfileId.value, FEATURE)
++
++    val hiddenTitles: Flow<Set<String>> = profileManager.activeProfileId.flatMapLatest { pid ->
++        factory.get(pid, FEATURE).data.map { it[HIDDEN_TITLES] ?: emptySet() }
++    }.distinctUntilChanged()
++
++    val hiddenPages: Flow<Set<String>> = profileManager.activeProfileId.flatMapLatest { pid ->
++        factory.get(pid, FEATURE).data.map { it[HIDDEN_PAGES] ?: emptySet() }
++    }.distinctUntilChanged()
++
++    val calendarEnabled: Flow<Boolean> = profileManager.activeProfileId.flatMapLatest { pid ->
++        factory.get(pid, FEATURE).data.map { !(it[CALENDAR_OFF] ?: false) }
++    }.distinctUntilChanged()
++
++    suspend fun setTitleHidden(key: String, hidden: Boolean) {
++        store().edit { prefs ->
++            val current = prefs[HIDDEN_TITLES] ?: emptySet()
++            prefs[HIDDEN_TITLES] = if (hidden) current + key else current - key
++        }
++    }
++
++    suspend fun clearHiddenTitles() {
++        store().edit { it.remove(HIDDEN_TITLES) }
++    }
++
++    suspend fun setPageHidden(route: String, hidden: Boolean) {
++        store().edit { prefs ->
++            val current = prefs[HIDDEN_PAGES] ?: emptySet()
++            prefs[HIDDEN_PAGES] = if (hidden) current + route else current - route
++        }
++    }
++
++    suspend fun setCalendarEnabled(enabled: Boolean) {
++        store().edit { it[CALENDAR_OFF] = !enabled }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryCalendarTv.kt b/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryCalendarTv.kt
+index 24d681503..99e7eed31 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryCalendarTv.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryCalendarTv.kt
+@@ -5,17 +5,22 @@ package com.nuvio.tv.ui.screens.library
+ import android.content.Context
+ import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.heightIn
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.lazy.LazyColumn
+ import androidx.compose.foundation.lazy.items
++import androidx.compose.foundation.lazy.rememberLazyListState
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.rememberCoroutineScope
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.focus.FocusRequester
+ import androidx.compose.ui.focus.focusRequester
+@@ -31,6 +36,7 @@ import com.nuvio.tv.core.network.NetworkResult
+ import com.nuvio.tv.domain.model.LibraryEntry
+ import com.nuvio.tv.domain.repository.MetaRepository
+ import com.nuvio.tv.ui.components.NuvioDialog
++import com.nuvio.tv.ui.screens.settings.ForkCalendarPrefsEntryPoint
+ import com.nuvio.tv.ui.theme.NuvioTheme
+ import dagger.hilt.EntryPoint
+ import dagger.hilt.InstallIn
+@@ -44,6 +50,8 @@ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.async
+ import kotlinx.coroutines.awaitAll
+ import kotlinx.coroutines.coroutineScope
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
+ import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.sync.Semaphore
+ import kotlinx.coroutines.sync.withPermit
+@@ -128,6 +136,13 @@ internal suspend fun loadLibraryCalendar(context: Context, items: List<LibraryEn
+ @Composable
+ internal fun LibraryCalendarButton(items: List<LibraryEntry>, onOpen: (LibraryEntry) -> Unit) {
+     var open by remember { mutableStateOf(false) }
++    // Per-profile page toggle: Settings > Advanced > Pages for this profile
++    val context = LocalContext.current
++    val calendarOn by remember {
++        EntryPointAccessors.fromApplication(context.applicationContext, ForkCalendarPrefsEntryPoint::class.java)
++            .forkCalendarPrefs().calendarEnabled
++    }.collectAsState(initial = true)
++    if (!calendarOn) return
+     Button(
+         onClick = { open = true },
+         colors = ButtonDefaults.colors(
+@@ -158,14 +173,46 @@ internal fun LibraryRandomPickButton(items: List<LibraryEntry>, onOpen: (Library
+     }
+ }
+ 
++private fun LibraryCalendarEvent.titleKey(): String = "${entry.type}:${entry.id}"
++
+ @Composable
+ private fun LibraryCalendarDialog(items: List<LibraryEntry>, onDismiss: () -> Unit, onOpen: (LibraryEntry) -> Unit) {
+     val context = LocalContext.current
+     var events by remember { mutableStateOf<List<LibraryCalendarEvent>?>(null) }
+     LaunchedEffect(items) { events = runCatching { loadLibraryCalendar(context, items) }.getOrDefault(emptyList()) }
++    // Per-profile hidden titles: Hide on a row drops that title, Show hidden brings them all back.
++    val store = remember {
++        EntryPointAccessors.fromApplication(context.applicationContext, ForkCalendarPrefsEntryPoint::class.java)
++            .forkCalendarPrefs()
++    }
++    val hidden by store.hiddenTitles.collectAsState(initial = emptySet())
++    val scope = rememberCoroutineScope()
++    val visible = remember(events, hidden) { events?.filter { it.titleKey() !in hidden } }
++    val hiddenCount = remember(events, hidden) { events?.map { it.titleKey() }?.distinct()?.count { it in hidden } ?: 0 }
+     val today = LocalDate.now()
+     val dayFormat = remember { DateTimeFormatter.ofPattern("EEE d MMM", Locale.getDefault()) }
+-    val firstFocus = remember { FocusRequester() }
++    val rowFocus = remember { FocusRequester() }
++    val restoreFocus = remember { FocusRequester() }
++    val listState = rememberLazyListState()
++    var focusTarget by remember { mutableStateOf(-1) }
++    var refocusTick by remember { mutableStateOf(0) }
++
++    // Focus stays on a row: the first upcoming one on open, the next one after a Hide.
++    LaunchedEffect(visible == null, refocusTick, visible?.size) {
++        val list = visible ?: return@LaunchedEffect
++        if (list.isEmpty()) {
++            if (refocusTick > 0) {
++                delay(80)
++                runCatching { restoreFocus.requestFocus() }
++            }
++            return@LaunchedEffect
++        }
++        val target = if (focusTarget >= 0) focusTarget.coerceIn(0, list.size - 1)
++        else list.indexOfFirst { it.date >= today }.coerceAtLeast(0)
++        runCatching { listState.scrollToItem(target) }
++        delay(80)
++        runCatching { rowFocus.requestFocus() }
++    }
+ 
+     NuvioDialog(
+         onDismiss = onDismiss,
+@@ -174,50 +221,92 @@ private fun LibraryCalendarDialog(items: List<LibraryEntry>, onDismiss: () -> Un
+         width = 900.dp,
+         usePlatformDefaultWidth = false,
+     ) {
+-        val list = events
++        val list = visible
+         when {
+             list == null -> Text("Loading saved releases…", color = NuvioTheme.colors.TextSecondary)
+-            list.isEmpty() -> Text("No release dates found for your saved titles.", color = NuvioTheme.colors.TextSecondary)
++            list.isEmpty() && hiddenCount == 0 -> Text("No release dates found for your saved titles.", color = NuvioTheme.colors.TextSecondary)
+             else -> {
+-                val firstUpcoming = list.indexOfFirst { it.date >= today }.coerceAtLeast(0)
+-                LaunchedEffect(list) { runCatching { firstFocus.requestFocus() } }
+-                LazyColumn(
+-                    modifier = Modifier.fillMaxWidth().heightIn(max = 520.dp),
+-                    verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.sm),
+-                ) {
+-                    items(list.size) { index ->
+-                        val event = list[index]
+-                        val day = when (event.date) {
+-                            today -> "Today"
+-                            today.plusDays(1) -> "Tomorrow"
+-                            today.minusDays(1) -> "Yesterday"
+-                            else -> event.date.format(dayFormat)
+-                        }
+-                        Card(
+-                            onClick = { onOpen(event.entry) },
+-                            modifier = Modifier
+-                                .fillMaxWidth()
+-                                .then(if (index == firstUpcoming) Modifier.focusRequester(firstFocus) else Modifier),
+-                            colors = CardDefaults.colors(
+-                                containerColor = NuvioTheme.colors.BackgroundElevated,
+-                                focusedContainerColor = NuvioTheme.colors.BackgroundCard
+-                            ),
+-                            scale = CardDefaults.scale(focusedScale = 1.02f)
++                val rowTarget = if (focusTarget >= 0) focusTarget.coerceIn(0, (list.size - 1).coerceAtLeast(0))
++                else list.indexOfFirst { it.date >= today }.coerceAtLeast(0)
++                Column(verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.sm)) {
++                    if (list.isEmpty()) {
++                        Text("All titles are hidden.", color = NuvioTheme.colors.TextSecondary)
++                    } else {
++                        LazyColumn(
++                            state = listState,
++                            modifier = Modifier.fillMaxWidth().heightIn(max = 480.dp),
++                            verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.sm),
+                         ) {
+-                            Column(modifier = Modifier.padding(horizontal = NuvioTheme.spacing.lg, vertical = NuvioTheme.spacing.md)) {
+-                                Text(
+-                                    text = "$day · ${event.entry.name}",
+-                                    style = MaterialTheme.typography.titleSmall,
+-                                    color = if (event.date >= today) NuvioTheme.colors.TextPrimary else NuvioTheme.colors.TextSecondary,
+-                                )
+-                                Text(
+-                                    text = (if (event.date > today) "Coming soon · " else "Available · ") + event.label,
+-                                    style = MaterialTheme.typography.bodySmall,
+-                                    color = NuvioTheme.colors.TextSecondary,
+-                                )
++                            items(list.size, key = { "${list[it].titleKey()}|${list[it].date}|$it" }) { index ->
++                                val event = list[index]
++                                val day = when (event.date) {
++                                    today -> "Today"
++                                    today.plusDays(1) -> "Tomorrow"
++                                    today.minusDays(1) -> "Yesterday"
++                                    else -> event.date.format(dayFormat)
++                                }
++                                Row(
++                                    modifier = Modifier.fillMaxWidth(),
++                                    horizontalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.sm),
++                                    verticalAlignment = Alignment.CenterVertically,
++                                ) {
++                                    Card(
++                                        onClick = { onOpen(event.entry) },
++                                        modifier = Modifier
++                                            .weight(1f)
++                                            .then(if (index == rowTarget) Modifier.focusRequester(rowFocus) else Modifier),
++                                        colors = CardDefaults.colors(
++                                            containerColor = NuvioTheme.colors.BackgroundElevated,
++                                            focusedContainerColor = NuvioTheme.colors.BackgroundCard
++                                        ),
++                                        scale = CardDefaults.scale(focusedScale = 1.02f)
++                                    ) {
++                                        Column(modifier = Modifier.padding(horizontal = NuvioTheme.spacing.lg, vertical = NuvioTheme.spacing.md)) {
++                                            Text(
++                                                text = "$day · ${event.entry.name}",
++                                                style = MaterialTheme.typography.titleSmall,
++                                                color = if (event.date >= today) NuvioTheme.colors.TextPrimary else NuvioTheme.colors.TextSecondary,
++                                            )
++                                            Text(
++                                                text = (if (event.date > today) "Coming soon · " else "Available · ") + event.label,
++                                                style = MaterialTheme.typography.bodySmall,
++                                                color = NuvioTheme.colors.TextSecondary,
++                                            )
++                                        }
++                                    }
++                                    Button(
++                                        onClick = {
++                                            focusTarget = index
++                                            refocusTick++
++                                            scope.launch { store.setTitleHidden(event.titleKey(), true) }
++                                        },
++                                        colors = ButtonDefaults.colors(
++                                            containerColor = NuvioTheme.colors.BackgroundCard,
++                                            contentColor = NuvioTheme.colors.TextPrimary
++                                        )
++                                    ) {
++                                        Text("Hide")
++                                    }
++                                }
+                             }
+                         }
+                     }
++                    if (hiddenCount > 0) {
++                        Button(
++                            onClick = {
++                                focusTarget = -1
++                                refocusTick++
++                                scope.launch { store.clearHiddenTitles() }
++                            },
++                            modifier = Modifier.focusRequester(restoreFocus),
++                            colors = ButtonDefaults.colors(
++                                containerColor = NuvioTheme.colors.BackgroundCard,
++                                contentColor = NuvioTheme.colors.TextPrimary
++                            )
++                        ) {
++                            Text("Show hidden ($hiddenCount)")
++                        }
++                    }
+                 }
+             }
+         }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkPagesSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkPagesSettings.kt
+new file mode 100644
+index 000000000..3317557e0
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkPagesSettings.kt
+@@ -0,0 +1,65 @@
++package com.nuvio.tv.ui.screens.settings
++
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalContext
++import com.nuvio.tv.data.local.ForkCalendarPrefsStore
++import com.nuvio.tv.ui.navigation.Screen
++import dagger.hilt.EntryPoint
++import dagger.hilt.InstallIn
++import dagger.hilt.android.EntryPointAccessors
++import dagger.hilt.components.SingletonComponent
++import kotlinx.coroutines.launch
++
++@EntryPoint
++@InstallIn(SingletonComponent::class)
++internal interface ForkCalendarPrefsEntryPoint {
++    fun forkCalendarPrefs(): ForkCalendarPrefsStore
++}
++
++/**
++ * Nuvio fork: per-profile page toggles. Hides sidebar pages (Home and Settings always stay)
++ * and the library Calendar button for the active profile only.
++ */
++@Composable
++internal fun ForkPagesSettingsGroup(modifier: Modifier = Modifier) {
++    val context = LocalContext.current
++    val store = EntryPointAccessors
++        .fromApplication(context.applicationContext, ForkCalendarPrefsEntryPoint::class.java)
++        .forkCalendarPrefs()
++    val hidden by store.hiddenPages.collectAsState(initial = emptySet())
++    val calendarOn by store.calendarEnabled.collectAsState(initial = true)
++    val scope = rememberCoroutineScope()
++    val pages = listOf(
++        Screen.TvChannels.route to "Live TV",
++        Screen.Jellyfin.route to "Jellyfin",
++        Screen.Search.route to "Search",
++        Screen.Library.route to "Library",
++        Screen.YouTube.route to "YouTube",
++        Screen.Discover.route to "Discover"
++    )
++    SettingsGroupCard(
++        modifier = modifier.fillMaxWidth(),
++        title = "Pages for this profile",
++        subtitle = "Choose which pages show in the sidebar. Home and Settings always stay."
++    ) {
++        pages.forEach { (route, label) ->
++            SettingsToggleRow(
++                title = label,
++                subtitle = null,
++                checked = route !in hidden,
++                onToggle = { scope.launch { store.setPageHidden(route, route !in hidden) } }
++            )
++        }
++        SettingsToggleRow(
++            title = "Library calendar button",
++            subtitle = "Show the Calendar button on the saved library.",
++            checked = calendarOn,
++            onToggle = { scope.launch { store.setCalendarEnabled(!calendarOn) } }
++        )
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
+index a9f4d7e0e..50d47fe04 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
+@@ -434,6 +434,10 @@ fun AdvancedSettingsContent(
+             }
+         }
+ 
++        item(key = "fork_pages_settings") {
++            ForkPagesSettingsGroup()
++        }
++
+         item(key = "performance_settings") {
+             SettingsGroupCard(
+                 modifier = Modifier.fillMaxWidth(),
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvSportsHubDialog.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvSportsHubDialog.kt
+index ddb265432..7c9309455 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvSportsHubDialog.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvSportsHubDialog.kt
+@@ -10,10 +10,14 @@ import androidx.compose.foundation.lazy.items
+ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.produceState
+ import androidx.compose.runtime.remember
+ import androidx.compose.ui.focus.FocusRequester
+ import androidx.compose.ui.focus.focusRequester
++import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.delay
++import kotlinx.coroutines.withContext
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.graphics.Color
+@@ -56,7 +60,12 @@ fun TvSportsHubDialog(
+     onDismiss: () -> Unit
+ ) {
+     if (!visible) return
+-    val rows = remember(channels) { buildRows(channels) }
++    val built by produceState<List<HubRow>?>(initialValue = SportsHubCache.peek(channels), channels) {
++        value = SportsHubCache.peek(channels) ?: withContext(Dispatchers.Default) {
++            buildRows(channels).also { SportsHubCache.store(channels, it) }
++        }
++    }
++    val rows = built ?: emptyList()
+     val firstFocus = remember { FocusRequester() }
+     val firstEventKey = rows.firstOrNull { it is HubRow.Event }?.let { (it as HubRow.Event).channel.id }
+     LaunchedEffect(firstEventKey) {
+@@ -73,7 +82,14 @@ fun TvSportsHubDialog(
+         subtitle = stringResource(R.string.sports_hub_subtitle),
+         width = 700.dp
+     ) {
+-        if (rows.isEmpty()) {
++        if (built == null) {
++            Text(
++                text = "…",
++                style = MaterialTheme.typography.bodyMedium,
++                color = Color.White.copy(alpha = 0.5f),
++                modifier = Modifier.padding(vertical = 24.dp)
++            )
++        } else if (rows.isEmpty()) {
+             Text(
+                 text = stringResource(R.string.sports_hub_empty),
+                 style = MaterialTheme.typography.bodyMedium,
+@@ -162,17 +178,51 @@ private fun SportsHubButton(label: String, onClick: () -> Unit, modifier: Modifi
+     }
+ }
+ 
++/**
++ * One pass over the guide: drops channels without a kickoff time and repeats, and drops each
++ * remaining event into its Live / Today / Later bucket. Runs off the main thread; the result is
++ * kept for the same channel list so reopening the hub does not walk the guide again.
++ */
++private object SportsHubCache {
++    private var source: List<TvChannelItem>? = null
++    private var builtAtMs: Long = 0L
++    private var rows: List<HubRow> = emptyList()
++
++    @Synchronized
++    fun peek(channels: List<TvChannelItem>): List<HubRow>? =
++        if (source === channels && System.currentTimeMillis() - builtAtMs < CACHE_MS) rows else null
++
++    @Synchronized
++    fun store(channels: List<TvChannelItem>, built: List<HubRow>) {
++        source = channels
++        builtAtMs = System.currentTimeMillis()
++        rows = built
++    }
++}
++
++private const val CACHE_MS = 60_000L
++
+ private fun buildRows(channels: List<TvChannelItem>): List<HubRow> {
+     val now = System.currentTimeMillis()
+     val endOfToday = Calendar.getInstance().apply {
+         set(Calendar.HOUR_OF_DAY, 23); set(Calendar.MINUTE, 59); set(Calendar.SECOND, 59); set(Calendar.MILLISECOND, 999)
+     }.timeInMillis
+-    val timed = channels.filter { it.startEpochMs != null }
+-        .distinctBy { it.type + ":" + it.id }
+-        .sortedBy { it.startEpochMs }
+-    val live = timed.filter { val s = it.startEpochMs!!; s <= now && now - s <= LIVE_WINDOW_MS }
+-    val today = timed.filter { val s = it.startEpochMs!!; s > now && s <= endOfToday }
+-    val later = timed.filter { it.startEpochMs!! > endOfToday }
++    val seen = HashSet<String>()
++    val live = ArrayList<TvChannelItem>()
++    val today = ArrayList<TvChannelItem>()
++    val later = ArrayList<TvChannelItem>()
++    for (channel in channels) {
++        val start = channel.startEpochMs ?: continue
++        if (!seen.add(channel.type + ":" + channel.id)) continue
++        when {
++            start <= now -> if (now - start <= LIVE_WINDOW_MS) live.add(channel)
++            start <= endOfToday -> today.add(channel)
++            else -> later.add(channel)
++        }
++    }
++    live.sortBy { it.startEpochMs }
++    today.sortBy { it.startEpochMs }
++    later.sortBy { it.startEpochMs }
+     return buildList {
+         if (live.isNotEmpty()) { add(HubRow.Header(R.string.sports_hub_live)); live.forEach { add(HubRow.Event(it, true)) } }
+         if (today.isNotEmpty()) { add(HubRow.Header(R.string.sports_hub_today)); today.forEach { add(HubRow.Event(it, false)) } }
