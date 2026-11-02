@@ -1,0 +1,206 @@
+diff --git a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
+index f4674a056..bc4d2ebf8 100644
+--- a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
++++ b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
+@@ -51,6 +51,7 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+     @Inject lateinit var simklAnimeIdPreferenceHolder: SimklAnimeIdPreferenceHolder
+     @Inject lateinit var serverUserStateProjection: ServerUserStateProjection
+     @Inject lateinit var releaseReminderCoordinator: com.nuvio.tv.core.reminders.ReleaseReminderCoordinator
++    @Inject lateinit var trailerPlayerPoolForTrim: dagger.Lazy<com.nuvio.tv.core.player.TrailerPlayerPool>
+     @Inject lateinit var addonRepositoryForDns: com.nuvio.tv.domain.repository.AddonRepository
+ 
+     companion object {
+@@ -91,8 +92,14 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+             when {
+                 level >= TRIM_MEMORY_COMPLETE -> cache.clear()
+                 level >= TRIM_MEMORY_RUNNING_LOW -> cache.trimToSize(cache.maxSize / 2)
++                level >= TRIM_MEMORY_RUNNING_MODERATE -> cache.trimToSize(cache.maxSize * 3 / 4)
+             }
+         }
++        // Idle trailer player and finished stream searches go first; playback keeps its own memory.
++        if (level >= TRIM_MEMORY_RUNNING_LOW) {
++            runCatching { trailerPlayerPoolForTrim.get().trimIdle() }
++        }
++        com.nuvio.tv.data.repository.ForkMemoryTrim.dispatch(level)
+     }
+ 
+     override fun onCreate() {
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/TrailerPlayerPool.kt b/app/src/main/java/com/nuvio/tv/core/player/TrailerPlayerPool.kt
+index b456d2b6c..84cead69c 100644
+--- a/app/src/main/java/com/nuvio/tv/core/player/TrailerPlayerPool.kt
++++ b/app/src/main/java/com/nuvio/tv/core/player/TrailerPlayerPool.kt
+@@ -154,6 +154,21 @@ class TrailerPlayerPool @Inject constructor(
+         }
+     }
+ 
++    /**
++     * Nuvio fork: frees the idle trailer player under memory pressure. Unlike [yield] the pool stays
++     * usable: [acquire] builds a fresh player on the next trailer. Does nothing while a trailer plays.
++     */
++    fun trimIdle() {
++        if (released.get() || _isTrailerPlaying.value) return
++        _player?.let { player ->
++            runCatching { player.stop() }
++            runCatching { player.clearMediaItems() }
++            runCatching { player.release() }
++        }
++        _player = null
++        appliedMaxHeight = null
++    }
++
+     /**
+      * Re-creates the player after a [yield]. Safe to call multiple times.
+      */
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/ForkMemoryTrim.kt b/app/src/main/java/com/nuvio/tv/data/repository/ForkMemoryTrim.kt
+new file mode 100644
+index 000000000..49bf882b7
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/repository/ForkMemoryTrim.kt
+@@ -0,0 +1,20 @@
++package com.nuvio.tv.data.repository
++
++import java.util.concurrent.CopyOnWriteArrayList
++
++/**
++ * Nuvio fork: lets in-memory caches shed entries when Android reports memory pressure.
++ * Caches register once; NuvioApplication.onTrimMemory and low-RAM prewarm call [dispatch].
++ */
++object ForkMemoryTrim {
++    private val listeners = CopyOnWriteArrayList<(Int) -> Unit>()
++
++    fun register(listener: (Int) -> Unit) {
++        listeners.add(listener)
++    }
++
++    /** [level] uses the ComponentCallbacks2 TRIM_MEMORY_* values. */
++    fun dispatch(level: Int) {
++        listeners.forEach { runCatching { it(level) } }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
+index 53c147052..7dfca3636 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
+@@ -61,7 +61,27 @@ object ForkTvLowRam {
+     /** Poster decode size factor: smaller bitmaps in low-RAM mode. */
+     const val DECODE_SCALE = 0.75f
+ 
+-    fun active(context: Context): Boolean = ForkTvPreferences.lowRamMode.current(context)
++    /** Cap for the player back buffer in low-RAM mode (custom buffer engine only). */
++    const val BACK_BUFFER_CAP_MS = 20_000
++
++    /** Completed stream searches kept in low-RAM mode. */
++    const val STREAM_SESSIONS_KEPT = 3
++
++    @Volatile
++    private var lowRamDevice: Boolean? = null
++
++    /** On when the user turned it on, or when Android reports a low-RAM device. */
++    fun active(context: Context): Boolean {
++        if (ForkTvPreferences.lowRamMode.current(context)) return true
++        val cached = lowRamDevice
++        if (cached != null) return cached
++        val detected = runCatching {
++            (context.applicationContext.getSystemService(Context.ACTIVITY_SERVICE) as? android.app.ActivityManager)
++                ?.isLowRamDevice == true
++        }.getOrDefault(false)
++        lowRamDevice = detected
++        return detected
++    }
+ 
+     fun decodeScale(context: Context): Float = if (active(context)) DECODE_SCALE else 1f
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/StreamRepositoryImpl.kt b/app/src/main/java/com/nuvio/tv/data/repository/StreamRepositoryImpl.kt
+index 27937af85..62d7b2424 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/StreamRepositoryImpl.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/StreamRepositoryImpl.kt
+@@ -62,6 +62,17 @@ class StreamRepositoryImpl @Inject constructor(
+     private val serverStreams: ServerStreams
+ ) : StreamRepository {
+     private val streamSearchSessions = StreamSearchSessionCache()
++
++    init {
++        // Nuvio fork: finished stream searches are dropped under memory pressure.
++        ForkMemoryTrim.register { level ->
++            when {
++                level >= android.content.ComponentCallbacks2.TRIM_MEMORY_COMPLETE -> streamSearchSessions.trimCompleted(0)
++                level >= android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW -> streamSearchSessions.trimCompleted(ForkTvLowRam.STREAM_SESSIONS_KEPT)
++                level >= android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_MODERATE -> streamSearchSessions.trimCompleted(6)
++            }
++        }
++    }
+     private val localPluginSearchPaused = MutableStateFlow(false)
+ 
+     override fun setLocalPluginSearchPaused(paused: Boolean) {
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/StreamSearchSessionCache.kt b/app/src/main/java/com/nuvio/tv/data/repository/StreamSearchSessionCache.kt
+index 947bec357..9cc4aab10 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/StreamSearchSessionCache.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/StreamSearchSessionCache.kt
+@@ -179,6 +179,21 @@ internal class StreamSearchSessionCache(
+         }
+     }
+ 
++    /** Drops the oldest finished searches until at most [keep] sessions remain. Running searches stay. */
++    fun trimCompleted(keep: Int) {
++        scope.launch {
++            mutex.withLock {
++                val iterator = sessions.entries.iterator()
++                while (sessions.size > keep && iterator.hasNext()) {
++                    val session = iterator.next().value
++                    if (session.completedAtMs == null) continue
++                    iterator.remove()
++                    session.cancelAndComplete()
++                }
++            }
++        }
++    }
++
+     private fun removeObsoleteSessionsLocked(requestedKey: StreamSearchRequestKey) {
+         val iterator = sessions.entries.iterator()
+         while (iterator.hasNext()) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/ForkStreamPrewarm.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/ForkStreamPrewarm.kt
+index 96d305b65..f5c8cff25 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/ForkStreamPrewarm.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/ForkStreamPrewarm.kt
+@@ -37,6 +37,10 @@ internal object ForkStreamPrewarm {
+ 
+     @Synchronized
+     fun start(context: Context, target: ForkPrewarmTarget) {
++        if (com.nuvio.tv.data.repository.ForkTvLowRam.active(context)) {
++            // Low-RAM mode keeps only a few finished searches.
++            com.nuvio.tv.data.repository.ForkMemoryTrim.dispatch(android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW)
++        }
+         if (target == last && job?.isActive == true) return
+         job?.cancel()
+         last = target
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+index 384897979..1fd1edae2 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+@@ -544,7 +544,11 @@ internal fun PlayerRuntimeController.initializePlayer(
+                 val budgetBytes = budgetMbEffective.toLong() * 1024L * 1024L
+                 // Build with the user's back buffer so seek-back works immediately, except on a heap
+                 // bound device, where the load control would hold it for the whole session.
+-                configuredBackBufferMs = bufferSettings.backBufferDurationMs
++                configuredBackBufferMs = if (com.nuvio.tv.data.repository.ForkTvLowRam.active(context)) {
++                    bufferSettings.backBufferDurationMs.coerceAtMost(com.nuvio.tv.data.repository.ForkTvLowRam.BACK_BUFFER_CAP_MS)
++                } else {
++                    bufferSettings.backBufferDurationMs
++                }
+                 val backBufferMsAtBuild = if (libdoviConversionActive && MemoryBudget.isLowRamTier) {
+                     0
+                 } else {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerMetadata.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerMetadata.kt
+index 410dfa3cd..b7e72ae4e 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerMetadata.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerMetadata.kt
+@@ -401,7 +401,8 @@ internal fun PlayerRuntimeController.evaluatePostPlayOverlayVisibility(positionM
+         val shouldPreloadByEnd = effectiveDuration > 0L &&
+             (effectiveDuration - positionMs) <= preloadLeadMs
+         // Nuvio fork: start the source search early (80% of the episode), not only near the end.
+-        val shouldPreloadEarly = effectiveDuration > 10 * 60_000L &&
++        val shouldPreloadEarly = !com.nuvio.tv.data.repository.ForkTvLowRam.active(context) &&
++            effectiveDuration > 10 * 60_000L &&
+             positionMs * 100L >= effectiveDuration * 80L
+         if (shouldPreloadByCard || shouldPreloadByEnd || shouldPreloadEarly) {
+             preloadNextEpisodeSources()
