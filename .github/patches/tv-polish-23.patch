@@ -1,0 +1,620 @@
+diff --git a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
+index 170c431d0..c9b07a5d1 100644
+--- a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
++++ b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
+@@ -178,8 +178,12 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+                     totalRamMb <= 3072 -> 0.20
+                     else -> 0.25
+                 }
++                val lowRamMode = com.nuvio.tv.data.repository.ForkTvLowRam.active(this@NuvioApplication)
+                 MemoryCache.Builder()
+-                    .maxSizePercent(context, cachePercent)
++                    .maxSizePercent(
++                        context,
++                        if (lowRamMode) com.nuvio.tv.data.repository.ForkTvLowRam.IMAGE_CACHE_PERCENT else cachePercent
++                    )
+                     .build()
+             }
+             .diskCache {
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/ForkTvKids.kt b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvKids.kt
+new file mode 100644
+index 000000000..2c8782482
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvKids.kt
+@@ -0,0 +1,47 @@
++package com.nuvio.tv.data.repository
++
++import android.content.Context
++
++/**
++ * Kids mode: a per-profile age cap. Items whose age rating is known and above the cap are hidden
++ * from Home rows, and a detail page above the cap closes at once. Items with no rating cannot be
++ * judged, so they stay visible.
++ */
++object ForkTvKids {
++    /** Cap levels: 0 off, 1 = G / TV-Y / TV-G, 2 = up to PG / TV-PG, 3 = up to PG-13 / TV-14. */
++    val capLabels: List<Pair<Int, String>> = listOf(
++        0 to "Off",
++        1 to "Little kids (G, TV-Y, TV-G)",
++        2 to "Kids (up to PG, TV-PG)",
++        3 to "Teens (up to PG-13, TV-14)",
++    )
++
++    fun cap(context: Context, profileId: Int): Int =
++        prefs(context).getInt("kids_cap_$profileId", 0)
++
++    fun setCap(context: Context, profileId: Int, cap: Int) {
++        prefs(context).edit().putInt("kids_cap_$profileId", cap).apply()
++    }
++
++    /** Level of a rating text, or null when it is not a known rating. */
++    fun levelOf(rating: String?): Int? {
++        val r = rating?.trim()?.uppercase()?.replace(" ", "")?.takeIf { it.isNotEmpty() } ?: return null
++        return when (r) {
++            "G", "TV-Y", "TVY", "TV-G", "TVG", "U", "0", "ALL" -> 1
++            "TV-Y7", "TV-Y7-FV", "TVY7", "PG", "TV-PG", "TVPG", "7" -> 2
++            "PG-13", "PG13", "TV-14", "TV14", "12", "13", "14" -> 3
++            "R", "NC-17", "NC17", "TV-MA", "TVMA", "X", "18", "16", "17", "21" -> 4
++            else -> null
++        }
++    }
++
++    fun allows(context: Context, profileId: Int, rating: String?): Boolean {
++        val cap = cap(context, profileId)
++        if (cap == 0) return true
++        val level = levelOf(rating) ?: return true
++        return level <= cap
++    }
++
++    private fun prefs(context: Context) =
++        context.applicationContext.getSharedPreferences("nuvio_fork_tv_settings", Context.MODE_PRIVATE)
++}
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
+index d9a2f4eb8..aec20a557 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
+@@ -49,6 +49,16 @@ object ForkTvPreferences {
+     val nuvioRead = ForkTvBoolPref("nuvio_read", false)
+     val catalogAccentUnderline = ForkTvBoolPref("catalog_accent_underline", false)
+     val skipFeedbackPrompt = ForkTvBoolPref("skip_feedback_prompt", true)
++    val lowRamMode = ForkTvBoolPref("low_ram_mode", false)
++}
++
++/** Low-RAM mode: fewer eager Home rows, no hero trailers, smaller image memory cache, shorter rows. */
++object ForkTvLowRam {
++    const val EAGER_ROWS = 2
++    const val MAX_ROW_ITEMS = 20
++    const val IMAGE_CACHE_PERCENT = 0.06
++
++    fun active(context: Context): Boolean = ForkTvPreferences.lowRamMode.current(context)
+ }
+ 
+ object ForkTvPlayerButtons {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
+index e72124ab5..147427f66 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
+@@ -478,6 +478,15 @@ fun MetaDetailsScreen(
+         initialValue = false
+     )
+     val selectedComment = uiState.selectedComment
++    // Fork: kids mode closes a detail page rated above the age cap of the profile in use.
++    val kidsContext = androidx.compose.ui.platform.LocalContext.current
++    val kidsRating = uiState.meta?.ageRating
++    LaunchedEffect(kidsRating) {
++        if (kidsRating != null && !viewModel.kidsAllows(kidsContext, kidsRating)) {
++            android.widget.Toast.makeText(kidsContext, "Not allowed for this profile (rated $kidsRating)", android.widget.Toast.LENGTH_LONG).show()
++            onBackPress()
++        }
++    }
+     var commentOverlayDirection by remember { mutableIntStateOf(0) }
+     var restorePlayFocusAfterTrailerBackToken by rememberSaveable { mutableIntStateOf(0) }
+     var restoreSharedTrailerFocusToken by rememberSaveable { mutableIntStateOf(0) }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt
+index c65efd174..29dabe609 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt
+@@ -190,6 +190,10 @@ class MetaDetailsViewModel @Inject constructor(
+         loadMeta()
+     }
+ 
++    /** Fork: kids mode check for the profile in use. */
++    fun kidsAllows(context: android.content.Context, rating: String?): Boolean =
++        com.nuvio.tv.data.repository.ForkTvKids.allows(context, profileManager.activeProfileId.value, rating)
++
+     private fun observeHideUnreleasedContent() {
+         viewModelScope.launch {
+             layoutPreferenceDataStore.hideUnreleasedContent
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/ForkTvHomeCache.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/ForkTvHomeCache.kt
+new file mode 100644
+index 000000000..37f58a97b
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/ForkTvHomeCache.kt
+@@ -0,0 +1,115 @@
++package com.nuvio.tv.ui.screens.home
++
++import android.content.Context
++import com.nuvio.tv.domain.model.CatalogRow
++import com.nuvio.tv.domain.model.ContentType
++import com.nuvio.tv.domain.model.MetaPreview
++import com.nuvio.tv.domain.model.PosterShape
++import org.json.JSONArray
++import org.json.JSONObject
++import java.io.File
++
++/**
++ * Nuvio fork: disk cache for the first page of every Home catalog row, so Home shows content
++ * at once on start and the network refresh replaces it. Only the fields the cards need are kept.
++ */
++internal object ForkTvHomeCache {
++    private const val DIR = "fork_home_rows"
++    private const val MAX_ITEMS = 40
++    private const val MAX_AGE_MS = 7L * 24 * 60 * 60 * 1000
++
++    private fun fileFor(context: Context, key: String): File {
++        val dir = File(context.cacheDir, DIR).apply { mkdirs() }
++        return File(dir, key.hashCode().toUInt().toString(16) + ".json")
++    }
++
++    fun save(context: Context, key: String, row: CatalogRow) {
++        if (row.items.isEmpty()) return
++        runCatching {
++            val items = JSONArray()
++            row.items.take(MAX_ITEMS).forEach { m ->
++                items.put(
++                    JSONObject()
++                        .put("id", m.id)
++                        .put("type", m.apiType)
++                        .put("name", m.name)
++                        .put("poster", m.poster)
++                        .put("shape", m.posterShape.name)
++                        .put("background", m.background)
++                        .put("logo", m.logo)
++                        .put("description", m.description)
++                        .put("releaseInfo", m.releaseInfo)
++                        .put("imdbRating", m.imdbRating?.toDouble())
++                        .put("genres", JSONArray(m.genres))
++                        .put("landscape", m.landscapePoster)
++                        .put("imdbId", m.imdbId)
++                        .put("rawPoster", m.rawPosterUrl)
++                )
++            }
++            val obj = JSONObject()
++                .put("savedAt", System.currentTimeMillis())
++                .put("key", key)
++                .put("addonId", row.addonId)
++                .put("addonName", row.addonName)
++                .put("addonBaseUrl", row.addonBaseUrl)
++                .put("catalogId", row.catalogId)
++                .put("catalogName", row.catalogName)
++                .put("rawType", row.apiType)
++                .put("supportsSkip", row.supportsSkip)
++                .put("skipStep", row.skipStep)
++                .put("items", items)
++            fileFor(context, key).writeText(obj.toString())
++        }
++    }
++
++    fun load(context: Context, key: String): CatalogRow? = runCatching {
++        val f = fileFor(context, key)
++        if (!f.exists()) return null
++        val obj = JSONObject(f.readText())
++        if (obj.optString("key") != key) return null
++        if (System.currentTimeMillis() - obj.optLong("savedAt") > MAX_AGE_MS) return null
++        val arr = obj.getJSONArray("items")
++        val items = (0 until arr.length()).map { i ->
++            val o = arr.getJSONObject(i)
++            val rawType = o.optString("type")
++            MetaPreview(
++                id = o.getString("id"),
++                type = ContentType.fromString(rawType),
++                rawType = rawType,
++                name = o.optString("name"),
++                poster = o.optStringOrNull("poster"),
++                posterShape = PosterShape.fromString(o.optString("shape")),
++                background = o.optStringOrNull("background"),
++                logo = o.optStringOrNull("logo"),
++                description = o.optStringOrNull("description"),
++                releaseInfo = o.optStringOrNull("releaseInfo"),
++                imdbRating = if (o.isNull("imdbRating")) null else o.optDouble("imdbRating").toFloat(),
++                genres = o.optJSONArray("genres")?.let { g -> (0 until g.length()).map { g.getString(it) } }.orEmpty(),
++                landscapePoster = o.optStringOrNull("landscape"),
++                imdbId = o.optStringOrNull("imdbId"),
++                rawPosterUrl = o.optStringOrNull("rawPoster"),
++            )
++        }
++        if (items.isEmpty()) return null
++        val rawType = obj.optString("rawType")
++        CatalogRow(
++            addonId = obj.getString("addonId"),
++            addonName = obj.optString("addonName"),
++            addonBaseUrl = obj.optString("addonBaseUrl"),
++            catalogId = obj.getString("catalogId"),
++            catalogName = obj.optString("catalogName"),
++            type = ContentType.fromString(rawType),
++            rawType = rawType,
++            items = items,
++            isLoading = false,
++            hasMore = obj.optBoolean("supportsSkip"),
++            currentPage = 0,
++            supportsSkip = obj.optBoolean("supportsSkip"),
++            skipStep = obj.optInt("skipStep", 100),
++            nextSkip = items.size,
++        )
++    }.getOrNull()
++
++    private fun JSONObject.optStringOrNull(name: String): String? =
++        if (isNull(name)) null else optString(name).ifBlank { null }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModel.kt
+index 7bb7a7597..908d21cf9 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModel.kt
+@@ -329,7 +329,8 @@ class HomeViewModel @Inject constructor(
+     internal var startupAuthNoticeJob: Job? = null
+ 
+     // Lazy catalog loading
+-    internal val eagerCatalogLoadCount: Int = 4
++    internal val eagerCatalogLoadCount: Int =
++        if (com.nuvio.tv.data.repository.ForkTvLowRam.active(appContext)) com.nuvio.tv.data.repository.ForkTvLowRam.EAGER_ROWS else 4
+     internal val lazyLoadRequestedKeys: MutableSet<String> = ConcurrentHashMap.newKeySet()
+     internal val pendingLazyCatalogs = linkedMapOf<String, Pair<Addon, CatalogDescriptor>>()
+     /** All placeholder descriptors for homeRow construction. */
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogPipeline.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogPipeline.kt
+index 2f1287cb6..b59b5a3a3 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogPipeline.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogPipeline.kt
+@@ -337,6 +337,21 @@ internal suspend fun HomeViewModel.loadAllCatalogsPipeline(
+             "Lazy loading: eager=${eagerHomeCatalogs.size} lazy=${lazyHomeCatalogs.size}"
+         )
+ 
++        // Fork: show the cached first page of every row at once; the network load below replaces it.
++        if (!isReload) {
++            var preloaded = false
++            (eagerHomeCatalogs + lazyHomeCatalogs).forEach { (addon, catalog) ->
++                val cacheKey = catalogKey(addonId = addon.id, type = catalog.apiType, catalogId = catalog.id)
++                ForkTvHomeCache.load(appContext, cacheKey)?.let { cached ->
++                    replaceCatalogRow(cacheKey, cached)
++                    preloaded = true
++                }
++            }
++            if (preloaded) {
++                _uiState.update { it.copy(isLoading = false) }
++            }
++        }
++
+         val eagerCatalogs = eagerHomeCatalogs + heroOnlyCatalogs
+         pendingCatalogLoads = eagerCatalogs.size
+         eagerCatalogs.forEach { (addon, catalog) ->
+@@ -448,6 +463,10 @@ internal fun HomeViewModel.loadCatalogPipeline(
+                         if (!isRefresh || !mergeRefreshedCatalogRow(key, result.data, requestedByUser, forceReplace)) {
+                             replaceCatalogRow(key, result.data)
+                         }
++                        if (!isRefresh) {
++                            val toCache = result.data
++                            viewModelScope.launch(Dispatchers.IO) { ForkTvHomeCache.save(appContext, key, toCache) }
++                        }
+                         // Trigger MDBList batch for newly loaded catalog data.
+                         onCatalogRowItemsChanged(key)
+                         // Remove placeholder descriptor now that real data is available
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogUtils.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogUtils.kt
+index 67f440ae9..ed0b50a8a 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogUtils.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogUtils.kt
+@@ -114,7 +114,14 @@ internal fun HomeViewModel.readCatalogRow(key: String): CatalogRow? = synchroniz
+     catalogsMap[key]
+ }
+ 
+-internal fun HomeViewModel.replaceCatalogRow(key: String, row: CatalogRow) {
++internal fun HomeViewModel.replaceCatalogRow(key: String, unfilteredRow: CatalogRow) {
++    // Fork: kids mode hides items rated above the age cap of the profile in use.
++    val kidsProfileId = profileManager.activeProfileId.value
++    val row = if (com.nuvio.tv.data.repository.ForkTvKids.cap(appContext, kidsProfileId) == 0) unfilteredRow else {
++        unfilteredRow.copy(items = unfilteredRow.items.filter {
++            com.nuvio.tv.data.repository.ForkTvKids.allows(appContext, kidsProfileId, it.ageRating)
++        })
++    }
+     synchronized(catalogStateLock) {
+         val previousRow = catalogsMap[key]
+         val previousById = previousRow?.items?.associateBy { it.id }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt
+index 00b3b75ae..b1805174c 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt
+@@ -156,8 +156,10 @@ fun ModernHomeContent(
+     val alwaysShowLandscapeClearlogo = uiState.alwaysShowLandscapeClearlogo
+     val fullScreenBackdrop = uiState.modernHeroFullScreenBackdropEnabled
+     val trailerPlaybackTarget = uiState.focusedPosterBackdropTrailerPlaybackTarget
++    val lowRamContext = androidx.compose.ui.platform.LocalContext.current
+     val effectiveAutoplayEnabled =
+-        uiState.focusedPosterBackdropTrailerEnabled &&
++        !com.nuvio.tv.data.repository.ForkTvLowRam.active(lowRamContext) &&
++            uiState.focusedPosterBackdropTrailerEnabled &&
+             (useLandscapePosters || uiState.focusedPosterBackdropExpandEnabled)
+     val landscapeExpandedCardMode =
+         useLandscapePosters &&
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt
+index db5eb9a1b..385a24579 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt
+@@ -55,6 +55,9 @@ internal fun ForkFeaturesPane(
+         }
+         item {
+             SettingsGroupCard(title = "Maintenance") {
++                forkKidsModeRow()
++                forkLowRamModeRow()
++                forkHealthRow()
+                 forkClearImageCacheRow()
+                 forkWhatsNewRow()
+                 forkCrashLogRow()
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvHealth.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvHealth.kt
+new file mode 100644
+index 000000000..9318ce747
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvHealth.kt
+@@ -0,0 +1,171 @@
++@file:OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
++
++package com.nuvio.tv.ui.screens.settings
++
++import android.app.ActivityManager
++import android.content.Context
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.items
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import androidx.tv.material3.Button
++import androidx.tv.material3.MaterialTheme
++import androidx.tv.material3.Text
++import com.nuvio.tv.domain.model.Addon
++import com.nuvio.tv.domain.repository.AddonRepository
++import com.nuvio.tv.ui.components.NuvioDialog
++import com.nuvio.tv.ui.theme.NuvioTheme
++import dagger.hilt.EntryPoint
++import dagger.hilt.InstallIn
++import dagger.hilt.android.EntryPointAccessors
++import dagger.hilt.components.SingletonComponent
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.async
++import kotlinx.coroutines.awaitAll
++import kotlinx.coroutines.coroutineScope
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import java.io.File
++import java.net.HttpURLConnection
++import java.net.URL
++
++@EntryPoint
++@InstallIn(SingletonComponent::class)
++internal interface ForkTvHealthEntryPoint {
++    fun addonRepository(): AddonRepository
++}
++
++private data class AddonHealth(val name: String, val ok: Boolean, val detail: String)
++
++private fun dirSize(file: File): Long =
++    if (file.isFile) file.length() else file.listFiles()?.sumOf { dirSize(it) } ?: 0L
++
++private fun mb(bytes: Long): String = "%.1f MB".format(bytes / (1024.0 * 1024.0))
++
++private fun checkAddon(addon: Addon): AddonHealth {
++    val name = addon.displayName.ifBlank { addon.baseUrl }
++    val url = addon.baseUrl.trimEnd('/') + "/manifest.json"
++    val start = System.currentTimeMillis()
++    return runCatching {
++        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
++            connectTimeout = 5000
++            readTimeout = 5000
++            requestMethod = "GET"
++        }
++        val code = conn.responseCode
++        conn.disconnect()
++        val ms = System.currentTimeMillis() - start
++        AddonHealth(name, code in 200..299, if (code in 200..299) "$ms ms" else "HTTP $code")
++    }.getOrElse { AddonHealth(name, false, it.javaClass.simpleName) }
++}
++
++/** Nuvio fork: Settings health screen with memory, storage, cache sizes and addon reachability. */
++@Composable
++internal fun forkHealthRow() {
++    var show by remember { mutableStateOf(false) }
++    SettingsActionRow(
++        title = "App health",
++        subtitle = "Memory, storage, cache sizes and whether every addon answers.",
++        onClick = { show = true },
++    )
++    if (show) ForkTvHealthDialog(onDismiss = { show = false })
++}
++
++@Composable
++private fun ForkTvHealthDialog(onDismiss: () -> Unit) {
++    val context = LocalContext.current
++    val scope = rememberCoroutineScope()
++    val entry = remember {
++        EntryPointAccessors.fromApplication(context.applicationContext, ForkTvHealthEntryPoint::class.java)
++    }
++    var lines by remember { mutableStateOf<List<String>>(emptyList()) }
++    var addons by remember { mutableStateOf<List<AddonHealth>?>(null) }
++    var nonce by remember { mutableStateOf(0) }
++
++    LaunchedEffect(nonce) {
++        lines = withContext(Dispatchers.IO) { systemLines(context) }
++        addons = null
++        val installed = runCatching { entry.addonRepository().getInstalledAddons().first() }.getOrDefault(emptyList())
++        addons = withContext(Dispatchers.IO) {
++            coroutineScope { installed.filter { it.enabled }.map { async { checkAddon(it) } }.awaitAll() }
++        }
++    }
++
++    NuvioDialog(
++        onDismiss = onDismiss,
++        title = "App health",
++        subtitle = "Read-only checks. Addons are asked for their manifest with a 5 second limit.",
++        width = 760.dp,
++        contentSpacing = 8.dp,
++    ) {
++        LazyColumn(
++            modifier = Modifier.fillMaxWidth().heightIn(max = 300.dp),
++            verticalArrangement = Arrangement.spacedBy(4.dp),
++        ) {
++            items(lines) { line ->
++                Text(text = line, style = MaterialTheme.typography.bodyMedium, color = NuvioTheme.colors.TextPrimary)
++            }
++            item {
++                Text(
++                    text = if (addons == null) "Addons: checking..." else {
++                        val bad = addons.orEmpty().count { !it.ok }
++                        "Addons: ${addons.orEmpty().size - bad} answer, $bad do not"
++                    },
++                    style = MaterialTheme.typography.titleSmall,
++                    color = NuvioTheme.colors.TextPrimary,
++                    modifier = Modifier.padding(top = 6.dp),
++                )
++            }
++            items(addons.orEmpty()) { a ->
++                Text(
++                    text = (if (a.ok) "OK  " else "FAIL  ") + a.name + "  (" + a.detail + ")",
++                    style = MaterialTheme.typography.bodyMedium,
++                    color = if (a.ok) NuvioTheme.colors.TextPrimary else NuvioTheme.colors.TextSecondary,
++                    maxLines = 1,
++                    overflow = TextOverflow.Ellipsis,
++                )
++            }
++        }
++        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.padding(top = 4.dp)) {
++            Button(onClick = { nonce++ }) { Text("Check again") }
++            Button(onClick = {
++                scope.launch(Dispatchers.IO) {
++                    File(context.cacheDir, "fork_home_rows").deleteRecursively()
++                    nonce++
++                }
++            }) { Text("Clear Home row cache") }
++            Button(onClick = onDismiss) { Text("Close") }
++        }
++    }
++}
++
++private fun systemLines(context: Context): List<String> {
++    val rt = Runtime.getRuntime()
++    val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
++    val mi = ActivityManager.MemoryInfo().also { am.getMemoryInfo(it) }
++    val dataFree = context.filesDir.usableSpace
++    return listOf(
++        "App memory: ${mb(rt.totalMemory() - rt.freeMemory())} used of ${mb(rt.maxMemory())}",
++        "Device memory: ${mb(mi.availMem)} free of ${mb(mi.totalMem)}" + if (mi.lowMemory) " (low)" else "",
++        "Low-RAM mode: " + if (com.nuvio.tv.data.repository.ForkTvLowRam.active(context)) "on" else "off",
++        "Free storage: ${mb(dataFree)}",
++        "Cache folder: ${mb(dirSize(context.cacheDir))}",
++        "Home row cache: ${mb(dirSize(File(context.cacheDir, "fork_home_rows")))}",
++        "Saved data: ${mb(dirSize(context.filesDir))}",
++    )
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvKidsRow.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvKidsRow.kt
+new file mode 100644
+index 000000000..3ec1c1ac9
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvKidsRow.kt
+@@ -0,0 +1,70 @@
++@file:OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
++
++package com.nuvio.tv.ui.screens.settings
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalContext
++import androidx.tv.material3.Button
++import androidx.tv.material3.MaterialTheme
++import androidx.tv.material3.Text
++import androidx.compose.ui.unit.dp
++import com.nuvio.tv.core.profile.ProfileManager
++import com.nuvio.tv.data.repository.ForkTvKids
++import com.nuvio.tv.ui.components.NuvioDialog
++import dagger.hilt.EntryPoint
++import dagger.hilt.InstallIn
++import dagger.hilt.android.EntryPointAccessors
++import dagger.hilt.components.SingletonComponent
++
++@EntryPoint
++@InstallIn(SingletonComponent::class)
++internal interface ForkTvKidsEntryPoint {
++    fun profileManager(): ProfileManager
++}
++
++/** Nuvio fork: age cap for the profile in use. Applies after the next Home refresh. */
++@Composable
++internal fun forkKidsModeRow() {
++    val context = LocalContext.current
++    val entry = remember(context) {
++        EntryPointAccessors.fromApplication(context.applicationContext, ForkTvKidsEntryPoint::class.java)
++    }
++    val profileId by entry.profileManager().activeProfileId.collectAsState()
++    var show by remember { mutableStateOf(false) }
++    var cap by remember(profileId) { mutableIntStateOf(ForkTvKids.cap(context, profileId)) }
++    SettingsActionRow(
++        title = "Kids mode (this profile)",
++        subtitle = "Hide titles rated above an age cap, and close detail pages that are. Titles with no rating stay visible.",
++        value = ForkTvKids.capLabels.firstOrNull { it.first == cap }?.second ?: "Off",
++        onClick = { show = true },
++    )
++    if (show) {
++        NuvioDialog(
++            onDismiss = { show = false },
++            title = "Kids mode",
++            subtitle = "Applies to the profile in use. Pull Home to refresh after a change.",
++            width = 620.dp,
++        ) {
++            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                ForkTvKids.capLabels.forEach { (level, label) ->
++                    Button(onClick = {
++                        ForkTvKids.setCap(context, profileId, level)
++                        cap = level
++                        show = false
++                    }) {
++                        Text((if (level == cap) "✓ " else "") + label, style = MaterialTheme.typography.bodyLarge)
++                    }
++                }
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
+index 7fe69068d..7831d16a0 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
+@@ -33,6 +33,13 @@ internal fun forkHomeVideoOnlyRow() = forkTvToggleRow(
+     pref = ForkTvPreferences.homeVideoRowsOnly
+ )
+ 
++@Composable
++internal fun forkLowRamModeRow() = forkTvToggleRow(
++    title = "Low-RAM mode",
++    subtitle = "For sticks with little memory: loads fewer Home rows first, turns off Home trailers, uses a smaller image cache. Restart the app after changing.",
++    pref = ForkTvPreferences.lowRamMode
++)
++
+ @Composable
+ internal fun forkFillerGuideRow() = forkTvToggleRow(
+     title = "Anime filler guide",
