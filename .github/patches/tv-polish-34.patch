@@ -1,0 +1,629 @@
+diff --git a/app/src/main/java/com/nuvio/tv/MainActivity.kt b/app/src/main/java/com/nuvio/tv/MainActivity.kt
+index 7414d3da6..0870caffe 100644
+--- a/app/src/main/java/com/nuvio/tv/MainActivity.kt
++++ b/app/src/main/java/com/nuvio/tv/MainActivity.kt
+@@ -1017,6 +1017,16 @@ open class MainActivity : ComponentActivity() {
+                     LaunchedEffect(navController, layoutChosen, pendingDeepLink) {
+                         val url = pendingDeepLink ?: return@LaunchedEffect
+                         if (!layoutChosen) return@LaunchedEffect
++                        if (url.startsWith("nuvio://livetv/", ignoreCase = true)) {
++                            pendingDeepLinkUrl.value = null
++                            val parts = url.substringAfter("nuvio://livetv/", "")
++                                .split('/').map { android.net.Uri.decode(it) }
++                            if (parts.size >= 2 && parts[0].isNotBlank() && parts[1].isNotBlank()) {
++                                com.nuvio.tv.forklivetv.ForkLiveReminders.pendingOpen.value = parts[0] to parts[1]
++                                navController.navigate(Screen.TvChannels.route) { launchSingleTop = true }
++                            }
++                            return@LaunchedEffect
++                        }
+                         when (val deepLink = DeepLinkParser.parse(url)) {
+                             is AppDeepLink.Meta -> {
+                                 pendingDeepLinkUrl.value = null
+diff --git a/app/src/main/java/com/nuvio/tv/core/reminders/ReleaseReminderNotifications.kt b/app/src/main/java/com/nuvio/tv/core/reminders/ReleaseReminderNotifications.kt
+index 61155236e..6def4d03f 100644
+--- a/app/src/main/java/com/nuvio/tv/core/reminders/ReleaseReminderNotifications.kt
++++ b/app/src/main/java/com/nuvio/tv/core/reminders/ReleaseReminderNotifications.kt
+@@ -54,7 +54,12 @@ internal object ReleaseReminderNotifications {
+         ) {
+             return
+         }
+-        val deepLink = "nuvio://detail/${reminder.itemType}/${android.net.Uri.encode(reminder.itemId)}"
++        val isLive = com.nuvio.tv.forklivetv.ForkLiveReminders.isLive(reminder)
++        val deepLink = if (isLive) {
++            com.nuvio.tv.forklivetv.ForkLiveReminders.deepLink(reminder)
++        } else {
++            "nuvio://detail/${reminder.itemType}/${android.net.Uri.encode(reminder.itemId)}"
++        }
+         val contentIntent = android.app.PendingIntent.getActivity(
+             context,
+             notificationId(reminder),
+@@ -65,10 +70,17 @@ internal object ReleaseReminderNotifications {
+         val builder = NotificationCompat.Builder(context, CHANNEL_ID)
+             .setSmallIcon(R.drawable.ic_notification_reminder)
+             .setContentTitle(reminder.title)
+-            .setContentText(context.getString(R.string.reminder_notification_text))
++            .setContentText(
++                context.getString(
++                    if (isLive) R.string.live_reminder_notification_text else R.string.reminder_notification_text
++                )
++            )
+             .setContentIntent(contentIntent)
+             .setAutoCancel(true)
+             .setCategory(NotificationCompat.CATEGORY_REMINDER)
++        if (isLive) {
++            builder.addAction(0, context.getString(R.string.live_reminder_watch_now), contentIntent)
++        }
+         if (poster != null) {
+             builder.setStyle(NotificationCompat.BigPictureStyle().bigPicture(poster))
+         }
+diff --git a/app/src/main/java/com/nuvio/tv/data/local/TvChannelsDataStore.kt b/app/src/main/java/com/nuvio/tv/data/local/TvChannelsDataStore.kt
+index 3d50fd118..66f3d5915 100644
+--- a/app/src/main/java/com/nuvio/tv/data/local/TvChannelsDataStore.kt
++++ b/app/src/main/java/com/nuvio/tv/data/local/TvChannelsDataStore.kt
+@@ -25,8 +25,10 @@ class TvChannelsDataStore @Inject constructor(
+     private val favoriteChannelKeysKey = stringSetPreferencesKey("favorite_tv_channel_keys")
+     private val openFullscreenOnClickKey = booleanPreferencesKey("open_fullscreen_on_click")
+     private val enabledEpgSourceIdsKey = stringSetPreferencesKey("enabled_epg_source_ids")
++    private val epgIndiaAddedKey = booleanPreferencesKey("epg_india_sources_added_v1")
+     private val hideAdultChannelsKey = booleanPreferencesKey("hide_adult_channels")
+     private val channelAutoplayKey = booleanPreferencesKey("channel_autoplay")
++    private val liveReminderLeadKey = androidx.datastore.preferences.core.intPreferencesKey("live_reminder_lead_minutes")
+ 
+     private fun store(profileId: Int = profileManager.activeProfileId.value) =
+         factory.get(profileId, FEATURE)
+@@ -71,6 +73,16 @@ class TvChannelsDataStore @Inject constructor(
+         store().edit { it[selectedAddonUrlsKey] = urls }
+     }
+ 
++    /** One time: switches newly added default guides on for profiles that already saved a selection. */
++    suspend fun addDefaultEpgSourcesOnce(newIds: Set<String>) {
++        store().edit { prefs ->
++            if (prefs[epgIndiaAddedKey] == true) return@edit
++            val saved = prefs[enabledEpgSourceIdsKey]
++            if (saved != null) prefs[enabledEpgSourceIdsKey] = saved + newIds
++            prefs[epgIndiaAddedKey] = true
++        }
++    }
++
+     suspend fun setEnabledEpgSourceIds(ids: Set<String>) {
+         store().edit { it[enabledEpgSourceIdsKey] = ids }
+     }
+@@ -79,6 +91,15 @@ class TvChannelsDataStore @Inject constructor(
+         store().edit { it[hideAdultChannelsKey] = hide }
+     }
+ 
++    /** Minutes before kickoff that a Live TV reminder fires (default 5). */
++    val liveReminderLeadMinutes: Flow<Int> = profileManager.activeProfileId.flatMapLatest { pid ->
++        factory.get(pid, FEATURE).data.map { prefs -> prefs[liveReminderLeadKey] ?: 5 }
++    }
++
++    suspend fun setLiveReminderLeadMinutes(minutes: Int) {
++        store().edit { it[liveReminderLeadKey] = minutes }
++    }
++
+     suspend fun setChannelAutoplay(enabled: Boolean) {
+         store().edit { it[channelAutoplayKey] = enabled }
+     }
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
+index 0c378e468..652a14eab 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
+@@ -354,7 +354,8 @@ class TvChannelsRepository @Inject constructor(
+                         addonManifestUrl = addon.baseUrl,
+                         addonLogo = addon.logo,
+                         catalogId = catalog.id,
+-                        catalogName = catName
++                        catalogName = catName,
++                        startEpochMs = runCatching { java.time.Instant.parse(meta.released).toEpochMilli() }.getOrNull()
+                     )
+                     if (seenKeys.add(channel.stableKey())) {
+                         loadedChannels.add(channel)
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/epg/TvEpgRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/epg/TvEpgRepository.kt
+index 29e272350..d3853b07e 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/epg/TvEpgRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/epg/TvEpgRepository.kt
+@@ -75,9 +75,66 @@ class TvEpgRepository @Inject constructor(
+                 url = "https://epgshare01.online/epgshare01/epg_ripper_US1.xml.gz",
+                 isEnabled = true,
+                 isDefault = true,
++            ),
++            EpgSourceConfig(
++                id = "default_epg_in1",
++                name = "India (IN1)",
++                url = "https://epgshare01.online/epgshare01/epg_ripper_IN1.xml.gz",
++                isEnabled = true,
++                isDefault = true,
++            ),
++            EpgSourceConfig(
++                id = "default_epg_in4",
++                name = "India regional (IN4)",
++                url = "https://epgshare01.online/epgshare01/epg_ripper_IN4.xml.gz",
++                isEnabled = true,
++                isDefault = true,
+             )
+         )
+ 
++        private val INDIA_SOURCE_IDS = setOf("default_epg_in1", "default_epg_in4")
++        private const val MAX_DESC_CHARS = 200
++        private val SLIM_DROP_PREFIXES = listOf(
++            "<sub-title", "<episode-num", "<rating", "<star-rating", "<date", "<video", "<audio",
++            "<length", "<country", "<language", "<url", "<previously-shown", "<premiere", "<new",
++            "<last-chance", "<subtitles"
++        )
++
++        /**
++         * Reads a guide line by line and drops the tags the parser never uses (credits, sub-titles,
++         * ratings...) and long descriptions, so a 60 MB guide does not sit in memory as one huge String.
++         */
++        internal fun slimXmlTv(reader: java.io.Reader): String {
++            val out = StringBuilder()
++            var inCredits = false
++            java.io.BufferedReader(reader, 64 * 1024).useLines { lines ->
++                for (raw in lines) {
++                    val t = raw.trimStart()
++                    if (inCredits) {
++                        if (t.startsWith("</credits")) inCredits = false
++                        continue
++                    }
++                    if (t.startsWith("<credits")) {
++                        if (!t.contains("</credits")) inCredits = true
++                        continue
++                    }
++                    if (SLIM_DROP_PREFIXES.any { t.startsWith(it) }) continue
++                    if (t.startsWith("<desc") && t.length > MAX_DESC_CHARS + 40 && t.contains("</desc>")) {
++                        val open = t.indexOf('>') + 1
++                        val text = t.substring(open, t.lastIndexOf("</desc>"))
++                        var cut = text.take(MAX_DESC_CHARS)
++                        val amp = cut.lastIndexOf('&')
++                        if (amp >= 0 && cut.indexOf(';', amp) < 0) cut = cut.substring(0, amp)
++                        cut = cut.trimEnd()
++                        out.append(t, 0, open).append(cut).append("</desc>\n")
++                        continue
++                    }
++                    out.append(raw).append('\n')
++                }
++            }
++            return out.toString()
++        }
++
+         private val ALIASES = mapOf(
+             "h2" to "history2",
+             "premiere1" to "premiereclubes",
+@@ -129,6 +186,7 @@ class TvEpgRepository @Inject constructor(
+         if (isInitialized) return
+         isInitialized = true
+         scope.launch {
++            tvChannelsDataStore.addDefaultEpgSourcesOnce(INDIA_SOURCE_IDS)
+             val initialIds = tvChannelsDataStore.enabledEpgSourceIds.firstOrNull()
+             val initialSet = initialIds ?: DEFAULT_EPG_SOURCES.map { it.id }.toSet()
+             _uiState.update { state ->
+@@ -260,6 +318,7 @@ class TvEpgRepository @Inject constructor(
+             val norm = normalizeText(dn)
+             if (norm.isNotBlank()) keys.add(norm)
+         }
++        rawIdKey(id)?.let { keys.add(it) }
+ 
+         for (k in keys) {
+             keyToChannelIds.getOrPut(k) { mutableListOf() }.add(id)
+@@ -272,7 +331,9 @@ class TvEpgRepository @Inject constructor(
+             if (channelMatchCache.containsKey(key)) {
+                 channelMatchCache[key]
+             } else {
+-                val matched = exactChannelId(channel.epgId) ?: matchChannelId(channel.name)
++                val matched = exactChannelId(channel.epgId)
++                    ?: addonIdChannelId(channel.id)
++                    ?: matchChannelId(channel.name)
+                 channelMatchCache[key] = matched
+                 matched
+             }
+@@ -301,6 +362,22 @@ class TvEpgRepository @Inject constructor(
+         return keyToChannelIds[normalizeText(raw.substringBefore('.'))]?.firstOrNull()
+     }
+ 
++    /**
++     * Guide ids and addon ids differ only in dots and case (NexoTV "10TV.in" vs guide "10.TV.in"),
++     * so both are reduced to their letters and digits without the country suffix.
++     */
++    private fun rawIdKey(id: String): String? {
++        val body = if (id.contains('.')) id.substringBeforeLast('.') else id
++        val key = body.lowercase().filter { it in 'a'..'z' || it in '0'..'9' }
++        return if (key.length >= 3) "id:$key" else null
++    }
++
++    private fun addonIdChannelId(addonChannelId: String): String? {
++        if (!addonChannelId.contains('.')) return null
++        val key = rawIdKey(addonChannelId.substringAfter('_')) ?: return null
++        return keyToChannelIds[key]?.firstOrNull()
++    }
++
+     private fun matchChannelId(channelName: String): String? {
+         val norm = normalizeText(channelName)
+         if (norm.isBlank()) return null
+@@ -315,7 +392,7 @@ class TvEpgRepository @Inject constructor(
+ 
+         // 3. Match por prefixo / contenção
+         for ((k, ids) in keyToChannelIds) {
+-            if (k.length >= 4 && (norm.contains(k) || k.contains(norm))) {
++            if (k.length >= 4 && !k.startsWith("id:") && (norm.contains(k) || k.contains(norm))) {
+                 return ids.firstOrNull()
+             }
+         }
+@@ -368,7 +445,7 @@ class TvEpgRepository @Inject constructor(
+                     val isGzip = (b1 == 0x1F && b2 == 0x8B) || url.lowercase().endsWith(".gz")
+                     val inputStream: InputStream = if (isGzip) GZIPInputStream(buffered, 64 * 1024) else buffered
+ 
+-                    val text = InputStreamReader(inputStream, StandardCharsets.UTF_8).use { it.readText() }
++                    val text = InputStreamReader(inputStream, StandardCharsets.UTF_8).use { slimXmlTv(it) }
+                     if (text.isNotBlank()) {
+                         runCatching {
+                             val temp = File(cacheDir, "epg_${sanitizedId}_temp.xml")
+diff --git a/app/src/main/java/com/nuvio/tv/domain/model/TvChannelsModels.kt b/app/src/main/java/com/nuvio/tv/domain/model/TvChannelsModels.kt
+index e4dacc169..887382b83 100644
+--- a/app/src/main/java/com/nuvio/tv/domain/model/TvChannelsModels.kt
++++ b/app/src/main/java/com/nuvio/tv/domain/model/TvChannelsModels.kt
+@@ -26,6 +26,8 @@ data class TvChannelItem(
+     /** XMLTV channel id (tvg-id / epg_channel_id) used to match the programme guide exactly. */
+     val epgId: String? = null,
+     val iptvSourceId: String? = null,
++    /** Kickoff / start time (epoch ms) when the addon lists the item as upcoming (catalog "released"). */
++    val startEpochMs: Long? = null,
+ ) {
+     val displayLogo: String?
+         get() = logo?.takeIf { it.isNotBlank() } ?: poster?.takeIf { it.isNotBlank() }
+diff --git a/app/src/main/java/com/nuvio/tv/forklivetv/ForkLiveReminders.kt b/app/src/main/java/com/nuvio/tv/forklivetv/ForkLiveReminders.kt
+new file mode 100644
+index 000000000..62eaf35c6
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/forklivetv/ForkLiveReminders.kt
+@@ -0,0 +1,48 @@
++package com.nuvio.tv.forklivetv
++
++import com.nuvio.tv.data.local.ReleaseReminder
++import com.nuvio.tv.domain.model.TvChannelItem
++import kotlinx.coroutines.flow.MutableStateFlow
++import java.text.SimpleDateFormat
++import java.util.Date
++import java.util.Locale
++
++/**
++ * Nuvio fork: Live TV reminders (for example Nuvio Live Sports upcoming events). They reuse the
++ * release reminder store, alarm and boot re-arm; the item type carries a "live:" prefix so the
++ * notification opens Live TV on that channel instead of a detail page.
++ */
++object ForkLiveReminders {
++    const val TYPE_PREFIX = "live:"
++    val LEAD_CHOICES = listOf(0, 5, 10, 15, 30)
++
++    fun isLive(reminder: ReleaseReminder) = reminder.itemType.startsWith(TYPE_PREFIX)
++
++    fun isUpcoming(channel: TvChannelItem, nowMs: Long = System.currentTimeMillis()) =
++        (channel.startEpochMs ?: 0L) > nowMs
++
++    fun matches(reminder: ReleaseReminder, channel: TvChannelItem) =
++        reminder.itemId == channel.id && reminder.itemType == TYPE_PREFIX + channel.type
++
++    fun build(channel: TvChannelItem, leadMinutes: Int, nowMs: Long = System.currentTimeMillis()): ReleaseReminder {
++        val start = channel.startEpochMs ?: nowMs
++        val fireAt = (start - leadMinutes * 60_000L).coerceAtLeast(nowMs + 3_000L)
++        val label = SimpleDateFormat("EEE d MMM, HH:mm", Locale.getDefault()).format(Date(start))
++        return ReleaseReminder(
++            itemId = channel.id,
++            itemType = TYPE_PREFIX + channel.type,
++            title = channel.name,
++            releaseDateMs = fireAt,
++            releaseDateIso = label,
++            posterUrl = channel.poster ?: channel.logo,
++            createdAtMs = nowMs
++        )
++    }
++
++    fun deepLink(reminder: ReleaseReminder): String =
++        "nuvio://livetv/${android.net.Uri.encode(reminder.itemType.removePrefix(TYPE_PREFIX))}/" +
++            android.net.Uri.encode(reminder.itemId)
++
++    /** Channel a notification asked Live TV to open ("type|id"); consumed once Live TV has loaded its channels. */
++    val pendingOpen = MutableStateFlow<Pair<String, String>?>(null)
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvChannelsSettingsPane.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvChannelsSettingsPane.kt
+index c34df61fa..47427fb01 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvChannelsSettingsPane.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvChannelsSettingsPane.kt
+@@ -137,6 +137,8 @@ internal fun TvChannelsSettingsPane(
+ 
+         item { TvLiveNetflixSettingsGroup() }
+ 
++        item { TvLiveRemindersGroup() }
++
+         // Grupo 2: Reprodução e Controle Parental
+         item {
+             SettingsGroupCard(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvLiveRemindersSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvLiveRemindersSettings.kt
+new file mode 100644
+index 000000000..56a6e6134
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvLiveRemindersSettings.kt
+@@ -0,0 +1,92 @@
++@file:OptIn(ExperimentalTvMaterial3Api::class)
++
++package com.nuvio.tv.ui.screens.settings
++
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.Notifications
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.res.stringResource
++import androidx.hilt.navigation.compose.hiltViewModel
++import androidx.lifecycle.ViewModel
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import androidx.lifecycle.viewModelScope
++import androidx.tv.material3.ExperimentalTvMaterial3Api
++import com.nuvio.tv.R
++import com.nuvio.tv.core.reminders.ReleaseReminderCoordinator
++import com.nuvio.tv.data.local.ReleaseReminder
++import com.nuvio.tv.data.local.ReleaseRemindersStore
++import com.nuvio.tv.data.local.TvChannelsDataStore
++import com.nuvio.tv.forklivetv.ForkLiveReminders
++import dagger.hilt.android.lifecycle.HiltViewModel
++import kotlinx.coroutines.flow.SharingStarted
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.map
++import kotlinx.coroutines.flow.stateIn
++import kotlinx.coroutines.launch
++import javax.inject.Inject
++
++@HiltViewModel
++class TvLiveRemindersSettingsViewModel @Inject constructor(
++    private val store: ReleaseRemindersStore,
++    private val coordinator: ReleaseReminderCoordinator,
++    private val channelsDataStore: TvChannelsDataStore
++) : ViewModel() {
++    val reminders: StateFlow<List<ReleaseReminder>> = store.reminders
++        .map { list -> list.filter { ForkLiveReminders.isLive(it) }.sortedBy { it.releaseDateMs } }
++        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
++
++    val leadMinutes: StateFlow<Int> = channelsDataStore.liveReminderLeadMinutes
++        .stateIn(viewModelScope, SharingStarted.Eagerly, 5)
++
++    fun cycleLead() {
++        val choices = ForkLiveReminders.LEAD_CHOICES
++        val next = choices[(choices.indexOf(leadMinutes.value) + 1).mod(choices.size)]
++        viewModelScope.launch { channelsDataStore.setLiveReminderLeadMinutes(next) }
++    }
++
++    fun delete(reminder: ReleaseReminder) {
++        viewModelScope.launch {
++            store.remove(reminder.itemId, reminder.itemType)
++            coordinator.scheduleNextAlarm()
++        }
++    }
++}
++
++/** Settings > Live TV: how early Live TV reminders fire and the list of saved ones (click removes). */
++@Composable
++internal fun TvLiveRemindersGroup(
++    viewModel: TvLiveRemindersSettingsViewModel = hiltViewModel()
++) {
++    val reminders by viewModel.reminders.collectAsStateWithLifecycle()
++    val lead by viewModel.leadMinutes.collectAsStateWithLifecycle()
++    SettingsGroupCard(
++        modifier = Modifier.fillMaxWidth(),
++        title = stringResource(R.string.live_reminders_title),
++        subtitle = stringResource(R.string.live_reminders_subtitle)
++    ) {
++        SettingsActionRow(
++            title = stringResource(R.string.live_reminders_lead),
++            subtitle = null,
++            value = stringResource(R.string.live_reminders_lead_value, lead),
++            leadingIcon = Icons.Default.Notifications,
++            onClick = { viewModel.cycleLead() }
++        )
++        if (reminders.isEmpty()) {
++            SettingsActionRow(
++                title = stringResource(R.string.live_reminders_empty),
++                subtitle = null,
++                onClick = {}
++            )
++        }
++        reminders.forEach { reminder ->
++            SettingsActionRow(
++                title = reminder.title,
++                subtitle = reminder.releaseDateIso,
++                onClick = { viewModel.delete(reminder) }
++            )
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
+index 51443154e..a07095104 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
+@@ -120,6 +120,7 @@ import com.nuvio.tv.ui.screens.tvchannels.components.TvChannelFullscreenHud
+ import com.nuvio.tv.ui.screens.tvchannels.components.TvChannelListItem
+ import com.nuvio.tv.ui.screens.tvchannels.components.TvChannelNetflixCard
+ import com.nuvio.tv.ui.screens.tvchannels.components.TvChannelPreviewPanel
++import com.nuvio.tv.forklivetv.ForkLiveReminders
+ import com.nuvio.tv.ui.screens.tvchannels.components.TvChannelScheduleDialog
+ import com.nuvio.tv.ui.screens.tvchannels.components.TvEpgGridGuide
+ import com.nuvio.tv.ui.theme.NuvioTheme
+@@ -132,8 +133,28 @@ fun TvChannelsScreen(
+ ) {
+     val state by viewModel.uiState.collectAsStateWithLifecycle()
+     val netflixLive by viewModel.netflixStyle.collectAsStateWithLifecycle()
++    val liveReminders by viewModel.liveReminders.collectAsStateWithLifecycle()
+     val listState = rememberLazyListState()
+     val context = LocalContext.current
++    var pendingReminderChannel by remember { mutableStateOf<TvChannelItem?>(null) }
++    val reminderPermissionLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
++        androidx.activity.result.contract.ActivityResultContracts.RequestPermission()
++    ) { _ ->
++        pendingReminderChannel?.let { viewModel.addLiveReminder(it) }
++        pendingReminderChannel = null
++    }
++    val requestLiveReminder: (TvChannelItem) -> Unit = { ch ->
++        val needsPermission = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU &&
++            androidx.core.content.ContextCompat.checkSelfPermission(
++                context, android.Manifest.permission.POST_NOTIFICATIONS
++            ) != android.content.pm.PackageManager.PERMISSION_GRANTED
++        if (needsPermission) {
++            pendingReminderChannel = ch
++            reminderPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
++        } else {
++            viewModel.addLiveReminder(ch)
++        }
++    }
+     val keyboardController = LocalSoftwareKeyboardController.current
+     val focusManager = LocalFocusManager.current
+ 
+@@ -1312,6 +1333,18 @@ fun TvChannelsScreen(
+                     onOpenSchedule = {
+                         viewModel.setScheduleDialogVisible(true)
+                     },
++                    reminderSet = state.previewChannel
++                        ?.takeIf { ForkLiveReminders.isUpcoming(it) }
++                        ?.let { ch -> liveReminders.any { ForkLiveReminders.matches(it, ch) } },
++                    onToggleReminder = {
++                        state.previewChannel?.let { ch ->
++                            if (liveReminders.any { ForkLiveReminders.matches(it, ch) }) {
++                                viewModel.removeLiveReminder(ch)
++                            } else {
++                                requestLiveReminder(ch)
++                            }
++                        }
++                    },
+                     onStreamSelected = { idx ->
+                         viewModel.selectStreamIndex(idx)
+                     },
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsViewModel.kt
+index f2554b7af..22d556935 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsViewModel.kt
+@@ -12,6 +12,8 @@ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.delay
+ import kotlinx.coroutines.flow.SharingStarted
+ import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.flow.map
+ import kotlinx.coroutines.flow.stateIn
+ import kotlinx.coroutines.launch
+ import javax.inject.Inject
+@@ -20,9 +22,47 @@ import javax.inject.Inject
+ class TvChannelsViewModel @Inject constructor(
+     private val repository: TvChannelsRepository,
+     val playerPool: TvChannelPreviewPlayerPool,
+-    private val layoutPreferenceDataStore: LayoutPreferenceDataStore
++    private val layoutPreferenceDataStore: LayoutPreferenceDataStore,
++    private val remindersStore: com.nuvio.tv.data.local.ReleaseRemindersStore,
++    private val reminderCoordinator: com.nuvio.tv.core.reminders.ReleaseReminderCoordinator,
++    private val channelsDataStore: com.nuvio.tv.data.local.TvChannelsDataStore
+ ) : ViewModel() {
+ 
++    /** Live TV reminders only (item type "live:..."). */
++    val liveReminders: StateFlow<List<com.nuvio.tv.data.local.ReleaseReminder>> = remindersStore.reminders
++        .map { list -> list.filter { com.nuvio.tv.forklivetv.ForkLiveReminders.isLive(it) } }
++        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
++
++    fun addLiveReminder(channel: TvChannelItem) {
++        viewModelScope.launch {
++            val lead = channelsDataStore.liveReminderLeadMinutes.first()
++            remindersStore.add(com.nuvio.tv.forklivetv.ForkLiveReminders.build(channel, lead))
++            reminderCoordinator.scheduleNextAlarm()
++        }
++    }
++
++    fun removeLiveReminder(channel: TvChannelItem) {
++        viewModelScope.launch {
++            remindersStore.remove(channel.id, com.nuvio.tv.forklivetv.ForkLiveReminders.TYPE_PREFIX + channel.type)
++            reminderCoordinator.scheduleNextAlarm()
++        }
++    }
++
++    init {
++        // A reminder notification asked Live TV to open a channel: select it once channels are loaded.
++        viewModelScope.launch {
++            com.nuvio.tv.forklivetv.ForkLiveReminders.pendingOpen.collect { target ->
++                if (target == null) return@collect
++                val (type, id) = target
++                val channel = uiState.first { s -> s.allChannels.any { it.id == id && it.type == type } }
++                    .allChannels.first { it.id == id && it.type == type }
++                com.nuvio.tv.forklivetv.ForkLiveReminders.pendingOpen.value = null
++                repository.selectChannelForPreview(channel, startPlayback = true)
++                repository.setFullscreen(true)
++            }
++        }
++    }
++
+     val uiState: StateFlow<TvChannelsUiState> = repository.uiState
+ 
+     /** Live TV "Netflix style": landscape cards and a muted preview that starts after a short focus delay. */
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt
+index cc89a6dfe..c73db2396 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt
+@@ -30,6 +30,8 @@ import androidx.compose.material.icons.Icons
+ import androidx.compose.foundation.clickable
+ import androidx.compose.material.icons.rounded.CalendarMonth
+ import androidx.compose.material.icons.rounded.Fullscreen
++import androidx.compose.material.icons.rounded.Notifications
++import androidx.compose.material.icons.rounded.NotificationsActive
+ import androidx.compose.material.icons.rounded.PlayArrow
+ import androidx.compose.material.icons.rounded.Star
+ import androidx.compose.material.icons.rounded.StarBorder
+@@ -86,6 +88,9 @@ fun TvChannelPreviewPanel(
+     onWatchFullscreen: () -> Unit,
+     onToggleFavorite: () -> Unit,
+     onOpenSchedule: () -> Unit,
++    /** Live TV reminder: null hides the button (event not upcoming); otherwise true when a reminder is set. */
++    reminderSet: Boolean? = null,
++    onToggleReminder: () -> Unit = {},
+     onStreamSelected: (Int) -> Unit,
+     mutePreview: Boolean = false,
+     onRequestChannelListFocus: (() -> Unit)? = null,
+@@ -374,15 +379,28 @@ fun TvChannelPreviewPanel(
+                     modifier = m
+                 )
+             }
++            val reminderButton: @Composable (Modifier) -> Unit = { m ->
++                if (reminderSet != null) {
++                    PanelActionButton(
++                        label = stringResource(if (reminderSet) R.string.live_reminder_button_set else R.string.live_reminder_button),
++                        icon = if (reminderSet) Icons.Rounded.NotificationsActive else Icons.Rounded.Notifications,
++                        onClick = onToggleReminder,
++                        iconTint = { focused -> if (focused) Color.Black else Color.White },
++                        modifier = m
++                    )
++                }
++            }
+             if (vertical) {
+                 Column(modifier = buttonsModifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                     fullscreenButton(Modifier.fillMaxWidth())
++                    reminderButton(Modifier.fillMaxWidth())
+                     favoriteButton(Modifier.fillMaxWidth())
+                     guideButton(Modifier.fillMaxWidth())
+                 }
+             } else {
+                 Row(modifier = buttonsModifier, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                     fullscreenButton(Modifier.weight(1.2f))
++                    if (reminderSet != null) reminderButton(Modifier.weight(1f))
+                     favoriteButton(Modifier.weight(1f))
+                     guideButton(Modifier.weight(0.9f))
+                 }
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 71306407d..8438db88d 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -3574,4 +3574,13 @@
+     <string name="tv_channels_select_channel">Select a channel</string>
+     <string name="tv_channels_watch_channel">Watch Channel</string>
+     <string name="tv_channels_remaining_minutes">%1$dm left</string>
++    <string name="live_reminder_notification_text">Starting soon on Live TV</string>
++    <string name="live_reminder_watch_now">Watch now</string>
++    <string name="live_reminder_button">Remind me</string>
++    <string name="live_reminder_button_set">Reminder on</string>
++    <string name="live_reminders_title">Live TV reminders</string>
++    <string name="live_reminders_subtitle">Remind me on upcoming events. A notification opens the channel.</string>
++    <string name="live_reminders_lead">Remind me before the start</string>
++    <string name="live_reminders_lead_value">%1$d min</string>
++    <string name="live_reminders_empty">No Live TV reminders</string>
+ </resources>
