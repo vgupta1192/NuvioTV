@@ -1,0 +1,42 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
+index 3521a6c27..e1d7eee17 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
+@@ -246,7 +246,9 @@ internal class ExoPictureEffects(
+         )
+         // Once the shader is in the chain it stays, with neutral numbers, until the player is released:
+         // taking it out again would be one more rebuild and one more burst of dropped frames.
+-        val fused = wantFused || (chainFused && !shaderBroken)
++        // Tall 50/60 fps video (YouTube 1440p/4K) already strains the decoder: no extra GL pass on top of it.
++        val tooHeavy = player.videoSize.height > MAX_EFFECT_HEIGHT && (player.videoFormat?.frameRate ?: 0f) > 32f
++        val fused = (wantFused || (chainFused && !shaderBroken)) && !tooHeavy
+         val scaled = fused && player.videoSize.height > MAX_EFFECT_HEIGHT
+         if (chainSet && fused == chainFused && scaled == chainScaled) return
+         val effects = ArrayList<Effect>()
+@@ -266,10 +268,8 @@ internal class ExoPictureEffects(
+     override fun onVideoSizeChanged(videoSize: VideoSize) {
+         if (autoEnhance) PlayerEffects.maybeAutoEnhance(videoSize.height, player.videoFormat?.bitrate)
+         val tooBig = videoSize.height > MAX_EFFECT_HEIGHT
+-        if (tooBig != scaledDown) {
+-            scaledDown = tooBig
+-            push()
+-        }
++        if (tooBig != scaledDown) scaledDown = tooBig
++        push()
+     }
+ 
+     override fun onPlayerError(error: PlaybackException) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt
+index fd8eeff27..36dc87e35 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt
+@@ -58,7 +58,8 @@ internal fun PlayerRuntimeController.youtubeOnDroppedFrames(droppedFrames: Int,
+         youtubeDropStrikes = 0
+         return
+     }
+-    if (++youtubeDropStrikes < 2) return
++    // Heavy loss (about a quarter of 60 fps or more) steps down at once; mild loss needs a second report.
++    if (++youtubeDropStrikes < 2 && perSecond < 15f) return
+     val lower = player.currentTracks.groups
+         .filter { it.type == C.TRACK_TYPE_VIDEO }
+         .flatMap { g -> (0 until g.length).filter { g.isTrackSupported(it) }.map { g.getTrackFormat(it).height } }
