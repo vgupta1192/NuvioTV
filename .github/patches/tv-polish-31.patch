@@ -1,0 +1,399 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/ratings/UserRatingsRepository.kt b/app/src/main/java/com/nuvio/tv/core/ratings/UserRatingsRepository.kt
+index d71d96589..e98cf53a1 100644
+--- a/app/src/main/java/com/nuvio/tv/core/ratings/UserRatingsRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/core/ratings/UserRatingsRepository.kt
+@@ -1,6 +1,7 @@
+ package com.nuvio.tv.core.ratings
+ 
+ import android.content.Context
++import com.nuvio.tv.data.local.TraktAuthDataStore
+ import com.nuvio.tv.data.mdblist.MdbListApiClient
+ import com.nuvio.tv.data.mdblist.MdbListAuthStore
+ import com.nuvio.tv.data.simkl.SimklApiClient
+@@ -8,11 +9,19 @@ import com.nuvio.tv.data.simkl.SimklApiRequest
+ import com.nuvio.tv.data.simkl.SimklAuthRepository
+ import com.nuvio.tv.data.simkl.SimklHttpMethod
+ import com.nuvio.tv.data.simkl.SimklRetryPolicy
++import com.nuvio.tv.data.remote.api.TraktApi
++import com.nuvio.tv.data.repository.TraktAuthService
+ import com.nuvio.tv.data.wetrakr.WeTrakrService
+ import dagger.hilt.android.qualifiers.ApplicationContext
+ import javax.inject.Inject
+ import javax.inject.Singleton
+ import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.launch
++import okhttp3.MediaType.Companion.toMediaType
++import okhttp3.RequestBody.Companion.toRequestBody
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.flow.asStateFlow
+@@ -31,14 +40,26 @@ class UserRatingsRepository @Inject constructor(
+     private val mdbListApi: MdbListApiClient,
+     private val mdbListStore: MdbListAuthStore,
+     private val weTrakr: WeTrakrService,
++    private val traktApi: TraktApi,
++    private val traktAuth: TraktAuthService,
++    traktStore: TraktAuthDataStore,
+ ) {
++    @Volatile private var traktConnected = false
++
++    init {
++        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
++            traktStore.state.collect { traktConnected = it.isAuthenticated }
++        }
++    }
++
+     private val prefs = context.getSharedPreferences("user_ratings", Context.MODE_PRIVATE)
+     private val _ratings = MutableStateFlow(load())
+     val ratings: StateFlow<Map<String, Int>> = _ratings.asStateFlow()
+ 
+     /** True when at least one connected account can store a rating. */
+     fun canRate(): Boolean =
+-        simklAuth.state.value.isAuthenticated ||
++        traktConnected ||
++            simklAuth.state.value.isAuthenticated ||
+             mdbListStore.state.value.isAuthenticated ||
+             weTrakr.state.value.isConnected
+ 
+@@ -48,6 +69,7 @@ class UserRatingsRepository @Inject constructor(
+      */
+     suspend fun rate(imdbId: String, isMovie: Boolean, rating: Int?): Boolean {
+         var saved = false
++        if (traktConnected) saved = attempt { trakt(imdbId, isMovie, rating) } || saved
+         if (simklAuth.state.value.isAuthenticated) saved = attempt { simkl(imdbId, isMovie, rating) } || saved
+         if (mdbListStore.state.value.isAuthenticated) saved = attempt { mdbList(imdbId, isMovie, rating) } || saved
+         if (weTrakr.state.value.isConnected) saved = attempt { weTrakr.setTitleRating(imdbId, isMovie, rating) } || saved
+@@ -55,6 +77,52 @@ class UserRatingsRepository @Inject constructor(
+         return saved
+     }
+ 
++    /** The trackers that show a status line in the rating dialog, in display order. */
++    fun providerLabels(): List<String> = buildList {
++        if (traktConnected) add(TRAKT)
++        if (simklAuth.state.value.isAuthenticated) add(SIMKL)
++        if (mdbListStore.state.value.isAuthenticated) add(MDBLIST)
++    }
++
++    /**
++     * Current 1-10 rating per tracker (null = not rated). Trakt is read live; the others report the value
++     * kept on this device. A tracker missing from the map could not be read.
++     */
++    suspend fun statuses(imdbId: String, isMovie: Boolean): Map<String, Int?> {
++        val local = _ratings.value[imdbId]
++        val out = LinkedHashMap<String, Int?>()
++        for (label in providerLabels()) {
++            if (label == TRAKT) {
++                val live = try { traktRating(imdbId, isMovie) } catch (cancel: CancellationException) { throw cancel } catch (_: Exception) { -1 }
++                if (live != null && live < 0) continue
++                out[label] = live
++            } else out[label] = local
++        }
++        return out
++    }
++
++    private suspend fun traktRating(imdbId: String, isMovie: Boolean): Int? {
++        val response = traktAuth.executeAuthorizedRequest { header ->
++            traktApi.getUserRatings(header, if (isMovie) "movies" else "shows")
++        } ?: return -1
++        if (!response.isSuccessful) return -1
++        val array = JSONArray(response.body()?.string().orEmpty())
++        for (i in 0 until array.length()) {
++            val row = array.optJSONObject(i) ?: continue
++            val title = row.optJSONObject(if (isMovie) "movie" else "show") ?: continue
++            if (title.optJSONObject("ids")?.optString("imdb") == imdbId) return row.optInt("rating").takeIf { it in 1..10 }
++        }
++        return null
++    }
++
++    private suspend fun trakt(imdbId: String, isMovie: Boolean, rating: Int?): Boolean {
++        val body = ratedBody(imdbId, isMovie, rating).toRequestBody("application/json".toMediaType())
++        val response = traktAuth.executeAuthorizedWriteRequest { header ->
++            if (rating == null) traktApi.removeUserRatings(header, body) else traktApi.addUserRatings(header, body)
++        }
++        return response?.isSuccessful == true
++    }
++
+     private suspend fun attempt(block: suspend () -> Boolean): Boolean = try {
+         block()
+     } catch (cancel: CancellationException) {
+@@ -106,5 +174,8 @@ class UserRatingsRepository @Inject constructor(
+ 
+     private companion object {
+         const val KEY = "ratings_by_imdb_id"
++        const val TRAKT = "Trakt"
++        const val SIMKL = "Simkl"
++        const val MDBLIST = "MDBList"
+     }
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/data/remote/api/TraktApi.kt b/app/src/main/java/com/nuvio/tv/data/remote/api/TraktApi.kt
+index bc0f983df..b01b4dd91 100644
+--- a/app/src/main/java/com/nuvio/tv/data/remote/api/TraktApi.kt
++++ b/app/src/main/java/com/nuvio/tv/data/remote/api/TraktApi.kt
+@@ -373,4 +373,22 @@ interface TraktApi {
+         @Header("Authorization") authorization: String,
+         @Body body: TraktListItemsMutationRequestDto
+     ): Response<TraktListItemsMutationResponseDto>
++
++    @GET("sync/ratings/{type}")
++    suspend fun getUserRatings(
++        @Header("Authorization") authorization: String,
++        @Path("type") type: String
++    ): Response<okhttp3.ResponseBody>
++
++    @POST("sync/ratings")
++    suspend fun addUserRatings(
++        @Header("Authorization") authorization: String,
++        @Body body: okhttp3.RequestBody
++    ): Response<okhttp3.ResponseBody>
++
++    @POST("sync/ratings/remove")
++    suspend fun removeUserRatings(
++        @Header("Authorization") authorization: String,
++        @Body body: okhttp3.RequestBody
++    ): Response<okhttp3.ResponseBody>
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
+index b72c01f58..a0950531a 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
+@@ -3133,24 +3133,7 @@ private fun MetaDetailsContent(
+         }
+ 
+         if (showUserRatingDialog && ratedImdbId != null) {
+-            UserRatingDialog(
+-                current = userRatings[ratedImdbId],
+-                onDismiss = { showUserRatingDialog = false },
+-                onSelect = { rating ->
+-                    showUserRatingDialog = false
+-                    ratingViewModel.rate(ratedImdbId, meta.apiType == "movie", rating) { saved ->
+-                        android.widget.Toast.makeText(
+-                            ratingContext,
+-                            when {
+-                                !saved -> R.string.user_rating_failed
+-                                rating == null -> R.string.user_rating_removed
+-                                else -> R.string.user_rating_saved
+-                            },
+-                            android.widget.Toast.LENGTH_SHORT
+-                        ).show()
+-                    }
+-                }
+-            )
++            UserRatingDialog(name = meta.name, imdbId = ratedImdbId, isMovie = meta.apiType == "movie", onDismiss = { showUserRatingDialog = false })
+         }
+         if (showEpisodeGoToDialog) {
+             EpisodeGoToDialog(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/UserRating.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/UserRating.kt
+index 746edeba8..a2e9ae4f1 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/UserRating.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/UserRating.kt
+@@ -1,16 +1,25 @@
+ package com.nuvio.tv.ui.screens.detail
+ 
+ import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.verticalScroll
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.focus.FocusRequester
+ import androidx.compose.ui.focus.focusRequester
+-import androidx.compose.ui.res.stringResource
+ import androidx.compose.ui.unit.dp
++import androidx.hilt.navigation.compose.hiltViewModel
++import androidx.tv.material3.MaterialTheme
+ import androidx.lifecycle.ViewModel
+ import androidx.lifecycle.viewModelScope
+ import androidx.tv.material3.Button
+@@ -34,6 +43,12 @@ class UserRatingViewModel @Inject constructor(
+ 
+     fun canRate(): Boolean = repository.canRate()
+ 
++    fun providerLabels(): List<String> = repository.providerLabels()
++
++    suspend fun statuses(imdbId: String, isMovie: Boolean): Map<String, Int?> = repository.statuses(imdbId, isMovie)
++
++    suspend fun write(imdbId: String, isMovie: Boolean, rating: Int?): Boolean = repository.rate(imdbId, isMovie, rating)
++
+     fun rate(imdbId: String, isMovie: Boolean, rating: Int?, onResult: (Boolean) -> Unit) {
+         viewModelScope.launch { onResult(repository.rate(imdbId, isMovie, rating)) }
+     }
+@@ -44,50 +59,105 @@ internal fun ratingImdbId(metaId: String, imdbId: String?): String? =
+     sequenceOf(imdbId, metaId.substringBefore(':'))
+         .firstOrNull { !it.isNullOrBlank() && it.startsWith("tt") }
+ 
+-/** Rating picker (ported idea from NuvioMobile-Enhanced): 1 to 10, or remove the current rating. */
++/**
++ * "Your rating" dialog (ported from Nuvio-ReSeq): half-star steps (1-10 on the trackers), one status line per
++ * connected tracker, Submit / Remove ratings / Close. Stays open after a write and shows the result.
++ */
+ @OptIn(ExperimentalTvMaterial3Api::class)
+ @Composable
+ fun UserRatingDialog(
+-    current: Int?,
++    name: String,
++    imdbId: String,
++    isMovie: Boolean,
+     onDismiss: () -> Unit,
+-    onSelect: (Int?) -> Unit,
++    viewModel: UserRatingViewModel = hiltViewModel(),
+ ) {
+-    val focusRequester = remember { FocusRequester() }
+-    LaunchedEffect(Unit) { runCatching { focusRequester.requestFocus() } }
++    val scope = rememberCoroutineScope()
++    val labels = remember { viewModel.providerLabels() }
++    var statuses by remember { mutableStateOf<Map<String, Int?>?>(null) }
++    var busy by remember { mutableStateOf(true) }
++    var saved by remember { mutableStateOf(false) }
++    var failed by remember { mutableStateOf(false) }
++    var selected by remember { mutableStateOf<Int?>(null) }
++    val firstFocus = remember { FocusRequester() }
++
++    LaunchedEffect(imdbId) {
++        val read = runCatching { viewModel.statuses(imdbId, isMovie) }.getOrNull()
++        statuses = read
++        selected = read?.values?.filterNotNull()?.distinct()?.singleOrNull()
++        busy = false
++        runCatching { firstFocus.requestFocus() }
++    }
++
++    fun write(rating: Int?) {
++        if (busy) return
++        busy = true
++        failed = false
++        scope.launch {
++            val ok = viewModel.write(imdbId, isMovie, rating)
++            if (ok) {
++                saved = true
++                statuses = runCatching { viewModel.statuses(imdbId, isMovie) }.getOrNull() ?: statuses
++                if (rating == null) selected = null
++            } else failed = true
++            busy = false
++        }
++    }
+ 
+     NuvioDialog(
+         onDismiss = onDismiss,
+-        title = stringResource(R.string.user_rating_title),
+-        width = 640.dp,
++        title = "Your rating",
++        subtitle = name,
++        width = 620.dp,
++        usePlatformDefaultWidth = false,
++        contentPadding = 16.dp,
++        contentSpacing = 8.dp,
+     ) {
+-        listOf(1..5, 6..10).forEach { range ->
+-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+-                range.forEach { value ->
+-                    Button(
+-                        onClick = { onSelect(value) },
+-                        modifier = Modifier.then(
+-                            if (value == (current ?: 8)) Modifier.focusRequester(focusRequester) else Modifier
+-                        ),
+-                        colors = ButtonDefaults.colors(
+-                            containerColor = if (value == current) NuvioTheme.colors.SurfaceVariant else NuvioTheme.colors.BackgroundCard,
+-                            contentColor = NuvioTheme.colors.TextPrimary,
+-                        )
+-                    ) {
+-                        Text(value.toString())
++        Column(
++            Modifier.fillMaxWidth().weight(1f, fill = false).verticalScroll(rememberScrollState()),
++            verticalArrangement = Arrangement.spacedBy(8.dp)
++        ) {
++            Text("Half-star steps · 1–10 on your trackers", style = MaterialTheme.typography.bodyMedium)
++            if (busy) Text("Contacting trackers…")
++            if (failed) Text("Could not save. Check your connection and try again.")
++            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
++                labels.forEach { label ->
++                    val known = statuses?.containsKey(label) == true
++                    val rating = statuses?.get(label)
++                    Text(
++                        label + ": " + when {
++                            statuses == null && !busy -> "Could not load existing rating"
++                            statuses == null -> "…"
++                            !known -> "Could not load existing rating"
++                            rating == null -> if (saved) "Rating removed" else "Not rated"
++                            else -> "${rating / 2.0} ★ ($rating/10)" + if (saved) " — saved" else ""
++                        },
++                        style = MaterialTheme.typography.bodyMedium
++                    )
++                }
++            }
++            listOf(1, 6).forEach { start ->
++                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                    for (rating in start until start + 5) {
++                        Button(
++                            modifier = Modifier.weight(1f).height(40.dp)
++                                .then(if (rating == (selected ?: 1)) Modifier.focusRequester(firstFocus) else Modifier),
++                            enabled = !busy,
++                            onClick = { selected = rating }
++                        ) {
++                            Text((if (selected == rating) "✓ " else "") + "${rating / 2.0} ★", maxLines = 1, softWrap = false)
++                        }
+                     }
+                 }
+             }
+-        }
+-        if (current != null) {
+-            Button(
+-                onClick = { onSelect(null) },
+-                modifier = Modifier.fillMaxWidth(),
+-                colors = ButtonDefaults.colors(
+-                    containerColor = NuvioTheme.colors.BackgroundCard,
+-                    contentColor = NuvioTheme.colors.TextPrimary,
+-                )
+-            ) {
+-                Text(stringResource(R.string.user_rating_remove))
++            Text("Submit to: " + labels.joinToString(), style = MaterialTheme.typography.bodyMedium)
++            if ("Simkl" in labels) {
++                Text("Simkl may also add newly rated titles to your watchlist.", style = MaterialTheme.typography.bodySmall)
++            }
++            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
++                Button(modifier = Modifier.height(40.dp), enabled = !busy && selected != null, onClick = { write(selected) }) { Text("Submit") }
++                Button(modifier = Modifier.height(40.dp), enabled = !busy, onClick = { write(null) }) { Text("Remove ratings") }
++                Button(modifier = Modifier.height(40.dp), onClick = onDismiss) { Text("Close") }
+             }
+         }
+     }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
+index 07071e00e..38f6edbbe 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/jellyfin/JellyfinDetailScreen.kt
+@@ -436,24 +436,7 @@ fun JellyfinDetailsScreen(
+         }
+ 
+         if (showUserRatingDialog && ratedImdbId != null) {
+-            UserRatingDialog(
+-                current = userRatings[ratedImdbId],
+-                onDismiss = { showUserRatingDialog = false },
+-                onSelect = { rating ->
+-                    showUserRatingDialog = false
+-                    userRatingViewModel.rate(ratedImdbId, !item.isSeries, rating) { saved ->
+-                        android.widget.Toast.makeText(
+-                            ratingContext,
+-                            when {
+-                                !saved -> com.nuvio.tv.R.string.user_rating_failed
+-                                rating == null -> com.nuvio.tv.R.string.user_rating_removed
+-                                else -> com.nuvio.tv.R.string.user_rating_saved
+-                            },
+-                            android.widget.Toast.LENGTH_SHORT,
+-                        ).show()
+-                    }
+-                },
+-            )
++            UserRatingDialog(name = item.name, imdbId = ratedImdbId, isMovie = !item.isSeries, onDismiss = { showUserRatingDialog = false })
+         }
+ 
+         ratings.trailerOverlay?.let { overlay ->
