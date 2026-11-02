@@ -1,0 +1,654 @@
+diff --git a/app/src/main/java/com/nuvio/tv/forklivetv/ForkLiveRecorder.kt b/app/src/main/java/com/nuvio/tv/forklivetv/ForkLiveRecorder.kt
+index 82f8705d3..deeb30d30 100644
+--- a/app/src/main/java/com/nuvio/tv/forklivetv/ForkLiveRecorder.kt
++++ b/app/src/main/java/com/nuvio/tv/forklivetv/ForkLiveRecorder.kt
+@@ -85,14 +85,24 @@ object ForkLiveRecorder {
+                 ArrayList(headers.orEmpty().map { "${it.key}\n${it.value}" })
+             )
+         _message.value = "Starting recording…"
++        // Flip the panel to "Stop recording" at once; run() replaces this with the real file.
++        val begun = System.currentTimeMillis()
++        _bytes.value = 0L
++        _active.value = Active(channel, File(recordingsDir(context), "pending"), begun, if (maxMinutes > 0) begun + maxMinutes * 60_000L else Long.MAX_VALUE)
+         try {
+             if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent) else context.startService(intent)
+         } catch (e: Exception) {
+             Log.w(TAG, "could not start the recording service", e)
+             _message.value = "Could not start recording: ${e.message ?: e.javaClass.simpleName}"
++            _active.value = null
+         }
+     }
+ 
++    /** Lets the player show the same message again next time. */
++    fun clearMessage() {
++        _message.value = null
++    }
++
+     fun stop() {
+         stopRequested = true
+         call?.cancel()
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/stream/ForkStreamRefreshStatus.kt b/app/src/main/java/com/nuvio/tv/ui/screens/stream/ForkStreamRefreshStatus.kt
+index c4105119c..a54beb72b 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/stream/ForkStreamRefreshStatus.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/ForkStreamRefreshStatus.kt
+@@ -37,11 +37,11 @@ internal fun ForkStreamRefreshStatus(
+     }
+     val text = when {
+         manualLoading || phase == 0 -> "Auto refresh: waiting for the load to finish"
+-        phase == 1 -> "Auto refresh: checking addons now · round ${rounds + 1} · +$added links so far"
++        phase == 1 -> "Auto refresh: checking addons now · round ${rounds + 1} · +$added new links since opening"
+         else -> {
+             val ago = ((now - lastAtMs) / 1000).coerceAtLeast(0)
+             val result = if (lastOk) "ok" else "timed out"
+-            "Auto refresh: last check ${ago}s ago ($result) · $rounds rounds · +$added links added"
++            "Auto refresh: last check ${ago}s ago ($result) · $rounds rounds · +$added new links since opening"
+         }
+     }
+     val color = if (phase == 2 && !lastOk) Color(0xFFFFB74D) else Color.White.copy(alpha = 0.6f)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
+index 37037b9d4..375a64e3a 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
+@@ -363,7 +363,8 @@ class StreamScreenViewModel @Inject constructor(
+                     it.copy(
+                         autoRefreshPhase = 2,
+                         autoRefreshRounds = it.autoRefreshRounds + 1,
+-                        autoRefreshAdded = it.autoRefreshAdded + roundAdded,
++                        // Never more than the list holds: the count is net growth since the screen opened.
++                        autoRefreshAdded = (it.autoRefreshAdded + roundAdded).coerceAtMost(it.allStreams.size),
+                         autoRefreshLastAtMs = System.currentTimeMillis(),
+                         autoRefreshLastOk = roundOk
+                     )
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt
+index 0bb24e1db..c716c8d10 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelFullscreenHud.kt
+@@ -96,8 +96,15 @@ fun TvChannelFullscreenHud(
+     val forkRecActive by ForkLiveRecorder.active.collectAsStateWithLifecycle()
+     val forkRecBytes by ForkLiveRecorder.bytes.collectAsStateWithLifecycle()
+     val forkRecMessage by ForkLiveRecorder.message.collectAsStateWithLifecycle()
++    // Toasts are often invisible on Android TV, so the recorder message is also drawn on screen.
++    var forkRecBanner by remember { mutableStateOf<String?>(null) }
+     LaunchedEffect(forkRecMessage) {
+-        forkRecMessage?.let { android.widget.Toast.makeText(forkRecContext, it, android.widget.Toast.LENGTH_LONG).show() }
++        val message = forkRecMessage ?: return@LaunchedEffect
++        android.widget.Toast.makeText(forkRecContext, message, android.widget.Toast.LENGTH_LONG).show()
++        forkRecBanner = message
++        ForkLiveRecorder.clearMessage()
++        delay(8000)
++        forkRecBanner = null
+     }
+     var sleepMinutes by remember { mutableStateOf(0) }
+     var isMuted by remember { mutableStateOf(false) }
+@@ -518,6 +525,24 @@ fun TvChannelFullscreenHud(
+             }
+         }
+ 
++        val forkRecLabel = when {
++            forkRecActive != null ->
++                "\u25cf REC " + android.text.format.Formatter.formatShortFileSize(forkRecContext, forkRecBytes) +
++                    (forkRecBanner?.let { " \u00b7 $it" } ?: "")
++            else -> forkRecBanner
++        }
++        if (forkRecLabel != null) {
++            Text(
++                text = forkRecLabel,
++                color = Color.White,
++                modifier = Modifier
++                    .align(Alignment.TopStart)
++                    .padding(24.dp)
++                    .background(Color(0xCC000000), RoundedCornerShape(8.dp))
++                    .padding(horizontal = 12.dp, vertical = 6.dp)
++            )
++        }
++
+         if (isOptionsOpen) {
+             TvChannelOptionsPanel(
+                 player = exoPlayer,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvSportsHubDialog.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvSportsHubDialog.kt
+index 247b76dd9..794b38339 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvSportsHubDialog.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvSportsHubDialog.kt
+@@ -10,15 +10,18 @@ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.height
+ import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
+ import androidx.compose.foundation.layout.width
+ import androidx.compose.foundation.lazy.LazyColumn
+ import androidx.compose.foundation.lazy.LazyRow
+ import androidx.compose.foundation.lazy.items
++import androidx.compose.foundation.shape.CircleShape
+ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.produceState
+ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.setValue
+@@ -32,6 +35,7 @@ import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.layout.ContentScale
+ import androidx.compose.ui.res.stringResource
+ import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.style.TextAlign
+ import androidx.compose.ui.text.style.TextOverflow
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.unit.sp
+@@ -69,9 +73,46 @@ private class SportsHub(
+ 
+ private enum class HubFilter { ALL, LIVE, TODAY, LATER }
+ 
++private val SPORT_ORDER = listOf("Football", "Basketball", "Baseball", "Hockey", "Soccer", "MMA", "Cricket", "Tennis", "Motorsport", "Other")
++
++private fun sportOf(ch: TvChannelItem): String {
++    val text = (ch.name + " " + ch.genres.joinToString(" ") + " " + ch.catalogName).lowercase()
++    return when {
++        "nba" in text || "basketball" in text || "wnba" in text -> "Basketball"
++        "nfl" in text || "ncaaf" in text || "american football" in text -> "Football"
++        "mlb" in text || "baseball" in text -> "Baseball"
++        "nhl" in text || "hockey" in text -> "Hockey"
++        "ufc" in text || "mma" in text || "boxing" in text || "wwe" in text -> "MMA"
++        "cricket" in text || "ipl" in text -> "Cricket"
++        "tennis" in text -> "Tennis"
++        "formula" in text || "f1" in text || "motogp" in text || "nascar" in text -> "Motorsport"
++        "soccer" in text || "premier league" in text || "la liga" in text || "champions league" in text ||
++            "serie a" in text || "bundesliga" in text || "ligue 1" in text || "football" in text || " fc" in text -> "Soccer"
++        else -> "Other"
++    }
++}
++
++private val TEAM_SPLIT = Regex("\\s+(?:vs\\.?|v|@|-|\u2013)\\s+", RegexOption.IGNORE_CASE)
++
++/** "Lakers vs Celtics" gives both team names; anything else gives null. */
++private fun teamsOf(ch: TvChannelItem): Pair<String, String>? {
++    val title = ch.name.substringAfter(": ", ch.name)
++    val parts = title.split(TEAM_SPLIT, limit = 2).map { it.trim() }
++    return if (parts.size == 2 && parts[0].isNotEmpty() && parts[1].isNotEmpty()) parts[0] to parts[1] else null
++}
++
++private fun teamColor(name: String): Color {
++    val hue = ((name.lowercase().hashCode() and 0x7fffffff) % 360).toFloat()
++    return Color.hsv(hue, 0.6f, 0.42f)
++}
++
++private fun initialsOf(name: String): String =
++    name.split(' ').filter { it.isNotBlank() }.take(2).joinToString("") { it.first().uppercase() }.ifEmpty { "?" }
++
+ /**
+- * Sports hub: a featured event, then Live now / Today / Later rows of event cards.
+- * OK on a live card watches it, OK on an upcoming card sets a reminder, hold OK watches at once.
++ * Sports hub laid out like a sports app: a top bar with sport chips, a hero event with a details
++ * panel, then Live & Upcoming rows of team cards. OK on a live card watches it, OK on an upcoming
++ * card sets a reminder, hold OK watches at once.
+  */
+ @OptIn(ExperimentalTvMaterial3Api::class)
+ @Composable
+@@ -91,9 +132,23 @@ fun TvSportsHubDialog(
+     }
+     val hub = built
+     var filter by remember { mutableIntStateOf(HubFilter.ALL.ordinal) }
++    var sport by remember { mutableStateOf<String?>(null) }
+     val active = HubFilter.entries[filter]
+     val firstFocus = remember { FocusRequester() }
+-    val featured = hub?.let { h ->
++    val sports = remember(hub) {
++        if (hub == null) emptyList() else {
++            val present = (hub.live + hub.today + hub.later).map { sportOf(it) }.toSet()
++            SPORT_ORDER.filter { it in present }
++        }
++    }
++    val view = remember(hub, sport) {
++        if (hub == null) null else if (sport == null) hub else SportsHub(
++            live = hub.live.filter { sportOf(it) == sport },
++            today = hub.today.filter { sportOf(it) == sport },
++            later = hub.later.filter { sportOf(it) == sport }
++        )
++    }
++    val featured = view?.let { h ->
+         when (active) {
+             HubFilter.LIVE -> h.live.firstOrNull()
+             HubFilter.TODAY -> h.today.firstOrNull()
+@@ -101,7 +156,7 @@ fun TvSportsHubDialog(
+             HubFilter.ALL -> h.live.firstOrNull() ?: h.today.firstOrNull() ?: h.later.firstOrNull()
+         }
+     }
+-    LaunchedEffect(featured?.id, filter) {
++    LaunchedEffect(featured?.id, filter, sport) {
+         if (featured != null) {
+             delay(150)
+             runCatching { firstFocus.requestFocus() }
+@@ -116,12 +171,13 @@ fun TvSportsHubDialog(
+     NuvioDialog(
+         onDismiss = onDismiss,
+         title = stringResource(R.string.sports_hub_title),
+-        subtitle = stringResource(R.string.sports_hub_subtitle),
+-        width = 860.dp
++        subtitle = null,
++        width = 1100.dp,
++        usePlatformDefaultWidth = false
+     ) {
+-        if (hub == null) {
++        if (hub == null || view == null) {
+             Text(
+-                text = "…",
++                text = "\u2026",
+                 style = MaterialTheme.typography.bodyMedium,
+                 color = Color.White.copy(alpha = 0.5f),
+                 modifier = Modifier.padding(vertical = 24.dp)
+@@ -134,66 +190,99 @@ fun TvSportsHubDialog(
+                 modifier = Modifier.padding(vertical = 24.dp)
+             )
+         } else {
+-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+-                HubChip(
+-                    label = stringResource(R.string.sports_hub_all) + " · " + hub.total,
+-                    selected = active == HubFilter.ALL,
+-                    onClick = { filter = HubFilter.ALL.ordinal }
+-                )
+-                if (hub.live.isNotEmpty()) HubChip(
+-                    label = stringResource(R.string.sports_hub_live) + " · " + hub.live.size,
+-                    selected = active == HubFilter.LIVE,
+-                    dot = LIVE_RED,
+-                    onClick = { filter = HubFilter.LIVE.ordinal }
+-                )
+-                if (hub.today.isNotEmpty()) HubChip(
+-                    label = stringResource(R.string.sports_hub_today) + " · " + hub.today.size,
+-                    selected = active == HubFilter.TODAY,
+-                    onClick = { filter = HubFilter.TODAY.ordinal }
+-                )
+-                if (hub.later.isNotEmpty()) HubChip(
+-                    label = stringResource(R.string.sports_hub_later) + " · " + hub.later.size,
+-                    selected = active == HubFilter.LATER,
+-                    onClick = { filter = HubFilter.LATER.ordinal }
++            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
++                item(key = "f_all") {
++                    HubChip(
++                        label = stringResource(R.string.sports_hub_all) + " \u00b7 " + hub.total,
++                        selected = active == HubFilter.ALL,
++                        onClick = { filter = HubFilter.ALL.ordinal }
++                    )
++                }
++                if (hub.live.isNotEmpty()) item(key = "f_live") {
++                    HubChip(
++                        label = stringResource(R.string.sports_hub_live) + " \u00b7 " + hub.live.size,
++                        selected = active == HubFilter.LIVE,
++                        dot = LIVE_RED,
++                        onClick = { filter = HubFilter.LIVE.ordinal }
++                    )
++                }
++                if (hub.today.isNotEmpty()) item(key = "f_today") {
++                    HubChip(
++                        label = stringResource(R.string.sports_hub_today) + " \u00b7 " + hub.today.size,
++                        selected = active == HubFilter.TODAY,
++                        onClick = { filter = HubFilter.TODAY.ordinal }
++                    )
++                }
++                if (hub.later.isNotEmpty()) item(key = "f_later") {
++                    HubChip(
++                        label = stringResource(R.string.sports_hub_later) + " \u00b7 " + hub.later.size,
++                        selected = active == HubFilter.LATER,
++                        onClick = { filter = HubFilter.LATER.ordinal }
++                    )
++                }
++                if (sports.size > 1) {
++                    item(key = "s_all") {
++                        HubChip(label = "All sports", selected = sport == null, onClick = { sport = null })
++                    }
++                    items(sports, key = { "s_$it" }) { name ->
++                        HubChip(label = name, selected = sport == name, onClick = { sport = name })
++                    }
++                }
++            }
++            if (view.isEmpty) {
++                Text(
++                    text = stringResource(R.string.sports_hub_empty),
++                    style = MaterialTheme.typography.bodyMedium,
++                    color = Color.White.copy(alpha = 0.5f),
++                    modifier = Modifier.padding(vertical = 24.dp)
+                 )
+             }
+             LazyColumn(
+-                modifier = Modifier.fillMaxWidth().height(380.dp),
+-                verticalArrangement = Arrangement.spacedBy(10.dp)
++                modifier = Modifier.fillMaxWidth().height(430.dp),
++                verticalArrangement = Arrangement.spacedBy(12.dp)
+             ) {
+                 if (featured != null) {
+                     item(key = "featured") {
+-                        val live = featured in hub.live
+-                        FeaturedCard(
+-                            channel = featured,
+-                            live = live,
+-                            reminderSet = !live && isReminderSet(featured),
+-                            timeText = featured.startEpochMs?.let { timeFormat.format(Date(it)) }.orEmpty(),
+-                            onClick = { onPrimary(featured, live) },
+-                            onLongClick = { onWatch(featured) },
+-                            modifier = Modifier.focusRequester(firstFocus)
+-                        )
++                        val live = featured in view.live
++                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
++                            HeroCard(
++                                channel = featured,
++                                live = live,
++                                reminderSet = !live && isReminderSet(featured),
++                                timeText = featured.startEpochMs?.let { timeFormat.format(Date(it)) }.orEmpty(),
++                                onClick = { onPrimary(featured, live) },
++                                onLongClick = { onWatch(featured) },
++                                modifier = Modifier.weight(1f).focusRequester(firstFocus)
++                            )
++                            DetailsPanel(
++                                channel = featured,
++                                live = live,
++                                reminderSet = !live && isReminderSet(featured),
++                                timeText = featured.startEpochMs?.let { timeFormat.format(Date(it)) }.orEmpty(),
++                                modifier = Modifier.width(260.dp)
++                            )
++                        }
+                     }
+                 }
+                 val sections = buildList {
+-                    if (active == HubFilter.ALL || active == HubFilter.LIVE) add(Triple(R.string.sports_hub_live, hub.live, true))
+-                    if (active == HubFilter.ALL || active == HubFilter.TODAY) add(Triple(R.string.sports_hub_today, hub.today, false))
+-                    if (active == HubFilter.ALL || active == HubFilter.LATER) add(Triple(R.string.sports_hub_later, hub.later, false))
++                    if (active == HubFilter.ALL || active == HubFilter.LIVE) add(Triple("Live now", view.live, true))
++                    if (active == HubFilter.ALL || active == HubFilter.TODAY) add(Triple("Today", view.today, false))
++                    if (active == HubFilter.ALL || active == HubFilter.LATER) add(Triple("Coming up", view.later, false))
+                 }
+-                for ((titleRes, list, live) in sections) {
++                for ((title, list, live) in sections) {
+                     val rest = list.filter { it !== featured }
+                     if (rest.isEmpty()) continue
+-                    item(key = "s$titleRes") {
++                    item(key = "s$title") {
+                         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                             Text(
+-                                text = stringResource(titleRes),
++                                text = title + " \u00b7 " + rest.size,
+                                 style = MaterialTheme.typography.titleSmall,
+                                 fontWeight = FontWeight.Bold,
+                                 color = if (live) LIVE_RED else NuvioTheme.colors.Secondary
+                             )
+-                            LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
++                            LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                 items(rest, key = { it.type + ":" + it.id }) { ch ->
+-                                    EventCard(
++                                    TeamCard(
+                                         channel = ch,
+                                         live = live,
+                                         reminderSet = !live && isReminderSet(ch),
+@@ -208,7 +297,7 @@ fun TvSportsHubDialog(
+                 }
+             }
+             Text(
+-                text = stringResource(R.string.sports_hub_hint),
++                text = "OK: " + stringResource(R.string.live_reminder_button) + " / watch live \u00b7 Hold OK: watch now \u00b7 \u25c4 \u25ba through a row",
+                 fontSize = 11.sp,
+                 color = Color.White.copy(alpha = 0.5f)
+             )
+@@ -257,9 +346,20 @@ private fun LiveBadge(live: Boolean, reminderSet: Boolean) {
+     )
+ }
+ 
++@Composable
++private fun TeamBadge(name: String, size: Int) {
++    Box(
++        modifier = Modifier.size(size.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.18f)),
++        contentAlignment = Alignment.Center
++    ) {
++        Text(text = initialsOf(name), fontSize = (size * 0.38f).sp, fontWeight = FontWeight.Bold, color = Color.White)
++    }
++}
++
++/** Big event card: both team colours split left and right, team badges, time or LIVE in the middle. */
+ @OptIn(ExperimentalTvMaterial3Api::class)
+ @Composable
+-private fun FeaturedCard(
++private fun HeroCard(
+     channel: TvChannelItem,
+     live: Boolean,
+     reminderSet: Boolean,
+@@ -268,15 +368,16 @@ private fun FeaturedCard(
+     onLongClick: () -> Unit,
+     modifier: Modifier = Modifier
+ ) {
++    val teams = teamsOf(channel)
+     val image = channel.poster ?: channel.logo
+     Surface(
+         onClick = onClick,
+         onLongClick = onLongClick,
+-        modifier = modifier.fillMaxWidth().height(150.dp),
+-        shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(16.dp)),
++        modifier = modifier.fillMaxWidth().height(190.dp),
++        shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(18.dp)),
+         scale = ClickableSurfaceDefaults.scale(focusedScale = 1.02f),
+         border = ClickableSurfaceDefaults.border(
+-            focusedBorder = Border(BorderStroke(2.dp, Color.White), shape = RoundedCornerShape(16.dp))
++            focusedBorder = Border(BorderStroke(2.dp, Color.White), shape = RoundedCornerShape(18.dp))
+         ),
+         colors = ClickableSurfaceDefaults.colors(
+             containerColor = Color(0xFF1B2433),
+@@ -284,36 +385,62 @@ private fun FeaturedCard(
+         )
+     ) {
+         Box(Modifier.fillMaxSize()) {
+-            if (image != null) {
+-                AsyncImage(
+-                    model = image,
+-                    contentDescription = null,
+-                    contentScale = ContentScale.Crop,
+-                    modifier = Modifier.fillMaxSize()
+-                )
+-            }
+-            Box(
+-                Modifier.fillMaxSize().background(
+-                    Brush.horizontalGradient(listOf(Color.Black.copy(alpha = 0.85f), Color.Black.copy(alpha = 0.25f)))
++            if (teams != null) {
++                Box(
++                    Modifier.fillMaxSize().background(
++                        Brush.horizontalGradient(listOf(teamColor(teams.first), Color(0xFF0E1420), teamColor(teams.second)))
++                    )
+                 )
+-            )
+-            Column(
+-                modifier = Modifier.fillMaxSize().padding(18.dp),
+-                verticalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterVertically)
+-            ) {
+-                LiveBadge(live, reminderSet)
+-                Text(
+-                    text = channel.name,
+-                    fontSize = 22.sp,
+-                    fontWeight = FontWeight.Bold,
+-                    color = Color.White,
+-                    maxLines = 2,
+-                    overflow = TextOverflow.Ellipsis
++            } else {
++                if (image != null) {
++                    AsyncImage(model = image, contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
++                }
++                Box(
++                    Modifier.fillMaxSize().background(
++                        Brush.horizontalGradient(listOf(Color.Black.copy(alpha = 0.85f), Color.Black.copy(alpha = 0.25f)))
++                    )
+                 )
++            }
++            Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.SpaceBetween) {
++                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
++                    LiveBadge(live, reminderSet)
++                    Text(
++                        text = listOf(sportOf(channel), channel.primaryGenre.orEmpty()).filter { it.isNotBlank() && it != "Other" }.distinct().joinToString(" \u00b7 "),
++                        fontSize = 11.sp,
++                        color = Color.White.copy(alpha = 0.8f),
++                        maxLines = 1,
++                        overflow = TextOverflow.Ellipsis
++                    )
++                }
++                if (teams != null) {
++                    Row(
++                        modifier = Modifier.fillMaxWidth(),
++                        horizontalArrangement = Arrangement.SpaceEvenly,
++                        verticalAlignment = Alignment.CenterVertically
++                    ) {
++                        TeamColumn(teams.first, Modifier.weight(1f))
++                        Text(
++                            text = if (live) "LIVE" else timeText.substringAfterLast(", ", timeText),
++                            fontSize = 26.sp,
++                            fontWeight = FontWeight.Bold,
++                            color = Color.White
++                        )
++                        TeamColumn(teams.second, Modifier.weight(1f))
++                    }
++                } else {
++                    Text(
++                        text = channel.name,
++                        fontSize = 24.sp,
++                        fontWeight = FontWeight.Bold,
++                        color = Color.White,
++                        maxLines = 2,
++                        overflow = TextOverflow.Ellipsis
++                    )
++                }
+                 Text(
+-                    text = listOf(timeText, channel.addonName).filter { it.isNotBlank() }.joinToString(" · "),
++                    text = listOf(timeText, channel.addonName).filter { it.isNotBlank() }.joinToString(" \u00b7 "),
+                     fontSize = 12.sp,
+-                    color = Color.White.copy(alpha = 0.75f),
++                    color = Color.White.copy(alpha = 0.8f),
+                     maxLines = 1,
+                     overflow = TextOverflow.Ellipsis
+                 )
+@@ -322,9 +449,54 @@ private fun FeaturedCard(
+     }
+ }
+ 
++@Composable
++private fun TeamColumn(name: String, modifier: Modifier = Modifier) {
++    Column(modifier, horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp)) {
++        TeamBadge(name, 56)
++        Text(
++            text = name,
++            fontSize = 15.sp,
++            fontWeight = FontWeight.SemiBold,
++            color = Color.White,
++            maxLines = 2,
++            overflow = TextOverflow.Ellipsis,
++            textAlign = TextAlign.Center
++        )
++    }
++}
++
++/** Plain-text details beside the hero: what, when, where to watch, what OK does. */
++@Composable
++private fun DetailsPanel(
++    channel: TvChannelItem,
++    live: Boolean,
++    reminderSet: Boolean,
++    timeText: String,
++    modifier: Modifier = Modifier
++) {
++    Column(
++        modifier = modifier.height(190.dp).clip(RoundedCornerShape(18.dp)).background(Color.White.copy(alpha = 0.06f)).padding(16.dp),
++        verticalArrangement = Arrangement.spacedBy(6.dp)
++    ) {
++        Text("Event info", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = NuvioTheme.colors.Secondary)
++        Text(channel.name, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = Color.White, maxLines = 3, overflow = TextOverflow.Ellipsis)
++        if (timeText.isNotBlank()) Text(timeText, fontSize = 12.sp, color = Color.White.copy(alpha = 0.75f))
++        Text("Source: " + channel.addonName, fontSize = 12.sp, color = Color.White.copy(alpha = 0.75f), maxLines = 1, overflow = TextOverflow.Ellipsis)
++        channel.description?.takeIf { it.isNotBlank() }?.let {
++            Text(it, fontSize = 11.sp, color = Color.White.copy(alpha = 0.6f), maxLines = 3, overflow = TextOverflow.Ellipsis)
++        }
++        Text(
++            text = if (live) "OK: watch now" else if (reminderSet) "Reminder set. OK: remove" else "OK: remind me. Hold OK: watch",
++            fontSize = 11.sp,
++            color = Color.White.copy(alpha = 0.5f)
++        )
++    }
++}
++
++/** Compact event card: badge and time on top, one row per team (or the title) below, source last. */
+ @OptIn(ExperimentalTvMaterial3Api::class)
+ @Composable
+-private fun EventCard(
++private fun TeamCard(
+     channel: TvChannelItem,
+     live: Boolean,
+     reminderSet: Boolean,
+@@ -332,57 +504,39 @@ private fun EventCard(
+     onClick: () -> Unit,
+     onLongClick: () -> Unit
+ ) {
+-    val image = channel.poster ?: channel.logo
++    val teams = teamsOf(channel)
+     Surface(
+         onClick = onClick,
+         onLongClick = onLongClick,
+-        modifier = Modifier.width(210.dp).height(112.dp),
+-        shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(12.dp)),
+-        scale = ClickableSurfaceDefaults.scale(focusedScale = 1.06f),
++        modifier = Modifier.width(250.dp).height(128.dp),
++        shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(14.dp)),
++        scale = ClickableSurfaceDefaults.scale(focusedScale = 1.05f),
+         border = ClickableSurfaceDefaults.border(
+-            focusedBorder = Border(BorderStroke(2.dp, Color.White), shape = RoundedCornerShape(12.dp))
++            focusedBorder = Border(BorderStroke(2.dp, Color.White), shape = RoundedCornerShape(14.dp))
+         ),
+         colors = ClickableSurfaceDefaults.colors(
+             containerColor = Color(0xFF1B2433),
+             focusedContainerColor = Color(0xFF243146)
+         )
+     ) {
+-        Box(Modifier.fillMaxSize()) {
+-            if (image != null) {
+-                AsyncImage(
+-                    model = image,
+-                    contentDescription = null,
+-                    contentScale = ContentScale.Crop,
+-                    modifier = Modifier.fillMaxSize()
+-                )
+-            }
+-            Box(
+-                Modifier.fillMaxSize().background(
+-                    Brush.verticalGradient(listOf(Color.Black.copy(alpha = 0.35f), Color.Black.copy(alpha = 0.85f)))
+-                )
+-            )
+-            Column(
+-                modifier = Modifier.fillMaxSize().padding(10.dp),
+-                verticalArrangement = Arrangement.SpaceBetween
+-            ) {
++        Column(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.SpaceBetween) {
++            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                 LiveBadge(live, reminderSet)
+-                Column {
+-                    Text(
+-                        text = channel.name,
+-                        fontSize = 13.sp,
+-                        fontWeight = FontWeight.SemiBold,
+-                        color = Color.White,
+-                        maxLines = 2,
+-                        overflow = TextOverflow.Ellipsis
+-                    )
+-                    Text(
+-                        text = timeText,
+-                        fontSize = 11.sp,
+-                        color = Color.White.copy(alpha = 0.7f),
+-                        maxLines = 1
+-                    )
++                Text(timeText, fontSize = 11.sp, color = Color.White.copy(alpha = 0.7f), maxLines = 1)
++            }
++            if (teams != null) {
++                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
++                    for (team in listOf(teams.first, teams.second)) {
++                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                            TeamBadge(team, 22)
++                            Text(team, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color.White, maxLines = 1, overflow = TextOverflow.Ellipsis)
++                        }
++                    }
+                 }
++            } else {
++                Text(channel.name, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = Color.White, maxLines = 2, overflow = TextOverflow.Ellipsis)
+             }
++            Text(channel.addonName, fontSize = 10.sp, color = Color.White.copy(alpha = 0.55f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+         }
+     }
+ }
