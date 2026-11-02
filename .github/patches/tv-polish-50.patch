@@ -1,0 +1,124 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
+index f6426b49a..8dc964a2a 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerEffectsTv.kt
+@@ -14,7 +14,6 @@ import androidx.media3.common.util.Size
+ import androidx.media3.effect.BaseGlShaderProgram
+ import androidx.media3.effect.GlEffect
+ import androidx.media3.effect.GlShaderProgram
+-import androidx.media3.effect.Presentation
+ import androidx.media3.exoplayer.ExoPlayer
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.DisposableEffect
+@@ -36,7 +35,6 @@ internal class ExoPictureEffects(private val player: ExoPlayer) : Player.Listene
+     private var shaderBroken = false
+     private var released = false
+     private var chainFused = false
+-    private var chainScaled = false
+     private var chainSet = false
+ 
+     init {
+@@ -50,20 +48,17 @@ internal class ExoPictureEffects(private val player: ExoPlayer) : Player.Listene
+ 
+     private fun push() {
+         if (released) return
+-        // Tall 50/60 fps video (YouTube 1440p/4K) already strains the decoder: no extra GL pass on top of it.
+-        val tooHeavy = player.videoSize.height > MAX_EFFECT_HEIGHT && (player.videoFormat?.frameRate ?: 0f) > 32f
+-        val fused = smartEnhance && !shaderBroken && !tooHeavy
+-        val scaled = fused && player.videoSize.height > MAX_EFFECT_HEIGHT
+-        if (fused == chainFused && scaled == chainScaled && (chainSet || !fused)) return
++        // Decide from the source format, never from videoSize: videoSize is the effect output, so reading it made the
++        // chain flip on and off every second (1080p/2160p) and that dropped frames. Tall or 50/60 fps video gets no pass.
++        val format = player.videoFormat
++        val known = format != null && format.height > 0
++        val tooHeavy = known && (format!!.height > MAX_EFFECT_HEIGHT || (format.frameRate.takeIf { it > 0f } ?: 0f) > 32f)
++        val fused = smartEnhance && !shaderBroken && known && !tooHeavy
++        if (fused == chainFused && (chainSet || !fused)) return
+         val effects = ArrayList<Effect>()
+-        if (fused) {
+-            // Above 1080p the frame is scaled down first, which keeps the pass inside what a TV box GPU can do.
+-            if (scaled) effects += Presentation.createForHeight(MAX_EFFECT_HEIGHT)
+-            effects += PictureShaderEffect()
+-        }
++        if (fused) effects += PictureShaderEffect()
+         chainSet = true
+         chainFused = fused
+-        chainScaled = scaled
+         runCatching { player.setVideoEffects(effects) }
+             .onFailure { Log.w(FX_TAG, "Picture effects could not be applied", it) }
+     }
+@@ -72,6 +67,10 @@ internal class ExoPictureEffects(private val player: ExoPlayer) : Player.Listene
+         push()
+     }
+ 
++    override fun onTracksChanged(tracks: androidx.media3.common.Tracks) {
++        push()
++    }
++
+     override fun onPlayerError(error: PlaybackException) {
+         if (error.errorCode == PlaybackException.ERROR_CODE_VIDEO_FRAME_PROCESSING_FAILED && !shaderBroken) {
+             Log.w(FX_TAG, "Picture shader failed, turning it off", error)
+@@ -95,7 +94,7 @@ internal class PictureShaderEffect : GlEffect {
+         PictureShaderProgram(useHdr)
+ }
+ 
+-/** Tallest frame the Smart Enhance shader runs on; taller video is scaled down to this first. */
++/** Tallest source the Smart Enhance shader runs on; taller video plays untouched. */
+ private const val MAX_EFFECT_HEIGHT = 1080
+ 
+ private class PictureShaderProgram(useHdr: Boolean) : BaseGlShaderProgram(useHdr, 1) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkLiveTvSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkLiveTvSettingsItems.kt
+index ec308a528..8ce37963c 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkLiveTvSettingsItems.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkLiveTvSettingsItems.kt
+@@ -5,6 +5,10 @@ package com.nuvio.tv.ui.screens.settings
+ import android.text.format.DateFormat
+ import android.text.format.Formatter
+ import androidx.compose.foundation.background
++import androidx.compose.foundation.focusable
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.input.key.onKeyEvent
+ import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.Column
+@@ -139,18 +143,33 @@ private fun ForkRecordingPlayer(file: File, onClose: () -> Unit) {
+         }
+     }
+     DisposableEffect(exo) { onDispose { exo.release() } }
++    val focus = remember { FocusRequester() }
+     Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+-        Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
++        androidx.compose.runtime.LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
++        Box(
++            modifier = Modifier.fillMaxSize().background(Color.Black)
++                .focusRequester(focus)
++                .focusable()
++                .onKeyEvent { e ->
++                    if (e.type != androidx.compose.ui.input.key.KeyEventType.KeyDown) return@onKeyEvent false
++                    when (e.key) {
++                        androidx.compose.ui.input.key.Key.DirectionCenter, androidx.compose.ui.input.key.Key.Enter,
++                        androidx.compose.ui.input.key.Key.MediaPlayPause -> {
++                            exo.playWhenReady = !exo.playWhenReady; true
++                        }
++                        androidx.compose.ui.input.key.Key.DirectionRight -> { exo.seekTo(exo.currentPosition + 10_000L); true }
++                        androidx.compose.ui.input.key.Key.DirectionLeft -> { exo.seekTo((exo.currentPosition - 10_000L).coerceAtLeast(0L)); true }
++                        else -> false
++                    }
++                },
++        ) {
+             AndroidView(
+                 modifier = Modifier.fillMaxSize(),
+                 factory = { ctx ->
+                     PlayerView(ctx).apply {
+                         this.player = exo
+-                        useController = true
+-                        controllerShowTimeoutMs = 4000
+-                        isFocusable = true
+-                        isFocusableInTouchMode = true
+-                        requestFocus()
++                        // The fork's exo_player_view layout has no controller, so useController = true crashes here.
++                        useController = false
+                     }
+                 },
+             )
