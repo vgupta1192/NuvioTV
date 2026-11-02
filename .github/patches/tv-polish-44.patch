@@ -1,0 +1,56 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt
+index 2070c92ec..dae73d236 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt
+@@ -3,6 +3,7 @@ package com.nuvio.tv.ui.screens.player
+ import android.content.Context
+ import android.util.Log
+ import android.widget.Toast
++import com.nuvio.tv.ui.screens.player.seekpreview.local.LocalPreviewSources
+ import androidx.media3.common.C
+ import androidx.media3.extractor.ExtractorsFactory
+ import com.nuvio.tv.R
+@@ -74,9 +75,15 @@ internal fun PlayerRuntimeController.autoSyncExtractorsFactory(
+     url: String,
+     headers: Map<String, String>,
+ ): ExtractorsFactory {
++    // Nuvio fork: Performance mode keeps every fork-only extra off the demux path (frame drops).
++    PlayerEffects.ensureLoaded(context)
++    if (PlayerEffects.performance.value) {
++        LocalPreviewSources.unregister(this)
++        return delegate
++    }
+     // Audio is copied too, for the audio sync fallback (idle unless it is listening).
+     // Video keyframes are copied too, for on-device seek previews (idle once all are made).
+-    val tapped = com.nuvio.tv.ui.screens.player.seekpreview.local.LocalPreviewSources.register(
++    val tapped = LocalPreviewSources.register(
+         owner = this,
+         context = context,
+         sourceKey = url,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+index 98afa9837..0929d51a5 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+@@ -2303,6 +2303,8 @@ private class SubtitleOffsetRenderersFactory(
+         )
+         playbackSpeedAwareAudioSink.setInitialPlaybackSpeed(playbackSpeedProvider())
+         onPlaybackSpeedAwareAudioSinkCreated(playbackSpeedAwareAudioSink)
++        // Nuvio fork: no PCM tap in Performance mode (the audio thread stays as upstream's).
++        if (PlayerEffects.performance.value) return playbackSpeedAwareAudioSink
+         return com.nuvio.tv.ui.screens.player.audiosync.AudioSyncTaps.wrapAudioSink(playbackSpeedAwareAudioSink) // AutoSync hook: audio sync fallback hears the playing audio
+     }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+index 425f62a90..bd7f842c5 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+@@ -2576,6 +2576,9 @@ private fun ExoPlayerSurface(
+                 applyRect(it)
+                 CustomStretchMemory.put(memoryKey, it)
+             }
++            // Nuvio fork: every capture reads a frame back from the GPU, a hitch on weak TVs.
++            // Performance mode keeps the first measurement and stops sampling.
++            if (PlayerEffects.performance.value) return@LaunchedEffect
+             delay(tracker.nextIntervalMs)
+         }
+     }
