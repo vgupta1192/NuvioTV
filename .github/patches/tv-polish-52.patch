@@ -1,0 +1,158 @@
+diff --git a/app/src/main/java/com/nuvio/tv/forklivetv/ForkLiveRecorder.kt b/app/src/main/java/com/nuvio/tv/forklivetv/ForkLiveRecorder.kt
+index deeb30d30..a029e743d 100644
+--- a/app/src/main/java/com/nuvio/tv/forklivetv/ForkLiveRecorder.kt
++++ b/app/src/main/java/com/nuvio/tv/forklivetv/ForkLiveRecorder.kt
+@@ -41,6 +41,13 @@ object ForkLiveRecorder {
+     private val _message = MutableStateFlow<String?>(null)
+     val message: StateFlow<String?> = _message.asStateFlow()
+ 
++    private val _playRequests = kotlinx.coroutines.flow.MutableSharedFlow<File>(extraBufferCapacity = 1)
++
++    /** A recording the user chose to watch; the nav host opens it in the main player. */
++    val playRequests: kotlinx.coroutines.flow.SharedFlow<File> = _playRequests
++
++    fun requestPlay(file: File) { _playRequests.tryEmit(file) }
++
+     @Volatile private var stopRequested = false
+     @Volatile private var call: Call? = null
+     @Volatile private var lastError: String? = null
+diff --git a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
+index 6e657a44b..04cc93d30 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
+@@ -162,6 +162,24 @@ private fun PlaybackNavHost(
+         )
+     }
+ 
++    // Live TV recordings chosen in Settings play in the main player, with its buttons.
++    androidx.compose.runtime.LaunchedEffect(Unit) {
++        com.nuvio.tv.forklivetv.ForkLiveRecorder.playRequests.collect { file ->
++            navController.navigate(
++                Screen.Player.createRoute(
++                    streamUrl = android.net.Uri.fromFile(file).toString(),
++                    title = file.nameWithoutExtension,
++                    streamName = "Live TV recording",
++                    contentType = "movie",
++                    contentName = file.nameWithoutExtension,
++                    videoId = "recording:" + file.name,
++                    addonName = "Live TV recording",
++                    returnToHomeOnBack = false
++                )
++            )
++        }
++    }
++
+     NavHost(
+         navController = navController,
+         startDestination = startDestination,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkLiveTvSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkLiveTvSettingsItems.kt
+index 2b8703de8..bb7ca430e 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkLiveTvSettingsItems.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkLiveTvSettingsItems.kt
+@@ -76,7 +76,6 @@ private fun ForkRecordingsDialog(onDismiss: () -> Unit) {
+     val message by ForkLiveRecorder.message.collectAsStateWithLifecycle()
+     var nonce by remember { mutableStateOf(0) }
+     var maxMinutes by remember { mutableStateOf(ForkLiveRecorder.maxMinutes(context)) }
+-    var playing by remember { mutableStateOf<File?>(null) }
+     val files = remember(nonce, active) { ForkLiveRecorder.list(context) }
+ 
+     NuvioDialog(onDismiss = onDismiss, title = "Live TV recordings", width = 760.dp) {
+@@ -109,7 +108,7 @@ private fun ForkRecordingsDialog(onDismiss: () -> Unit) {
+                 items(files, key = { it.absolutePath }) { f ->
+                     val live = a?.file?.absolutePath == f.absolutePath
+                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+-                        Button(onClick = { if (!live) playing = f }, enabled = !live, modifier = Modifier.weight(1f)) {
++                        Button(onClick = { if (!live) { ForkLiveRecorder.requestPlay(f); onDismiss() } }, enabled = !live, modifier = Modifier.weight(1f)) {
+                             Text(
+                                 text = f.nameWithoutExtension.replace('_', ' ') + "  ·  " +
+                                     Formatter.formatShortFileSize(context, f.length()) +
+@@ -131,52 +130,6 @@ private fun ForkRecordingsDialog(onDismiss: () -> Unit) {
+             }
+         }
+     }
+-    playing?.let { ForkRecordingPlayer(file = it, onClose = { playing = null }) }
+-}
+-
+-@Composable
+-private fun ForkRecordingPlayer(file: File, onClose: () -> Unit) {
+-    val context = LocalContext.current
+-    val exo = remember(file) {
+-        ExoPlayer.Builder(context).build().apply {
+-            setMediaItem(MediaItem.fromUri(android.net.Uri.fromFile(file)))
+-            prepare()
+-            playWhenReady = true
+-        }
+-    }
+-    DisposableEffect(exo) { onDispose { exo.release() } }
+-    val focus = remember { FocusRequester() }
+-    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+-        androidx.compose.runtime.LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
+-        Box(
+-            modifier = Modifier.fillMaxSize().background(Color.Black)
+-                .focusRequester(focus)
+-                .focusable()
+-                .onKeyEvent { e ->
+-                    if (e.type != androidx.compose.ui.input.key.KeyEventType.KeyDown) return@onKeyEvent false
+-                    when (e.key) {
+-                        androidx.compose.ui.input.key.Key.DirectionCenter, androidx.compose.ui.input.key.Key.Enter,
+-                        androidx.compose.ui.input.key.Key.MediaPlayPause -> {
+-                            exo.playWhenReady = !exo.playWhenReady; true
+-                        }
+-                        androidx.compose.ui.input.key.Key.DirectionRight -> { exo.seekTo(exo.currentPosition + 10_000L); true }
+-                        androidx.compose.ui.input.key.Key.DirectionLeft -> { exo.seekTo((exo.currentPosition - 10_000L).coerceAtLeast(0L)); true }
+-                        else -> false
+-                    }
+-                },
+-        ) {
+-            AndroidView(
+-                modifier = Modifier.fillMaxSize(),
+-                factory = { ctx ->
+-                    PlayerView(ctx).apply {
+-                        this.player = exo
+-                        // The fork's exo_player_view layout has no controller, so useController = true crashes here.
+-                        useController = false
+-                    }
+-                },
+-            )
+-        }
+-    }
+ }
+ 
+ @Composable
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt
+index 901b8aded..2b2a1d891 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt
+@@ -128,7 +128,9 @@ fun YouTubeScreen(
+     var shortsFixed by remember { mutableStateOf<List<YtItem>?>(null) }
+     val openItem: (YtItem, List<YtItem>) -> Unit = { v, from ->
+         if (v.kind == YtKind.VIDEO && v.videoId != null && (v.isShort || (state.tab == YtTab.SHORTS && state.subTitle == null))) {
+-            shortsFixed = if (state.rows.isNotEmpty()) from else null
++            // Outside the Shorts tab (search, channels, playlists) the swipe list is the shorts among the results.
++            val shortsOnly = if (state.tab == YtTab.SHORTS && state.subTitle == null) from else from.filter { it.isShort }
++            shortsFixed = if (state.tab != YtTab.SHORTS || state.subTitle != null || state.rows.isNotEmpty()) shortsOnly else null
+             shortsStart = v.videoId
+         } else viewModel.activate(v, from, onPlay)
+     }
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
+index 4425e54ac..0d6ec3e45 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
+@@ -50,7 +50,16 @@ data class YtItem(
+     val subtitle: String? = null
+ ) {
+     /** A vertical short, which opens in the Shorts player. */
+-    val isShort: Boolean get() = kind == YtKind.VIDEO && source.isShorts
++    val isShort: Boolean get() = kind == YtKind.VIDEO && !isLive && (source.isShorts || titleSaysShort || durationSeconds()?.let { it <= 60 } == true)
++
++    private val titleSaysShort: Boolean get() = title.contains("#shorts", ignoreCase = true) || title.contains("#short ", ignoreCase = true)
++
++    /** The length from the card's time badge ("0:45", "1:02:10"), when the badge is a time. */
++    private fun durationSeconds(): Int? {
++        val parts = badge?.trim()?.split(":") ?: return null
++        if (parts.size !in 2..3 || parts.any { it.isEmpty() || !it.all(Char::isDigit) }) return null
++        return parts.fold(0) { acc, p -> acc * 60 + p.toInt() }
++    }
+ }
+ 
+ data class YtRow(
