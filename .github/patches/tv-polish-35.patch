@@ -1,0 +1,770 @@
+diff --git a/app/src/main/java/com/nuvio/tv/MainActivity.kt b/app/src/main/java/com/nuvio/tv/MainActivity.kt
+index 0870caffe..121ab495b 100644
+--- a/app/src/main/java/com/nuvio/tv/MainActivity.kt
++++ b/app/src/main/java/com/nuvio/tv/MainActivity.kt
+@@ -1228,6 +1228,20 @@ open class MainActivity : ComponentActivity() {
+                             focusedSplashCacheKey = null
+                             focusedSplashTheme = null
+                             hasSelectedProfileThisSession = false
++                            com.nuvio.tv.forklivetv.ForkIdleReturn.touch()
++                        }
++                        // Nuvio fork: idle for 30 minutes goes back to the profile picker.
++                        LaunchedEffect(profiles.size, currentRoute) {
++                            while (true) {
++                                kotlinx.coroutines.delay(60_000L)
++                                if (com.nuvio.tv.forklivetv.ForkIdleReturn.shouldReturn(
++                                        this@MainActivity, currentRoute, profiles.size
++                                    )
++                                ) {
++                                    handleSwitchProfile()
++                                    break
++                                }
++                            }
+                         }
+                         Box(modifier = Modifier.fillMaxSize()) {
+                             CompositionLocalProvider(LocalNavViewModelStoreOwner provides navViewModelStoreOwner) {
+@@ -1418,6 +1432,7 @@ open class MainActivity : ComponentActivity() {
+     override fun onUserInteraction() {
+         super.onUserInteraction()
+         ambientIdleController.onInteraction()
++        com.nuvio.tv.forklivetv.ForkIdleReturn.touch()
+     }
+ 
+     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+diff --git a/app/src/main/java/com/nuvio/tv/data/local/TvChannelsDataStore.kt b/app/src/main/java/com/nuvio/tv/data/local/TvChannelsDataStore.kt
+index 66f3d5915..2adc137b1 100644
+--- a/app/src/main/java/com/nuvio/tv/data/local/TvChannelsDataStore.kt
++++ b/app/src/main/java/com/nuvio/tv/data/local/TvChannelsDataStore.kt
+@@ -30,6 +30,8 @@ class TvChannelsDataStore @Inject constructor(
+     private val channelAutoplayKey = booleanPreferencesKey("channel_autoplay")
+     private val liveReminderLeadKey = androidx.datastore.preferences.core.intPreferencesKey("live_reminder_lead_minutes")
+ 
++    private val epgOverridesKey = stringSetPreferencesKey("epg_channel_overrides")
++
+     private fun store(profileId: Int = profileManager.activeProfileId.value) =
+         factory.get(profileId, FEATURE)
+ 
+@@ -100,6 +102,24 @@ class TvChannelsDataStore @Inject constructor(
+         store().edit { it[liveReminderLeadKey] = minutes }
+     }
+ 
++    /** Manual guide picks per channel ("channelKey\u0001guideChannelId"), saved per profile. */
++    val epgOverrides: Flow<Map<String, String>> = profileManager.activeProfileId.flatMapLatest { pid ->
++        factory.get(pid, FEATURE).data.map { prefs ->
++            (prefs[epgOverridesKey] ?: emptySet()).mapNotNull { entry ->
++                val i = entry.indexOf('\u0001')
++                if (i <= 0) null else entry.substring(0, i) to entry.substring(i + 1)
++            }.toMap()
++        }
++    }
++
++    /** Pins a channel to a guide channel id, or clears the pin when [guideId] is null. */
++    suspend fun setEpgOverride(channelKey: String, guideId: String?) {
++        store().edit { prefs ->
++            val kept = (prefs[epgOverridesKey] ?: emptySet()).filterNot { it.startsWith(channelKey + '\u0001') }.toSet()
++            prefs[epgOverridesKey] = if (guideId == null) kept else kept + (channelKey + '\u0001' + guideId)
++        }
++    }
++
+     suspend fun setChannelAutoplay(enabled: Boolean) {
+         store().edit { it[channelAutoplayKey] = enabled }
+     }
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
+index 652a14eab..5ee69462b 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
+@@ -233,6 +233,13 @@ class TvChannelsRepository @Inject constructor(
+         loadChannels(tvAddons, effectiveSelectedUrls)
+     }
+ 
++    fun searchGuideChannels(query: String) = tvEpgRepository.searchGuideChannels(query)
++
++    fun hasEpgOverride(channel: TvChannelItem) = tvEpgRepository.hasEpgOverride(channel)
++
++    suspend fun setEpgOverride(channel: TvChannelItem, guideId: String?) =
++        tvEpgRepository.setEpgOverride(channel, guideId)
++
+     fun refresh() {
+         channelsMemoryCache.clear()
+         streamMemoryCache.clear()
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/epg/TvEpgRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/epg/TvEpgRepository.kt
+index d3853b07e..4bee2f31e 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/epg/TvEpgRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/epg/TvEpgRepository.kt
+@@ -36,8 +36,12 @@ data class TvEpgUiState(
+     val errorMessage: String? = null,
+     val epgByChannelKey: Map<String, ChannelEpgInfo> = emptyMap(),
+     val epgSources: List<EpgSourceConfig> = TvEpgRepository.DEFAULT_EPG_SOURCES,
++    val overrideVersion: Int = 0,
+ )
+ 
++/** A guide channel offered by the Fix Channel picker. */
++data class GuideChannelHit(val id: String, val name: String, val programCount: Int)
++
+ @Singleton
+ class TvEpgRepository @Inject constructor(
+     @ApplicationContext private val context: Context,
+@@ -170,6 +174,9 @@ class TvEpgRepository @Inject constructor(
+     private val keyToChannelIds = mutableMapOf<String, MutableList<String>>()
+     private val channelMatchCache = mutableMapOf<String, String?>()
+ 
++    @Volatile
++    private var epgOverrides: Map<String, String> = emptyMap()
++
+     private var syncJob: Job? = null
+     private var isInitialized = false
+     private var iptvGuides: List<EpgSourceConfig> = emptyList()
+@@ -198,6 +205,14 @@ class TvEpgRepository @Inject constructor(
+             }
+             syncEpg(forceRefresh = false)
+ 
++            launch {
++                tvChannelsDataStore.epgOverrides.collect { map ->
++                    epgOverrides = map
++                    synchronized(this@TvEpgRepository) { channelMatchCache.clear() }
++                    _uiState.update { it.copy(overrideVersion = it.overrideVersion + 1) }
++                }
++            }
++
+             tvChannelsDataStore.enabledEpgSourceIds.collect { savedEnabledIds ->
+                 val enabledSet = savedEnabledIds ?: DEFAULT_EPG_SOURCES.map { it.id }.toSet()
+                 _uiState.update { state ->
+@@ -331,7 +346,8 @@ class TvEpgRepository @Inject constructor(
+             if (channelMatchCache.containsKey(key)) {
+                 channelMatchCache[key]
+             } else {
+-                val matched = exactChannelId(channel.epgId)
++                val matched = epgOverrides[key]?.takeIf { cachedProgramsByChannelId.containsKey(it) }
++                    ?: exactChannelId(channel.epgId)
+                     ?: addonIdChannelId(channel.id)
+                     ?: matchChannelId(channel.name)
+                 channelMatchCache[key] = matched
+@@ -355,6 +371,30 @@ class TvEpgRepository @Inject constructor(
+         )
+     }
+ 
++    fun hasEpgOverride(channel: TvChannelItem): Boolean = epgOverrides.containsKey(channel.stableKey())
++
++    suspend fun setEpgOverride(channel: TvChannelItem, guideId: String?) {
++        tvChannelsDataStore.setEpgOverride(channel.stableKey(), guideId)
++    }
++
++    /** Guide channels whose id or display name contains every word of [query], best matches first. */
++    fun searchGuideChannels(query: String, limit: Int = 40): List<GuideChannelHit> {
++        val words = query.lowercase().split(Regex("\\s+")).filter { it.isNotBlank() }
++        if (words.isEmpty()) return emptyList()
++        val hits = ArrayList<GuideChannelHit>()
++        synchronized(this) {
++            for ((id, ch) in cachedChannels) {
++                val count = cachedProgramsByChannelId[id]?.size ?: 0
++                if (count == 0) continue
++                val name = ch.displayNames.firstOrNull() ?: id
++                val hay = (name + " " + id + " " + ch.displayNames.joinToString(" ")).lowercase()
++                if (words.all { hay.contains(it) }) hits.add(GuideChannelHit(id, name, count))
++            }
++        }
++        return hits.sortedWith(compareBy({ !it.name.lowercase().startsWith(words.first()) }, { it.name.length }))
++            .take(limit)
++    }
++
+     /** The channel's own XMLTV id (tvg-id / epg_channel_id), when the loaded guides know it. */
+     private fun exactChannelId(epgId: String?): String? {
+         val raw = epgId?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+diff --git a/app/src/main/java/com/nuvio/tv/forklivetv/ForkIdleReturn.kt b/app/src/main/java/com/nuvio/tv/forklivetv/ForkIdleReturn.kt
+new file mode 100644
+index 000000000..0aeae19b4
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/forklivetv/ForkIdleReturn.kt
+@@ -0,0 +1,39 @@
++package com.nuvio.tv.forklivetv
++
++import android.content.Context
++import android.media.AudioManager
++import android.os.SystemClock
++
++/**
++ * Nuvio fork: after 30 minutes without any remote input the app returns to the profile picker, so a
++ * shared TV does not stay on the last person's profile. Skipped while audio is playing, on the
++ * player screen, and when there is only one profile.
++ */
++object ForkIdleReturn {
++    const val IDLE_MS = 30 * 60_000L
++    private const val PREFS = "fork_idle_return"
++    private const val KEY_ENABLED = "enabled"
++
++    @Volatile
++    private var lastInputMs = SystemClock.elapsedRealtime()
++
++    fun touch() {
++        lastInputMs = SystemClock.elapsedRealtime()
++    }
++
++    fun enabled(context: Context): Boolean =
++        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_ENABLED, true)
++
++    fun setEnabled(context: Context, enabled: Boolean) {
++        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_ENABLED, enabled).apply()
++    }
++
++    /** True when the app has been idle long enough, nothing is playing and the user is not in the player. */
++    fun shouldReturn(context: Context, currentRoute: String?, profileCount: Int): Boolean {
++        if (profileCount < 2 || !enabled(context)) return false
++        if (currentRoute?.startsWith("player") == true) return false
++        if (SystemClock.elapsedRealtime() - lastInputMs < IDLE_MS) return false
++        val audio = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
++        return audio?.isMusicActive != true
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
+index fe4778a33..a9f4d7e0e 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
+@@ -439,6 +439,17 @@ fun AdvancedSettingsContent(
+                 modifier = Modifier.fillMaxWidth(),
+                 title = stringResource(R.string.advanced_section_performance)
+             ) {
++                val idleContext = LocalContext.current
++                var idleReturnOn by remember { mutableStateOf(com.nuvio.tv.forklivetv.ForkIdleReturn.enabled(idleContext)) }
++                SettingsToggleRow(
++                    title = stringResource(R.string.idle_return_title),
++                    subtitle = stringResource(R.string.idle_return_subtitle),
++                    checked = idleReturnOn,
++                    onToggle = {
++                        idleReturnOn = !idleReturnOn
++                        com.nuvio.tv.forklivetv.ForkIdleReturn.setEnabled(idleContext, idleReturnOn)
++                    }
++                )
+                 SettingsToggleRow(
+                     title = stringResource(R.string.advanced_fast_horizontal_navigation),
+                     subtitle = stringResource(R.string.advanced_fast_horizontal_navigation_subtitle),
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
+index a07095104..0c6a8ce57 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
+@@ -122,6 +122,8 @@ import com.nuvio.tv.ui.screens.tvchannels.components.TvChannelNetflixCard
+ import com.nuvio.tv.ui.screens.tvchannels.components.TvChannelPreviewPanel
+ import com.nuvio.tv.forklivetv.ForkLiveReminders
+ import com.nuvio.tv.ui.screens.tvchannels.components.TvChannelScheduleDialog
++import com.nuvio.tv.ui.screens.tvchannels.components.TvFixChannelDialog
++import com.nuvio.tv.ui.screens.tvchannels.components.TvSportsHubDialog
+ import com.nuvio.tv.ui.screens.tvchannels.components.TvEpgGridGuide
+ import com.nuvio.tv.ui.theme.NuvioTheme
+ 
+@@ -155,6 +157,8 @@ fun TvChannelsScreen(
+             viewModel.addLiveReminder(ch)
+         }
+     }
++    var showSportsHub by remember { mutableStateOf(false) }
++    var fixGuideChannel by remember { mutableStateOf<TvChannelItem?>(null) }
+     val keyboardController = LocalSoftwareKeyboardController.current
+     val focusManager = LocalFocusManager.current
+ 
+@@ -615,6 +619,27 @@ fun TvChannelsScreen(
+                         }
+                     }
+ 
++                    // Sports hub: live and upcoming timed events
++                    Button(
++                        onClick = { showSportsHub = true },
++                        modifier = Modifier.focusProperties {
++                            down = searchInputFocusRequester
++                        },
++                        shape = ButtonDefaults.shape(shape = RoundedCornerShape(22.dp)),
++                        colors = ButtonDefaults.colors(
++                            containerColor = Color.White.copy(alpha = 0.10f),
++                            contentColor = Color.White,
++                            focusedContainerColor = Color.White,
++                            focusedContentColor = Color.Black
++                        )
++                    ) {
++                        Text(
++                            text = stringResource(R.string.sports_hub_button),
++                            fontSize = 12.sp,
++                            fontWeight = FontWeight.SemiBold
++                        )
++                    }
++
+                     // Netflix style chip (same preference as Settings > Live TV)
+                     Button(
+                         onClick = { viewModel.setNetflixStyle(!netflixLive) },
+@@ -1345,6 +1370,7 @@ fun TvChannelsScreen(
+                             }
+                         }
+                     },
++                    onFixGuide = { fixGuideChannel = state.previewChannel },
+                     onStreamSelected = { idx ->
+                         viewModel.selectStreamIndex(idx)
+                     },
+@@ -1373,6 +1399,43 @@ fun TvChannelsScreen(
+         onAddIptv = viewModel::addIptvSource
+     )
+ 
++    TvSportsHubDialog(
++        visible = showSportsHub,
++        channels = state.allChannels,
++        isReminderSet = { ch -> liveReminders.any { ForkLiveReminders.matches(it, ch) } },
++        onToggleReminder = { ch ->
++            if (liveReminders.any { ForkLiveReminders.matches(it, ch) }) {
++                viewModel.removeLiveReminder(ch)
++            } else {
++                requestLiveReminder(ch)
++            }
++        },
++        onWatch = { ch ->
++            showSportsHub = false
++            viewModel.watchChannel(ch)
++        },
++        onDismiss = { showSportsHub = false }
++    )
++
++    fixGuideChannel?.let { fixCh ->
++        val fixContext = LocalContext.current
++        TvFixChannelDialog(
++            channel = fixCh,
++            hasOverride = viewModel.hasEpgOverride(fixCh),
++            search = { q -> viewModel.searchGuideChannels(q) },
++            onPick = { hit ->
++                viewModel.setEpgOverride(fixCh, hit.id)
++                android.widget.Toast.makeText(fixContext, fixContext.getString(R.string.fix_guide_saved), android.widget.Toast.LENGTH_SHORT).show()
++                fixGuideChannel = null
++            },
++            onReset = {
++                viewModel.setEpgOverride(fixCh, null)
++                fixGuideChannel = null
++            },
++            onDismiss = { fixGuideChannel = null }
++        )
++    }
++
+     TvChannelScheduleDialog(
+         visible = state.isScheduleDialogVisible,
+         channel = state.previewChannel,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsViewModel.kt
+index 22d556935..c4615f880 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsViewModel.kt
+@@ -33,6 +33,19 @@ class TvChannelsViewModel @Inject constructor(
+         .map { list -> list.filter { com.nuvio.tv.forklivetv.ForkLiveReminders.isLive(it) } }
+         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+ 
++    fun searchGuideChannels(query: String) = repository.searchGuideChannels(query)
++
++    fun hasEpgOverride(channel: TvChannelItem) = repository.hasEpgOverride(channel)
++
++    fun setEpgOverride(channel: TvChannelItem, guideId: String?) {
++        viewModelScope.launch { repository.setEpgOverride(channel, guideId) }
++    }
++
++    fun watchChannel(channel: TvChannelItem) {
++        repository.selectChannelForPreview(channel, startPlayback = true)
++        repository.setFullscreen(true)
++    }
++
+     fun addLiveReminder(channel: TvChannelItem) {
+         viewModelScope.launch {
+             val lead = channelsDataStore.liveReminderLeadMinutes.first()
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt
+index c73db2396..15a37d8fe 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPanel.kt
+@@ -91,6 +91,7 @@ fun TvChannelPreviewPanel(
+     /** Live TV reminder: null hides the button (event not upcoming); otherwise true when a reminder is set. */
+     reminderSet: Boolean? = null,
+     onToggleReminder: () -> Unit = {},
++    onFixGuide: (() -> Unit)? = null,
+     onStreamSelected: (Int) -> Unit,
+     mutePreview: Boolean = false,
+     onRequestChannelListFocus: (() -> Unit)? = null,
+@@ -390,12 +391,24 @@ fun TvChannelPreviewPanel(
+                     )
+                 }
+             }
++            val fixGuideButton: @Composable (Modifier) -> Unit = { m ->
++                if (onFixGuide != null) {
++                    PanelActionButton(
++                        label = stringResource(R.string.fix_guide_button),
++                        icon = Icons.Rounded.CalendarMonth,
++                        onClick = onFixGuide,
++                        iconTint = { focused -> if (focused) Color.Black else Color.White },
++                        modifier = m
++                    )
++                }
++            }
+             if (vertical) {
+                 Column(modifier = buttonsModifier, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                     fullscreenButton(Modifier.fillMaxWidth())
+                     reminderButton(Modifier.fillMaxWidth())
+                     favoriteButton(Modifier.fillMaxWidth())
+                     guideButton(Modifier.fillMaxWidth())
++                    fixGuideButton(Modifier.fillMaxWidth())
+                 }
+             } else {
+                 Row(modifier = buttonsModifier, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+@@ -403,6 +416,7 @@ fun TvChannelPreviewPanel(
+                     if (reminderSet != null) reminderButton(Modifier.weight(1f))
+                     favoriteButton(Modifier.weight(1f))
+                     guideButton(Modifier.weight(0.9f))
++                    if (onFixGuide != null) fixGuideButton(Modifier.weight(0.9f))
+                 }
+             }
+         }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelZappingDrawer.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelZappingDrawer.kt
+index f59c3aaf9..a0399308e 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelZappingDrawer.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelZappingDrawer.kt
+@@ -355,6 +355,16 @@ fun TvChannelZappingDrawer(
+                                             overflow = TextOverflow.Ellipsis,
+                                             fontSize = 10.sp
+                                         )
++                                        ch.epgInfo?.nextProgram?.let { next ->
++                                            Text(
++                                                text = "${next.formattedTimeRange.substringBefore(" - ")}  ${next.title}",
++                                                style = MaterialTheme.typography.labelSmall,
++                                                color = if (isFocused) Color.Black.copy(alpha = 0.55f) else Color.White.copy(alpha = 0.38f),
++                                                maxLines = 1,
++                                                overflow = TextOverflow.Ellipsis,
++                                                fontSize = 9.sp
++                                            )
++                                        }
+                                     }
+                                 }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvFixChannelDialog.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvFixChannelDialog.kt
+new file mode 100644
+index 000000000..a7f9045ea
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvFixChannelDialog.kt
+@@ -0,0 +1,135 @@
++package com.nuvio.tv.ui.screens.tvchannels.components
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.items
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import androidx.tv.material3.Button
++import androidx.tv.material3.ButtonDefaults
++import androidx.tv.material3.ExperimentalTvMaterial3Api
++import androidx.tv.material3.MaterialTheme
++import androidx.tv.material3.Text
++import com.nuvio.tv.R
++import com.nuvio.tv.data.repository.epg.GuideChannelHit
++import com.nuvio.tv.domain.model.TvChannelItem
++import com.nuvio.tv.ui.components.NuvioDialog
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.withContext
++
++/** Lets the user pick the guide (EPG) channel for one Live TV channel by hand. */
++@OptIn(ExperimentalTvMaterial3Api::class)
++@Composable
++fun TvFixChannelDialog(
++    channel: TvChannelItem?,
++    hasOverride: Boolean,
++    search: (String) -> List<GuideChannelHit>,
++    onPick: (GuideChannelHit) -> Unit,
++    onReset: () -> Unit,
++    onDismiss: () -> Unit
++) {
++    if (channel == null) return
++    var query by remember(channel.id) { mutableStateOf(channel.name) }
++    var hits by remember(channel.id) { mutableStateOf<List<GuideChannelHit>>(emptyList()) }
++
++    LaunchedEffect(channel.id, query) {
++        delay(250)
++        hits = withContext(Dispatchers.Default) { search(query) }
++    }
++
++    NuvioDialog(
++        onDismiss = onDismiss,
++        title = stringResource(R.string.fix_guide_title, channel.name),
++        subtitle = stringResource(R.string.fix_guide_subtitle),
++        width = 580.dp
++    ) {
++        Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
++            OutlinedTextField(
++                value = query,
++                onValueChange = { query = it },
++                singleLine = true,
++                label = { androidx.compose.material3.Text(stringResource(R.string.fix_guide_search_hint)) },
++                modifier = Modifier.fillMaxWidth()
++            )
++            if (hits.isEmpty()) {
++                Text(
++                    text = stringResource(R.string.fix_guide_no_results),
++                    style = MaterialTheme.typography.bodyMedium,
++                    color = Color.White.copy(alpha = 0.5f),
++                    modifier = Modifier.padding(vertical = 16.dp)
++                )
++            } else {
++                LazyColumn(
++                    modifier = Modifier.fillMaxWidth().height(260.dp).padding(top = 8.dp),
++                    verticalArrangement = Arrangement.spacedBy(6.dp)
++                ) {
++                    items(hits, key = { it.id }) { hit ->
++                        Button(
++                            onClick = { onPick(hit) },
++                            modifier = Modifier.fillMaxWidth(),
++                            shape = ButtonDefaults.shape(shape = RoundedCornerShape(8.dp)),
++                            colors = ButtonDefaults.colors(
++                                containerColor = Color.White.copy(alpha = 0.06f),
++                                contentColor = Color.White,
++                                focusedContainerColor = Color.White,
++                                focusedContentColor = Color.Black
++                            )
++                        ) {
++                            Row(
++                                modifier = Modifier.fillMaxWidth(),
++                                horizontalArrangement = Arrangement.SpaceBetween
++                            ) {
++                                Text(
++                                    text = hit.name,
++                                    fontSize = 13.sp,
++                                    fontWeight = FontWeight.SemiBold,
++                                    maxLines = 1,
++                                    overflow = TextOverflow.Ellipsis,
++                                    modifier = Modifier.weight(1f)
++                                )
++                                Text(
++                                    text = stringResource(R.string.fix_guide_programs, hit.programCount),
++                                    fontSize = 11.sp
++                                )
++                            }
++                        }
++                    }
++                }
++            }
++            if (hasOverride) {
++                Button(
++                    onClick = onReset,
++                    modifier = Modifier.padding(top = 10.dp),
++                    shape = ButtonDefaults.shape(shape = RoundedCornerShape(22.dp)),
++                    colors = ButtonDefaults.colors(
++                        containerColor = Color.White.copy(alpha = 0.10f),
++                        contentColor = Color.White,
++                        focusedContainerColor = Color.White,
++                        focusedContentColor = Color.Black
++                    )
++                ) {
++                    Text(text = stringResource(R.string.fix_guide_reset), fontSize = 12.sp)
++                }
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvSportsHubDialog.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvSportsHubDialog.kt
+new file mode 100644
+index 000000000..8376f8c4a
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvSportsHubDialog.kt
+@@ -0,0 +1,165 @@
++package com.nuvio.tv.ui.screens.tvchannels.components
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.items
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import androidx.tv.material3.Button
++import androidx.tv.material3.ButtonDefaults
++import androidx.tv.material3.ExperimentalTvMaterial3Api
++import androidx.tv.material3.MaterialTheme
++import androidx.tv.material3.Text
++import com.nuvio.tv.R
++import com.nuvio.tv.domain.model.TvChannelItem
++import com.nuvio.tv.forklivetv.ForkLiveReminders
++import com.nuvio.tv.ui.components.NuvioDialog
++import com.nuvio.tv.ui.theme.NuvioTheme
++import java.text.SimpleDateFormat
++import java.util.Calendar
++import java.util.Date
++import java.util.Locale
++
++private sealed interface HubRow {
++    data class Header(val titleRes: Int) : HubRow
++    data class Event(val channel: TvChannelItem, val live: Boolean) : HubRow
++}
++
++private const val LIVE_WINDOW_MS = 3 * 60 * 60_000L
++
++/** Live now / Today / Later events from the user's own channels (addons that list kickoff times). */
++@OptIn(ExperimentalTvMaterial3Api::class)
++@Composable
++fun TvSportsHubDialog(
++    visible: Boolean,
++    channels: List<TvChannelItem>,
++    isReminderSet: (TvChannelItem) -> Boolean,
++    onToggleReminder: (TvChannelItem) -> Unit,
++    onWatch: (TvChannelItem) -> Unit,
++    onDismiss: () -> Unit
++) {
++    if (!visible) return
++    val rows = remember(channels) { buildRows(channels) }
++    val timeFormat = remember { SimpleDateFormat("EEE d MMM, HH:mm", Locale.getDefault()) }
++
++    NuvioDialog(
++        onDismiss = onDismiss,
++        title = stringResource(R.string.sports_hub_title),
++        subtitle = stringResource(R.string.sports_hub_subtitle),
++        width = 700.dp
++    ) {
++        if (rows.isEmpty()) {
++            Text(
++                text = stringResource(R.string.sports_hub_empty),
++                style = MaterialTheme.typography.bodyMedium,
++                color = Color.White.copy(alpha = 0.5f),
++                modifier = Modifier.padding(vertical = 24.dp)
++            )
++        } else {
++            LazyColumn(
++                modifier = Modifier.fillMaxWidth().height(340.dp),
++                verticalArrangement = Arrangement.spacedBy(6.dp)
++            ) {
++                items(rows, key = {
++                    when (it) {
++                        is HubRow.Header -> "h${it.titleRes}"
++                        is HubRow.Event -> "e${it.channel.type}:${it.channel.id}"
++                    }
++                }) { row ->
++                    when (row) {
++                        is HubRow.Header -> Text(
++                            text = stringResource(row.titleRes),
++                            style = MaterialTheme.typography.titleSmall,
++                            fontWeight = FontWeight.Bold,
++                            color = NuvioTheme.colors.Secondary,
++                            modifier = Modifier.padding(top = 8.dp, bottom = 2.dp)
++                        )
++                        is HubRow.Event -> {
++                            val ch = row.channel
++                            Row(
++                                modifier = Modifier.fillMaxWidth(),
++                                verticalAlignment = Alignment.CenterVertically,
++                                horizontalArrangement = Arrangement.spacedBy(8.dp)
++                            ) {
++                                androidx.compose.foundation.layout.Column(modifier = Modifier.weight(1f)) {
++                                    Text(
++                                        text = ch.name,
++                                        fontSize = 13.sp,
++                                        fontWeight = FontWeight.SemiBold,
++                                        color = Color.White,
++                                        maxLines = 1,
++                                        overflow = TextOverflow.Ellipsis
++                                    )
++                                    Text(
++                                        text = ch.startEpochMs?.let { timeFormat.format(Date(it)) }.orEmpty(),
++                                        fontSize = 11.sp,
++                                        color = Color.White.copy(alpha = 0.6f)
++                                    )
++                                }
++                                if (!row.live) {
++                                    val set = isReminderSet(ch)
++                                    SportsHubButton(
++                                        label = stringResource(if (set) R.string.live_reminder_button_set else R.string.live_reminder_button),
++                                        onClick = { onToggleReminder(ch) }
++                                    )
++                                }
++                                SportsHubButton(
++                                    label = stringResource(R.string.sports_hub_watch),
++                                    onClick = { onWatch(ch) }
++                                )
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
++
++@OptIn(ExperimentalTvMaterial3Api::class)
++@Composable
++private fun SportsHubButton(label: String, onClick: () -> Unit) {
++    Button(
++        onClick = onClick,
++        shape = ButtonDefaults.shape(shape = RoundedCornerShape(22.dp)),
++        colors = ButtonDefaults.colors(
++            containerColor = Color.White.copy(alpha = 0.10f),
++            contentColor = Color.White,
++            focusedContainerColor = Color.White,
++            focusedContentColor = Color.Black
++        )
++    ) {
++        Text(text = label, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
++    }
++}
++
++private fun buildRows(channels: List<TvChannelItem>): List<HubRow> {
++    val now = System.currentTimeMillis()
++    val endOfToday = Calendar.getInstance().apply {
++        set(Calendar.HOUR_OF_DAY, 23); set(Calendar.MINUTE, 59); set(Calendar.SECOND, 59); set(Calendar.MILLISECOND, 999)
++    }.timeInMillis
++    val timed = channels.filter { it.startEpochMs != null }
++        .distinctBy { it.type + ":" + it.id }
++        .sortedBy { it.startEpochMs }
++    val live = timed.filter { val s = it.startEpochMs!!; s <= now && now - s <= LIVE_WINDOW_MS }
++    val today = timed.filter { val s = it.startEpochMs!!; s > now && s <= endOfToday }
++    val later = timed.filter { it.startEpochMs!! > endOfToday }
++    return buildList {
++        if (live.isNotEmpty()) { add(HubRow.Header(R.string.sports_hub_live)); live.forEach { add(HubRow.Event(it, true)) } }
++        if (today.isNotEmpty()) { add(HubRow.Header(R.string.sports_hub_today)); today.forEach { add(HubRow.Event(it, false)) } }
++        if (later.isNotEmpty()) { add(HubRow.Header(R.string.sports_hub_later)); later.take(60).forEach { add(HubRow.Event(it, false)) } }
++    }
++}
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 8438db88d..4a3d75c88 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -3583,4 +3583,22 @@
+     <string name="live_reminders_lead">Remind me before the start</string>
+     <string name="live_reminders_lead_value">%1$d min</string>
+     <string name="live_reminders_empty">No Live TV reminders</string>
++    <string name="idle_return_title">Return to profile picker when idle</string>
++    <string name="idle_return_subtitle">After 30 minutes without input (not while playing), go back to the profile picker.</string>
++    <string name="fix_guide_button">Fix guide</string>
++    <string name="fix_guide_title">%1$s • Fix guide</string>
++    <string name="fix_guide_subtitle">Pick the guide channel that matches this channel. It is remembered for this profile.</string>
++    <string name="fix_guide_search_hint">Search guide channels</string>
++    <string name="fix_guide_no_results">No guide channels found</string>
++    <string name="fix_guide_programs">%1$d programmes</string>
++    <string name="fix_guide_reset">Reset to automatic</string>
++    <string name="fix_guide_saved">Guide channel saved</string>
++    <string name="sports_hub_button">Sports</string>
++    <string name="sports_hub_title">Sports hub</string>
++    <string name="sports_hub_subtitle">Live and upcoming events from your channels</string>
++    <string name="sports_hub_live">Live now</string>
++    <string name="sports_hub_today">Today</string>
++    <string name="sports_hub_later">Later</string>
++    <string name="sports_hub_empty">No timed events in your channels right now</string>
++    <string name="sports_hub_watch">Watch</string>
+ </resources>
