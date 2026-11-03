@@ -1,0 +1,137 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
+index ebc06ae..e0c1aa6 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackNetworking.kt
+@@ -145,7 +145,7 @@ internal object PlayerPlaybackNetworking {
+                 setUserAgent(PlayerMediaSourceFactory.DEFAULT_USER_AGENT)
+             }
+         }
+-        return LoggingDataSourceFactory(httpFactory, "HTTP")
++        return YouTubeChunkedDataSourceFactory(LoggingDataSourceFactory(httpFactory, "HTTP"))
+     }
+ 
+     @UnstableApi
+diff --git a/b/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeChunkedDataSource.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeChunkedDataSource.kt
+new file mode 100644
+index 0000000..597b9d3
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeChunkedDataSource.kt
+@@ -0,0 +1,118 @@
++package com.nuvio.tv.ui.screens.player
++
++import android.net.Uri
++import androidx.media3.common.C
++import androidx.media3.common.util.UnstableApi
++import androidx.media3.datasource.DataSource
++import androidx.media3.datasource.DataSpec
++import androidx.media3.datasource.TransferListener
++
++/**
++ * Wraps the player's HTTP source so on-demand googlevideo downloads go out as bounded
++ * `&range=start-end` requests. googlevideo throttles long open-ended requests (a 4K stream
++ * can sit at a few hundred KB/s for tens of seconds) but serves ranged chunks at full speed.
++ *
++ * Everything else (other hosts, live and HLS segments, URLs that already carry a range) passes
++ * through untouched, and the wrapped source keeps the player's headers and OkHttp client.
++ */
++@UnstableApi
++internal class YouTubeChunkedDataSourceFactory(
++    private val upstream: DataSource.Factory,
++    private val chunkSizeBytes: Long = CHUNK_SIZE
++) : DataSource.Factory {
++
++    override fun createDataSource(): DataSource =
++        YouTubeChunkedDataSource(upstream.createDataSource(), chunkSizeBytes)
++
++    companion object {
++        /** Large enough to keep request count low, small enough to stay under the throttle. */
++        const val CHUNK_SIZE = 8L * 1024 * 1024
++
++        fun shouldChunk(uri: Uri): Boolean {
++            val host = uri.host.orEmpty().lowercase()
++            if (!host.endsWith("googlevideo.com")) return false
++            val path = uri.path.orEmpty()
++            if (!path.contains("videoplayback")) return false
++            if (path.contains("/sq/") || path.contains("/live/")) return false
++            if (uri.getQueryParameter("range") != null) return false
++            if (uri.getQueryParameter("source") == "yt_live_broadcast") return false
++            return true
++        }
++    }
++}
++
++@UnstableApi
++private class YouTubeChunkedDataSource(
++    private val upstream: DataSource,
++    private val chunkSize: Long
++) : DataSource {
++
++    private var chunked = false
++    private var original: DataSpec? = null
++    private var chunkStart = 0L
++    private var chunkEnd = 0L
++    private var remaining = C.LENGTH_UNSET.toLong()
++    private var bytesInChunk = 0L
++
++    override fun addTransferListener(transferListener: TransferListener) {
++        upstream.addTransferListener(transferListener)
++    }
++
++    override fun open(dataSpec: DataSpec): Long {
++        chunked = YouTubeChunkedDataSourceFactory.shouldChunk(dataSpec.uri)
++        if (!chunked) return upstream.open(dataSpec)
++        original = dataSpec
++        chunkStart = dataSpec.position
++        remaining = dataSpec.length
++        openChunk()
++        return remaining
++    }
++
++    private fun openChunk() {
++        val spec = original ?: throw IllegalStateException("no data spec")
++        var end = chunkStart + chunkSize - 1
++        if (remaining != C.LENGTH_UNSET.toLong()) {
++            end = minOf(end, chunkStart + remaining - 1)
++        }
++        chunkEnd = end
++        bytesInChunk = 0
++        val ranged = spec.uri.buildUpon().appendQueryParameter("range", "$chunkStart-$end").build()
++        upstream.open(
++            spec.buildUpon()
++                .setUri(ranged)
++                .setPosition(0)
++                .setLength(C.LENGTH_UNSET.toLong())
++                .build()
++        )
++    }
++
++    override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
++        if (!chunked) return upstream.read(buffer, offset, length)
++        val read = upstream.read(buffer, offset, length)
++        if (read != C.RESULT_END_OF_INPUT) {
++            bytesInChunk += read
++            return read
++        }
++        val got = bytesInChunk
++        upstream.close()
++        // A short chunk means the file ended inside it.
++        if (got < chunkEnd - chunkStart + 1) return C.RESULT_END_OF_INPUT
++        chunkStart += got
++        if (remaining != C.LENGTH_UNSET.toLong()) {
++            remaining -= got
++            if (remaining <= 0) return C.RESULT_END_OF_INPUT
++        }
++        openChunk()
++        return upstream.read(buffer, offset, length).also { if (it > 0) bytesInChunk += it }
++    }
++
++    override fun getUri(): Uri? = upstream.uri
++
++    override fun getResponseHeaders(): Map<String, List<String>> = upstream.responseHeaders
++
++    override fun close() {
++        upstream.close()
++        original = null
++        chunked = false
++    }
++}
