@@ -1,0 +1,136 @@
+diff --git a/app/src/main/java/com/nuvio/tv/data/trailer/YoutubeChunkedDataSourceFactory.kt b/app/src/main/java/com/nuvio/tv/data/trailer/YoutubeChunkedDataSourceFactory.kt
+index 01fb82c..538cd45 100644
+--- a/app/src/main/java/com/nuvio/tv/data/trailer/YoutubeChunkedDataSourceFactory.kt
++++ b/app/src/main/java/com/nuvio/tv/data/trailer/YoutubeChunkedDataSourceFactory.kt
+@@ -6,11 +6,12 @@ import androidx.media3.common.C
+ import androidx.media3.common.util.UnstableApi
+ import androidx.media3.datasource.DataSource
+ import androidx.media3.datasource.DataSpec
+-import androidx.media3.datasource.DefaultHttpDataSource
++import androidx.media3.datasource.okhttp.OkHttpDataSource
++import com.nuvio.tv.ui.screens.player.PlayerPlaybackNetworking
+ import androidx.media3.datasource.TransferListener
+ 
+ /**
+- * A DataSource.Factory that wraps DefaultHttpDataSource and appends YouTube's
++ * A DataSource.Factory that wraps an OkHttp data source and appends YouTube's
+  * `&range=start-end` query parameter on each request. YouTube throttles (and
+  * kills) connections that try to download full adaptive streams in one shot,
+  * but honours chunked range-param requests at full speed.
+@@ -29,16 +30,15 @@ class YoutubeChunkedDataSourceFactory(
+     }
+ 
+     override fun createDataSource(): DataSource {
+-        val upstream = DefaultHttpDataSource.Factory()
+-            .setConnectTimeoutMs(15_000)
+-            .setReadTimeoutMs(15_000)
+-            .setAllowCrossProtocolRedirects(true)
++        // googlevideo ties a stream URL to the address that asked for it; the extractor goes out over IPv4
++        // first, so fetch the stream through the same IPv4-first OkHttp client (HttpURLConnection took IPv6).
++        val upstream = OkHttpDataSource.Factory(PlayerPlaybackNetworking.playbackHttpClient)
+             .createDataSource()
+         return YoutubeChunkedDataSource(upstream, chunkSizeBytes)
+     }
+ 
+     private class YoutubeChunkedDataSource(
+-        private val upstream: DefaultHttpDataSource,
++        private val upstream: OkHttpDataSource,
+         private val chunkSize: Long
+     ) : DataSource {
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeFirstChunkCache.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeFirstChunkCache.kt
+index 1a89e4a..0871d02 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeFirstChunkCache.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeFirstChunkCache.kt
+@@ -7,8 +7,9 @@ import androidx.media3.common.MimeTypes
+ import org.xmlpull.v1.XmlPullParser
+ import java.io.ByteArrayInputStream
+ import java.io.ByteArrayOutputStream
+-import java.net.HttpURLConnection
+-import java.net.URL
++import com.nuvio.tv.ui.screens.player.PlayerPlaybackNetworking
++import okhttp3.Request
++import java.util.concurrent.TimeUnit
+ import java.util.concurrent.Executors
+ 
+ /**
+@@ -119,31 +120,39 @@ object YouTubeFirstChunkCache {
+         }
+     }
+ 
++    // googlevideo ties a stream URL to the address that asked for it. The extractor and the player's OkHttp
++    // client both go out over IPv4 first (IPv4FirstDns); HttpURLConnection took IPv6 first on dual-stack
++    // networks, so the prefetched bytes came from another address than the stream.
++    private val prefetchClient by lazy {
++        PlayerPlaybackNetworking.playbackHttpClient.newBuilder()
++            .connectTimeout(8, TimeUnit.SECONDS)
++            .readTimeout(8, TimeUnit.SECONDS)
++            .build()
++    }
++
+     private fun download(url: String, bytes: Int, userAgent: String?): ByteArray? {
+-        var conn: HttpURLConnection? = null
+         return try {
+             val ranged = Uri.parse(url).buildUpon().appendQueryParameter("range", "0-${bytes - 1}").build().toString()
+-            conn = (URL(ranged).openConnection() as HttpURLConnection).apply {
+-                connectTimeout = 8_000
+-                readTimeout = 8_000
+-                userAgent?.takeIf { it.isNotBlank() }?.let { setRequestProperty("User-Agent", it) }
+-            }
+-            if (conn.responseCode !in 200..299) return null
+-            val out = ByteArrayOutputStream(bytes)
+-            val buffer = ByteArray(64 * 1024)
+-            conn.inputStream.use { input ->
+-                while (out.size() < bytes) {
+-                    val read = input.read(buffer, 0, minOf(buffer.size, bytes - out.size()))
+-                    if (read < 0) break
+-                    out.write(buffer, 0, read)
++            val request = Request.Builder().url(ranged)
++                .apply { userAgent?.takeIf { it.isNotBlank() }?.let { header("User-Agent", it) } }
++                .build()
++            prefetchClient.newCall(request).execute().use { response ->
++                if (!response.isSuccessful) return null
++                val body = response.body ?: return null
++                val out = ByteArrayOutputStream(bytes)
++                val buffer = ByteArray(64 * 1024)
++                body.byteStream().use { input ->
++                    while (out.size() < bytes) {
++                        val read = input.read(buffer, 0, minOf(buffer.size, bytes - out.size()))
++                        if (read < 0) break
++                        out.write(buffer, 0, read)
++                    }
+                 }
++                out.toByteArray().takeIf { it.isNotEmpty() }
+             }
+-            out.toByteArray().takeIf { it.isNotEmpty() }
+         } catch (e: Exception) {
+             Log.w(TAG, "first-bytes prefetch failed: ${e.message}")
+             null
+-        } finally {
+-            runCatching { conn?.disconnect() }
+         }
+     }
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeShortsPlayer.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeShortsPlayer.kt
+index e05c8f4..f1baa50 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeShortsPlayer.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeShortsPlayer.kt
+@@ -54,7 +54,8 @@ import androidx.media3.common.MimeTypes
+ import androidx.media3.common.PlaybackException
+ import androidx.media3.common.Player
+ import androidx.media3.common.util.UnstableApi
+-import androidx.media3.datasource.DefaultHttpDataSource
++import androidx.media3.datasource.okhttp.OkHttpDataSource
++import com.nuvio.tv.ui.screens.player.PlayerPlaybackNetworking
+ import androidx.media3.exoplayer.ExoPlayer
+ import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+ import androidx.media3.ui.AspectRatioFrameLayout
+@@ -104,7 +105,7 @@ fun YouTubeShortsPlayer(
+     var progress by remember { mutableFloatStateOf(0f) }
+     var hint by remember { mutableStateOf(true) }
+ 
+-    val httpFactory = remember { DefaultHttpDataSource.Factory().setAllowCrossProtocolRedirects(true) }
++    val httpFactory = remember { OkHttpDataSource.Factory(PlayerPlaybackNetworking.playbackHttpClient) }
+     val player = remember {
+         ExoPlayer.Builder(context)
+             .setMediaSourceFactory(DefaultMediaSourceFactory(context).setDataSourceFactory(httpFactory))
