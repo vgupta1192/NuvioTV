@@ -1,0 +1,133 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+index d1b677d..975d25f 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+@@ -97,7 +97,7 @@ private const val MPV_AFR_SETTLE_DELAY_MS = 2_000L
+ private const val AUDIO_DELAY_REFRESH_DEBOUNCE_MS = 120L
+ private const val PLAYER_RELEASE_TIMEOUT_MS = 3000L
+ private const val PLAYER_REBUILD_SETTLE_DELAY_MS = 120L
+-private const val ADAPTIVE_QUALITY_INCREASE_MIN_DURATION_MS = 2_000
++private const val ADAPTIVE_QUALITY_INCREASE_MIN_DURATION_MS = 1_000
+ private const val ADAPTIVE_INITIAL_BITRATE_ESTIMATE_BPS = 25_000_000L
+ 
+ internal data class StartupSubtitlePreparation(
+@@ -678,7 +678,7 @@ internal fun PlayerRuntimeController.initializePlayer(
+                 ADAPTIVE_QUALITY_INCREASE_MIN_DURATION_MS,
+                 AdaptiveTrackSelection.DEFAULT_MAX_DURATION_FOR_QUALITY_DECREASE_MS,
+                 AdaptiveTrackSelection.DEFAULT_MIN_DURATION_TO_RETAIN_AFTER_DISCARD_MS,
+-                AdaptiveTrackSelection.DEFAULT_BANDWIDTH_FRACTION
++                0.9f
+             )
+             trackSelector = object : DefaultTrackSelector(context, adaptiveTrackSelectionFactory) {
+                 override fun selectAllTracks(
+@@ -1164,6 +1164,7 @@ internal fun PlayerRuntimeController.initializePlayer(
+                 playWhenReady = false
+                 prepare()
+                 YouTubeDiag.attach(this)
++                QualityToast.attach(this, context)
+ 
+                 addListener(object : Player.Listener {
+                     override fun onPositionDiscontinuity(
+diff --git a/b/app/src/main/java/com/nuvio/tv/ui/screens/player/QualityToast.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/QualityToast.kt
+new file mode 100644
+index 0000000..a4bae58
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/QualityToast.kt
+@@ -0,0 +1,47 @@
++package com.nuvio.tv.ui.screens.player
++
++import android.content.Context
++import android.util.Log
++import android.widget.Toast
++import androidx.media3.common.Format
++import androidx.media3.exoplayer.DecoderReuseEvaluation
++import androidx.media3.exoplayer.ExoPlayer
++import androidx.media3.exoplayer.analytics.AnalyticsListener
++import com.nuvio.tv.youtube.YouTubeSettings
++
++/**
++ * Nuvio TV fork: shows the video quality when playback starts and whenever adaptive
++ * streaming moves up or down. The toast can be switched off in the YouTube settings;
++ * the log line is always written.
++ */
++internal object QualityToast {
++    private const val TAG = "NuvioQuality"
++
++    fun attach(player: ExoPlayer, context: Context) {
++        val app = context.applicationContext
++        player.addAnalyticsListener(object : AnalyticsListener {
++            private var lastHeight = 0
++            private var toast: Toast? = null
++
++            override fun onVideoInputFormatChanged(
++                eventTime: AnalyticsListener.EventTime,
++                format: Format,
++                decoderReuseEvaluation: DecoderReuseEvaluation?
++            ) {
++                val height = format.height
++                Log.d(TAG, "video ${format.width}x$height ${format.bitrate / 1000}k")
++                if (height <= 0 || height == lastHeight) return
++                val previous = lastHeight
++                lastHeight = height
++                if (!YouTubeSettings.qualityToast(app)) return
++                val message = when {
++                    previous == 0 -> "Quality: ${height}p"
++                    height > previous -> "Quality up: ${height}p"
++                    else -> "Quality down: ${height}p"
++                }
++                toast?.cancel()
++                toast = Toast.makeText(app, message, Toast.LENGTH_SHORT).also { it.show() }
++            }
++        })
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/YouTubeSettingsContent.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/YouTubeSettingsContent.kt
+index 4f3873e..b06398b 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/YouTubeSettingsContent.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/YouTubeSettingsContent.kt
+@@ -68,6 +68,7 @@ internal fun YouTubeSettingsContent(
+     var hideWatched by remember { mutableStateOf(YouTubeSettings.hideWatched(context)) }
+     var hideUpcoming by remember { mutableStateOf(YouTubeSettings.hideUpcoming(context)) }
+     var codec by remember { mutableStateOf(YouTubeSettings.codecPreference(context)) }
++    var qualityToast by remember { mutableStateOf(YouTubeSettings.qualityToast(context)) }
+ 
+     Column(
+         modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
+@@ -138,6 +139,15 @@ internal fun YouTubeSettingsContent(
+                     YouTubeSettings.setAutoplayNext(context, autoplay)
+                 }
+             )
++            SettingsToggleRow(
++                title = "Show quality messages",
++                subtitle = "A short message with the video size when playback starts and when quality goes up or down",
++                checked = qualityToast,
++                onToggle = {
++                    qualityToast = !qualityToast
++                    YouTubeSettings.setQualityToast(context, qualityToast)
++                }
++            )
+             SettingsActionRow(
+                 title = "Video format",
+                 subtitle = "Auto prefers VP9, then H.264, and leaves AV1 for last. Pick H.264 if video stutters.",
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeSettings.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeSettings.kt
+index d808fb7..5278353 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeSettings.kt
+@@ -24,6 +24,7 @@ object YouTubeSettings {
+     private const val KEY_HIDE_WATCHED = "hide_watched"
+     private const val KEY_HIDE_UPCOMING = "hide_upcoming"
+     private const val KEY_CODEC = "codec_preference"
++    private const val KEY_QUALITY_TOAST = "quality_toast"
+ 
+     /** SponsorBlock's segment types, in the order they're listed. */
+     val sponsorCategories: List<Pair<String, String>> = listOf(
+@@ -165,6 +166,9 @@ object YouTubeSettings {
+     fun setShortsMuted(context: Context, on: Boolean) = prefs(context).edit().putBoolean("shorts_muted", on).apply()
+     fun shortsSpeed(context: Context) = prefs(context).getFloat("shorts_speed", 1f)
+     fun setShortsSpeed(context: Context, speed: Float) = prefs(context).edit().putFloat("shorts_speed", speed).apply()
++    /** Show a message with the video size at start and on every automatic quality change. */
++    fun qualityToast(context: Context) = prefs(context).getBoolean(KEY_QUALITY_TOAST, true)
++    fun setQualityToast(context: Context, on: Boolean) = prefs(context).edit().putBoolean(KEY_QUALITY_TOAST, on).apply()
+     fun shortsInfo(context: Context) = prefs(context).getBoolean("shorts_info", true)
+     fun setShortsInfo(context: Context, on: Boolean) = prefs(context).edit().putBoolean("shorts_info", on).apply()
+ 
