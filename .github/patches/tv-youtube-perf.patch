@@ -1,0 +1,648 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+index 975d25f..7329f3c 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+@@ -573,7 +573,10 @@ internal fun PlayerRuntimeController.initializePlayer(
+                 BitrateAwareLoadControl(
+                     minBufferMs = bufferSettings.minBufferMs,
+                     maxBufferMs = bufferSettings.maxBufferMs,
+-                    bufferForPlaybackMs = bufferSettings.bufferForPlaybackMs,
++                    // YouTube fork: start a YouTube video after 1 s of data; the first frame should not wait for more.
++                    bufferForPlaybackMs = if (com.nuvio.tv.youtube.YouTubeProgress.isYouTubeId(contentId)) {
++                        minOf(bufferSettings.bufferForPlaybackMs, 1_000)
++                    } else bufferSettings.bufferForPlaybackMs,
+                     bufferForPlaybackAfterRebufferMs = bufferSettings.bufferForPlaybackAfterRebufferMs,
+                     // Allow buffering past the byte budget until the minimum time threshold is
+                     // met. Without this, high-bitrate remux files (e.g. 100+ Mbps UHD MKV with
+@@ -596,6 +599,12 @@ internal fun PlayerRuntimeController.initializePlayer(
+                 )
+                 DefaultLoadControl.Builder()
+                     .setBackBuffer(1_500, /* retainBackBufferFromKeyframe = */ true)
++                    .apply {
++                        // YouTube fork: start a YouTube video after 1 s of data.
++                        if (com.nuvio.tv.youtube.YouTubeProgress.isYouTubeId(contentId)) {
++                            setBufferDurationsMs(50_000, 50_000, 1_000, 2_500)
++                        }
++                    }
+                     .build()
+             }
+             _loadControl = loadControl
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeChunkedDataSource.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeChunkedDataSource.kt
+index 597b9d3..8e19b23 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeChunkedDataSource.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeChunkedDataSource.kt
+@@ -1,17 +1,27 @@
+ package com.nuvio.tv.ui.screens.player
+ 
+ import android.net.Uri
++import android.util.Log
+ import androidx.media3.common.C
+ import androidx.media3.common.util.UnstableApi
+ import androidx.media3.datasource.DataSource
+ import androidx.media3.datasource.DataSpec
+ import androidx.media3.datasource.TransferListener
++import com.nuvio.tv.youtube.YouTubeFirstChunkCache
++import java.io.ByteArrayOutputStream
++import java.util.concurrent.Executors
++import java.util.concurrent.Future
++import java.util.concurrent.TimeUnit
+ 
+ /**
+  * Wraps the player's HTTP source so on-demand googlevideo downloads go out as bounded
+  * `&range=start-end` requests. googlevideo throttles long open-ended requests (a 4K stream
+  * can sit at a few hundred KB/s for tens of seconds) but serves ranged chunks at full speed.
+  *
++ * The first request is small, so the first frame does not wait for a large response; the next chunk
++ * downloads in the background while the player drains the current one; and bytes fetched while the
++ * card was highlighted ([YouTubeFirstChunkCache]) start the stream with no network wait.
++ *
+  * Everything else (other hosts, live and HLS segments, URLs that already carry a range) passes
+  * through untouched, and the wrapped source keeps the player's headers and OkHttp client.
+  */
+@@ -22,97 +32,226 @@ internal class YouTubeChunkedDataSourceFactory(
+ ) : DataSource.Factory {
+ 
+     override fun createDataSource(): DataSource =
+-        YouTubeChunkedDataSource(upstream.createDataSource(), chunkSizeBytes)
++        YouTubeChunkedDataSource(upstream.createDataSource(), upstream, chunkSizeBytes)
+ 
+     companion object {
++        private const val TAG = "YTChunkedDS"
++
+         /** Large enough to keep request count low, small enough to stay under the throttle. */
+         const val CHUNK_SIZE = 8L * 1024 * 1024
+ 
++        /** The first request is small so the first frame does not wait for a large response. */
++        private const val FIRST_CHUNK_SIZE = 1L * 1024 * 1024
++
++        /** Longest the player waits for a read-ahead chunk before it falls back to a direct request. */
++        private const val READ_AHEAD_WAIT_MS = 30_000L
++
++        /** Shared pool so the next chunk downloads while the player drains the current one. */
++        private val readAheadPool = Executors.newFixedThreadPool(3) { runnable ->
++            Thread(runnable, "yt-read-ahead").apply { isDaemon = true }
++        }
++
+         fun shouldChunk(uri: Uri): Boolean {
+             val host = uri.host.orEmpty().lowercase()
+             if (!host.endsWith("googlevideo.com")) return false
+             val path = uri.path.orEmpty()
+             if (!path.contains("videoplayback")) return false
+             if (path.contains("/sq/") || path.contains("/live/")) return false
++            if (path.endsWith(".m3u8") || path.endsWith(".ts")) return false
+             if (uri.getQueryParameter("range") != null) return false
++            if (uri.getQueryParameter("live") == "1") return false
+             if (uri.getQueryParameter("source") == "yt_live_broadcast") return false
+             return true
+         }
+     }
+-}
+ 
+-@UnstableApi
+-private class YouTubeChunkedDataSource(
+-    private val upstream: DataSource,
+-    private val chunkSize: Long
+-) : DataSource {
+-
+-    private var chunked = false
+-    private var original: DataSpec? = null
+-    private var chunkStart = 0L
+-    private var chunkEnd = 0L
+-    private var remaining = C.LENGTH_UNSET.toLong()
+-    private var bytesInChunk = 0L
+-
+-    override fun addTransferListener(transferListener: TransferListener) {
+-        upstream.addTransferListener(transferListener)
+-    }
++    private class YouTubeChunkedDataSource(
++        private val upstream: DataSource,
++        private val factory: DataSource.Factory,
++        private val chunkSize: Long
++    ) : DataSource {
+ 
+-    override fun open(dataSpec: DataSpec): Long {
+-        chunked = YouTubeChunkedDataSourceFactory.shouldChunk(dataSpec.uri)
+-        if (!chunked) return upstream.open(dataSpec)
+-        original = dataSpec
+-        chunkStart = dataSpec.position
+-        remaining = dataSpec.length
+-        openChunk()
+-        return remaining
+-    }
++        private var chunked = false
++        private var original: DataSpec? = null
++        private var currentUri: Uri? = null
++        private var chunkStart = 0L
++        private var chunkEnd = 0L
++        private var remaining = C.LENGTH_UNSET.toLong()
++        private var absoluteEnd = C.LENGTH_UNSET.toLong()
++        private var bytesInChunk = 0L
++        private var prefetched: ByteArray? = null
++        private var prefetchedPos = 0
++        private var streamEndsAfterPrefetched = false
++        private var readAhead: Future<ByteArray>? = null
++        private var readAheadStart = 0L
++        private var readAheadRequested = 0L
+ 
+-    private fun openChunk() {
+-        val spec = original ?: throw IllegalStateException("no data spec")
+-        var end = chunkStart + chunkSize - 1
+-        if (remaining != C.LENGTH_UNSET.toLong()) {
+-            end = minOf(end, chunkStart + remaining - 1)
++        override fun addTransferListener(transferListener: TransferListener) {
++            upstream.addTransferListener(transferListener)
++        }
++
++        override fun open(dataSpec: DataSpec): Long {
++            chunked = shouldChunk(dataSpec.uri)
++            if (!chunked) return upstream.open(dataSpec)
++            original = dataSpec
++            currentUri = dataSpec.uri
++            chunkStart = dataSpec.position
++            remaining = dataSpec.length
++            absoluteEnd = if (dataSpec.length != C.LENGTH_UNSET.toLong()) dataSpec.position + dataSpec.length else C.LENGTH_UNSET.toLong()
++            prefetched = null
++            prefetchedPos = 0
++            streamEndsAfterPrefetched = false
++            cancelReadAhead()
++
++            // Bytes downloaded before the viewer pressed OK cover the start of the file (init segment
++            // and the first media data), so a request inside them needs no network wait.
++            val cached = YouTubeFirstChunkCache.get(dataSpec.uri.toString())
++            if (cached != null && dataSpec.position < cached.bytes.size) {
++                val from = dataSpec.position.toInt()
++                val available = cached.bytes.size - from
++                val wanted = if (remaining != C.LENGTH_UNSET.toLong()) minOf(remaining, available.toLong()).toInt() else available
++                prefetched = cached.bytes.copyOfRange(from, from + wanted)
++                chunkStart = dataSpec.position + wanted
++                if (remaining != C.LENGTH_UNSET.toLong()) remaining -= wanted
++                streamEndsAfterPrefetched = (remaining != C.LENGTH_UNSET.toLong() && remaining <= 0) ||
++                    cached.bytes.size < cached.requested
++                if (!streamEndsAfterPrefetched) startReadAhead(chunkStart)
++                Log.i(TAG, "open at ${dataSpec.position}: prefetched $wanted bytes")
++                return dataSpec.length
++            }
++            openChunk()
++            return dataSpec.length
+         }
+-        chunkEnd = end
+-        bytesInChunk = 0
+-        val ranged = spec.uri.buildUpon().appendQueryParameter("range", "$chunkStart-$end").build()
+-        upstream.open(
+-            spec.buildUpon()
+-                .setUri(ranged)
+-                .setPosition(0)
+-                .setLength(C.LENGTH_UNSET.toLong())
+-                .build()
+-        )
+-    }
+ 
+-    override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+-        if (!chunked) return upstream.read(buffer, offset, length)
+-        val read = upstream.read(buffer, offset, length)
+-        if (read != C.RESULT_END_OF_INPUT) {
+-            bytesInChunk += read
+-            return read
++        private fun cancelReadAhead() {
++            readAhead?.cancel(true)
++            readAhead = null
+         }
+-        val got = bytesInChunk
+-        upstream.close()
+-        // A short chunk means the file ended inside it.
+-        if (got < chunkEnd - chunkStart + 1) return C.RESULT_END_OF_INPUT
+-        chunkStart += got
+-        if (remaining != C.LENGTH_UNSET.toLong()) {
+-            remaining -= got
+-            if (remaining <= 0) return C.RESULT_END_OF_INPUT
++
++        /** Downloads the chunk at [start] in the background so it is ready when the current one ends. */
++        private fun startReadAhead(start: Long) {
++            val spec = original ?: return
++            if (readAhead != null) return
++            val size = if (absoluteEnd != C.LENGTH_UNSET.toLong()) minOf(chunkSize, absoluteEnd - start) else chunkSize
++            if (size <= 0) return
++            readAheadStart = start
++            readAheadRequested = size
++            readAhead = readAheadPool.submit<ByteArray> { fetchRange(spec, start, size) }
+         }
+-        openChunk()
+-        return upstream.read(buffer, offset, length).also { if (it > 0) bytesInChunk += it }
+-    }
+ 
+-    override fun getUri(): Uri? = upstream.uri
++        private fun fetchRange(spec: DataSpec, start: Long, size: Long): ByteArray {
++            val source = factory.createDataSource()
++            try {
++                val ranged = spec.buildUpon()
++                    .setUri(spec.uri.buildUpon().appendQueryParameter("range", "$start-${start + size - 1}").build())
++                    .setPosition(0)
++                    .setLength(C.LENGTH_UNSET.toLong())
++                    .build()
++                source.open(ranged)
++                val out = ByteArrayOutputStream(size.toInt())
++                val block = ByteArray(64 * 1024)
++                while (true) {
++                    val n = source.read(block, 0, block.size)
++                    if (n == C.RESULT_END_OF_INPUT) break
++                    out.write(block, 0, n)
++                }
++                return out.toByteArray()
++            } finally {
++                runCatching { source.close() }
++            }
++        }
+ 
+-    override fun getResponseHeaders(): Map<String, List<String>> = upstream.responseHeaders
++        /** Moves the read-ahead chunk into memory when it covers the chunk the player needs next. */
++        private fun takeReadAhead(): Boolean {
++            val pending = readAhead ?: return false
++            if (readAheadStart != chunkStart) {
++                cancelReadAhead()
++                return false
++            }
++            val bytes = try {
++                pending.get(READ_AHEAD_WAIT_MS, TimeUnit.MILLISECONDS)
++            } catch (e: Exception) {
++                Log.w(TAG, "Read-ahead at $chunkStart failed: ${e.message}")
++                cancelReadAhead()
++                return false
++            }
++            readAhead = null
++            prefetched = bytes
++            prefetchedPos = 0
++            streamEndsAfterPrefetched = bytes.size < readAheadRequested
++            chunkStart += bytes.size
++            if (remaining != C.LENGTH_UNSET.toLong()) remaining -= bytes.size
++            if (!streamEndsAfterPrefetched) startReadAhead(chunkStart)
++            return true
++        }
+ 
+-    override fun close() {
+-        upstream.close()
+-        original = null
+-        chunked = false
++        private fun openChunk() {
++            val spec = original ?: throw IllegalStateException("no data spec")
++            if (takeReadAhead()) return
++            val size = if (chunkStart == spec.position) minOf(FIRST_CHUNK_SIZE, chunkSize) else chunkSize
++            var end = chunkStart + size - 1
++            if (remaining != C.LENGTH_UNSET.toLong()) {
++                end = minOf(end, chunkStart + remaining - 1)
++            }
++            chunkEnd = end
++            bytesInChunk = 0
++            val ranged = spec.uri.buildUpon().appendQueryParameter("range", "$chunkStart-$end").build()
++            upstream.open(
++                spec.buildUpon()
++                    .setUri(ranged)
++                    .setPosition(0)
++                    .setLength(C.LENGTH_UNSET.toLong())
++                    .build()
++            )
++            startReadAhead(end + 1)
++        }
++
++        override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
++            if (!chunked) return upstream.read(buffer, offset, length)
++            val memory = prefetched
++            if (memory != null) {
++                if (prefetchedPos < memory.size) {
++                    val count = minOf(length, memory.size - prefetchedPos)
++                    System.arraycopy(memory, prefetchedPos, buffer, offset, count)
++                    prefetchedPos += count
++                    return count
++                }
++                prefetched = null
++                if (streamEndsAfterPrefetched || (remaining != C.LENGTH_UNSET.toLong() && remaining <= 0)) {
++                    return C.RESULT_END_OF_INPUT
++                }
++                openChunk()
++                return read(buffer, offset, length)
++            }
++            val read = upstream.read(buffer, offset, length)
++            if (read != C.RESULT_END_OF_INPUT) {
++                bytesInChunk += read
++                return read
++            }
++            val got = bytesInChunk
++            upstream.close()
++            // A short chunk means the file ended inside it.
++            if (got < chunkEnd - chunkStart + 1) return C.RESULT_END_OF_INPUT
++            chunkStart += got
++            if (remaining != C.LENGTH_UNSET.toLong()) {
++                remaining -= got
++                if (remaining <= 0) return C.RESULT_END_OF_INPUT
++            }
++            openChunk()
++            return read(buffer, offset, length)
++        }
++
++        override fun getUri(): Uri? = upstream.uri ?: currentUri
++
++        override fun getResponseHeaders(): Map<String, List<String>> = upstream.responseHeaders
++
++        override fun close() {
++            cancelReadAhead()
++            upstream.close()
++            prefetched = null
++            original = null
++            currentUri = null
++            chunked = false
++        }
+     }
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeDiag.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeDiag.kt
+index bf4d2c1..195fff6 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeDiag.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/YouTubeDiag.kt
+@@ -31,6 +31,7 @@ internal object YouTubeDiag {
+     private const val CLIENT = "tv"
+     private const val ENDPOINT = "https://nuviodiag.kissmissi.duckdns.org/d/yt"
+     private const val STALL_MS = 15_000L
++    private const val PROBE_DELAY_MS = 6_000L
+     private const val SEGMENT_BYTES = 1_500_000
+     private const val LOG_LINES = 160
+     private const val CHROME_UA =
+@@ -73,8 +74,10 @@ internal object YouTubeDiag {
+         startedAtMs = SystemClock.elapsedRealtime()
+         ready = false
+         job = scope.launch {
+-            send("prepare", url, probe(url))
+-            delay(STALL_MS)
++            // The probe downloads from the same host the player needs, so it waits until the stream has had its start.
++            delay(PROBE_DELAY_MS)
++            send("prepare", url, if (ready) null else probe(url))
++            delay(STALL_MS - PROBE_DELAY_MS)
+             if (!ready) send("stall", url, null)
+         }
+     }
+diff --git a/pb/app/src/main/java/com/nuvio/tv/youtube/YouTubeFirstChunkCache.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeFirstChunkCache.kt
+new file mode 100644
+index 0000000..1a89e4a
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeFirstChunkCache.kt
+@@ -0,0 +1,149 @@
++package com.nuvio.tv.youtube
++
++import android.net.Uri
++import android.util.Log
++import android.util.Xml
++import androidx.media3.common.MimeTypes
++import org.xmlpull.v1.XmlPullParser
++import java.io.ByteArrayInputStream
++import java.io.ByteArrayOutputStream
++import java.net.HttpURLConnection
++import java.net.URL
++import java.util.concurrent.Executors
++
++/**
++ * The first bytes of a YouTube video and audio stream, downloaded while the card is still highlighted.
++ * The chunked data source serves a request that starts inside these bytes from memory, so the player
++ * has its init segment and first media data for the first frame without a network round trip.
++ */
++object YouTubeFirstChunkCache {
++    class Entry(val bytes: ByteArray, val requested: Int)
++
++    private const val TAG = "YouTubeStart"
++    private const val MAX_ENTRIES = 8
++    private const val VIDEO_BYTES = 3 * 1024 * 1024
++    private const val AUDIO_BYTES = 512 * 1024
++
++    private val entries = object : LinkedHashMap<String, Entry>(16, 0.75f, true) {
++        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Entry>?): Boolean = size > MAX_ENTRIES
++    }
++    private val inFlight = HashSet<String>()
++    private val executor = Executors.newFixedThreadPool(2) { runnable ->
++        Thread(runnable, "yt-first-chunk").apply { isDaemon = true }
++    }
++
++    fun get(url: String): Entry? = synchronized(entries) { entries[url] }
++
++    private class Rep(val video: Boolean, val height: Int, val bandwidth: Long, val codecs: String, val url: String)
++
++    /**
++     * Reads the manifest, picks the video size and audio the player will most likely start with, and
++     * downloads their first bytes in the background. [codecOrder] is the MIME order from the settings.
++     */
++    fun prefetchFromMpd(mpd: ByteArray, userAgent: String?, preferredHeight: Int, codecOrder: List<String>) {
++        val reps = runCatching { parse(mpd) }.getOrDefault(emptyList())
++        val videos = reps.filter { it.video && it.url.contains("googlevideo.com") }
++        val audios = reps.filter { !it.video && it.url.contains("googlevideo.com") }
++        if (videos.isNotEmpty()) {
++            val heights = videos.map { it.height }.distinct().sorted()
++            val target = if (preferredHeight > 0) {
++                heights.lastOrNull { it <= preferredHeight } ?: heights.first()
++            } else {
++                heights.lastOrNull { it <= 1080 } ?: heights.first()
++            }
++            val best = videos.filter { it.height == target }.minWithOrNull(
++                compareBy<Rep> { rep ->
++                    val mime = MimeTypes.getVideoMediaMimeType(rep.codecs)
++                    codecOrder.indexOf(mime).let { if (it < 0) codecOrder.size else it }
++                }.thenByDescending { it.bandwidth }
++            )
++            best?.let { prefetch(it.url, VIDEO_BYTES, userAgent) }
++        }
++        audios.maxByOrNull { it.bandwidth }?.let { prefetch(it.url, AUDIO_BYTES, userAgent) }
++    }
++
++    private fun parse(mpd: ByteArray): List<Rep> {
++        val parser = Xml.newPullParser()
++        parser.setInput(ByteArrayInputStream(mpd), null)
++        val out = ArrayList<Rep>()
++        var setVideo = false
++        var video = false
++        var height = 0
++        var bandwidth = 0L
++        var codecs = ""
++        var inRep = false
++        var event = parser.eventType
++        while (event != XmlPullParser.END_DOCUMENT) {
++            if (event == XmlPullParser.START_TAG) {
++                when (parser.name) {
++                    "AdaptationSet" -> {
++                        val kind = parser.getAttributeValue(null, "contentType")
++                            ?: parser.getAttributeValue(null, "mimeType").orEmpty()
++                        setVideo = kind.startsWith("video")
++                    }
++                    "Representation" -> {
++                        inRep = true
++                        val mime = parser.getAttributeValue(null, "mimeType")
++                        video = if (mime != null) mime.startsWith("video") else setVideo
++                        height = parser.getAttributeValue(null, "height")?.toIntOrNull() ?: 0
++                        bandwidth = parser.getAttributeValue(null, "bandwidth")?.toLongOrNull() ?: 0L
++                        codecs = parser.getAttributeValue(null, "codecs").orEmpty()
++                    }
++                    "BaseURL" -> if (inRep) {
++                        val text = parser.nextText().trim()
++                        if (text.startsWith("http")) out.add(Rep(video, height, bandwidth, codecs, text))
++                    }
++                }
++            } else if (event == XmlPullParser.END_TAG && parser.name == "Representation") {
++                inRep = false
++            }
++            event = parser.next()
++        }
++        return out
++    }
++
++    private fun prefetch(rawUrl: String, bytes: Int, userAgent: String?) {
++        // Same normalisation as the data source, which looks the entry up by Uri.toString().
++        val url = Uri.parse(rawUrl).toString()
++        synchronized(entries) {
++            if (entries.containsKey(url) || !inFlight.add(url)) return
++        }
++        executor.execute {
++            try {
++                val data = download(url, bytes, userAgent)
++                if (data != null) synchronized(entries) { entries[url] = Entry(data, bytes) }
++                Log.i(TAG, "first-bytes prefetch ${data?.size ?: 0} of $bytes")
++            } finally {
++                synchronized(entries) { inFlight.remove(url) }
++            }
++        }
++    }
++
++    private fun download(url: String, bytes: Int, userAgent: String?): ByteArray? {
++        var conn: HttpURLConnection? = null
++        return try {
++            val ranged = Uri.parse(url).buildUpon().appendQueryParameter("range", "0-${bytes - 1}").build().toString()
++            conn = (URL(ranged).openConnection() as HttpURLConnection).apply {
++                connectTimeout = 8_000
++                readTimeout = 8_000
++                userAgent?.takeIf { it.isNotBlank() }?.let { setRequestProperty("User-Agent", it) }
++            }
++            if (conn.responseCode !in 200..299) return null
++            val out = ByteArrayOutputStream(bytes)
++            val buffer = ByteArray(64 * 1024)
++            conn.inputStream.use { input ->
++                while (out.size() < bytes) {
++                    val read = input.read(buffer, 0, minOf(buffer.size, bytes - out.size()))
++                    if (read < 0) break
++                    out.write(buffer, 0, read)
++                }
++            }
++            out.toByteArray().takeIf { it.isNotEmpty() }
++        } catch (e: Exception) {
++            Log.w(TAG, "first-bytes prefetch failed: ${e.message}")
++            null
++        } finally {
++            runCatching { conn?.disconnect() }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeSettings.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeSettings.kt
+index 5278353..ac89d7d 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeSettings.kt
+@@ -205,10 +205,38 @@ object YouTubeSettings {
+             "avc" -> listOf(avc, vp9, av1)
+             "vp9" -> listOf(vp9, avc, av1)
+             "av1" -> listOf(av1, vp9, avc)
+-            else -> listOf(vp9, avc, av1)
++            else -> {
++                // Same sizes, but a codec this device decodes in hardware starts faster and drops fewer frames.
++                val order = listOf(vp9, avc, av1)
++                val hardware = hardwareMimes
++                order.filter { it in hardware } + order.filter { it !in hardware }
++            }
+         }
+     }
+ 
++    /** Video MIME types this device decodes in hardware, from the platform codec list. */
++    private val hardwareMimes: Set<String> by lazy {
++        runCatching {
++            val found = HashSet<String>()
++            android.media.MediaCodecList(android.media.MediaCodecList.REGULAR_CODECS).codecInfos
++                .filter { !it.isEncoder }
++                .forEach { info ->
++                    val hardware = if (android.os.Build.VERSION.SDK_INT >= 29) {
++                        info.isHardwareAccelerated && !info.isSoftwareOnly
++                    } else {
++                        !info.name.startsWith("OMX.google.") && !info.name.startsWith("c2.android.")
++                    }
++                    if (!hardware) return@forEach
++                    info.supportedTypes.forEach { type ->
++                        when (type.lowercase()) {
++                            "video/avc", "video/x-vnd.on2.vp9", "video/av01" -> found.add(type.lowercase())
++                        }
++                    }
++                }
++            found.toSet()
++        }.getOrDefault(emptySet())
++    }
++
+     /** The video height to start at; 0 lets the player choose. */
+     fun preferredHeight(context: Context) = prefs(context).getInt(KEY_QUALITY, 0)
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
+index 54ddf83..01e879c 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
+@@ -142,6 +142,9 @@ class YouTubeViewModel @Inject constructor(
+         const val MAX_CLIENT_SWITCHES = 8
+         const val PREFETCH_DELAY_MS = 100L
+         const val PREFETCH_AHEAD = 3
++        const val WARM_ENGINE_DELAY_MS = 1_500L
++        /** A long-lived public video; only used to wake the engine up. */
++        const val WARM_VIDEO_ID = "jNQXAC9IVRw"
+         const val WARM_FIRST_VIDEOS = 2
+         const val WARM_START_DELAY_MS = 400L
+         const val MAX_CACHED = 24
+@@ -176,6 +179,7 @@ class YouTubeViewModel @Inject constructor(
+     val canGoBack: Boolean get() = backStack.isNotEmpty()
+ 
+     init {
++        warmUpEngine()
+         selectTab(YouTubeSettings.lastTab(context))
+         // The first videos of every feed are the likeliest first click, so their streams are looked up as
+         // soon as the feed shows, before any card is focused. Shorts are skipped: the Shorts player does its own.
+@@ -886,7 +890,7 @@ class YouTubeViewModel @Inject constructor(
+         // describe in a DASH manifest so the player can offer every quality. A single combined
+         // stream (one low quality) is the last resort.
+         val url = info.hlsManifestUrl?.takeIf { info.isLive }
+-            ?: dashUrl(videoId, info)
++            ?: dashUrl(videoId, info, info.clientInfo?.userAgent)
+             ?: info.hlsManifestUrl
+             ?: info.dashManifestUrl
+             ?: info.urlFormats?.firstOrNull()?.url
+@@ -899,6 +903,20 @@ class YouTubeViewModel @Inject constructor(
+         return YtPlayable(url, video.title, video.thumbnail, videoId, headers)
+     }
+ 
++    /**
++     * The first lookup after the app starts is slow (the engine loads its signature code and visitor data).
++     * Do one cheap lookup as soon as the YouTube page opens, before anyone presses OK, unless a real one is already running.
++     */
++    private fun warmUpEngine() {
++        viewModelScope.launch(Dispatchers.IO) {
++            delay(WARM_ENGINE_DELAY_MS)
++            if (inflight.isNotEmpty() || resolved.isNotEmpty()) return@launch
++            val t0 = android.os.SystemClock.elapsedRealtime()
++            runCatching { service.mediaItemService.getFormatInfoObserve(WARM_VIDEO_ID).blockingFirst() }
++            Log.i(TAG, "engine warm-up ${android.os.SystemClock.elapsedRealtime() - t0}ms")
++        }
++    }
++
+     /** One lookup per video at a time: hovering a card and then pressing OK share the same request. */
+     private fun lookup(video: YtItem): Deferred<Result<YtPlayable>> {
+         val id = video.videoId ?: return CompletableDeferred(Result.failure(IllegalStateException("Not a video")))
+@@ -1157,10 +1175,16 @@ class YouTubeViewModel @Inject constructor(
+     private fun playable(info: MediaItemFormatInfo): Boolean =
+         !info.isUnplayable && (info.containsDashFormats() || (info.isLive && info.containsHlsUrl()))
+ 
+-    private fun dashUrl(videoId: String, info: MediaItemFormatInfo): String? {
++    private fun dashUrl(videoId: String, info: MediaItemFormatInfo, userAgent: String?): String? {
+         if (!info.containsDashFormats()) return null
+         val mpd = runCatching { info.createMpdStream()?.use { it.readBytes() } }.getOrNull()
+         Log.i(TAG, "mpd bytes=${mpd?.size}")
++        // Download the first bytes of the stream the player will most likely start with, so OK is instant.
++        if (mpd != null && mpd.isNotEmpty() && !info.isLive) {
++            YouTubeFirstChunkCache.prefetchFromMpd(
++                mpd, userAgent, YouTubeSettings.preferredHeight(context), YouTubeSettings.codecMimeOrder(context)
++            )
++        }
+         return mpd?.takeIf { it.isNotEmpty() }?.let { YouTubeMpdServer.publish(videoId, it) }
+     }
+ 
