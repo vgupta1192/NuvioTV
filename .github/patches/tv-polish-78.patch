@@ -1,0 +1,182 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/LiveTvPlayerPrefs.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/LiveTvPlayerPrefs.kt
+new file mode 100644
+index 000000000..b57a2dc9a
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/LiveTvPlayerPrefs.kt
+@@ -0,0 +1,49 @@
++package com.nuvio.tv.ui.screens.tvchannels.components
++
++import android.content.Context
++import com.nuvio.tv.ui.screens.player.AspectMode
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++
++/** Live TV player choices that outlive a channel: picture scale (default Custom Stretch) and automatic subtitles. */
++object LiveTvPlayerPrefs {
++    private const val FILE = "live_tv_player_prefs"
++    private const val KEY_SCALE = "scale"
++    private const val KEY_AUTO_SUBS = "auto_subtitles"
++
++    private val _scale = MutableStateFlow(AspectMode.CUSTOM_STRETCH)
++    val scale: StateFlow<AspectMode> = _scale.asStateFlow()
++
++    @Volatile
++    var autoSubtitles: Boolean = true
++        private set
++
++    @Volatile
++    private var loaded = false
++
++    fun ensureLoaded(context: Context) {
++        if (loaded) return
++        synchronized(this) {
++            if (loaded) return
++            val prefs = context.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
++            prefs.getString(KEY_SCALE, null)?.let { name ->
++                runCatching { AspectMode.valueOf(name) }.getOrNull()?.let { _scale.value = it }
++            }
++            autoSubtitles = prefs.getBoolean(KEY_AUTO_SUBS, true)
++            loaded = true
++        }
++    }
++
++    fun setScale(context: Context, mode: AspectMode) {
++        ensureLoaded(context)
++        _scale.value = mode
++        context.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE).edit().putString(KEY_SCALE, mode.name).apply()
++    }
++
++    fun setAutoSubtitles(context: Context, enabled: Boolean) {
++        ensureLoaded(context)
++        autoSubtitles = enabled
++        context.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE).edit().putBoolean(KEY_AUTO_SUBS, enabled).apply()
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelOptionsPanel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelOptionsPanel.kt
+index b1364cc0d..853e2cd4a 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelOptionsPanel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelOptionsPanel.kt
+@@ -15,6 +15,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.DisposableEffect
+ import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+@@ -74,6 +75,8 @@ fun TvChannelOptionsPanel(
+     var autoQuality by remember(player) { mutableStateOf(true) }
+     var stats by remember(player) { mutableStateOf("") }
+     val firstFocus = remember { FocusRequester() }
++    val panelContext = androidx.compose.ui.platform.LocalContext.current
++    val scaleMode by LiveTvPlayerPrefs.scale.collectAsState()
+ 
+     DisposableEffect(player) {
+         val listener = object : Player.Listener {
+@@ -152,6 +155,7 @@ fun TvChannelOptionsPanel(
+                     selected = !anyTextSelected,
+                     modifier = Modifier.focusRequester(firstFocus),
+                     onClick = {
++                        LiveTvPlayerPrefs.setAutoSubtitles(panelContext, false)
+                         player?.let {
+                             it.trackSelectionParameters = it.trackSelectionParameters.buildUpon()
+                                 .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+@@ -170,6 +174,7 @@ fun TvChannelOptionsPanel(
+                                 label = trackLabel(group.getTrackFormat(i), "Subtitle ${i + 1}"),
+                                 selected = group.isTrackSelected(i),
+                                 onClick = {
++                                    LiveTvPlayerPrefs.setAutoSubtitles(panelContext, true)
+                                     player?.let {
+                                         it.trackSelectionParameters = it.trackSelectionParameters.buildUpon()
+                                             .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+@@ -243,6 +248,17 @@ fun TvChannelOptionsPanel(
+                 }
+             }
+ 
++            item { SectionLabel("Picture scale") }
++            com.nuvio.tv.ui.screens.player.AspectMode.entries.forEach { mode ->
++                item {
++                    OptionRow(
++                        label = androidx.compose.ui.res.stringResource(mode.labelResId),
++                        selected = scaleMode == mode,
++                        onClick = { LiveTvPlayerPrefs.setScale(panelContext, mode) }
++                    )
++                }
++            }
++
+             item { SectionLabel("Sleep timer") }
+             item {
+                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
+index fd9f45546..afcfed22e 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvChannelPreviewPlayer.kt
+@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.size
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.DisposableEffect
+ import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+@@ -103,13 +104,39 @@ fun TvChannelPreviewPlayer(
+         runCatching { view.applyLiveTvSubtitleStyle(style) }
+     }
+ 
+-    // Live TV always plays with Custom Stretch: the picture area (without baked-in black bars)
+-    // is stretched over the whole player, in the preview and in fullscreen.
+-    DisposableEffect(playerView, player) {
++    // Picture scale chosen in the Live TV options; Custom Stretch unless changed. Subtitles pick themselves.
++    LiveTvPlayerPrefs.ensureLoaded(context)
++    val scaleMode by LiveTvPlayerPrefs.scale.collectAsState()
++    DisposableEffect(player) {
++        val activePlayer = player ?: return@DisposableEffect onDispose {}
++        fun autoSelectSubtitles(tracks: androidx.media3.common.Tracks) {
++            if (!LiveTvPlayerPrefs.autoSubtitles) return
++            val groups = tracks.groups.filter { it.type == androidx.media3.common.C.TRACK_TYPE_TEXT && it.length > 0 }
++            if (groups.isEmpty() || groups.any { it.isSelected }) return
++            val language = java.util.Locale.getDefault().language
++            val group = groups.firstOrNull { g -> (0 until g.length).any { g.getTrackFormat(it).language?.startsWith(language, ignoreCase = true) == true } }
++                ?: groups.first()
++            val index = (0 until group.length).firstOrNull { group.getTrackFormat(it).language?.startsWith(language, ignoreCase = true) == true } ?: 0
++            runCatching {
++                activePlayer.trackSelectionParameters = activePlayer.trackSelectionParameters.buildUpon()
++                    .setTrackTypeDisabled(androidx.media3.common.C.TRACK_TYPE_TEXT, false)
++                    .setOverrideForType(androidx.media3.common.TrackSelectionOverride(group.mediaTrackGroup, index))
++                    .build()
++            }
++        }
++        val listener = object : Player.Listener {
++            override fun onTracksChanged(tracks: androidx.media3.common.Tracks) = autoSelectSubtitles(tracks)
++        }
++        activePlayer.addListener(listener)
++        autoSelectSubtitles(activePlayer.currentTracks)
++        onDispose { activePlayer.removeListener(listener) }
++    }
++
++    DisposableEffect(playerView, player, scaleMode) {
+         val view = playerView
+         val activePlayer = player
+         if (view == null || activePlayer == null) return@DisposableEffect onDispose {}
+-        val sync = { view.post { runCatching { applyExoAspectMode(view, AspectMode.CUSTOM_STRETCH) } } }
++        val sync = { view.post { runCatching { applyExoAspectMode(view, scaleMode) } } }
+         val playerListener = object : Player.Listener {
+             override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+                 sync()
+@@ -133,9 +160,14 @@ fun TvChannelPreviewPlayer(
+         onDispose { playerView?.keepScreenOn = false }
+     }
+ 
+-    LaunchedEffect(playerView, player, streamUrl) {
++    LaunchedEffect(playerView, player, streamUrl, scaleMode) {
+         val view = playerView ?: return@LaunchedEffect
+         if (player == null || streamUrl.isNullOrBlank()) return@LaunchedEffect
++        if (scaleMode != AspectMode.CUSTOM_STRETCH) {
++            setExoCustomStretchRect(view, null)
++            runCatching { applyExoAspectMode(view, scaleMode) }
++            return@LaunchedEffect
++        }
+         fun applyRect(rect: VideoContentRect?) {
+             setExoCustomStretchRect(view, rect)
+             runCatching { applyExoAspectMode(view, AspectMode.CUSTOM_STRETCH) }
