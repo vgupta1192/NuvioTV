@@ -1,0 +1,284 @@
+diff --git a/app/src/main/java/com/nuvio/tv/forklivetv/ForkSportsPrefs.kt b/app/src/main/java/com/nuvio/tv/forklivetv/ForkSportsPrefs.kt
+new file mode 100644
+index 000000000..0398d8985
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/forklivetv/ForkSportsPrefs.kt
+@@ -0,0 +1,49 @@
++package com.nuvio.tv.forklivetv
++
++import android.content.Context
++import java.security.MessageDigest
++
++/** Fork: Sports hub options and the Live TV parental PIN (device-wide, plain SharedPreferences). */
++object ForkSportsPrefs {
++    private const val FILE = "fork_sports"
++    private val WINDOW_CHOICES = listOf(2, 3, 4, 6)
++
++    private fun prefs(context: Context) =
++        context.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
++
++    fun liveWindowHours(context: Context): Int = prefs(context).getInt("live_window_hours", 3)
++
++    fun cycleLiveWindowHours(context: Context): Int {
++        val next = WINDOW_CHOICES[(WINDOW_CHOICES.indexOf(liveWindowHours(context)) + 1).mod(WINDOW_CHOICES.size)]
++        prefs(context).edit().putInt("live_window_hours", next).apply()
++        return next
++    }
++
++    fun showLater(context: Context): Boolean = prefs(context).getBoolean("show_later", true)
++
++    fun setShowLater(context: Context, value: Boolean) {
++        prefs(context).edit().putBoolean("show_later", value).apply()
++    }
++
++    fun signature(context: Context): String = "${liveWindowHours(context)}:${showLater(context)}"
++
++    private fun hash(pin: String): String =
++        MessageDigest.getInstance("SHA-256").digest(("nuvio-fork-pin:$pin").toByteArray())
++            .joinToString("") { "%02x".format(it) }
++
++    fun hasPin(context: Context): Boolean = prefs(context).contains("pin_hash")
++
++    /** Returns false when the PIN is not 4 to 8 digits. */
++    fun setPin(context: Context, pin: String): Boolean {
++        if (!pin.matches(Regex("\\d{4,8}"))) return false
++        prefs(context).edit().putString("pin_hash", hash(pin)).apply()
++        return true
++    }
++
++    fun checkPin(context: Context, pin: String): Boolean =
++        prefs(context).getString("pin_hash", null) == hash(pin.trim())
++
++    fun clearPin(context: Context) {
++        prefs(context).edit().remove("pin_hash").apply()
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkSportsParentalSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkSportsParentalSettings.kt
+new file mode 100644
+index 000000000..ab55f0549
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkSportsParentalSettings.kt
+@@ -0,0 +1,112 @@
++@file:OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
++
++package com.nuvio.tv.ui.screens.settings
++
++import android.widget.Toast
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableIntStateOf
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.unit.dp
++import androidx.tv.material3.Button
++import androidx.tv.material3.Text
++import com.nuvio.tv.forklivetv.ForkSportsPrefs
++import com.nuvio.tv.ui.components.NuvioDialog
++import com.nuvio.tv.ui.reshaped.phoneentry.PhoneEntryButton
++
++/** Settings > Live TV: Sports hub options. */
++@Composable
++internal fun ForkSportsSettingsGroup() {
++    val context = LocalContext.current
++    var windowHours by remember { mutableIntStateOf(ForkSportsPrefs.liveWindowHours(context)) }
++    var showLater by remember { mutableStateOf(ForkSportsPrefs.showLater(context)) }
++    SettingsGroupCard(
++        modifier = Modifier.fillMaxWidth(),
++        title = "Sports hub",
++        subtitle = "Games found in your channels' guide. Scores and team following are not part of this fork."
++    ) {
++        SettingsActionRow(
++            title = "Count a game as live for",
++            subtitle = "How long after kickoff a game stays under Live. Longer suits cricket and tennis.",
++            value = "$windowHours h",
++            onClick = { windowHours = ForkSportsPrefs.cycleLiveWindowHours(context) }
++        )
++        SettingsToggleRow(
++            title = "Show later games",
++            subtitle = "Lists games after today under Coming up. Off keeps the hub to live and today.",
++            checked = showLater,
++            onToggle = {
++                showLater = !showLater
++                ForkSportsPrefs.setShowLater(context, showLater)
++            }
++        )
++    }
++}
++
++/** Settings > Live TV: PIN that guards turning adult channels back on. */
++@Composable
++internal fun ForkParentalPinGroup(onUnlockAdult: () -> Unit) {
++    val context = LocalContext.current
++    var hasPin by remember { mutableStateOf(ForkSportsPrefs.hasPin(context)) }
++    var dialog by remember { mutableStateOf(false) }
++    SettingsGroupCard(
++        modifier = Modifier.fillMaxWidth(),
++        title = "Parental PIN",
++        subtitle = "With a PIN set, Hide adult channels can only be turned off by entering it here."
++    ) {
++        SettingsActionRow(
++            title = if (hasPin) "PIN is set" else "No PIN set",
++            subtitle = "Choose OK to " + if (hasPin) "unlock adult channels or remove the PIN." else "set a 4 to 8 digit PIN.",
++            value = if (hasPin) "On" else "Off",
++            onClick = { dialog = true }
++        )
++    }
++    if (dialog) {
++        NuvioDialog(onDismiss = { dialog = false }, title = "Parental PIN", width = 640.dp) {
++            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
++                if (!hasPin) {
++                    Text("Type a 4 to 8 digit PIN on your phone.")
++                    PhoneEntryButton(title = "New PIN", secret = true, onValue = { pin ->
++                        if (ForkSportsPrefs.setPin(context, pin.trim())) {
++                            hasPin = true
++                            dialog = false
++                            Toast.makeText(context, "PIN set", Toast.LENGTH_SHORT).show()
++                        } else {
++                            Toast.makeText(context, "Use 4 to 8 digits", Toast.LENGTH_SHORT).show()
++                        }
++                    })
++                } else {
++                    Text("Enter the PIN to unlock adult channels.")
++                    PhoneEntryButton(title = "PIN to unlock", secret = true, onValue = { pin ->
++                        if (ForkSportsPrefs.checkPin(context, pin)) {
++                            onUnlockAdult()
++                            dialog = false
++                            Toast.makeText(context, "Adult channels shown", Toast.LENGTH_SHORT).show()
++                        } else {
++                            Toast.makeText(context, "Wrong PIN", Toast.LENGTH_SHORT).show()
++                        }
++                    })
++                    Text("Or enter the PIN to remove it.")
++                    PhoneEntryButton(title = "PIN to remove", secret = true, onValue = { pin ->
++                        if (ForkSportsPrefs.checkPin(context, pin)) {
++                            ForkSportsPrefs.clearPin(context)
++                            hasPin = false
++                            dialog = false
++                            Toast.makeText(context, "PIN removed", Toast.LENGTH_SHORT).show()
++                        } else {
++                            Toast.makeText(context, "Wrong PIN", Toast.LENGTH_SHORT).show()
++                        }
++                    })
++                }
++                Button(onClick = { dialog = false }) { Text("Close") }
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvChannelsSettingsPane.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvChannelsSettingsPane.kt
+index 47427fb01..4729d247d 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvChannelsSettingsPane.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvChannelsSettingsPane.kt
+@@ -138,6 +138,8 @@ internal fun TvChannelsSettingsPane(
+         item { TvLiveNetflixSettingsGroup() }
+ 
+         item { TvLiveRemindersGroup() }
++        item { ForkSportsSettingsGroup() }
++        item { ForkParentalPinGroup(onUnlockAdult = { viewModel.setHideAdultChannels(false) }) }
+ 
+         // Grupo 2: Reprodução e Controle Parental
+         item {
+@@ -153,12 +155,16 @@ internal fun TvChannelsSettingsPane(
+                     checked = channelsState.hideAdultChannels,
+                     onToggle = {
+                         val newValue = !channelsState.hideAdultChannels
+-                        viewModel.setHideAdultChannels(newValue)
+-                        Toast.makeText(
+-                            context,
+-                            if (newValue) adultHiddenMsg else adultVisibleMsg,
+-                            Toast.LENGTH_SHORT
+-                        ).show()
++                        if (!newValue && com.nuvio.tv.forklivetv.ForkSportsPrefs.hasPin(context)) {
++                            Toast.makeText(context, "Enter the PIN under Parental PIN to show adult channels", Toast.LENGTH_SHORT).show()
++                        } else {
++                            viewModel.setHideAdultChannels(newValue)
++                            Toast.makeText(
++                                context,
++                                if (newValue) adultHiddenMsg else adultVisibleMsg,
++                                Toast.LENGTH_SHORT
++                            ).show()
++                        }
+                     }
+                 )
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvSportsHubDialog.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvSportsHubDialog.kt
+index 2139981bb..2d871035d 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvSportsHubDialog.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvSportsHubDialog.kt
+@@ -53,12 +53,12 @@ import com.nuvio.tv.ui.theme.NuvioTheme
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.delay
+ import kotlinx.coroutines.withContext
++import com.nuvio.tv.forklivetv.ForkSportsPrefs
+ import java.text.SimpleDateFormat
+ import java.util.Calendar
+ import java.util.Date
+ import java.util.Locale
+ 
+-private const val LIVE_WINDOW_MS = 3 * 60 * 60_000L
+ private val LIVE_RED = Color(0xFFE5393B)
+ 
+ /** Events from the user's own channels, bucketed by kickoff time. */
+@@ -125,9 +125,12 @@ fun TvSportsHubDialog(
+     onDismiss: () -> Unit
+ ) {
+     if (!visible) return
+-    val built by produceState<SportsHub?>(initialValue = SportsHubCache.peek(channels), channels) {
+-        value = SportsHubCache.peek(channels) ?: withContext(Dispatchers.Default) {
+-            buildHub(channels).also { SportsHubCache.store(channels, it) }
++    val appContext = androidx.compose.ui.platform.LocalContext.current
++    val sig = ForkSportsPrefs.signature(appContext)
++    val built by produceState<SportsHub?>(initialValue = SportsHubCache.peek(channels, sig), channels, sig) {
++        value = SportsHubCache.peek(channels, sig) ?: withContext(Dispatchers.Default) {
++            buildHub(channels, ForkSportsPrefs.liveWindowHours(appContext) * 60 * 60_000L, ForkSportsPrefs.showLater(appContext))
++                .also { SportsHubCache.store(channels, sig, it) }
+         }
+     }
+     val hub = built
+@@ -558,14 +561,16 @@ private object SportsHubCache {
+     private var source: List<TvChannelItem>? = null
+     private var builtAtMs: Long = 0L
+     private var hub: SportsHub? = null
++    private var lastSig: String = ""
+ 
+     @Synchronized
+-    fun peek(channels: List<TvChannelItem>): SportsHub? =
+-        if (source === channels && System.currentTimeMillis() - builtAtMs < CACHE_MS) hub else null
++    fun peek(channels: List<TvChannelItem>, sig: String): SportsHub? =
++        if (source === channels && sig == lastSig && System.currentTimeMillis() - builtAtMs < CACHE_MS) hub else null
+ 
+     @Synchronized
+-    fun store(channels: List<TvChannelItem>, built: SportsHub) {
++    fun store(channels: List<TvChannelItem>, sig: String, built: SportsHub) {
+         source = channels
++        lastSig = sig
+         builtAtMs = System.currentTimeMillis()
+         hub = built
+     }
+@@ -573,7 +578,7 @@ private object SportsHubCache {
+ 
+ private const val CACHE_MS = 60_000L
+ 
+-private fun buildHub(channels: List<TvChannelItem>): SportsHub {
++private fun buildHub(channels: List<TvChannelItem>, liveWindowMs: Long, showLater: Boolean): SportsHub {
+     val now = System.currentTimeMillis()
+     val endOfToday = Calendar.getInstance().apply {
+         set(Calendar.HOUR_OF_DAY, 23); set(Calendar.MINUTE, 59); set(Calendar.SECOND, 59); set(Calendar.MILLISECOND, 999)
+@@ -586,9 +591,9 @@ private fun buildHub(channels: List<TvChannelItem>): SportsHub {
+         val start = channel.startEpochMs ?: continue
+         if (!seen.add(channel.type + ":" + channel.id)) continue
+         when {
+-            start <= now -> if (now - start <= LIVE_WINDOW_MS) live.add(channel)
++            start <= now -> if (now - start <= liveWindowMs) live.add(channel)
+             start <= endOfToday -> today.add(channel)
+-            else -> later.add(channel)
++            else -> if (showLater) later.add(channel)
+         }
+     }
+     return SportsHub(
