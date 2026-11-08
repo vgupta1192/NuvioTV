@@ -1,0 +1,388 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/MpvMediaSessionPlayer.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/MpvMediaSessionPlayer.kt
+new file mode 100644
+index 000000000..9c8d5619d
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/MpvMediaSessionPlayer.kt
+@@ -0,0 +1,117 @@
++package com.nuvio.tv.ui.screens.player
++
++import android.os.Looper
++import androidx.media3.common.C
++import androidx.media3.common.MediaItem
++import androidx.media3.common.Player
++import androidx.media3.common.PlaybackParameters
++import androidx.media3.common.SimpleBasePlayer
++import com.google.common.util.concurrent.Futures
++import com.google.common.util.concurrent.ListenableFuture
++
++/** A small Media3 facade that lets Android media controls operate libmpv. */
++internal data class MpvMediaSessionSnapshot(
++    val mediaId: String,
++    val mediaItem: MediaItem,
++    val durationMs: Long,
++    val positionMs: Long,
++    val bufferedPositionMs: Long,
++    val isPlaying: Boolean,
++    val isBuffering: Boolean,
++    val isEnded: Boolean,
++    val isSeekable: Boolean,
++    val speed: Float,
++)
++
++internal interface MpvMediaSessionCommandTarget {
++    fun setPlayWhenReady(playWhenReady: Boolean)
++    fun seekTo(positionMs: Long)
++}
++
++/**
++ * MediaSession requires a [Player]. mpv does not implement Media3's player contract, so this
++ * adapter exposes the single active mpv item and forwards only operations mpv supports.
++ */
++internal class MpvMediaSessionPlayer(
++    private val snapshotProvider: () -> MpvMediaSessionSnapshot,
++    private val commandTarget: MpvMediaSessionCommandTarget,
++) : SimpleBasePlayer(Looper.getMainLooper()) {
++
++    fun refresh() = invalidateState()
++
++    override fun getState(): State {
++        val snapshot = snapshotProvider()
++        // Media3 exposes speed and pitch as one command; mpv's speed property cannot apply an
++        // independent pitch, so keep that command unavailable for this adapter.
++        val commandsBuilder = Player.Commands.Builder()
++            .addAll(
++                Player.COMMAND_PLAY_PAUSE,
++                Player.COMMAND_RELEASE,
++                Player.COMMAND_GET_CURRENT_MEDIA_ITEM,
++                Player.COMMAND_GET_TIMELINE,
++                Player.COMMAND_GET_MEDIA_ITEMS_METADATA,
++                Player.COMMAND_GET_METADATA,
++                Player.COMMAND_GET_AUDIO_ATTRIBUTES,
++                Player.COMMAND_GET_VOLUME,
++                Player.COMMAND_GET_TRACKS,
++            )
++        if (snapshot.isSeekable) {
++            commandsBuilder.addAll(
++                Player.COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM,
++                Player.COMMAND_SEEK_BACK,
++                Player.COMMAND_SEEK_FORWARD,
++            )
++        }
++        val commands = commandsBuilder.build()
++        val durationUs = if (snapshot.durationMs > 0L) {
++            snapshot.durationMs * 1_000L
++        } else {
++            C.TIME_UNSET
++        }
++        val mediaItemData = MediaItemData.Builder(snapshot.mediaId)
++            .setMediaItem(snapshot.mediaItem)
++            .setMediaMetadata(snapshot.mediaItem.mediaMetadata)
++            .setDurationUs(durationUs)
++            .setIsSeekable(snapshot.isSeekable)
++            .build()
++        val playbackState = when {
++            snapshot.isEnded -> Player.STATE_ENDED
++            snapshot.isBuffering -> Player.STATE_BUFFERING
++            else -> Player.STATE_READY
++        }
++        return State.Builder()
++            .setAvailableCommands(commands)
++            .setPlayWhenReady(snapshot.isPlaying, Player.PLAY_WHEN_READY_CHANGE_REASON_USER_REQUEST)
++            .setPlaybackState(playbackState)
++            .setSeekBackIncrementMs(C.DEFAULT_SEEK_BACK_INCREMENT_MS)
++            .setSeekForwardIncrementMs(C.DEFAULT_SEEK_FORWARD_INCREMENT_MS)
++            .setPlaybackParameters(PlaybackParameters(snapshot.speed))
++            .setContentPositionMs(snapshot.positionMs.coerceAtLeast(0L))
++            .setContentBufferedPositionMs(
++                SimpleBasePlayer.PositionSupplier.getConstant(
++                    snapshot.bufferedPositionMs.coerceAtLeast(snapshot.positionMs)
++                )
++            )
++            .setPlaylist(listOf(mediaItemData))
++            .setCurrentMediaItemIndex(0)
++            .build()
++    }
++
++    override fun handleSetPlayWhenReady(playWhenReady: Boolean): ListenableFuture<Void> {
++        commandTarget.setPlayWhenReady(playWhenReady)
++        return immediateVoidFuture()
++    }
++
++    override fun handleSeek(mediaItemIndex: Int, positionMs: Long, command: Int): ListenableFuture<Void> {
++        if (mediaItemIndex == 0) commandTarget.seekTo(positionMs.coerceAtLeast(0L))
++        return immediateVoidFuture()
++    }
++
++    // Only release the Media3 facade; the controller owns mpv's lifetime.
++    override fun handleRelease(): ListenableFuture<Void> = immediateVoidFuture()
++
++    /** Media3 declares a non-null Java [Void] generic while Guava exposes it as nullable to Kotlin. */
++    @Suppress("UNCHECKED_CAST")
++    private fun immediateVoidFuture(): ListenableFuture<Void> =
++        Futures.immediateVoidFuture() as ListenableFuture<Void>
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSessionMetadata.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSessionMetadata.kt
+index 13127412b..fc59a1930 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSessionMetadata.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSessionMetadata.kt
+@@ -2,7 +2,10 @@ package com.nuvio.tv.ui.screens.player
+ 
+ import android.net.Uri
+ import android.util.Log
++import androidx.media3.common.MediaItem
+ import androidx.media3.common.MediaMetadata
++import androidx.media3.exoplayer.ExoPlayer
++import androidx.media3.session.MediaSession
+ 
+ /**
+  * Builds a [MediaMetadata] from the current playback information so that
+@@ -60,7 +63,7 @@ internal fun PlayerRuntimeController.buildMediaSessionMetadata(): MediaMetadata
+  * - When TMDB enrichment updates the title / artwork
+  */
+ internal fun PlayerRuntimeController.updateMediaSessionMetadata() {
+-    val session = currentMediaSession ?: return
++    if (currentMediaSession == null) return
+     val metadata = buildMediaSessionMetadata()
+     val mediaId = currentFilename?.takeIf { it.isNotBlank() }
+     try {
+@@ -84,6 +87,7 @@ internal fun PlayerRuntimeController.updateMediaSessionMetadata() {
+             // DefaultMediaSourceFactory.createMediaSource requires one, so setMediaItem threw
+             // every time. The metadata is applied on the next call, once the real item exists.
+         }
++        mpvMediaSessionPlayer?.refresh()
+         Log.d(
+             PlayerRuntimeController.TAG,
+             "MediaSession metadata updated: title=${metadata.title}, " +
+@@ -93,3 +97,81 @@ internal fun PlayerRuntimeController.updateMediaSessionMetadata() {
+         Log.w(PlayerRuntimeController.TAG, "Failed to update MediaSession metadata", e)
+     }
+ }
++
++/** Releases the current engine's session and its mpv facade, if any. */
++internal fun PlayerRuntimeController.releaseMediaSession() {
++    runCatching { currentMediaSession?.release() }
++    currentMediaSession = null
++    runCatching { mpvMediaSessionPlayer?.release() }
++    mpvMediaSessionPlayer = null
++}
++
++internal fun PlayerRuntimeController.installExoMediaSession(player: ExoPlayer) {
++    releaseMediaSession()
++    if (player.canAdvertiseSession()) {
++        currentMediaSession = MediaSession.Builder(context, SafeMediaSessionPlayer(player)).build()
++    }
++    updateMediaSessionMetadata()
++}
++
++/** Creates the foreground-only MediaSession used by Bluetooth and other Android media controls. */
++internal fun PlayerRuntimeController.installMpvMediaSession() {
++    runCatching {
++        if (!isUsingMpvEngine() || isInBackground || mpvView == null || currentStreamUrl.isBlank()) return
++        if (currentMediaSession != null && mpvMediaSessionPlayer != null) {
++            mpvMediaSessionPlayer?.refresh()
++            return
++        }
++        releaseMediaSession()
++        val sessionPlayer = MpvMediaSessionPlayer(
++            snapshotProvider = ::mpvMediaSessionSnapshot,
++            commandTarget = object : MpvMediaSessionCommandTarget {
++                override fun setPlayWhenReady(playWhenReady: Boolean) {
++                    if (!isUsingMpvEngine() || isInBackground) return
++                    if (isPlaybackCurrentlyPlaying() != playWhenReady) {
++                        onEvent(PlayerEvent.OnPlayPause)
++                    }
++                }
++
++                override fun seekTo(positionMs: Long) {
++                    if (!isUsingMpvEngine() || isInBackground) return
++                    onEvent(PlayerEvent.OnSeekTo(positionMs))
++                }
++            }
++        )
++        mpvMediaSessionPlayer = sessionPlayer
++        currentMediaSession = MediaSession.Builder(context, sessionPlayer).build()
++        updateMediaSessionMetadata()
++    }.onFailure { error ->
++        releaseMediaSession()
++        Log.w(PlayerRuntimeController.TAG, "Failed to install MPV MediaSession", error)
++    }
++}
++
++internal fun PlayerRuntimeController.refreshMpvMediaSession() {
++    mpvMediaSessionPlayer?.refresh()
++}
++
++private fun PlayerRuntimeController.mpvMediaSessionSnapshot(): MpvMediaSessionSnapshot {
++    val view = mpvView
++    val positionMs = view?.currentPositionMs()?.coerceAtLeast(0L) ?: 0L
++    val durationMs = view?.durationMs()?.coerceAtLeast(0L) ?: 0L
++    val bufferedPositionMs = positionMs + ((view?.demuxerCacheDurationSec() ?: 0.0) * 1_000.0).toLong()
++    val metadata = buildMediaSessionMetadata()
++    val mediaId = currentFilename?.takeIf { it.isNotBlank() } ?: MediaItem.DEFAULT_MEDIA_ID
++    return MpvMediaSessionSnapshot(
++        mediaId = mediaId,
++        mediaItem = MediaItem.Builder()
++            .setMediaId(mediaId)
++            .setMediaMetadata(metadata)
++            .build(),
++        durationMs = durationMs,
++        positionMs = positionMs,
++        bufferedPositionMs = bufferedPositionMs,
++        isPlaying = view?.isPlayingNow() == true,
++        isBuffering = _uiState.value.isBuffering,
++        isEnded = _uiState.value.playbackEnded,
++        isSeekable = !_playbackTimeline.value.isLive && view?.isLiveStreamNow() != true,
++        speed = _uiState.value.playbackSpeed,
++    )
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
+index fbaf68a69..f96c67efa 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
+@@ -628,6 +628,7 @@ class PlayerRuntimeController(
+     internal var loudnessEnhancer: LoudnessEnhancer? = null
+     internal var trackSelector: DefaultTrackSelector? = null
+     internal var currentMediaSession: MediaSession? = null
++    internal var mpvMediaSessionPlayer: MpvMediaSessionPlayer? = null
+     internal var ffmpegAudioRenderer: FfmpegAudioRenderer? = null
+     internal var mpvView: NuvioMpvSurfaceView? = null
+     internal val subtitleCueTracker = SubtitleCueTracker()
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+index 7329f3ce1..d522efd8a 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+@@ -1108,11 +1108,7 @@ internal fun PlayerRuntimeController.initializePlayer(
+                 setHandleAudioBecomingNoisy(true)
+ 
+                 try {
+-                    currentMediaSession?.release()
+-                    if (canAdvertiseSession()) {
+-                        currentMediaSession = MediaSession.Builder(context, SafeMediaSessionPlayer(this)).build()
+-                    }
+-                    updateMediaSessionMetadata()
++                    installExoMediaSession(this)
+                 } catch (e: Exception) {
+                     e.printStackTrace()
+                 }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerLifecycle.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerLifecycle.kt
+index 182b75e48..74a528a30 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerLifecycle.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerLifecycle.kt
+@@ -61,12 +61,7 @@ internal fun PlayerRuntimeController.releasePlayer(
+     audioRouteChangeJob?.cancel()
+     audioRouteChangeJob = null
+ 
+-    try {
+-        currentMediaSession?.release()
+-        currentMediaSession = null
+-    } catch (e: Exception) {
+-        e.printStackTrace()
+-    }
++    releaseMediaSession()
+     progressJob?.cancel()
+     mpvTrackRefreshJob?.cancel()
+     mpvTrackRefreshJob = null
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerMpv.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerMpv.kt
+index 4f7dd6c2b..30cc66a9b 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerMpv.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerMpv.kt
+@@ -40,6 +40,7 @@ internal fun PlayerRuntimeController.attachMpvView(view: NuvioMpvSurfaceView?) {
+         view.applyBluetoothAudioRoute(currentAudioOutputRoute?.isBluetooth == true)
+         view.setAudioDelayMs(_uiState.value.audioDelayMs)
+         view.applyAspectMode(_uiState.value.aspectMode)
++        installMpvMediaSession()
+         view.setPaused(false)
+         applyPendingMpvSeekIfNeeded(view)
+         hasRenderedFirstFrame = false
+@@ -97,11 +98,7 @@ internal fun PlayerRuntimeController.initializeMpvPlayer(
+     _exoPlayer?.release()
+     _exoPlayer = null
+     trackSelector = null
+-    try {
+-        currentMediaSession?.release()
+-    } catch (_: Exception) {
+-    }
+-    currentMediaSession = null
++    releaseMediaSession()
+     notifyAudioSessionUpdate(false)
+ 
+     val view = mpvView
+@@ -159,6 +156,7 @@ internal fun PlayerRuntimeController.initializeMpvPlayer(
+         view.applyBluetoothAudioRoute(currentAudioOutputRoute?.isBluetooth == true)
+         view.setAudioDelayMs(_uiState.value.audioDelayMs)
+         view.applyAspectMode(_uiState.value.aspectMode)
++        installMpvMediaSession()
+         view.setPaused(false)
+         applyPendingMpvSeekIfNeeded(view)
+ 
+@@ -232,12 +230,7 @@ internal fun PlayerRuntimeController.pauseForLifecycle() {
+ 
+     // Release the MediaSession so the system doesn't route media commands
+     // (play/pause, audio focus) to this player while the app is in the background.
+-    try {
+-        currentMediaSession?.release()
+-        currentMediaSession = null
+-    } catch (e: Exception) {
+-        e.printStackTrace()
+-    }
++    releaseMediaSession()
+ 
+     // Mark as user-paused so autoplay logic doesn't resume playback.
+     userPausedManually = true
+@@ -308,20 +301,19 @@ internal fun PlayerRuntimeController.resumeForLifecycle() {
+         return
+     }
+ 
++    if (isUsingMpvEngine()) {
++        installMpvMediaSession()
++        return
++    }
++
+     val player = _exoPlayer
+-    if (player != null && !isUsingMpvEngine()) {
++    if (player != null) {
+         // Restore automatic audio focus handling that was disabled in pauseForLifecycle().
+         player.setAudioAttributes(player.audioAttributes, true)
+ 
+         // Re-create the MediaSession so media controls work in the foreground.
+-        if (currentMediaSession == null) {
+-            try {
+-                currentMediaSession = androidx.media3.session.MediaSession.Builder(context, SafeMediaSessionPlayer(player)).build()
+-                updateMediaSessionMetadata()
+-            } catch (e: Exception) {
+-                e.printStackTrace()
+-            }
+-        }
++        if (currentMediaSession == null) runCatching { installExoMediaSession(player) }
++            .onFailure { it.printStackTrace() }
+     }
+ }
+ 
+@@ -634,6 +626,7 @@ internal fun PlayerRuntimeController.seekPlaybackTo(
+             // Keep subtitle/audio delay sticky during FF/RW seeks.
+             view.setSubtitleDelayMs(mpvSubtitleDelayMs(_uiState.value.subtitleDelayMs))
+             view.setAudioDelayMs(_uiState.value.audioDelayMs)
++            refreshMpvMediaSession()
+         }
+     } else {
+         _exoPlayer?.let { player ->
+@@ -673,6 +666,7 @@ internal fun PlayerRuntimeController.setPlaybackSpeedInternal(speed: Float) {
+ internal fun PlayerRuntimeController.setPlaybackPaused(paused: Boolean) {
+     if (isUsingMpvEngine()) {
+         mpvView?.setPaused(paused)
++        refreshMpvMediaSession()
+         _uiState.update { it.copy(isPlaying = !paused) }
+     } else {
+         _exoPlayer?.let { player ->
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
+index 450df57db..0d3eed591 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
+@@ -382,6 +382,7 @@ internal fun PlayerRuntimeController.startProgressUpdates() {
+                         durationMs = playerDuration
+                     )
+                     val playingNow = view.isPlayingNow()
++                    refreshMpvMediaSession()
+                     subtitleCueTracker.updateText(view.currentSubtitleText())
+                     val cacheBuffering = view.isPausedForCacheNow() || view.isCoreIdleNow()
+                     var firstFrameReady = hasRenderedFirstFrame
