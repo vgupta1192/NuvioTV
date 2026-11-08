@@ -1,0 +1,151 @@
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt
+index 421ac8d80..b2f306287 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt
+@@ -1,6 +1,15 @@
+ package com.nuvio.tv.youtube
+ 
++import android.os.SystemClock
+ import androidx.activity.compose.BackHandler
++import androidx.compose.animation.AnimatedVisibility
++import androidx.compose.animation.expandVertically
++import androidx.compose.animation.fadeIn
++import androidx.compose.animation.fadeOut
++import androidx.compose.animation.shrinkVertically
++import androidx.compose.animation.core.tween
++import androidx.compose.runtime.mutableLongStateOf
++import kotlinx.coroutines.delay
+ import androidx.compose.foundation.Image
+ import androidx.compose.foundation.background
+ import androidx.compose.foundation.border
+@@ -150,8 +159,37 @@ fun YouTubeScreen(
+     }
+     BackHandler(enabled = suggestionsOpen) { suggestionsOpen = false }
+ 
++    // Scrolling down folds the header and tabs away; Back or reaching the top brings them back.
++    var headerHidden by remember { mutableStateOf(false) }
++    var headerHideSuppressedUntil by remember { mutableLongStateOf(0L) }
++    var focusHeaderAfterBack by remember { mutableStateOf(false) }
++    val selectedTabFocus = remember { FocusRequester() }
++    LaunchedEffect(state.tab, state.subTitle) { headerHidden = false }
++    BackHandler(enabled = headerHidden && state.subTitle == null && !showAccounts && !suggestionsOpen) {
++        headerHidden = false
++        headerHideSuppressedUntil = SystemClock.elapsedRealtime() + 700L
++        focusHeaderAfterBack = true
++    }
++    LaunchedEffect(focusHeaderAfterBack, headerHidden) {
++        if (focusHeaderAfterBack && !headerHidden) {
++            var tries = 0
++            while (tries < 8) {
++                delay(30)
++                if (runCatching { selectedTabFocus.requestFocus() }.isSuccess) break
++                tries++
++            }
++            focusHeaderAfterBack = false
++        }
++    }
++
+     Box(Modifier.fillMaxSize()) {
+     Column(Modifier.fillMaxSize().padding(start = 24.dp, end = 24.dp, top = 20.dp)) {
++        AnimatedVisibility(
++            visible = !headerHidden,
++            enter = expandVertically(tween(220)) + fadeIn(tween(160)),
++            exit = shrinkVertically(tween(200)) + fadeOut(tween(120))
++        ) {
++        Column {
+         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+             if (YouTubeSettings.showClock(appContext)) HeaderClock()
+             // Who's watching: the account or channel profile in use. Sign in when there's none.
+@@ -224,7 +262,8 @@ fun YouTubeScreen(
+             horizontalArrangement = Arrangement.spacedBy(10.dp)
+         ) {
+             items(tabs) { tab ->
+-                TabChip(tab.title, selected = state.tab == tab && state.subTitle == null) {
++                val isSelected = state.tab == tab && state.subTitle == null
++                TabChip(tab.title, selected = isSelected, modifier = if (isSelected) Modifier.focusRequester(selectedTabFocus) else Modifier) {
+                     showAccounts = false
+                     query = ""
+                     suggestionsOpen = false
+@@ -250,6 +289,9 @@ fun YouTubeScreen(
+             }
+         }
+ 
++        }
++        }
++
+         error?.let {
+             Text(it, color = YtRed, modifier = Modifier.padding(bottom = 8.dp).clickable { viewModel.clearError() })
+         }
+@@ -297,6 +339,11 @@ fun YouTubeScreen(
+             onSignOut = {
+                 showAccounts = false
+                 accountViewModel.signOut { viewModel.selectTab(state.tab) }
++            },
++            onScrollPosition = { index, offset ->
++                if (SystemClock.elapsedRealtime() >= headerHideSuppressedUntil) {
++                    headerHidden = !(index == 0 && offset <= 24) && state.subTitle == null
++                }
+             }
+         )
+     }
+@@ -349,7 +396,8 @@ private fun Content(
+     showAccounts: Boolean,
+     onSelectAccount: (Int) -> Unit,
+     onAddAccount: () -> Unit,
+-    onSignOut: () -> Unit
++    onSignOut: () -> Unit,
++    onScrollPosition: (Int, Int) -> Unit = { _, _ -> }
+ ) {
+     when {
+         account.code != null -> SignInPanel(account, onCancelSignIn)
+@@ -383,7 +431,13 @@ private fun Content(
+ 
+         state.isEmpty -> Message("Nothing here yet", null, null) {}
+ 
+-        state.rows.isNotEmpty() -> LazyColumn(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(20.dp)) {
++        state.rows.isNotEmpty() -> {
++        val columnState = rememberLazyListState()
++        LaunchedEffect(columnState) {
++            snapshotFlow { columnState.firstVisibleItemIndex to columnState.firstVisibleItemScrollOffset }
++                .collect { (i, o) -> onScrollPosition(i, o) }
++        }
++        LazyColumn(Modifier.fillMaxSize(), state = columnState, verticalArrangement = Arrangement.spacedBy(20.dp)) {
+             itemsIndexed(state.rows) { rowIndex, row ->
+                 LaunchedEffect(rowIndex, state.rows.size, state.tab, state.loadingRows) {
+                     if (rowIndex >= state.rows.size - 3) viewModel.loadMoreRows()
+@@ -412,6 +466,7 @@ private fun Content(
+                 }
+             }
+         }
++        }
+ 
+         state.tab == YtTab.CHANNELS && state.subTitle == null -> ChannelsSplit(state, viewModel, onOpen)
+ 
+@@ -424,6 +479,10 @@ private fun Content(
+                     (info.visibleItemsInfo.lastOrNull()?.index ?: 0) >= info.totalItemsCount - 8
+                 }.collect { nearEnd -> if (nearEnd) viewModel.loadMore() }
+             }
++            LaunchedEffect(gridState) {
++                snapshotFlow { gridState.firstVisibleItemIndex to gridState.firstVisibleItemScrollOffset }
++                    .collect { (i, o) -> onScrollPosition(i, o) }
++            }
+             LazyVerticalGrid(
+                 state = gridState,
+                 columns = GridCells.Fixed(YouTubeSettings.posterColumns(androidx.compose.ui.platform.LocalContext.current)),
+@@ -674,14 +733,14 @@ private fun Message(title: String, detail: String?, action: String?, onAction: (
+ }
+ 
+ @Composable
+-private fun TabChip(label: String, selected: Boolean, onClick: () -> Unit) {
++private fun TabChip(label: String, selected: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
+     var focused by remember { mutableStateOf(false) }
+     Text(
+         label,
+         color = Color.White,
+         fontSize = 16.sp,
+         fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+-        modifier = Modifier
++        modifier = modifier
+             .clip(RoundedCornerShape(20.dp))
+             .background(if (selected) YtRed else CardBg)
+             .border(2.dp, if (focused) Color.White else Color.Transparent, RoundedCornerShape(20.dp))
