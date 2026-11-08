@@ -1,0 +1,510 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/diagnostics/DebugReport.kt b/app/src/main/java/com/nuvio/tv/core/diagnostics/DebugReport.kt
+new file mode 100644
+index 000000000..16ad44afd
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/diagnostics/DebugReport.kt
+@@ -0,0 +1,197 @@
++package com.nuvio.tv.core.diagnostics
++
++import android.content.Context
++import android.content.pm.PackageManager
++import android.net.Uri
++import android.os.Build
++import android.os.Process
++import com.nuvio.tv.BuildConfig
++import com.nuvio.tv.core.player.LastPlaybackDiagnostics
++import com.nuvio.tv.domain.model.Addon
++import com.nuvio.tv.domain.model.AuthState
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++import org.json.JSONObject
++import java.text.SimpleDateFormat
++import java.util.Date
++import java.util.Locale
++import java.util.TimeZone
++import java.util.UUID
++
++/** A redacted debug report, ready to hand to the phone. */
++data class DebugReport(
++    val id: String,
++    val fileName: String,
++    val text: String
++)
++
++/**
++ * Collects the information needed to investigate a problem: app and device versions, the
++ * active addon list, the last playback diagnostics and the recent app log.
++ *
++ * Everything passes through [DebugReportRedactor] before leaving the device. Addon URLs are cut
++ * down to their host, and tokens, passwords, email addresses and IP addresses are removed.
++ */
++object DebugReportBuilder {
++
++    suspend fun build(
++        context: Context,
++        addons: List<Addon>,
++        diagnostics: LastPlaybackDiagnostics,
++        playerPreference: String,
++        internalPlayerEngine: String,
++        authState: AuthState
++    ): DebugReport = withContext(Dispatchers.IO) {
++        val id = UUID.randomUUID().toString().replace("-", "").take(8).uppercase(Locale.US)
++        val raw = buildString {
++            appendLine("Nuvio TV debug report")
++            appendLine("ID: $id")
++            appendLine("Generated: ${timestamp()}")
++
++            section("APP")
++            appendLine("version=${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
++            appendLine("package=${BuildConfig.APPLICATION_ID}")
++            appendLine("buildType=${BuildConfig.BUILD_TYPE}")
++            appendLine("debugBuild=${BuildConfig.IS_DEBUG_BUILD}")
++            appendLine(
++                "account=" + when (authState) {
++                    is AuthState.FullAccount -> "signed in"
++                    AuthState.SignedOut -> "signed out"
++                    AuthState.Loading -> "loading"
++                }
++            )
++
++            section("DEVICE")
++            appendLine("manufacturer=${Build.MANUFACTURER}")
++            appendLine("brand=${Build.BRAND}")
++            appendLine("model=${Build.MODEL}")
++            appendLine("device=${Build.DEVICE}")
++            appendLine("product=${Build.PRODUCT}")
++            appendLine("android=${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})")
++            appendLine("abis=${Build.SUPPORTED_ABIS.joinToString(",")}")
++            val metrics = context.resources.displayMetrics
++            appendLine("screen=${metrics.widthPixels}x${metrics.heightPixels} @ ${metrics.densityDpi}dpi")
++            appendLine("locale=${Locale.getDefault().toLanguageTag()}")
++            appendLine("timezone=${TimeZone.getDefault().id}")
++            appendLine("fireTv=${Build.MANUFACTURER.equals("Amazon", ignoreCase = true)}")
++            val packageManager = context.packageManager
++            appendLine("leanback=${packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK)}")
++            appendLine("television=${packageManager.hasSystemFeature(PackageManager.FEATURE_TELEVISION)}")
++
++            section("PLAYBACK")
++            appendLine("playerPreference=$playerPreference")
++            appendLine("internalPlayerEngine=$internalPlayerEngine")
++            appendLine("lastPlayback=${if (diagnostics.timestampMs == 0L) "none" else "present"}")
++            appendLine(
++                runCatching { JSONObject(diagnostics.toJson()).toString(2) }
++                    .getOrElse { diagnostics.toJson() }
++            )
++
++            section("ADDONS (${addons.size})")
++            if (addons.isEmpty()) {
++                appendLine("(none)")
++            } else {
++                addons.sortedBy { it.name.lowercase(Locale.US) }.forEach { addon ->
++                    val host = runCatching { Uri.parse(addon.baseUrl).host }.getOrNull()
++                        ?.takeIf { it.isNotBlank() }
++                        ?: "unknown"
++                    appendLine(
++                        "- ${addon.name} | version=${addon.version} | " +
++                            "${if (addon.enabled) "enabled" else "disabled"} | " +
++                            "types=${addon.rawTypes.joinToString(",")} | " +
++                            "resources=${addon.resources.joinToString(",") { it.name }} | host=$host"
++                    )
++                }
++            }
++
++            runCatching { ForkCrashReporter.latestSummary(context) }
++                .getOrNull()
++                ?.let { section("LATEST SAVED CRASH OR FREEZE REPORT"); appendLine(it) }
++
++            section("RECENT LOG")
++            appendLine(readRecentLogs())
++        }
++        val text = DebugReportRedactor.redact(raw)
++        DebugReport(id = id, fileName = "debug-report-$id.txt", text = text)
++    }
++
++    private fun StringBuilder.section(name: String) {
++        appendLine()
++        appendLine("== $name ==")
++    }
++
++    private fun timestamp(): String =
++        SimpleDateFormat("yyyy-MM-dd HH:mm:ss z", Locale.US).apply {
++            timeZone = TimeZone.getDefault()
++        }.format(Date())
++
++    /**
++     * Reads the app's own logcat tail. Android only lets an app read its own UID's log, which is
++     * exactly what a report needs. If a device blocks it, the report says so instead of failing.
++     */
++    private fun readRecentLogs(maxLines: Int = 700): String {
++        return runCatching {
++            val process = ProcessBuilder(
++                "logcat", "-d", "-v", "time", "-t", maxLines.toString(), "--pid=${Process.myPid()}"
++            ).redirectErrorStream(true).start()
++            val output = process.inputStream.bufferedReader().use { it.readText() }
++            process.waitFor()
++            if (output.isBlank()) {
++                "No recent log lines were available."
++            } else {
++                output.trimEnd().takeLast(150_000)
++            }
++        }.getOrElse { error ->
++            "Log unavailable (${error.javaClass.simpleName})."
++        }
++    }
++}
++
++/**
++ * Removes credentials and personal data from a report. Addon and stream URLs keep only their
++ * host, because the path and query usually contain a user's configuration token.
++ */
++object DebugReportRedactor {
++
++    private val bearer = Regex("""(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}""")
++    private val keyValue = Regex(
++        """(?i)\b(authorization|proxy-authorization|x-api-key|set-cookie|cookie|access[_-]?token|refresh[_-]?token|api[_-]?key|apikey|debrid[_-]?key|premiumize[_-]?key|torbox[_-]?key|rd[_-]?key|password|passwd|secret|token|auth)(\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s&,;]+)"""
++    )
++    private val querySecret = Regex(
++        """(?i)([?&](?:access[_-]?token|refresh[_-]?token|api[_-]?key|apikey|token|secret|password|auth|code)=)[^&\s]+"""
++    )
++    private val email = Regex("""[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}""")
++    private val url = Regex("""https?://[^\s"'<>]+""", RegexOption.IGNORE_CASE)
++    private val ipv4 = Regex(
++        """(?<![\d.])(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?![\d.])"""
++    )
++    private val uuid = Regex("""(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b""")
++    private val longToken = Regex("""\b[A-Za-z0-9_-]{48,}\b""")
++
++    fun redact(text: String): String {
++        var out = text
++        out = bearer.replace(out) { "${it.groupValues[1]}[redacted]" }
++        out = keyValue.replace(out) {
++            "${it.groupValues[1]}${it.groupValues[2]}[redacted]"
++        }
++        out = querySecret.replace(out) { "${it.groupValues[1]}[redacted]" }
++        out = url.replace(out) { match ->
++            val value = match.value
++            val scheme = value.indexOf("://")
++            if (scheme < 0) {
++                value
++            } else {
++                val hostStart = scheme + 3
++                val hostEnd = value.indexOfAny(charArrayOf('/', '?', '#'), hostStart)
++                    .let { if (it < 0) value.length else it }
++                val host = value.substring(hostStart, hostEnd).substringAfterLast('@')
++                value.substring(0, hostStart) + host + "/[redacted]"
++            }
++        }
++        out = email.replace(out, "[email]")
++        out = ipv4.replace(out, "[ip]")
++        out = uuid.replace(out, "[id]")
++        out = longToken.replace(out, "[redacted]")
++        return out
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/network/NetworkConnectionKind.kt b/app/src/main/java/com/nuvio/tv/core/network/NetworkConnectionKind.kt
+new file mode 100644
+index 000000000..36a0ff47c
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/network/NetworkConnectionKind.kt
+@@ -0,0 +1,35 @@
++package com.nuvio.tv.core.network
++
++internal enum class NetworkConnectionKind { Wifi, Ethernet, Offline }
++
++internal enum class NetworkTransport { Wifi, Ethernet, Cellular, Vpn }
++
++/**
++ * Before Android 9 a VPN's capabilities do not include the underlying Wi-Fi or
++ * Ethernet transport. The active network is then only [NetworkTransport.Vpn],
++ * which would otherwise look offline. Use another reported network for the label.
++ * Android 9 and later can put the underlying transport on the VPN itself.
++ *
++ * [others] is read only when the active network is a VPN with no physical transport.
++ */
++internal fun networkConnectionKind(
++    active: Set<NetworkTransport>?,
++    others: () -> List<Set<NetworkTransport>> = { emptyList() },
++): NetworkConnectionKind {
++    if (active == null) return NetworkConnectionKind.Offline
++    physicalConnection(active)?.let { return it }
++    if (NetworkTransport.Vpn !in active) return NetworkConnectionKind.Offline
++    val underlying = others().mapNotNull { physicalConnection(it) }
++    return underlying.firstOrNull { it == NetworkConnectionKind.Ethernet }
++        ?: underlying.firstOrNull()
++        ?: NetworkConnectionKind.Offline
++}
++
++private fun physicalConnection(transports: Set<NetworkTransport>): NetworkConnectionKind? {
++    return when {
++        NetworkTransport.Ethernet in transports -> NetworkConnectionKind.Ethernet
++        NetworkTransport.Wifi in transports -> NetworkConnectionKind.Wifi
++        NetworkTransport.Cellular in transports -> NetworkConnectionKind.Wifi
++        else -> null
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/util/AppLogo.kt b/app/src/main/java/com/nuvio/tv/core/util/AppLogo.kt
+new file mode 100644
+index 000000000..6623fe910
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/util/AppLogo.kt
+@@ -0,0 +1,15 @@
++package com.nuvio.tv.core.util
++
++import android.content.Context
++import com.nuvio.tv.R
++
++/**
++ * Raw bytes of the app wordmark image, served to the web-config pages,
++ * or null when the resource cannot be read.
++ */
++fun Context.readAppLogoBytes(): ByteArray? =
++    try {
++        resources.openRawResource(R.drawable.app_logo_wordmark).use { it.readBytes() }
++    } catch (_: Exception) {
++        null
++    }
+diff --git a/app/src/main/java/com/nuvio/tv/reshaped/debuglog/DebugLogServer.kt b/app/src/main/java/com/nuvio/tv/reshaped/debuglog/DebugLogServer.kt
+index d3c1b72eb..92023afa7 100644
+--- a/app/src/main/java/com/nuvio/tv/reshaped/debuglog/DebugLogServer.kt
++++ b/app/src/main/java/com/nuvio/tv/reshaped/debuglog/DebugLogServer.kt
+@@ -17,6 +17,7 @@ internal class DebugLogServer(
+     private val reportDir: File,
+     private val audioSyncLog: () -> String,
+     private val frameLog: () -> String = { "" },
++    private val debugReport: () -> String = { "" },
+ ) : NanoHTTPD(port) {
+ 
+     val token: String = newToken()
+@@ -30,6 +31,7 @@ internal class DebugLogServer(
+             uri == pagePath || uri == "/$token" -> html(page())
+             uri == "$filePrefix$AUDIO_SYNC_LOG" -> text(AUDIO_SYNC_LOG, audioSyncLog())
+             uri == "$filePrefix$FRAME_LOG" -> text(FRAME_LOG, frameLog())
++            uri == "$filePrefix$DEBUG_REPORT" -> text(DEBUG_REPORT, debugReport().ifBlank { "The report is still being prepared. Reload in a moment." })
+             uri.startsWith(filePrefix) -> reports().firstOrNull { it.name == uri.removePrefix(filePrefix) }
+                 ?.let { file -> runCatching { text(file.name, file.readText()) }.getOrNull() }
+                 ?: newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Not found")
+@@ -84,6 +86,8 @@ border:1px solid rgba(255,255,255,0.14);background:rgba(255,255,255,0.04);color:
+   $rows
+   <h2>Audio sync</h2>
+   <a class="row" href="${h(filePrefix + AUDIO_SYNC_LOG)}" download="$AUDIO_SYNC_LOG"><span>Audio sync log</span></a>
++  <h2>Report</h2>
++  <a class="row" href="${h(filePrefix + DEBUG_REPORT)}" download="$DEBUG_REPORT"><span>Debug report (app, device, addons, recent log)</span></a>
+   <h2>Playback</h2>
+   <a class="row" href="${h(filePrefix + FRAME_LOG)}" download="$FRAME_LOG"><span>Dropped frames log</span></a>
+ </div>
+@@ -105,6 +109,7 @@ border:1px solid rgba(255,255,255,0.14);background:rgba(255,255,255,0.04);color:
+     companion object {
+         private const val AUDIO_SYNC_LOG = "audio-sync-log.txt"
+         private const val FRAME_LOG = "playback-frame-log.txt"
++        private const val DEBUG_REPORT = "debug-report.txt"
+         private const val MAX_REPORTS = 10
+         /** After the phone entry pages (8120+), so they never collide. */
+         private const val START_PORT = 8130
+@@ -120,10 +125,11 @@ border:1px solid rgba(255,255,255,0.14);background:rgba(255,255,255,0.04);color:
+             reportDir: File,
+             audioSyncLog: () -> String,
+             frameLog: () -> String = { "" },
++            debugReport: () -> String = { "" },
+         ): DebugLogServer? {
+             for (port in START_PORT until START_PORT + MAX_ATTEMPTS) {
+                 try {
+-                    return DebugLogServer(port, reportDir, audioSyncLog, frameLog).apply { start(SOCKET_READ_TIMEOUT, false) }
++                    return DebugLogServer(port, reportDir, audioSyncLog, frameLog, debugReport).apply { start(SOCKET_READ_TIMEOUT, false) }
+                 } catch (_: Exception) {
+                 }
+             }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/reshaped/debuglog/DebugLogQrDialog.kt b/app/src/main/java/com/nuvio/tv/ui/reshaped/debuglog/DebugLogQrDialog.kt
+index 7bd23e2ed..861b3e329 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/reshaped/debuglog/DebugLogQrDialog.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/reshaped/debuglog/DebugLogQrDialog.kt
+@@ -8,6 +8,9 @@ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.size
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.LaunchedEffect
++import androidx.hilt.navigation.compose.hiltViewModel
++import com.nuvio.tv.ui.screens.settings.DebugReportViewModel
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+@@ -45,6 +48,9 @@ internal fun DebugLogQrDialog(onDismiss: () -> Unit) {
+     val context = LocalContext.current
+     val lifecycleOwner = LocalLifecycleOwner.current
+     var state by remember { mutableStateOf<DebugLogQrState?>(null) }
++    val reportViewModel: DebugReportViewModel = hiltViewModel()
++    val reportText = remember { java.util.concurrent.atomic.AtomicReference("") }
++    LaunchedEffect(Unit) { reportText.set(reportViewModel.buildReportText()) }
+     DisposableEffect(lifecycleOwner) {
+         var running: DebugLogServer? = null
+         val observer = LifecycleEventObserver { _, event ->
+@@ -56,7 +62,7 @@ internal fun DebugLogQrDialog(onDismiss: () -> Unit) {
+                     } else {
+                         // Where AutoSyncDebugLog saves its reports.
+                         val reports = File(context.cacheDir, "autosync-debug")
+-                        val server = DebugLogServer.startOnAvailablePort(reports, { SyncLog.text() }, { PlaybackFrameLog.text() })
++                        val server = DebugLogServer.startOnAvailablePort(reports, { SyncLog.text() }, { PlaybackFrameLog.text() }, { reportText.get() })
+                         running = server
+                         if (server == null) {
+                             DebugLogQrState(null, null, context.getString(R.string.error_server_ports_unavailable))
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginViewModel.kt
+index cd258b36f..c97a69dd6 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginViewModel.kt
+@@ -4,6 +4,7 @@ import android.content.Context
+ import androidx.lifecycle.ViewModel
+ import androidx.lifecycle.viewModelScope
+ import com.nuvio.tv.R
++import com.nuvio.tv.core.util.readAppLogoBytes
+ import com.nuvio.tv.core.plugin.PluginManager
+ import com.nuvio.tv.core.plugin.PluginSafety
+ import com.nuvio.tv.core.profile.ProfileManager
+@@ -46,10 +47,7 @@ class PluginViewModel @Inject constructor(
+     }
+ 
+     private fun loadLogoBytes() {
+-        try {
+-            val inputStream = context.resources.openRawResource(R.drawable.app_logo_wordmark)
+-            logoBytes = inputStream.use { it.readBytes() }
+-        } catch (_: Exception) { }
++        logoBytes = context.readAppLogoBytes()
+     }
+ 
+     private fun observePluginData() {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/AboutScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/AboutScreen.kt
+index 54b2c0a5f..9a669cfef 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/AboutScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/AboutScreen.kt
+@@ -75,6 +75,7 @@ fun AboutSettingsContent(
+     val context = LocalContext.current
+     val aboutScrollState = rememberScrollState()
+     var firstRowFocused by remember { mutableStateOf(false) }
++    var showDebugReport by remember { mutableStateOf(false) }
+     val firstRowModifier = Modifier.onFocusChanged { firstRowFocused = it.isFocused }
+     val defaultBringIntoViewSpec = LocalBringIntoViewSpec.current
+     val aboutBringIntoViewSpec = remember(aboutScrollState, defaultBringIntoViewSpec) {
+@@ -174,6 +175,13 @@ fun AboutSettingsContent(
+                                 )
+                             }
+ 
++                            SettingsActionRow(
++                                title = "Debug report",
++                                subtitle = "Scan a QR code to download a redacted report (app, device, addons, recent log) on your phone",
++                                trailingIcon = Icons.AutoMirrored.Filled.KeyboardArrowRight,
++                                onClick = { showDebugReport = true }
++                            )
++
+                             SettingsActionRow(
+                                 title = stringResource(R.string.about_licenses_attributions),
+                                 subtitle = stringResource(R.string.about_licenses_attributions_subtitle),
+@@ -187,4 +195,8 @@ fun AboutSettingsContent(
+             }
+         }
+     }
++
++    if (showDebugReport) {
++        com.nuvio.tv.ui.reshaped.debuglog.DebugLogQrDialog(onDismiss = { showDebugReport = false })
++    }
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/DebugReportViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/DebugReportViewModel.kt
+new file mode 100644
+index 000000000..f94819053
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/DebugReportViewModel.kt
+@@ -0,0 +1,34 @@
++package com.nuvio.tv.ui.screens.settings
++
++import android.content.Context
++import androidx.lifecycle.ViewModel
++import com.nuvio.tv.core.auth.AuthManager
++import com.nuvio.tv.core.diagnostics.DebugReportBuilder
++import com.nuvio.tv.data.local.PlayerSettingsDataStore
++import com.nuvio.tv.domain.repository.AddonRepository
++import dagger.hilt.android.lifecycle.HiltViewModel
++import dagger.hilt.android.qualifiers.ApplicationContext
++import kotlinx.coroutines.flow.first
++import javax.inject.Inject
++
++@HiltViewModel
++class DebugReportViewModel @Inject constructor(
++    @ApplicationContext private val context: Context,
++    private val addonRepository: AddonRepository,
++    private val playerSettingsDataStore: PlayerSettingsDataStore,
++    private val authManager: AuthManager
++) : ViewModel() {
++
++    /** The redacted report text, or a one-line reason when it could not be built. */
++    suspend fun buildReportText(): String = runCatching {
++        val settings = playerSettingsDataStore.playerSettings.first()
++        DebugReportBuilder.build(
++            context = context,
++            addons = addonRepository.getInstalledAddons().first(),
++            diagnostics = playerSettingsDataStore.lastPlaybackDiagnostics.first(),
++            playerPreference = settings.playerPreference.name,
++            internalPlayerEngine = settings.internalPlayerEngine.name,
++            authState = authManager.authState.value
++        ).text
++    }.getOrElse { "Debug report unavailable (${it.javaClass.simpleName})." }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
+index 50d47fe04..ffa1e367a 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
+@@ -7,6 +7,9 @@ import com.nuvio.tv.ui.theme.NuvioTheme
+ 
+ import android.net.ConnectivityManager
+ import android.net.NetworkCapabilities
++import com.nuvio.tv.core.network.NetworkConnectionKind
++import com.nuvio.tv.core.network.NetworkTransport
++import com.nuvio.tv.core.network.networkConnectionKind
+ import androidx.compose.animation.AnimatedVisibility
+ import androidx.compose.animation.core.LinearEasing
+ import androidx.compose.animation.core.RepeatMode
+@@ -92,26 +95,32 @@ private interface ProfileManagerEntryPoint {
+ 
+ private enum class NetworkTestState { Idle, TestingLatency, TestingDownload, Done, Error }
+ 
+-private enum class ConnectionType { WiFi, Ethernet, Offline }
+-
+-private fun getConnectionType(context: android.content.Context): ConnectionType {
+-    val cm = context.getSystemService<ConnectivityManager>() ?: return ConnectionType.Offline
+-    val network = cm.activeNetwork ?: return ConnectionType.Offline
+-    val caps = cm.getNetworkCapabilities(network) ?: return ConnectionType.Offline
+-    return when {
+-        caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> ConnectionType.Ethernet
+-        caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> ConnectionType.WiFi
+-        caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> ConnectionType.WiFi // treat cellular as connected
+-        else -> ConnectionType.Offline
+-    }
++private fun getConnectionType(context: android.content.Context): NetworkConnectionKind {
++    val cm = context.getSystemService<ConnectivityManager>() ?: return NetworkConnectionKind.Offline
++    return runCatching {
++        fun transportsOf(network: android.net.Network): Set<NetworkTransport>? {
++            val caps = cm.getNetworkCapabilities(network) ?: return null
++            return buildSet {
++                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) add(NetworkTransport.Ethernet)
++                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) add(NetworkTransport.Wifi)
++                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) add(NetworkTransport.Cellular)
++                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) add(NetworkTransport.Vpn)
++            }
++        }
++        val active = cm.activeNetwork
++        networkConnectionKind(
++            active = active?.let { transportsOf(it) },
++            others = { cm.allNetworks.filter { it != active }.mapNotNull { transportsOf(it) } }
++        )
++    }.getOrDefault(NetworkConnectionKind.Offline)
+ }
+ 
+ @Composable
+-private fun ConnectionStatusBadge(type: ConnectionType) {
++private fun ConnectionStatusBadge(type: NetworkConnectionKind) {
+     val (icon, label, color) = when (type) {
+-        ConnectionType.WiFi -> Triple(Icons.Default.Wifi, stringResource(R.string.network_connection_wifi), NuvioTheme.colors.Success)
+-        ConnectionType.Ethernet -> Triple(Icons.Default.Wifi, stringResource(R.string.network_connection_ethernet), NuvioTheme.colors.Success)
+-        ConnectionType.Offline -> Triple(Icons.Default.SignalWifiOff, stringResource(R.string.network_connection_offline), NuvioTheme.colors.Error)
++        NetworkConnectionKind.Wifi -> Triple(Icons.Default.Wifi, stringResource(R.string.network_connection_wifi), NuvioTheme.colors.Success)
++        NetworkConnectionKind.Ethernet -> Triple(Icons.Default.Wifi, stringResource(R.string.network_connection_ethernet), NuvioTheme.colors.Success)
++        NetworkConnectionKind.Offline -> Triple(Icons.Default.SignalWifiOff, stringResource(R.string.network_connection_offline), NuvioTheme.colors.Error)
+     }
+     Row(
+         modifier = Modifier
