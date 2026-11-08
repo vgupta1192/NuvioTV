@@ -1,0 +1,150 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
+index ee43f4351..7401cfa1c 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
+@@ -1184,6 +1184,20 @@ private fun PlaybackNavHost(
+                                 onOpenChannel = { channelId, name ->
+                                     youtubeVm.openChannel(channelId, name)
+                                     navController.popBackStack()
++                                },
++                                related = youtubeVm.related.collectAsState().value,
++                                relatedLoading = youtubeVm.relatedLoading.collectAsState().value,
++                                onLoadRelated = { youtubeVm.loadRelated(upNextVideoId) },
++                                onPlayRelated = { item ->
++                                    upNextPlayerVm.onEvent(com.nuvio.tv.ui.screens.player.PlayerEvent.OnDismissTransientOverlay)
++                                    youtubeVm.activate(item, youtubeVm.related.value) { v ->
++                                        navController.navigate(youtubePlayerRoute(v)) {
++                                            popUpTo(backStackEntry.destination.id) { inclusive = true }
++                                        }
++                                    }
++                                },
++                                onSeekTo = { ms ->
++                                    upNextPlayerVm.onEvent(com.nuvio.tv.ui.screens.player.PlayerEvent.OnSeekTo(ms))
+                                 }
+                             )
+                         }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/AudioSelectionOverlay.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/AudioSelectionOverlay.kt
+index 8895421da..6d22a3322 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/AudioSelectionOverlay.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/AudioSelectionOverlay.kt
+@@ -169,6 +169,7 @@ internal fun AudioSelectionOverlay(
+         onDismiss = onDismiss,
+         modifier = modifier,
+         captureKeys = false,
++        overlayTint = Color.Black.copy(alpha = 0.78f),
+         contentPadding = PaddingValues(start = 44.dp, end = 44.dp, top = 28.dp, bottom = 64.dp)
+     ) {
+         Column(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt
+index 36dc87e35..923ce5222 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt
+@@ -200,7 +200,10 @@ internal fun PlayerRuntimeController.updateAvailableTracks(tracks: Tracks) {
+                     val langDisplay = format.language?.takeIf { it != "und" }?.let {
+                         com.nuvio.tv.ui.util.languageCodeToName(it)
+                     }
+-                    val baseName = format.label ?: langDisplay ?: context.getString(com.nuvio.tv.R.string.player_track_audio_fallback, audioTracks.size + 1)
++                    val usableLabel = format.label?.trim()?.takeIf {
++                        it.isNotEmpty() && !it.equals("und", ignoreCase = true) && !it.equals("unknown", ignoreCase = true)
++                    }
++                    val baseName = usableLabel ?: langDisplay ?: context.getString(com.nuvio.tv.R.string.player_track_audio_fallback, audioTracks.size + 1)
+                     val suffix = listOfNotNull(codecName, channelLayout).joinToString(" ")
+                     val displayName = if (suffix.isNotEmpty()) "$baseName ($suffix)" else baseName
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubePlayerPanel.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubePlayerPanel.kt
+index 625756c4a..4e702ed7d 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubePlayerPanel.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubePlayerPanel.kt
+@@ -45,7 +45,7 @@ import androidx.compose.ui.text.style.TextOverflow
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.unit.sp
+ 
+-private enum class PanelMode { MAIN, PLAYLISTS, COMMENTS, REPLIES }
++private enum class PanelMode { MAIN, PLAYLISTS, COMMENTS, REPLIES, CHAPTERS, RELATED }
+ 
+ private val PanelBg = Color(0xF2111114)
+ private val RowBg = Color(0xFF1C1C1E)
+@@ -68,7 +68,12 @@ fun BoxScope.YouTubePlayerPanel(
+     videoId: String,
+     viewModel: YouTubePlayerViewModel,
+     onClose: () -> Unit,
+-    onOpenChannel: (channelId: String, name: String) -> Unit
++    onOpenChannel: (channelId: String, name: String) -> Unit,
++    related: List<YtItem> = emptyList(),
++    relatedLoading: Boolean = false,
++    onLoadRelated: () -> Unit = {},
++    onPlayRelated: (YtItem) -> Unit = {},
++    onSeekTo: (Long) -> Unit = {}
+ ) {
+     val state by viewModel.state.collectAsState()
+     var mode by remember { mutableStateOf(PanelMode.MAIN) }
+@@ -108,6 +113,8 @@ fun BoxScope.YouTubePlayerPanel(
+                 }
+                 PanelMode.PLAYLISTS -> Text("Save to playlist", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                 PanelMode.COMMENTS -> Text("Comments", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
++                PanelMode.CHAPTERS -> Text("Chapters", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
++                PanelMode.RELATED -> Text("Related videos", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                 PanelMode.REPLIES -> {
+                     Text("Replies", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                     replyingTo?.let {
+@@ -124,6 +131,8 @@ fun BoxScope.YouTubePlayerPanel(
+                 PanelMode.PLAYLISTS -> state.playlists == null
+                 PanelMode.COMMENTS -> state.commentsLoading && state.comments.isEmpty()
+                 PanelMode.REPLIES -> state.repliesLoading && state.replies.isEmpty()
++                PanelMode.CHAPTERS -> false
++                PanelMode.RELATED -> relatedLoading && related.isEmpty()
+             }
+             if (busy) {
+                 Box(Modifier.fillMaxWidth().padding(16.dp), Alignment.Center) { CircularProgressIndicator(color = Accent) }
+@@ -145,6 +154,13 @@ fun BoxScope.YouTubePlayerPanel(
+                         mode = PanelMode.COMMENTS
+                         viewModel.loadComments()
+                     })
++                    if (info.chapters.isNotEmpty()) {
++                        add(PanelEntry("Chapters", "${info.chapters.size} sections") { mode = PanelMode.CHAPTERS })
++                    }
++                    add(PanelEntry("Related videos", null) {
++                        mode = PanelMode.RELATED
++                        onLoadRelated()
++                    })
+                     info.channelId?.let { channel ->
+                         add(PanelEntry("Open channel", info.author.takeIf(String::isNotBlank)) { onOpenChannel(channel, info.author) })
+                         add(PanelEntry("Hide this channel", "Keeps it off the YouTube page") { viewModel.hideChannel() })
+@@ -172,6 +188,16 @@ fun BoxScope.YouTubePlayerPanel(
+                         }
+                     )
+                 }
++                PanelMode.CHAPTERS -> info?.chapters.orEmpty().map { (title, startMs) ->
++                    PanelEntry(title, formatChapterClock(startMs)) { onSeekTo(startMs); onClose() }
++                }
++                PanelMode.RELATED -> related.filter { it.kind == YtKind.VIDEO && it.videoId != videoId }.map { item ->
++                    PanelEntry(
++                        title = item.title,
++                        detail = item.subtitle ?: item.author,
++                        titleLines = 2
++                    ) { onPlayRelated(item) }
++                }
+                 PanelMode.REPLIES -> state.replies.map { c ->
+                     PanelEntry(
+                         title = c.text,
+@@ -188,6 +214,8 @@ fun BoxScope.YouTubePlayerPanel(
+                         PanelMode.PLAYLISTS -> "You have no playlists."
+                         PanelMode.COMMENTS -> "No comments to show."
+                         PanelMode.REPLIES -> "No replies to show."
++                        PanelMode.CHAPTERS -> "This video has no chapters."
++                        PanelMode.RELATED -> "No related videos to show."
+                     },
+                     color = Color.Gray, fontSize = 14.sp
+                 )
+@@ -360,3 +388,11 @@ private fun NavigableList(
+         }
+     }
+ }
++
++private fun formatChapterClock(timeMs: Long): String {
++    val total = (timeMs / 1000).coerceAtLeast(0)
++    val h = total / 3600
++    val m = (total % 3600) / 60
++    val sec = total % 60
++    return if (h > 0) "%d:%02d:%02d".format(h, m, sec) else "%d:%02d".format(m, sec)
++}
