@@ -1,0 +1,257 @@
+diff --git a/app/src/main/java/com/nuvio/tv/MainActivity.kt b/app/src/main/java/com/nuvio/tv/MainActivity.kt
+index 6e0205c05..138679dff 100644
+--- a/app/src/main/java/com/nuvio/tv/MainActivity.kt
++++ b/app/src/main/java/com/nuvio/tv/MainActivity.kt
+@@ -892,7 +892,7 @@ open class MainActivity : ComponentActivity() {
+ 
+                     val startDestination = when {
+                         needsExperienceSelection -> Screen.ExperienceModeSelection.route
+-                        layoutChosen -> Screen.Home.route
++                        layoutChosen -> com.nuvio.tv.ui.screens.settings.ForkStartPage.get(this@MainActivity) ?: Screen.Home.route
+                         else -> Screen.LayoutSelection.route
+                     }
+                     val navController = rememberNavController()
+@@ -1109,8 +1109,10 @@ open class MainActivity : ComponentActivity() {
+                     val strNavGenres = stringResource(R.string.nav_genres)
+                     val strNavSettings = stringResource(R.string.nav_settings)
+                     val hiddenPages by forkCalendarPrefs.hiddenPages.collectAsState(initial = emptySet())
++                    val pageOrder by forkCalendarPrefs.pageOrder.collectAsState(initial = emptyList())
+                     val drawerItems = remember(
+                         hiddenPages,
++                        pageOrder,
+                         strNavHome,
+                         strNavDiscover,
+                         strNavTvChannels,
+@@ -1184,6 +1186,13 @@ open class MainActivity : ComponentActivity() {
+                                     iconRes = R.raw.sidebar_settings
+                                 )
+                             )
++                        }.let { items ->
++                            val movable = items.filter { it.route != Screen.Home.route && it.route != Screen.Settings.route }
++                            val orderedRoutes = com.nuvio.tv.ui.screens.settings.ForkSidebarOrder
++                                .apply(movable.map { it.route }, pageOrder)
++                            items.filter { it.route == Screen.Home.route } +
++                                orderedRoutes.mapNotNull { r -> movable.firstOrNull { it.route == r } } +
++                                items.filter { it.route == Screen.Settings.route }
+                         }
+                     }
+                     val selectedDrawerRoute = drawerItems.firstOrNull { item ->
+diff --git a/app/src/main/java/com/nuvio/tv/data/local/ForkCalendarPrefsStore.kt b/app/src/main/java/com/nuvio/tv/data/local/ForkCalendarPrefsStore.kt
+index baaec7738..b809dcdf6 100644
+--- a/app/src/main/java/com/nuvio/tv/data/local/ForkCalendarPrefsStore.kt
++++ b/app/src/main/java/com/nuvio/tv/data/local/ForkCalendarPrefsStore.kt
+@@ -2,6 +2,7 @@ package com.nuvio.tv.data.local
+ 
+ import androidx.datastore.preferences.core.booleanPreferencesKey
+ import androidx.datastore.preferences.core.edit
++import androidx.datastore.preferences.core.stringPreferencesKey
+ import androidx.datastore.preferences.core.stringSetPreferencesKey
+ import com.nuvio.tv.core.profile.ProfileManager
+ import kotlinx.coroutines.ExperimentalCoroutinesApi
+@@ -27,6 +28,7 @@ class ForkCalendarPrefsStore @Inject constructor(
+         const val FEATURE = "fork_calendar_prefs"
+         private val HIDDEN_TITLES = stringSetPreferencesKey("hidden_calendar_titles")
+         private val HIDDEN_PAGES = stringSetPreferencesKey("hidden_sidebar_pages")
++        private val PAGE_ORDER = stringPreferencesKey("sidebar_page_order")
+         private val CALENDAR_OFF = booleanPreferencesKey("library_calendar_off")
+     }
+ 
+@@ -62,6 +64,16 @@ class ForkCalendarPrefsStore @Inject constructor(
+         }
+     }
+ 
++    val pageOrder: Flow<List<String>> = profileManager.activeProfileId.flatMapLatest { pid ->
++        factory.get(pid, FEATURE).data.map { prefs ->
++            (prefs[PAGE_ORDER] ?: "").split(',').map { it.trim() }.filter { it.isNotEmpty() }
++        }
++    }.distinctUntilChanged()
++
++    suspend fun setPageOrder(routes: List<String>) {
++        store().edit { it[PAGE_ORDER] = routes.joinToString(",") }
++    }
++
+     suspend fun setCalendarEnabled(enabled: Boolean) {
+         store().edit { it[CALENDAR_OFF] = !enabled }
+     }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
+index f96c67efa..962ed7ab1 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
+@@ -557,6 +557,7 @@ class PlayerRuntimeController(
+     internal var autoSubtitleSelected: Boolean = false
+     internal var forkSleepWatcherStarted: Boolean = false
+     internal var isUserExplicitSubtitleSelection: Boolean = false
++    internal var youtubeSubtitleStartApplied: Boolean = false
+     internal var lastSubtitlePreferredLanguage: String? = null
+     internal var lastSubtitleSecondaryLanguage: String? = null
+     internal var lastSubtitleTertiaryLanguage: String? = null
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt
+index 779702561..fdde29ac2 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt
+@@ -1797,6 +1797,19 @@ private fun audioMatchesSubtitleTargetForForced(audioTrack: TrackInfo, target: S
+ 
+ internal fun PlayerRuntimeController.tryAutoSelectPreferredSubtitleFromAvailableTracks() {
+     if (TvForkPlayerPrefs.subtitlesStartOff) return
++    if (com.nuvio.tv.youtube.YouTubeProgress.isYouTubeId(contentId) &&
++        !com.nuvio.tv.youtube.YouTubeSettings.autoSubtitles(context)
++    ) {
++        if (!isUserExplicitSubtitleSelection) {
++            if (!youtubeSubtitleStartApplied && (if (isUsingMpvEngine()) mpvView != null else _exoPlayer != null)) {
++                youtubeSubtitleStartApplied = true
++                disableSubtitles()
++                autoSubtitleSelected = true
++            }
++            return
++        }
++        youtubeSubtitleStartApplied = true
++    }
+     if (isUserExplicitSubtitleSelection) {
+         Log.d(PlayerRuntimeController.TAG, "AUTO_SUB stop: user explicitly selected current subtitle")
+         return
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkPagesSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkPagesSettings.kt
+index 3317557e0..e4249d816 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkPagesSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkPagesSettings.kt
+@@ -4,6 +4,9 @@ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.collectAsState
+ import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
+ import androidx.compose.runtime.rememberCoroutineScope
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.platform.LocalContext
+@@ -15,6 +18,28 @@ import dagger.hilt.android.EntryPointAccessors
+ import dagger.hilt.components.SingletonComponent
+ import kotlinx.coroutines.launch
+ 
++/** Nuvio fork: the page the app opens on, kept in a small file so it is known before the first screen is drawn. */
++object ForkStartPage {
++    private const val PREFS = "fork_start_page"
++    private const val KEY = "route"
++    val choices = listOf(
++        Screen.TvChannels.route to "Live TV",
++        Screen.Jellyfin.route to "Jellyfin",
++        Screen.Search.route to "Search",
++        Screen.Library.route to "Library",
++        Screen.YouTube.route to "YouTube"
++    )
++
++    fun get(context: android.content.Context): String? = runCatching {
++        context.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE).getString(KEY, null)
++    }.getOrNull()?.takeIf { r -> choices.any { it.first == r } }
++
++    fun set(context: android.content.Context, route: String?) {
++        val p = context.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)
++        p.edit().apply { if (route == null) remove(KEY) else putString(KEY, route) }.apply()
++    }
++}
++
+ @EntryPoint
+ @InstallIn(SingletonComponent::class)
+ internal interface ForkCalendarPrefsEntryPoint {
+@@ -33,6 +58,8 @@ internal fun ForkPagesSettingsGroup(modifier: Modifier = Modifier) {
+         .forkCalendarPrefs()
+     val hidden by store.hiddenPages.collectAsState(initial = emptySet())
+     val calendarOn by store.calendarEnabled.collectAsState(initial = true)
++    val order by store.pageOrder.collectAsState(initial = emptyList())
++    var startRoute by remember { mutableStateOf(ForkStartPage.get(context)) }
+     val scope = rememberCoroutineScope()
+     val pages = listOf(
+         Screen.TvChannels.route to "Live TV",
+@@ -55,6 +82,31 @@ internal fun ForkPagesSettingsGroup(modifier: Modifier = Modifier) {
+                 onToggle = { scope.launch { store.setPageHidden(route, route !in hidden) } }
+             )
+         }
++        val ordered = ForkSidebarOrder.apply(pages.map { it.first }, order)
++        ordered.forEachIndexed { index, route ->
++            val label = pages.first { it.first == route }.second
++            SettingsActionRow(
++                title = "Move $label up",
++                subtitle = null,
++                value = "Position ${index + 1}",
++                enabled = index > 0,
++                onClick = {
++                    val next = ordered.toMutableList().apply { add(index - 1, removeAt(index)) }
++                    scope.launch { store.setPageOrder(next) }
++                }
++            )
++        }
++        SettingsActionRow(
++            title = "Open the app on",
++            subtitle = "The page the app starts on instead of Home. Tap to cycle.",
++            value = ForkStartPage.choices.firstOrNull { it.first == startRoute }?.second ?: "Home",
++            onClick = {
++                val all = listOf<String?>(null) + ForkStartPage.choices.map { it.first }
++                val next = all[(all.indexOf(startRoute) + 1) % all.size]
++                ForkStartPage.set(context, next)
++                startRoute = next
++            }
++        )
+         SettingsToggleRow(
+             title = "Library calendar button",
+             subtitle = "Show the Calendar button on the saved library.",
+@@ -63,3 +115,11 @@ internal fun ForkPagesSettingsGroup(modifier: Modifier = Modifier) {
+         )
+     }
+ }
++
++/** Nuvio fork: applies the saved sidebar order to the movable pages (unlisted pages keep their usual place after the listed ones). */
++object ForkSidebarOrder {
++    fun apply(routes: List<String>, saved: List<String>): List<String> {
++        val mine = saved.filter { it in routes }.distinct()
++        return mine + routes.filter { it !in mine }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/YouTubeSettingsContent.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/YouTubeSettingsContent.kt
+index 5f1f24b90..6345fb52b 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/YouTubeSettingsContent.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/YouTubeSettingsContent.kt
+@@ -72,6 +72,7 @@ internal fun YouTubeSettingsContent(
+     var contentRegion by remember { mutableStateOf(YouTubeSettings.contentRegion(context)) }
+     var qualityToast by remember { mutableStateOf(YouTubeSettings.qualityToast(context)) }
+     var clockOn by remember { mutableStateOf(YouTubeSettings.showClock(context)) }
++    var autoSubtitles by remember { mutableStateOf(YouTubeSettings.autoSubtitles(context)) }
+     var videoPreviews by remember { mutableStateOf(YouTubeSettings.videoPreviews(context)) }
+     var posterColumns by remember { mutableStateOf(YouTubeSettings.posterColumns(context)) }
+ 
+@@ -147,6 +148,15 @@ internal fun YouTubeSettingsContent(
+         }
+ 
+         SettingsGroupCard(title = "Playback") {
++            SettingsToggleRow(
++                title = "Automatically select subtitles",
++                subtitle = "Start YouTube videos with your preferred subtitles when available",
++                checked = autoSubtitles,
++                onToggle = {
++                    autoSubtitles = !autoSubtitles
++                    YouTubeSettings.setAutoSubtitles(context, autoSubtitles)
++                }
++            )
+             SettingsToggleRow(
+                 title = "Video previews",
+                 subtitle = "Play a short preview, with sound, when you rest on a video card",
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeSettings.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeSettings.kt
+index 390b7141d..f0043e56f 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeSettings.kt
+@@ -27,6 +27,7 @@ object YouTubeSettings {
+     private const val KEY_QUALITY_TOAST = "quality_toast"
+     private const val KEY_COMPATIBILITY = "compatibility_mode"
+     private const val KEY_CONTENT_REGION = "content_region"
++    private const val KEY_AUTO_SUBTITLES = "auto_subtitles"
+     private const val KEY_VIDEO_PREVIEWS = "video_previews"
+     private const val KEY_POSTER_COLUMNS = "poster_columns"
+     private const val KEY_SHOW_CLOCK = "show_clock"
+@@ -270,6 +271,9 @@ object YouTubeSettings {
+ 
+     fun qualityLabel(height: Int) = if (height <= 0) "Auto" else "${height}p"
+ 
++    fun autoSubtitles(context: Context) = prefs(context).getBoolean(KEY_AUTO_SUBTITLES, true)
++    fun setAutoSubtitles(context: Context, on: Boolean) = prefs(context).edit().putBoolean(KEY_AUTO_SUBTITLES, on).apply()
++
+     fun videoPreviews(context: Context) = prefs(context).getBoolean(KEY_VIDEO_PREVIEWS, true)
+     fun setVideoPreviews(context: Context, on: Boolean) = prefs(context).edit().putBoolean(KEY_VIDEO_PREVIEWS, on).apply()
+ 
