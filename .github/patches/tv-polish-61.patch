@@ -1,0 +1,783 @@
+diff --git a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
+index c9b07a5d1..80045d6a0 100644
+--- a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
++++ b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
+@@ -151,7 +151,7 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+                 }
+                 add(SvgDecoder.Factory())
+                 add(
+-                    coil3.network.okhttp.OkHttpNetworkFetcherFactory(
++                    com.nuvio.tv.core.network.imageNetworkFetcherFactory(
+                         callFactory = { imageOkHttpClient },
+                         cacheStrategy = {
+                             StaleWhileRevalidateCacheStrategy(
+diff --git a/app/src/main/java/com/nuvio/tv/core/network/ImageConnectivity.kt b/app/src/main/java/com/nuvio/tv/core/network/ImageConnectivity.kt
+new file mode 100644
+index 000000000..43104effe
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/network/ImageConnectivity.kt
+@@ -0,0 +1,57 @@
++package com.nuvio.tv.core.network
++
++import android.content.Context
++import android.net.ConnectivityManager
++import android.net.NetworkCapabilities
++import coil3.annotation.ExperimentalCoilApi
++import coil3.network.CacheStrategy
++import coil3.network.ConnectivityChecker
++import coil3.network.okhttp.OkHttpNetworkFetcherFactory
++import okhttp3.Call
++import okhttp3.OkHttpClient
++
++/**
++ * Coil's default checker only looks at [NetworkCapabilities.NET_CAPABILITY_INTERNET] on the
++ * active network. A DNS VPN is that network and omits the capability, so Coil sends
++ * `only-if-cached` and OkHttp answers HTTP 504. Treat a VPN transport as online. No active
++ * network stays offline so a miss still fails locally instead of occupying the image dispatcher.
++ */
++internal fun imageNetworkIsOnline(
++    activeNetworkPresent: Boolean,
++    capabilitiesPresent: Boolean,
++    hasInternet: Boolean,
++    isVpn: Boolean,
++): Boolean {
++    if (!activeNetworkPresent || !capabilitiesPresent) return false
++    return hasInternet || isVpn
++}
++
++@OptIn(ExperimentalCoilApi::class)
++internal fun imageConnectivityChecker(context: Context): ConnectivityChecker {
++    val manager = context.getSystemService(ConnectivityManager::class.java)
++        ?: return ConnectivityChecker.ONLINE
++    return ConnectivityChecker {
++        runCatching { manager.imageNetworkIsOnline() }.getOrDefault(true)
++    }
++}
++
++@OptIn(ExperimentalCoilApi::class)
++internal fun imageNetworkFetcherFactory(
++    callFactory: () -> Call.Factory = ::OkHttpClient,
++    cacheStrategy: () -> CacheStrategy = { CacheStrategy.DEFAULT },
++) = OkHttpNetworkFetcherFactory(
++    callFactory = callFactory,
++    cacheStrategy = cacheStrategy,
++    connectivityChecker = ::imageConnectivityChecker,
++)
++
++private fun ConnectivityManager.imageNetworkIsOnline(): Boolean {
++    val network = activeNetwork
++    val capabilities = network?.let { getNetworkCapabilities(it) }
++    return imageNetworkIsOnline(
++        activeNetworkPresent = network != null,
++        capabilitiesPresent = capabilities != null,
++        hasInternet = capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true,
++        isVpn = capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true,
++    )
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/dvmkv/HevcAlternativeTransferSei.java b/app/src/main/java/com/nuvio/tv/core/player/dvmkv/HevcAlternativeTransferSei.java
+new file mode 100644
+index 000000000..8f07199b5
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/player/dvmkv/HevcAlternativeTransferSei.java
+@@ -0,0 +1,189 @@
++package com.nuvio.tv.core.player.dvmkv;
++
++import androidx.annotation.Nullable;
++import androidx.media3.common.C;
++import androidx.media3.common.ColorInfo;
++import androidx.media3.common.Format;
++import androidx.media3.common.util.UnstableApi;
++import androidx.media3.container.NalUnitUtil;
++import androidx.media3.extractor.ExtractorInput;
++import java.io.IOException;
++import java.util.List;
++
++/**
++ * Reads the HEVC alternative transfer characteristics SEI (payload type 147). HLG streams made to
++ * stay compatible with SDR decoders signal BT.2020 in the SPS VUI and carry the HLG transfer only
++ * in this SEI, which sits in the access units rather than in the codec private data.
++ */
++@UnstableApi
++/* package */ final class HevcAlternativeTransferSei {
++
++  private static final int NAL_UNIT_TYPE_SPS = 33;
++  private static final int NAL_UNIT_TYPE_PREFIX_SEI = 39;
++  // NAL unit types below this carry slice data; the prefix SEI comes before them.
++  private static final int FIRST_NON_VCL_NAL_UNIT_TYPE = 32;
++  private static final int SEI_PAYLOAD_TYPE_ALTERNATIVE_TRANSFER = 147;
++  private static final int MAX_SEI_NAL_UNIT_SIZE = 64 * 1024;
++
++  private HevcAlternativeTransferSei() {}
++
++  /**
++   * Peeks the leading NAL units of a length-prefixed access unit and returns the preferred ISO
++   * transfer characteristics from its alternative transfer SEI, or {@link Format#NO_VALUE} if it
++   * has none. Leaves the peek position where it was.
++   */
++  public static int peekPreferredTransfer(
++      ExtractorInput input, int sampleSize, int nalUnitLengthFieldLength) throws IOException {
++    if (nalUnitLengthFieldLength < 1 || nalUnitLengthFieldLength > 4) {
++      return Format.NO_VALUE;
++    }
++    byte[] lengthField = new byte[4];
++    byte[] nalHeader = new byte[1];
++    long offset = 0;
++    try {
++      while (offset + nalUnitLengthFieldLength + 2 <= sampleSize) {
++        if (!input.peekFully(lengthField, 0, nalUnitLengthFieldLength, true)) {
++          return Format.NO_VALUE;
++        }
++        long nalLength = 0;
++        for (int i = 0; i < nalUnitLengthFieldLength; i++) {
++          nalLength = (nalLength << 8) | (lengthField[i] & 0xFF);
++        }
++        offset += nalUnitLengthFieldLength;
++        if (nalLength < 2 || offset + nalLength > sampleSize) {
++          return Format.NO_VALUE;
++        }
++        if (!input.peekFully(nalHeader, 0, 1, true)) {
++          return Format.NO_VALUE;
++        }
++        int nalUnitType = (nalHeader[0] >> 1) & 0x3F;
++        if (nalUnitType < FIRST_NON_VCL_NAL_UNIT_TYPE) {
++          return Format.NO_VALUE;
++        }
++        if (nalUnitType == NAL_UNIT_TYPE_PREFIX_SEI && nalLength <= MAX_SEI_NAL_UNIT_SIZE) {
++          byte[] nalUnit = new byte[(int) nalLength];
++          nalUnit[0] = nalHeader[0];
++          if (!input.peekFully(nalUnit, 1, nalUnit.length - 1, true)) {
++            return Format.NO_VALUE;
++          }
++          int preferredTransfer = parsePreferredTransfer(nalUnit, nalUnit.length);
++          if (preferredTransfer != Format.NO_VALUE) {
++            return preferredTransfer;
++          }
++        } else if (!input.advancePeekPosition((int) nalLength - 1, true)) {
++          return Format.NO_VALUE;
++        }
++        offset += nalLength;
++      }
++      return Format.NO_VALUE;
++    } finally {
++      input.resetPeekPosition();
++    }
++  }
++
++  /**
++   * Returns the preferred ISO transfer characteristics from a prefix SEI NAL unit (with its 2-byte
++   * header and emulation prevention bytes), or {@link Format#NO_VALUE} if it has no alternative
++   * transfer message.
++   */
++  /* package */ static int parsePreferredTransfer(byte[] nalUnit, int length) {
++    if (length < 3) {
++      return Format.NO_VALUE;
++    }
++    byte[] rbsp = new byte[length - 2];
++    System.arraycopy(nalUnit, 2, rbsp, 0, rbsp.length);
++    int rbspLength = NalUnitUtil.unescapeStream(rbsp, rbsp.length);
++    int position = 0;
++    // Stop at the rbsp trailing bits (a lone 0x80 byte).
++    while (position < rbspLength && !(position == rbspLength - 1 && rbsp[position] == (byte) 0x80)) {
++      int payloadType = 0;
++      while (position < rbspLength && rbsp[position] == (byte) 0xFF) {
++        payloadType += 255;
++        position++;
++      }
++      if (position >= rbspLength) {
++        return Format.NO_VALUE;
++      }
++      payloadType += rbsp[position++] & 0xFF;
++      int payloadSize = 0;
++      while (position < rbspLength && rbsp[position] == (byte) 0xFF) {
++        payloadSize += 255;
++        position++;
++      }
++      if (position >= rbspLength) {
++        return Format.NO_VALUE;
++      }
++      payloadSize += rbsp[position++] & 0xFF;
++      if (position + payloadSize > rbspLength) {
++        return Format.NO_VALUE;
++      }
++      if (payloadType == SEI_PAYLOAD_TYPE_ALTERNATIVE_TRANSFER && payloadSize >= 1) {
++        return rbsp[position] & 0xFF;
++      }
++      position += payloadSize;
++    }
++    return Format.NO_VALUE;
++  }
++
++  /** Whether the container colour info or the SPS VUI already declares a PQ or HLG transfer. */
++  public static boolean declaresHdrTransfer(Format format) {
++    if (format.colorInfo != null && isHdrTransfer(format.colorInfo.colorTransfer)) {
++      return true;
++    }
++    @Nullable NalUnitUtil.H265SpsData sps = findSps(format.initializationData);
++    return sps != null && isHdrTransfer(sps.colorTransfer);
++  }
++
++  public static boolean isHdrTransfer(@C.ColorTransfer int colorTransfer) {
++    return colorTransfer == C.COLOR_TRANSFER_ST2084 || colorTransfer == C.COLOR_TRANSFER_HLG;
++  }
++
++  /**
++   * Returns {@code format} with {@code colorTransfer} applied. Colour space, range and bit depth
++   * come from the existing colour info, else from the SPS in the initialization data.
++   */
++  public static Format withColorTransfer(Format format, @C.ColorTransfer int colorTransfer) {
++    ColorInfo.Builder builder;
++    if (format.colorInfo != null) {
++      builder = format.colorInfo.buildUpon();
++    } else {
++      builder =
++          new ColorInfo.Builder()
++              .setColorSpace(C.COLOR_SPACE_BT2020)
++              .setColorRange(C.COLOR_RANGE_LIMITED);
++      @Nullable NalUnitUtil.H265SpsData sps = findSps(format.initializationData);
++      if (sps != null) {
++        if (sps.colorSpace != Format.NO_VALUE) {
++          builder.setColorSpace(sps.colorSpace);
++        }
++        if (sps.colorRange != Format.NO_VALUE) {
++          builder.setColorRange(sps.colorRange);
++        }
++        builder
++            .setLumaBitdepth(sps.bitDepthLumaMinus8 + 8)
++            .setChromaBitdepth(sps.bitDepthChromaMinus8 + 8);
++      }
++    }
++    return format.buildUpon().setColorInfo(builder.setColorTransfer(colorTransfer).build()).build();
++  }
++
++  @Nullable
++  private static NalUnitUtil.H265SpsData findSps(List<byte[]> initializationData) {
++    for (byte[] data : initializationData) {
++      boolean[] prefixFlags = new boolean[3];
++      int start = NalUnitUtil.findNalUnit(data, 0, data.length, prefixFlags);
++      while (start < data.length) {
++        int next = NalUnitUtil.findNalUnit(data, start + 3, data.length, prefixFlags);
++        if (NalUnitUtil.getH265NalUnitType(data, start) == NAL_UNIT_TYPE_SPS) {
++          try {
++            return NalUnitUtil.parseH265SpsNalUnit(data, start + 3, next, null);
++          } catch (RuntimeException e) {
++            return null;
++          }
++        }
++        start = next;
++      }
++    }
++    return null;
++  }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/dvmkv/MatroskaExtractor.java b/app/src/main/java/com/nuvio/tv/core/player/dvmkv/MatroskaExtractor.java
+index 87d2dae0e..ff8409c2a 100644
+--- a/app/src/main/java/com/nuvio/tv/core/player/dvmkv/MatroskaExtractor.java
++++ b/app/src/main/java/com/nuvio/tv/core/player/dvmkv/MatroskaExtractor.java
+@@ -251,6 +251,7 @@ public class MatroskaExtractor implements Extractor {
+   private static final int MAX_EARLY_DTS_SCAN_BYTES = 8 * 1024 * 1024;
+   private static final int MAX_EARLY_DTS_FRAME_BYTES = 256 * 1024;
+   private static final int MAX_EARLY_DTS_BLOCK_HEADER_BYTES = 4096;
++  private static final int MAX_HEVC_ALTERNATIVE_TRANSFER_SAMPLES = 8;
+   private static final int MAX_EBML_HEADER_SIZE = 12; // 4-byte id + 8-byte data size.
+   private static final int MAX_SEEK_HEAD_FOLLOWS = 4;
+ 
+@@ -2255,6 +2256,18 @@ public class MatroskaExtractor implements Extractor {
+       maybeEndTracks();
+     }
+ 
++    if (track.isHevc
++        && track.hevcAlternativeTransferSamplesToCheck > 0
++        && !track.requiresDolbyVisionTransform
++        && !sampleEncodingHandled
++        && sampleBytesRead == 0
++        && zlibSampleSource == null
++        && !track.hasContentEncryption
++        && track.sampleStrippedBytes == null) {
++      track.hevcAlternativeTransferSamplesToCheck--;
++      maybeApplyHevcAlternativeTransfer(input, track, size);
++    }
++
+     TrackOutput output = track.output;
+     if (!sampleEncodingHandled) {
+       if (track.hasContentEncryption) {
+@@ -2485,6 +2498,34 @@ public class MatroskaExtractor implements Extractor {
+     return finishWriteSampleData();
+   }
+ 
++  /**
++   * Applies the HDR transfer from an HEVC alternative transfer SEI when the container and VUI
++   * declare none, so the decoder and display get HLG for streams that signal it only there.
++   */
++  private void maybeApplyHevcAlternativeTransfer(ExtractorInput input, Track track, int size)
++      throws IOException {
++    Format format = checkNotNull(track.format);
++    if (HevcAlternativeTransferSei.declaresHdrTransfer(format)) {
++      track.hevcAlternativeTransferSamplesToCheck = 0;
++      return;
++    }
++    int preferredTransfer =
++        HevcAlternativeTransferSei.peekPreferredTransfer(
++            input, size, track.nalUnitLengthFieldLength);
++    if (preferredTransfer == Format.NO_VALUE) {
++      return;
++    }
++    track.hevcAlternativeTransferSamplesToCheck = 0;
++    @C.ColorTransfer
++    int colorTransfer = ColorInfo.isoTransferCharacteristicsToColorTransfer(preferredTransfer);
++    if (!HevcAlternativeTransferSei.isHdrTransfer(colorTransfer)) {
++      return;
++    }
++    track.format = HevcAlternativeTransferSei.withColorTransfer(format, colorTransfer);
++    checkNotNull(track.output).format(track.format);
++    Log.i(TAG, "HEVC alternative transfer SEI: preferred transfer " + preferredTransfer);
++  }
++
+   private int writeLengthDelimitedSampleAsAnnexB(
+       TrackOutput output,
+       byte[] sampleLengthDelimitedData,
+@@ -3220,6 +3261,7 @@ public class MatroskaExtractor implements Extractor {
+     public byte @MonotonicNonNull [] dolbyVisionConfigBytes;
+     public @C.ColorTransfer int bitstreamColorTransfer = Format.NO_VALUE;
+     public @C.ColorTransfer int dolbyVisionBaseLayerTransfer = Format.NO_VALUE;
++    public int hevcAlternativeTransferSamplesToCheck = MAX_HEVC_ALTERNATIVE_TRANSFER_SAMPLES;
+     public byte @MonotonicNonNull [] pendingDolbyVisionBlockAdditionalData;
+ 
+     // Audio elements. Initially set to their default values.
+diff --git a/app/src/main/java/com/nuvio/tv/ui/components/ContinueWatchingSection.kt b/app/src/main/java/com/nuvio/tv/ui/components/ContinueWatchingSection.kt
+index 1de9e1590..e3ec81c32 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/components/ContinueWatchingSection.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/components/ContinueWatchingSection.kt
+@@ -469,6 +469,12 @@ fun ContinueWatchingCard(
+     val longPressKeyTracker = rememberLongPressKeyTracker()
+ 
+     val progress = remember(item) { (item as? ContinueWatchingItem.InProgress)?.progress }
++    val remainingEpisodes = remember(item) {
++        when (item) {
++            is ContinueWatchingItem.InProgress -> item.remainingEpisodes
++            is ContinueWatchingItem.NextUp -> item.info.remainingEpisodes
++        }
++    }
+     val nextUp = remember(item) { (item as? ContinueWatchingItem.NextUp)?.info }
+     val cardContext = LocalContext.current
+     val episodeStr = remember(progress, nextUp, cardContext) {
+@@ -690,6 +696,7 @@ fun ContinueWatchingCard(
+                 badgeBackground = badgeBackground,
+                 showBadge = progress == null,
+                 shufflePlayback = item.shufflePlayback,
++                remainingEpisodes = remainingEpisodes,
+                 progressFraction = progressFraction,
+                 hasProgress = progress != null,
+                 onImageError = {
+@@ -795,7 +802,17 @@ fun ContinueWatchingCard(
+                     )
+                 }
+ 
+-                if (item.shufflePlayback) EpisodeShuffleBadge(Modifier.align(Alignment.TopStart))
++                if (item.shufflePlayback || remainingEpisodes != null) {
++                    Column(
++                        modifier = Modifier
++                            .align(Alignment.TopStart)
++                            .padding(NuvioTheme.spacing.sm),
++                        verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.xs)
++                    ) {
++                        if (item.shufflePlayback) EpisodeShuffleBadge()
++                        remainingEpisodes?.let { EpisodeCountBadge(it) }
++                    }
++                }
+ 
+                 // Content info at bottom
+                 if (!textBelowArtwork) {
+@@ -916,6 +933,23 @@ fun ContinueWatchingCard(
+     }
+ }
+ 
++/** Small badge for the number of episodes left in a series. */
++@Composable
++private fun EpisodeCountBadge(count: Int) {
++    Box(
++        modifier = Modifier
++            .clip(BadgeShape)
++            .background(Color.Black.copy(alpha = 0.72f))
++            .padding(horizontal = NuvioTheme.spacing.sm, vertical = NuvioTheme.spacing.xs)
++    ) {
++        Text(
++            text = stringResource(R.string.cw_episodes_left, count),
++            style = MaterialTheme.typography.labelSmall,
++            color = NuvioTheme.colors.TextPrimary
++        )
++    }
++}
++
+ // Wide card layout with the artwork as a strip on the left and the details stacked beside it.
+ @Composable
+ private fun WideCardContent(
+@@ -936,6 +970,7 @@ private fun WideCardContent(
+     badgeBackground: Color,
+     showBadge: Boolean,
+     shufflePlayback: Boolean,
++    remainingEpisodes: Int?,
+     progressFraction: Float,
+     hasProgress: Boolean,
+     onImageError: () -> Unit
+@@ -974,7 +1009,17 @@ private fun WideCardContent(
+                     onError = { onImageError() }
+                 )
+             }
+-            if (shufflePlayback) EpisodeShuffleBadge(Modifier.align(Alignment.TopStart))
++            if (shufflePlayback || remainingEpisodes != null) {
++                Column(
++                    modifier = Modifier
++                        .align(Alignment.TopStart)
++                        .padding(NuvioTheme.spacing.sm),
++                    verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.xs)
++                ) {
++                    if (shufflePlayback) EpisodeShuffleBadge()
++                    remainingEpisodes?.let { EpisodeCountBadge(it) }
++                }
++            }
+         }
+ 
+         Column(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeUiState.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeUiState.kt
+index aa47e2a6e..64f05d957 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeUiState.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeUiState.kt
+@@ -96,7 +96,8 @@ sealed class ContinueWatchingItem {
+         override val shufflePlayback: Boolean = false,
+         val originalPoster: String? = null,
+         val customLandscapePoster: String? = null,
+-        val mdbListRatings: com.nuvio.tv.domain.model.MDBListRatings? = null
++        val mdbListRatings: com.nuvio.tv.domain.model.MDBListRatings? = null,
++        val remainingEpisodes: Int? = null
+     ) : ContinueWatchingItem()
+ 
+     @Immutable
+@@ -142,7 +143,8 @@ data class NextUpInfo(
+     val seedSeason: Int? = null,
+     val seedEpisode: Int? = null,
+     val contentLanguage: String? = null,
+-    val mdbListRatings: com.nuvio.tv.domain.model.MDBListRatings? = null
++    val mdbListRatings: com.nuvio.tv.domain.model.MDBListRatings? = null,
++    val remainingEpisodes: Int? = null
+ )
+ 
+ @Immutable
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModel.kt
+index 908d21cf9..909f51e33 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModel.kt
+@@ -299,6 +299,7 @@ class HomeViewModel @Inject constructor(
+     internal val cwLastProcessedNextUpContentIds: MutableSet<String> = ConcurrentHashMap.newKeySet()
+     internal val cwProcessedOlderSeedContentIds: MutableSet<String> = ConcurrentHashMap.newKeySet()
+     internal val cwEnrichedNextUpOverlay = ConcurrentHashMap<String, NextUpInfo>()
++    internal var cwLastWatchedEpisodeCounts: Map<String, Int> = emptyMap()
+     /** In-memory cache of enriched InProgress items per contentId+episode key. */
+     internal val cwEnrichedInProgressOverlay = ConcurrentHashMap<String, ContinueWatchingItem.InProgress>()
+     /** Bumped to force the CW pipeline to re-run (e.g. after cache clear). */
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelContinueWatching.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelContinueWatching.kt
+index c3cfbffe0..5d8d4d063 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelContinueWatching.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelContinueWatching.kt
+@@ -93,6 +93,22 @@ internal data class CwMetaSummary(
+     val country: String?,
+     val videos: List<CwVideoSummary>
+ ) {
++    /** Regular episodes after the latest watched one, or null when the addon has no episode list. */
++    fun remainingEpisodeCount(watched: Set<Pair<Int, Int>>): Int? {
++        val episodes = videos.mapNotNull { video ->
++            val season = video.season
++            val episode = video.episode
++            if (season != null && season > 0 && episode != null) season to episode else null
++        }.distinct()
++        if (episodes.isEmpty()) return null
++        val order = compareBy<Pair<Int, Int>>({ it.first }, { it.second })
++        val latestWatched = watched
++            .filter { it.first > 0 }
++            .maxWithOrNull(order)
++            ?: return episodes.size
++        return episodes.count { order.compare(it, latestWatched) > 0 }.coerceAtLeast(0)
++    }
++
+     fun watchableEpisodes(): List<CwVideoSummary> {
+         val candidates = videos.filter { it.season != null && it.episode != null && (it.season ?: 0) > 0 }
+         fun isFutureRelease(raw: String?): Boolean = isEpisodeReleaseAired(raw) == false
+@@ -1571,6 +1587,23 @@ private suspend fun HomeViewModel.enrichVisibleContinueWatchingItems(
+ 
+     val metaCache = cwMetaCache
+     val enrichmentSemaphore = Semaphore(CW_MAX_ENRICHMENT_CONCURRENCY)
++    val watchedEpisodesByShow = if (finalItems.any { item ->
++            when (item) {
++                is ContinueWatchingItem.InProgress -> isSeriesTypeCW(item.progress.contentType)
++                is ContinueWatchingItem.NextUp -> isSeriesTypeCW(item.info.contentType)
++            }
++        }
++    ) {
++        runCatching { watchProgressRepository.getWatchedShowEpisodes() }.getOrDefault(emptyMap())
++    } else {
++        emptyMap()
++    }
++    val watchedCounts = watchedEpisodesByShow.mapValues { it.value.size }
++    if (watchedCounts != cwLastWatchedEpisodeCounts) {
++        cwLastWatchedEpisodeCounts = watchedCounts
++        cwEnrichedNextUpOverlay.clear()
++        cwEnrichedInProgressOverlay.clear()
++    }
+     val enrichedItems = finalItems
+         .mapIndexed { index, item ->
+             async(Dispatchers.IO) {
+@@ -1592,7 +1625,10 @@ private suspend fun HomeViewModel.enrichVisibleContinueWatchingItems(
+                                     )
+                                 )
+                             } else {
+-                                enrichInProgressItem(item, metaCache, debug)
++                                enrichInProgressItem(
++                                    item, metaCache, debug,
++                                    watchedEpisodesByShow[item.progress.contentId].orEmpty()
++                                )
+                             }
+                         }
+                         is ContinueWatchingItem.NextUp -> {
+@@ -1628,7 +1664,10 @@ private suspend fun HomeViewModel.enrichVisibleContinueWatchingItems(
+                                     item.copy(info = overlay)
+                                 }
+                             } else {
+-                                enrichNextUpItem(item, metaCache, debug)
++                                enrichNextUpItem(
++                                    item, metaCache, debug,
++                                    watchedEpisodesByShow[item.info.contentId].orEmpty()
++                                )
+                             }
+                         }
+                     }
+@@ -1926,7 +1965,8 @@ private suspend fun HomeViewModel.buildNextUpItem(
+ private suspend fun HomeViewModel.enrichInProgressItem(
+     item: ContinueWatchingItem.InProgress,
+     metaCache: MutableMap<String, CwMetaSummary?>,
+-    debug: CwDebugSession? = null
++    debug: CwDebugSession? = null,
++    watchedEpisodes: Set<Pair<Int, Int>> = emptySet()
+ ): ContinueWatchingItem.InProgress = coroutineScope {
+     val shouldEnrichTmdb = currentTmdbSettings.enabled && currentTmdbSettings.enrichContinueWatching
+ 
+@@ -1943,6 +1983,11 @@ private suspend fun HomeViewModel.enrichInProgressItem(
+     if (meta == null) {
+         return@coroutineScope item
+     }
++    val remainingEpisodes = if (isSeriesTypeCW(item.progress.contentType)) {
++        meta.remainingEpisodeCount(watchedEpisodes)
++    } else {
++        null
++    }
+     val video = resolveVideoForProgress(item.progress, meta)
+     val genres = meta.genres.take(3)
+     val releaseInfo = meta.releaseInfo?.takeIf { it.isNotBlank() }
+@@ -2013,14 +2058,16 @@ private suspend fun HomeViewModel.enrichInProgressItem(
+         contentLanguage = tmdbData?.contentLanguage
+             ?: normalizeLanguageCode(meta.language)
+             ?: countryToLanguageCode(meta.country)
+-            ?: item.contentLanguage
++            ?: item.contentLanguage,
++        remainingEpisodes = remainingEpisodes
+     )
+ }
+ 
+ private suspend fun HomeViewModel.enrichNextUpItem(
+     item: ContinueWatchingItem.NextUp,
+     metaCache: MutableMap<String, CwMetaSummary?>,
+-    debug: CwDebugSession? = null
++    debug: CwDebugSession? = null,
++    watchedEpisodes: Set<Pair<Int, Int>> = emptySet()
+ ): ContinueWatchingItem.NextUp = coroutineScope {
+     val progressSeed = item.info.toProgressSeed()
+     val shouldEnrichTmdb = currentTmdbSettings.enabled && currentTmdbSettings.enrichContinueWatching
+@@ -2035,6 +2082,11 @@ private suspend fun HomeViewModel.enrichNextUpItem(
+     } else null
+ 
+     val meta = resolveMetaForProgress(progressSeed, metaCache, debug) ?: return@coroutineScope item
++    val remainingEpisodes = if (isSeriesTypeCW(progressSeed.contentType)) {
++        meta.remainingEpisodeCount(watchedEpisodes)
++    } else {
++        null
++    }
+     val video = resolveNextUpVideoFromMeta(progressSeed, meta)
+ 
+     val tmdbData = if (shouldEnrichTmdb) {
+@@ -2117,7 +2169,8 @@ private suspend fun HomeViewModel.enrichNextUpItem(
+             ?: normalizeLanguageCode(meta.language)
+             ?: countryToLanguageCode(meta.country)
+             ?: item.info.contentLanguage,
+-        imdbRating = episodeRating
++        imdbRating = episodeRating,
++        remainingEpisodes = remainingEpisodes
+     )
+     if (shouldTraceNextUpSeries(progressSeed)) {
+         logNextUpDecision(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamProviderGrouping.kt b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamProviderGrouping.kt
+new file mode 100644
+index 000000000..24ec049f3
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamProviderGrouping.kt
+@@ -0,0 +1,18 @@
++package com.nuvio.tv.ui.screens.stream
++
++import com.nuvio.tv.domain.model.Stream
++
++private fun Stream.providerKey(): String =
++    pluginSourceName?.takeIf(String::isNotBlank) ?: addonName
++
++// Keeps each addon's and provider's first-seen order so quality ranking inside a group survives.
++internal fun groupStreamsByProvider(streams: List<Stream>): List<Stream> =
++    streams.groupBy { it.addonName }.values.flatMap { addonStreams ->
++        addonStreams.groupBy { it.providerKey() }.values.flatten()
++    }
++
++internal fun streamProviderHeader(stream: Stream, previous: Stream? = null): String? =
++    stream.pluginSourceName?.takeIf {
++        it.isNotBlank() && it != stream.addonName &&
++            (previous?.addonName != stream.addonName || previous.pluginSourceName != it)
++    }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreen.kt
+index 778d7cbab..c89ee78bf 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreen.kt
+@@ -1348,6 +1348,7 @@ private fun StreamsList(
+                         color = NuvioTheme.colors.TextSecondary,
+                         modifier = Modifier.padding(start = NuvioTheme.spacing.xs)
+                     )
++                    StreamProviderHeader(streamProviderHeader(shared.stream))
+                     StreamCard(
+                         stream = shared.stream,
+                         showFileSizeBadges = showFileSizeBadges,
+@@ -1369,7 +1370,11 @@ private fun StreamsList(
+         itemsIndexed(streams, key = { index, _ ->
+             streamKeys[index]
+         }) { index, stream ->
+-            Box(modifier = Modifier.padding(vertical = NuvioTheme.spacing.xs)) {
++            Column(
++                modifier = Modifier.padding(vertical = NuvioTheme.spacing.xs),
++                verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.sm)
++            ) {
++                StreamProviderHeader(streamProviderHeader(stream, streams.getOrNull(index - 1)))
+                 val isPartySource = partySource?.matches(stream) == true
+                 StreamCard(
+                     stream = stream,
+@@ -1403,6 +1408,20 @@ private fun StreamsList(
+     }
+ }
+ 
++@Composable
++private fun StreamProviderHeader(sourceName: String?) {
++    sourceName?.let { sourceName ->
++        Text(
++            text = sourceName,
++            modifier = Modifier.padding(start = NuvioTheme.spacing.lg),
++            style = MaterialTheme.typography.labelSmall.copy(
++                textDirection = sourceName.contentTextDirection()
++            ),
++            color = NuvioTheme.extendedColors.textSecondary
++        )
++    }
++}
++
+ @OptIn(ExperimentalTvMaterial3Api::class)
+ @Composable
+ private fun StreamCard(
+@@ -1531,16 +1550,6 @@ private fun StreamCard(
+                     }
+                 }
+ 
+-                stream.pluginSourceName?.takeIf { it.isNotBlank() && it != stream.addonName }?.let { sourceName ->
+-                    Text(
+-                        text = sourceName,
+-                        style = MaterialTheme.typography.labelSmall.copy(
+-                            textDirection = sourceName.contentTextDirection()
+-                        ),
+-                        color = NuvioTheme.extendedColors.textSecondary
+-                    )
+-                }
+-
+                 streamDescription?.let { description ->
+                     if (description.isNotBlank() && description != streamName) {
+                         Text(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
+index 2a4a939a0..880893bbd 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
+@@ -267,11 +267,12 @@ class StreamScreenViewModel @Inject constructor(
+                         }
+                         val updatedAllStreams = updatedAddonStreams.flatMap { it.streams }
+                         val currentFilter = state.selectedAddonFilter
+-                        val fullFiltered = if (currentFilter == null) {
++                        val fullFilteredRaw = if (currentFilter == null) {
+                             updatedAllStreams
+                         } else {
+                             updatedAllStreams.filter { it.addonName == currentFilter }
+                         }
++                        val fullFiltered = groupStreamsByProvider(fullFilteredRaw)
+                         streamFilterFullList = fullFiltered
+                         val pageEnd = state.filteredStreams.size
+                             .coerceAtLeast(STREAM_FILTER_PAGE_SIZE.coerceAtMost(fullFiltered.size))
+@@ -401,7 +402,8 @@ class StreamScreenViewModel @Inject constructor(
+         val groups = byName.values.toList().let { orderStreamGroups?.invoke(it) ?: it }
+         val allStreams = groups.flatMap { it.streams }
+         val filter = current.selectedAddonFilter
+-        val fullFiltered = if (filter == null) allStreams else allStreams.filter { it.addonName == filter }
++        val fullFilteredRaw = if (filter == null) allStreams else allStreams.filter { it.addonName == filter }
++        val fullFiltered = groupStreamsByProvider(fullFilteredRaw)
+         streamFilterFullList = fullFiltered
+         val shown = maxOf(current.filteredStreams.size, STREAM_FILTER_PAGE_SIZE).coerceAtMost(fullFiltered.size)
+         updateUiStateIfChanged {
+@@ -769,11 +771,12 @@ class StreamScreenViewModel @Inject constructor(
+                 }
+ 
+                 val currentFilter = _uiState.value.selectedAddonFilter
+-                val fullFiltered = if (currentFilter == null) {
++                val fullFilteredRaw = if (currentFilter == null) {
+                     allStreams
+                 } else {
+                     allStreams.filter { it.addonName == currentFilter }
+                 }
++                val fullFiltered = groupStreamsByProvider(fullFilteredRaw)
+                 streamFilterFullList = fullFiltered
+                 val currentPageSize = _uiState.value.filteredStreams.size
+                 val isFirstLoad = currentPageSize == 0
+@@ -878,11 +881,12 @@ class StreamScreenViewModel @Inject constructor(
+                                     addonStreams.streams
+                                 }
+                                 val currentFilter = state.selectedAddonFilter
+-                                val fullFiltered = if (currentFilter == null) {
++                                val fullFilteredRaw = if (currentFilter == null) {
+                                     updatedAllStreams
+                                 } else {
+                                     updatedAllStreams.filter { it.addonName == currentFilter }
+                                 }
++                                val fullFiltered = groupStreamsByProvider(fullFilteredRaw)
+                                 streamFilterFullList = fullFiltered
+                                 val pageEnd = state.filteredStreams.size
+                                     .coerceAtLeast(STREAM_FILTER_PAGE_SIZE.coerceAtMost(fullFiltered.size))
+@@ -1381,11 +1385,12 @@ class StreamScreenViewModel @Inject constructor(
+             if (state.selectedAddonFilter == addonName) {
+                 return@updateUiStateIfChanged state
+             }
+-            val fullFiltered = if (addonName == null) {
++            val fullFilteredRaw = if (addonName == null) {
+                 state.allStreams
+             } else {
+                 state.allStreams.filter { it.addonName == addonName }
+             }
++            val fullFiltered = groupStreamsByProvider(fullFilteredRaw)
+             streamFilterFullList = fullFiltered
+             val paginatedStreams = if (fullFiltered.size > STREAM_FILTER_PAGE_SIZE) {
+                 fullFiltered.subList(0, STREAM_FILTER_PAGE_SIZE)
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 5874158d4..b235e9641 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -138,6 +138,7 @@
+ 
+     <string name="continue_watching">Continue Watching</string>
+     <string name="cw_upcoming">Upcoming</string>
++    <string name="cw_episodes_left">#%1$d EP left</string>
+     <string name="cw_next_up">Next Up</string>
+     <string name="cw_next_up_short">Next</string>
+     <string name="cw_new_episode">New Episode</string>
