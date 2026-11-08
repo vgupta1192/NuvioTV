@@ -1,0 +1,1329 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt
+index 923ce5222..779702561 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerTracks.kt
+@@ -32,7 +32,7 @@ internal fun PlayerRuntimeController.applyYouTubeCodecPreference() {
+     val order = com.nuvio.tv.youtube.YouTubeSettings.codecMimeOrder(context)
+     // H.264 stops at 1080p on YouTube; in Auto keep it there so "most compatible" really plays H.264.
+     val capToAvc = com.nuvio.tv.youtube.YouTubeSettings.codecPreference(context) == "avc" &&
+-        com.nuvio.tv.youtube.YouTubeSettings.preferredHeight(context) <= 0
++        com.nuvio.tv.youtube.YouTubeSettings.effectivePreferredHeight(context) <= 0
+     val builder = player.trackSelectionParameters.buildUpon()
+         .setPreferredVideoMimeTypes(*order.toTypedArray())
+     if (capToAvc) builder.setMaxVideoSize(1920, 1080) else builder.setMaxVideoSize(Int.MAX_VALUE, Int.MAX_VALUE)
+@@ -414,7 +414,7 @@ internal fun PlayerRuntimeController.updateAvailableTracks(tracks: Tracks) {
+         com.nuvio.tv.youtube.YouTubeSettings.playbackSpeed(context).takeIf { it > 0f && it != 1f }?.let { speed ->
+             onEvent(PlayerEvent.OnSetPlaybackSpeed(speed))
+         }
+-        val preferred = com.nuvio.tv.youtube.YouTubeSettings.preferredHeight(context)
++        val preferred = com.nuvio.tv.youtube.YouTubeSettings.effectivePreferredHeight(context)
+         if (preferred > 0) {
+             val height = videoQualities.map { it.heightPx }.firstOrNull { it <= preferred }
+                 ?: videoQualities.last().heightPx
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+index c8b1a9e36..4f5f24b5b 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+@@ -249,6 +249,29 @@ fun PlayerScreen(
+     onOpenPartyMedia: (PartyMedia) -> Unit = {}
+ ) {
+     val uiState by viewModel.uiState.collectAsState()
++    // YouTube's translated captions are served by YouTubeMpdServer as a segmented track that ExoPlayer
++    // fetches but never turns into cues, so the current line is read and shown here instead.
++    val youtubeCaptionVideo = viewModel.controller.contentId
++        ?.takeIf { com.nuvio.tv.youtube.YouTubeProgress.isYouTubeId(it) }
++        ?.removePrefix(com.nuvio.tv.youtube.YouTubeProgress.ID_PREFIX)
++    val youtubeCaptionLanguage = uiState.subtitleTracks
++        .getOrNull(uiState.selectedSubtitleTrackIndex)
++        ?.takeIf { "*" in (it.name.orEmpty()) }
++        ?.language
++    val youtubeCaptionTranslated = youtubeCaptionVideo != null &&
++        youtubeCaptionLanguage != null &&
++        com.nuvio.tv.youtube.YouTubeMpdServer.hasTranslatedTrack(youtubeCaptionVideo, youtubeCaptionLanguage)
++    LaunchedEffect(youtubeCaptionVideo, youtubeCaptionLanguage, youtubeCaptionTranslated) {
++        val videoId = youtubeCaptionVideo ?: return@LaunchedEffect
++        val language = youtubeCaptionLanguage ?: return@LaunchedEffect
++        if (!youtubeCaptionTranslated) return@LaunchedEffect
++        val captions = com.nuvio.tv.youtube.YouTubeTranslatedCaptions(videoId, language)
++        while (true) {
++            val position = viewModel.controller.exoPlayer?.currentPosition ?: 0L
++            viewModel.controller.subtitleCueTracker.updateText(captions.lineAt(position))
++            delay(250)
++        }
++    }
+     val playerBadges = rememberPlayerBadges(viewModel, uiState)
+     val partyState by viewModel.party.state.collectAsState()
+     val partyPlayback by viewModel.party.playback.collectAsState()
+@@ -1202,9 +1225,9 @@ fun PlayerScreen(
+             !postPlayRecommendationState.isTrailerPlaying &&
+             (!postPlayRecommendationState.isVisible || !postPlayRecommendationState.hasAutoPlayedTrailer)
+         ) {
+-            LaunchedEffect(postPlayRecommendationState.isVisible) {
++            LaunchedEffect(postPlayRecommendationState.isVisible, youtubeCaptionTranslated) {
+                 val playerView = viewModel.controller.exoPlayerView
+-                val vis = if (postPlayRecommendationState.isVisible) {
++                val vis = if (postPlayRecommendationState.isVisible || youtubeCaptionTranslated) {
+                     android.view.View.GONE
+                 } else {
+                     android.view.View.VISIBLE
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/YouTubeSettingsContent.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/YouTubeSettingsContent.kt
+index d33dec756..5f1f24b90 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/YouTubeSettingsContent.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/YouTubeSettingsContent.kt
+@@ -51,6 +51,7 @@ internal fun YouTubeSettingsContent(
+     var sponsorOn by remember { mutableStateOf(YouTubeSettings.sponsorBlockEnabled(context)) }
+     var categories by remember { mutableStateOf(YouTubeSettings.sponsorCategoriesOn(context)) }
+     var quality by remember { mutableStateOf(YouTubeSettings.preferredHeight(context)) }
++    var compatibility by remember { mutableStateOf(YouTubeSettings.compatibilityMode(context)) }
+     var hiddenTabs by remember { mutableStateOf(YouTubeSettings.hiddenTabs(context)) }
+     var autoplay by remember { mutableStateOf(YouTubeSettings.autoplayNext(context)) }
+     var sponsorAsk by remember { mutableStateOf(YouTubeSettings.sponsorAsk(context)) }
+@@ -184,12 +185,16 @@ internal fun YouTubeSettingsContent(
+             )
+             SettingsActionRow(
+                 title = "Video format",
+-                subtitle = "Auto prefers VP9, then H.264, and leaves AV1 for last. Pick H.264 if video stutters.",
++                subtitle = if (YouTubeSettings.compatibilityActive(context))
++                    "Auto uses H.264 on this device for smoother playback. Pick H.264 if video stutters."
++                else "Auto prefers VP9, then H.264, and leaves AV1 for last. Pick H.264 if video stutters.",
+                 value = YouTubeSettings.codecLabel(codec),
+                 onClick = {
+                     val choices = YouTubeSettings.codecChoices
+                     codec = choices[(choices.indexOf(codec).coerceAtLeast(0) + 1) % choices.size]
+                     YouTubeSettings.setCodecPreference(context, codec)
++                    YouTubeSettings.onUserSelectedCodec(context, codec)
++                    compatibility = YouTubeSettings.compatibilityMode(context)
+                 }
+             )
+             SettingsActionRow(
+@@ -203,14 +208,32 @@ internal fun YouTubeSettingsContent(
+                     com.nuvio.tv.youtube.YouTubeContentRegion.apply(context)
+                 }
+             )
++            SettingsActionRow(
++                title = "Device compatibility",
++                subtitle = YouTubeSettings.compatibilityDescription(context, compatibility),
++                value = YouTubeSettings.compatibilityLabel(context, compatibility),
++                onClick = {
++                    val next = when (compatibility) {
++                        "auto" -> "on"
++                        "on" -> "off"
++                        else -> "auto"
++                    }
++                    YouTubeSettings.setCompatibilityMode(context, next)
++                    compatibility = next
++                }
++            )
+             SettingsActionRow(
+                 title = "Default quality",
+-                subtitle = "The video size to start at. You can still change it in the player.",
++                subtitle = if (quality <= 0 && YouTubeSettings.compatibilityActive(context))
++                    "Auto currently starts at ${YouTubeSettings.compatibilityMaxHeight(context)}p on this device. You can still change it in the player."
++                else "The video size to start at. You can still change it in the player.",
+                 value = YouTubeSettings.qualityLabel(quality),
+                 onClick = {
+-                    val choices = YouTubeSettings.qualityChoices
++                    val choices = YouTubeSettings.qualityCycle(context)
+                     quality = choices[(choices.indexOf(quality).coerceAtLeast(0) + 1) % choices.size]
+                     YouTubeSettings.setPreferredHeight(context, quality)
++                    YouTubeSettings.onUserSelectedQuality(context, quality)
++                    compatibility = YouTubeSettings.compatibilityMode(context)
+                 }
+             )
+         }
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeAutoCaptions.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeAutoCaptions.kt
+new file mode 100644
+index 000000000..1a2188edd
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeAutoCaptions.kt
+@@ -0,0 +1,70 @@
++package com.nuvio.tv.youtube
++
++/**
++ * YouTube's speech-recognition captions roll up. In its WebVTT file each caption holds two lines: the line before
++ * on top (plain) and the new line under it (with a timing tag on every word), followed by a ten-millisecond
++ * caption that shows the old line alone. Shown as they come, the old line stays up while the new one appears.
++ *
++ * [tidy] leaves one line per caption, the newest, with no timing tags, no repeats, and each caption ending where
++ * the next begins, so the previous line is gone when the next one appears.
++ */
++object YouTubeAutoCaptions {
++    private class Cue(val start: Long, var end: Long, val text: String)
++
++    private val tags = Regex("<[^>]*>")
++    private val space = Regex("[\\s\\u00A0]+")
++    private val timing = Regex("(?:(\\d+):)?(\\d{1,2}):(\\d{2})[.,](\\d{3})\\s*-->\\s*(?:(\\d+):)?(\\d{1,2}):(\\d{2})[.,](\\d{3})")
++
++    /**
++     * Auto-generated captions use inline timing tags such as `<00:00:19.760>` and `<c>`.
++     * A translated track can lose the `kind=asr` query parameter, so detect the rolling
++     * format from the file itself instead of trusting the URL alone.
++     */
++    fun looksAutomatic(file: String): Boolean =
++        file.contains("<c>") || Regex("<\\d{2}:\\d{2}:\\d{2}\\.\\d{3}>").containsMatchIn(file)
++
++    /** The captions in [file] (WebVTT) with only each caption's newest line. Anything else is returned as it is. */
++    fun tidy(file: String): String {
++        val text = file.replace("\r\n", "\n")
++        if (!text.trimStart('﻿', ' ', '\n').startsWith("WEBVTT")) return file
++        val cues = ArrayList<Cue>()
++        for (block in text.split(Regex("\n{2,}"))) {
++            val lines = block.split('\n')
++            val at = lines.indexOfFirst { "-->" in it }
++            if (at < 0) continue
++            val m = timing.find(lines[at]) ?: continue
++            val start = millis(m.groupValues[1], m.groupValues[2], m.groupValues[3], m.groupValues[4])
++            val end = millis(m.groupValues[5], m.groupValues[6], m.groupValues[7], m.groupValues[8])
++            val newest = lines.drop(at + 1)
++                .map { it.replace(tags, "").replace(space, " ").trim() }
++                .lastOrNull { it.isNotEmpty() } ?: continue
++            val last = cues.lastOrNull()
++            // The old line shown again on its own for a moment: the same caption, lasting a little longer.
++            if (last != null && last.text == newest) last.end = maxOf(last.end, end)
++            else cues += Cue(start, end, newest)
++        }
++        if (cues.isEmpty()) return file
++        // A caption never carries on under the next one.
++        for (i in 0 until cues.lastIndex) {
++            val next = cues[i + 1].start
++            if (cues[i].end > next && next > cues[i].start) cues[i].end = next
++        }
++        return buildString {
++            append("WEBVTT\n\n")
++            for (c in cues) {
++                append(stamp(c.start)).append(" --> ").append(stamp(maxOf(c.end, c.start + 1))).append('\n')
++                append(c.text).append("\n\n")
++            }
++        }
++    }
++
++    private fun millis(h: String, m: String, s: String, ms: String): Long =
++        (h.toLongOrNull() ?: 0L) * 3_600_000 + m.toLong() * 60_000 + s.toLong() * 1_000 + ms.toLong()
++
++    private fun stamp(ms: Long): String {
++        val h = ms / 3_600_000
++        val m = ms / 60_000 % 60
++        val s = ms / 1_000 % 60
++        return "%02d:%02d:%02d.%03d".format(h, m, s, ms % 1_000)
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeCaptionSegments.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeCaptionSegments.kt
+new file mode 100644
+index 000000000..4ef89f551
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeCaptionSegments.kt
+@@ -0,0 +1,33 @@
++package com.nuvio.tv.youtube
++
++/** Builds a WebVTT segment with timestamps relative to its start, including cues crossing its edges. */
++internal object YouTubeCaptionSegments {
++    const val DURATION_SECONDS = 60L
++    private val timing = Regex("(?:(\\d+):)?(\\d{1,2}):(\\d{2})[.,](\\d{3})\\s*-->\\s*(?:(\\d+):)?(\\d{1,2}):(\\d{2})[.,](\\d{3})")
++
++    fun extract(file: String, number: Long): String {
++        if (number < 0 || number > (Long.MAX_VALUE - DURATION_SECONDS * 1000) / (DURATION_SECONDS * 1000)) return "WEBVTT\n\n"
++        val start = number * DURATION_SECONDS * 1000
++        val end = start + DURATION_SECONDS * 1000
++        val result = StringBuilder("WEBVTT\n\n")
++        for (block in file.replace("\r\n", "\n").split(Regex("\n{2,}"))) {
++            val lines = block.lines()
++            val index = lines.indexOfFirst { "-->" in it }
++            if (index < 0) continue
++            val match = timing.find(lines[index]) ?: continue
++            fun time(i: Int) = (match.groupValues[i].toLongOrNull() ?: 0L) * 3_600_000 +
++                match.groupValues[i + 1].toLong() * 60_000 + match.groupValues[i + 2].toLong() * 1_000 + match.groupValues[i + 3].toLong()
++            val cueStart = time(1)
++            val cueEnd = time(5)
++            if (cueEnd <= start || cueStart >= end) continue
++            result.append(stamp((cueStart - start).coerceAtLeast(0))).append(" --> ")
++                .append(stamp((cueEnd - start).coerceAtMost(end - start))).append('\n')
++            result.append(lines.drop(index + 1).joinToString("\n")).append("\n\n")
++        }
++        return result.toString()
++    }
++
++    private fun stamp(ms: Long): String = "%02d:%02d:%02d.%03d".format(
++        java.util.Locale.US, ms / 3_600_000, ms / 60_000 % 60, ms / 1_000 % 60, ms % 1_000
++    )
++}
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeCaptionTranslation.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeCaptionTranslation.kt
+new file mode 100644
+index 000000000..bb179ea43
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeCaptionTranslation.kt
+@@ -0,0 +1,260 @@
++package com.nuvio.tv.youtube
++
++import android.util.Log
++import okhttp3.FormBody
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import org.json.JSONArray
++import org.json.JSONObject
++import java.io.File
++import java.net.URLEncoder
++import java.util.concurrent.ConcurrentHashMap
++import java.util.concurrent.Executors
++import java.util.concurrent.TimeUnit
++
++/**
++ * Translates caption text for the auto-translated tracks.
++ *
++ * YouTube hands translated captions only to its own apps, so the video's own captions are fetched
++ * and translated here. The free Google endpoint that does the translating refuses some networks
++ * outright: instead of a translation it answers with a captcha (HTTP 302 to google.com/sorry), and
++ * a home connection behind a VPN or a shared IP can stay barred for a long time.
++ *
++ * So more than one translator is tried. A provider that refuses is put on a cool-down and skipped
++ * for the next few minutes, which keeps the page from waiting on a service that is already saying
++ * no. Lines that did get translated are remembered in memory and on disk, so seeking back over the
++ * same minute costs no requests at all.
++ */
++internal object YouTubeCaptionTranslation {
++    private const val TAG = "YouTubeCaptions"
++    private const val USER_AGENT =
++        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
++    /** How long a refusing translator is skipped for. */
++    private const val COOLDOWN_MS = 10 * 60 * 1000L
++    /** MyMemory answers a single GET, and the free endpoint caps the query at about 500 URL-encoded bytes. */
++    private const val MYMEMORY_MAX_CHARS = 300
++    /** Translated lines kept in memory for the session. */
++    private const val MEMORY_LIMIT = 4_000
++    /** Translated lines read back from a language's cache file. */
++    private const val DISK_LIMIT = 20_000
++    private const val DISK_MAX_BYTES = 4L * 1024 * 1024
++    private const val SEP = "\u0000"
++
++    private class Provider(val name: String, val translate: (String, String, String?) -> String?)
++
++    private val providers = listOf(
++        Provider("google", ::translateWithGoogle),
++        Provider("mymemory", ::translateWithMyMemory)
++    )
++
++    private val cooldownUntil = ConcurrentHashMap<String, Long>()
++    private val memory = ConcurrentHashMap<String, String>()
++    private val diskMaps = ConcurrentHashMap<String, MutableMap<String, String>>()
++
++    @Volatile private var cacheDir: File? = null
++
++    private val writer = Executors.newSingleThreadExecutor { runnable ->
++        Thread(runnable, "yt-caption-cache").apply { isDaemon = true }
++    }
++
++    private val http by lazy {
++        // Redirects are not followed: a captcha block is a redirect, and following it would read as
++        // a successful HTML page rather than the refusal it is.
++        OkHttpClient.Builder()
++            .followRedirects(false)
++            .followSslRedirects(false)
++            .connectTimeout(10, TimeUnit.SECONDS)
++            .readTimeout(15, TimeUnit.SECONDS)
++            .callTimeout(20, TimeUnit.SECONDS)
++            .build()
++    }
++
++    /** Tells the translator where to keep its cache. Null keeps translations in memory only. */
++    fun attach(dir: File?) {
++        cacheDir = dir
++    }
++
++    /** Translates [text] into [language]; null when no translator could be reached. */
++    fun translate(text: String, language: String, source: String?): String? {
++        if (text.isBlank()) return text
++        val target = targetCode(language)
++        val sourceCode = source?.let(::sourceCode)
++        val key = target + SEP + text
++
++        memory[key]?.let { return it }
++        diskMap(target)[text]?.let {
++            memory[key] = it
++            return it
++        }
++
++        for (provider in providers) {
++            if (isCooling(provider.name)) continue
++            val result = runCatching { provider.translate(text, target, sourceCode) }
++                .onFailure { Log.w(TAG, "${provider.name} translate failed", it) }
++                .getOrNull()
++            if (!result.isNullOrBlank()) {
++                if (provider.name != "google") Log.d(TAG, "translated the captions with ${provider.name}")
++                remember(target, text, result)
++                return result
++            }
++        }
++        val cooling = providers.filter { isCooling(it.name) }.joinToString(",") { it.name }
++        Log.w(TAG, "no translator could handle the captions right now (source=${source ?: "unknown"}, cooling=[$cooling])")
++        return null
++    }
++
++    // ---- translators ----
++
++    private fun translateWithGoogle(text: String, target: String, source: String?): String? {
++        val request = Request.Builder()
++            .url("https://translate.googleapis.com/translate_a/single?client=gtx&sl=${source ?: "auto"}&tl=$target&dt=t")
++            .header("User-Agent", USER_AGENT)
++            .post(FormBody.Builder().add("q", text).build())
++            .build()
++        http.newCall(request).execute().use { response ->
++            if (!response.isSuccessful) {
++                // 302 is the captcha block, 403 and 429 are the same refusal phrased differently.
++                if (response.code == 302 || response.code == 403 || response.code == 429) {
++                    cool("google")
++                    Log.w(TAG, "google translate refused this network (HTTP ${response.code}); using another translator")
++                } else {
++                    Log.w(TAG, "google translate -> HTTP ${response.code}")
++                }
++                return null
++            }
++            val parts = JSONArray(response.body.string()).getJSONArray(0)
++            val translated = buildString {
++                for (i in 0 until parts.length()) append(parts.getJSONArray(i).optString(0))
++            }
++            return translated.takeIf { it.isNotBlank() }
++        }
++    }
++
++    private fun translateWithMyMemory(text: String, target: String, source: String?): String? {
++        // It cannot guess the source language, and the free endpoint only takes short queries.
++        if (source == null || text.length > MYMEMORY_MAX_CHARS) return null
++        val query = URLEncoder.encode(text, "UTF-8").replace("+", "%20")
++        val request = Request.Builder()
++            .url("https://api.mymemory.translated.net/get?q=$query&langpair=$source%7C$target")
++            .header("User-Agent", USER_AGENT)
++            .build()
++        http.newCall(request).execute().use { response ->
++            if (!response.isSuccessful) {
++                Log.w(TAG, "mymemory -> HTTP ${response.code}")
++                return null
++            }
++            val json = JSONObject(response.body.string())
++            if (json.optBoolean("quotaFinished")) {
++                cool("mymemory")
++                Log.w(TAG, "mymemory is out of quota for today; using another translator")
++                return null
++            }
++            val translated = json.optJSONObject("responseData")?.optString("translatedText").orEmpty()
++            if (translated.isBlank() || translated.contains("MYMEMORY WARNING", ignoreCase = true)) {
++                cool("mymemory")
++                return null
++            }
++            return translated
++        }
++    }
++
++    private fun isCooling(name: String) = (cooldownUntil[name] ?: 0L) > System.currentTimeMillis()
++
++    private fun cool(name: String) {
++        cooldownUntil[name] = System.currentTimeMillis() + COOLDOWN_MS
++    }
++
++    // ---- remembered lines ----
++
++    /** Remembers one line that a caller translated in a batch. */
++    fun rememberLine(language: String, text: String, translated: String) {
++        if (text.isBlank() || translated.isBlank()) return
++        remember(targetCode(language), text, translated)
++    }
++
++    private fun remember(language: String, text: String, translated: String) {
++        memory[language + SEP + text] = translated
++        if (memory.size > MEMORY_LIMIT) memory.clear()
++        diskMap(language)[text] = translated
++
++        val file = fileFor(language) ?: return
++        writer.execute {
++            runCatching {
++                if (file.length() > DISK_MAX_BYTES) {
++                    file.delete()
++                    diskMaps[language]?.clear()
++                }
++                file.appendText(escape(text) + "\t" + escape(translated) + "\n")
++            }.onFailure { Log.w(TAG, "couldn't cache a translated caption line", it) }
++        }
++    }
++
++    private fun diskMap(language: String): MutableMap<String, String> =
++        diskMaps[language] ?: synchronized(diskMaps) {
++            diskMaps.getOrPut(language) { readDisk(language) }
++        }
++
++    private fun readDisk(language: String): MutableMap<String, String> {
++        val lines = HashMap<String, String>()
++        val file = fileFor(language) ?: return lines
++        if (!file.exists()) return lines
++        runCatching {
++            file.useLines { all ->
++                all.take(DISK_LIMIT).forEach { line ->
++                    val tab = line.indexOf('\t')
++                    if (tab <= 0) return@forEach
++                    val text = unescape(line.substring(0, tab))
++                    if (text.isNotEmpty()) lines[text] = unescape(line.substring(tab + 1))
++                }
++            }
++        }.onFailure { Log.w(TAG, "couldn't read the caption translation cache", it) }
++        return lines
++    }
++
++    private fun fileFor(language: String): File? {
++        val dir = cacheDir ?: return null
++        val folder = File(dir, "yt-captions").apply { mkdirs() }
++        return File(folder, language.replace(Regex("[^A-Za-z0-9_-]"), "_") + ".tsv")
++    }
++
++    // ---- codes ----
++
++    internal fun targetCode(language: String): String = when (language) {
++        "zh-Hans" -> "zh-CN"
++        "zh-Hant" -> "zh-TW"
++        "iw" -> "he"
++        else -> language
++    }
++
++    internal fun sourceCode(language: String): String =
++        if (language == "iw") "he" else language.substringBefore('-')
++
++    // ---- cache file escaping ----
++
++    internal fun escape(value: String): String = value
++        .replace("\\", "\\\\")
++        .replace("\t", "\\t")
++        .replace("\r", "")
++        .replace("\n", "\\n")
++
++    internal fun unescape(value: String): String {
++        val out = StringBuilder(value.length)
++        var i = 0
++        while (i < value.length) {
++            val c = value[i]
++            if (c == '\\' && i + 1 < value.length) {
++                when (value[i + 1]) {
++                    't' -> out.append('\t')
++                    'n' -> out.append('\n')
++                    '\\' -> out.append('\\')
++                    else -> out.append(value[i + 1])
++                }
++                i += 2
++            } else {
++                out.append(c)
++                i++
++            }
++        }
++        return out.toString()
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeCompatibility.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeCompatibility.kt
+new file mode 100644
+index 000000000..fd643803f
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeCompatibility.kt
+@@ -0,0 +1,130 @@
++package com.nuvio.tv.youtube
++
++import android.app.ActivityManager
++import android.content.Context
++import android.media.MediaCodecInfo
++import android.media.MediaCodecList
++import android.os.Build
++import androidx.media3.common.MimeTypes
++import java.util.Locale
++
++private const val GB = 1024L * 1024L * 1024L
++private const val ONE_GB = GB
++private const val ONE_AND_HALF_GB = 3L * GB / 2L
++
++/**
++ * What this device can decode reliably, used to decide YouTube's starting codec and quality.
++ *
++ * This is deliberately capability-based rather than brand-based: a 1.5 GB box with a good
++ * hardware H.264 decoder can still be a fine 1080p player, while a 2 GB box with a poor VP9
++ * decoder can freeze after seeking.
++ */
++internal data class YouTubeDeviceProfile(
++    val lowRamDevice: Boolean,
++    val totalRamBytes: Long,
++    val hasHardwareAvc: Boolean,
++    val hasHardwareVp9: Boolean,
++    val hasHardwareAv1: Boolean,
++    val maxAvcHeight: Int?,
++    val maxVp9Height: Int?,
++    val maxAv1Height: Int?,
++) {
++    /**
++     * H.264 + a quality cap are worth using when the device is short on memory or has no
++     * hardware VP9 decoder. AV1 alone doesn't trigger this: the normal codec order already
++     * leaves AV1 last.
++     */
++    val needsCompatibility: Boolean
++        get() =
++            lowRamDevice ||
++                (totalRamBytes in 1L..ONE_AND_HALF_GB) ||
++                !hasHardwareAvc ||
++                !hasHardwareVp9 ||
++                (maxVp9Height != null && maxVp9Height < 1080)
++
++    /** The starting size used when compatibility is active. */
++    val compatibilityHeight: Int
++        get() = when {
++            !hasHardwareAvc -> 720
++            totalRamBytes in 1L..ONE_GB -> 720
++            else -> 1080
++        }
++
++    /** A short explanation for the settings screen and diagnostics. */
++    val reason: String
++        get() = when {
++            !hasHardwareAvc -> "Limited hardware decoding"
++            !hasHardwareVp9 -> "No hardware VP9 decoder"
++            maxVp9Height != null && maxVp9Height < 1080 -> "VP9 limited to ${maxVp9Height}p"
++            lowRamDevice || totalRamBytes in 1L..ONE_AND_HALF_GB -> "Low memory"
++            else -> "Full hardware decoding"
++        }
++}
++
++internal object YouTubeCompatibility {
++    @Volatile
++    private var cached: YouTubeDeviceProfile? = null
++
++    fun deviceProfile(context: Context): YouTubeDeviceProfile {
++        cached?.let { return it }
++        return synchronized(this) {
++            cached?.let { return it }
++            val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
++            val memory = ActivityManager.MemoryInfo()
++            runCatching { activityManager?.getMemoryInfo(memory) }
++            val avc = hardwareSupport(MimeTypes.VIDEO_H264)
++            val vp9 = hardwareSupport(MimeTypes.VIDEO_VP9)
++            val av1 = hardwareSupport(MimeTypes.VIDEO_AV1)
++            val profile = YouTubeDeviceProfile(
++                lowRamDevice = activityManager?.isLowRamDevice == true,
++                totalRamBytes = memory.totalMem,
++                hasHardwareAvc = avc.available,
++                hasHardwareVp9 = vp9.available,
++                hasHardwareAv1 = av1.available,
++                maxAvcHeight = avc.maxHeight,
++                maxVp9Height = vp9.maxHeight,
++                maxAv1Height = av1.maxHeight,
++            )
++            cached = profile
++            profile
++        }
++    }
++
++    private data class DecoderSupport(val available: Boolean, val maxHeight: Int?)
++
++    private fun hardwareSupport(mimeType: String): DecoderSupport {
++        var available = false
++        var maxHeight: Int? = null
++        runCatching {
++            val codecs = MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos
++            for (info in codecs) {
++                if (info.isEncoder) continue
++                if (info.supportedTypes.none { it.equals(mimeType, true) }) continue
++                if (!isHardwareDecoder(info)) continue
++                available = true
++                val height = runCatching {
++                    info.getCapabilitiesForType(mimeType).videoCapabilities?.supportedHeights?.upper
++                }.getOrNull()
++                if (height != null && height > 0) {
++                    maxHeight = maxOf(maxHeight ?: 0, height)
++                }
++            }
++        }
++        return DecoderSupport(available, maxHeight)
++    }
++
++    private fun isHardwareDecoder(info: MediaCodecInfo): Boolean {
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && info.isHardwareAccelerated) return true
++        return !isSoftwareDecoderName(info.name)
++    }
++
++    private fun isSoftwareDecoderName(name: String): Boolean {
++        val lower = name.lowercase(Locale.US)
++        return lower.startsWith("omx.google.") ||
++            lower.startsWith("c2.android.") ||
++            lower.startsWith("c2.google.") ||
++            lower.startsWith("omx.ffmpeg.") ||
++            lower.startsWith("lib") ||
++            lower.startsWith("ffmpeg")
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeMpdServer.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeMpdServer.kt
+index 6c88bbe5b..63a96cc59 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeMpdServer.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeMpdServer.kt
+@@ -1,10 +1,9 @@
+ package com.nuvio.tv.youtube
+ 
+ import android.util.Log
+-import okhttp3.FormBody
+ import okhttp3.OkHttpClient
+ import okhttp3.Request
+-import org.json.JSONArray
++import java.io.File
+ import java.net.InetAddress
+ import java.net.ServerSocket
+ import java.net.Socket
+@@ -20,47 +19,88 @@ import java.util.concurrent.Executors
+  *
+  * It also serves the auto-translated captions. YouTube refuses to hand those out without a token only its own
+  * apps can make (HTTP 429), so when a translated language is picked, the video's own captions are fetched and
+- * translated here instead.
++ * translated here instead. Which translator does the work, and what happens when none can be reached, is
++ * [YouTubeCaptionTranslation]'s business; when translation fails the original captions are served rather than
++ * nothing, so the viewer still has readable subtitles.
+  */
+ object YouTubeMpdServer {
+     private const val TAG = "YouTubeCaptions"
+     private const val USER_AGENT =
+-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
++        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+     /** How much text goes to the translator in one request. */
+-    private const val CHUNK_CHARS = 4500
++    private const val CHUNK_CHARS = 600
++    /** How much text a fallback translator can take in one request; it keeps the line breaks. */
++    private const val FALLBACK_CHUNK_CHARS = 240
+     /** How many translation requests may run at once. */
+-    private const val MAX_PARALLEL = 6
++    private const val MAX_PARALLEL = 1
+ 
+     private val manifests = ConcurrentHashMap<String, ByteArray>()
++    /** YouTube's visitor cookie, used for the translated caption URL (the same idea as Morphe's caption cookies). */
++    private val captionCookies = ConcurrentHashMap<String, String>()
+     private val pool = Executors.newCachedThreadPool()
+ 
+     @Volatile private var server: ServerSocket? = null
+ 
+     /** Stores [mpd] and returns the URL to play it from. */
+     @Synchronized
+-    fun publish(videoId: String, mpd: ByteArray): String {
++    fun publish(videoId: String, mpd: ByteArray, visitorCookie: String? = null): String {
+         // Kept at least as long as the view model keeps its cached lookups.
+-        if (manifests.size > 64) manifests.clear()
++        if (manifests.size > 64) {
++            manifests.clear()
++            captionCookies.clear()
++        }
++        if (visitorCookie.isNullOrBlank()) captionCookies.remove(videoId) else captionCookies[videoId] = visitorCookie
+         manifests[videoId] = rewriteTranslatedCaptions(videoId, YouTubeAudioTracks.tidy(mpd))
+         return "http://127.0.0.1:${ensureStarted().localPort}/yt/$videoId.mpd"
+     }
+ 
++    /** Where translated caption lines are remembered between videos; null keeps them in memory only. */
++    fun attach(cacheDir: File?) = YouTubeCaptionTranslation.attach(cacheDir)
++
++    /** Whether this video has a translated caption track in [language]. */
++    fun hasTranslatedTrack(videoId: String, language: String): Boolean = trackIndex(videoId, language) >= 0
++
++    /** The address of one 60-second piece of the translated captions, or null when there are none. */
++    fun segmentUrl(videoId: String, language: String, number: Long): String? {
++        val index = trackIndex(videoId, language).takeIf { it >= 0 } ?: return null
++        val port = server?.localPort ?: return null
++        return "http://127.0.0.1:$port/yt/cap/$videoId/$index/$number.vtt"
++    }
++
++    private fun trackIndex(videoId: String, language: String): Int =
++        captionUrls[videoId]?.indexOfFirst { address ->
++            Regex("[?&]tlang=([^&]+)").find(address)?.groupValues?.get(1) == language
++        } ?: -1
++
+     // ---- translated captions ----
+ 
+     /** Each video's translated caption addresses, in the order they were swapped out of the manifest. */
+     private val captionUrls = ConcurrentHashMap<String, List<String>>()
++    /** The language the video's own captions are in, read from the manifest; empty when unknown. */
++    private val captionLanguages = ConcurrentHashMap<String, String>()
+     private val translatedCache = ConcurrentHashMap<String, ByteArray>()
++    private val sourceCache = ConcurrentHashMap<String, String>()
++    private val segmentLock = Any()
+     private val http by lazy { OkHttpClient.Builder().followRedirects(true).build() }
+ 
+     private fun rewriteTranslatedCaptions(videoId: String, mpd: ByteArray): ByteArray {
+         val port = ensureStarted().localPort
+         val urls = ArrayList<String>()
+-        val rewritten = Regex("<BaseURL>([^<]*timedtext[^<]*)</BaseURL>").replace(String(mpd, Charsets.UTF_8)) { m ->
++        val xml = String(mpd, Charsets.UTF_8)
++        captionLanguages[videoId] = subtitleLanguage(xml).orEmpty()
++        val rewritten = Regex("<BaseURL>([^<]*timedtext[^<]*)</BaseURL>").replace(xml) { m ->
+             val url = m.groupValues[1].replace("&amp;", "&")
+-            if ("tlang=" !in url) m.value
++            // Translated captions are fetched and translated here; automatic ones (their lines roll up, the old
++            // one staying above the new) are tidied here. Written-by-people captions go straight to YouTube.
++            if ("tlang=" !in url && !isAutomatic(url)) m.value
+             else {
+                 urls += url
+-                "<BaseURL>http://127.0.0.1:$port/yt/cap/$videoId/${urls.size - 1}</BaseURL>"
++                val index = urls.size - 1
++                if ("tlang=" in url && Regex("[?&]fmt=vtt(&|$)").containsMatchIn(url)) {
++                    "<SegmentTemplate timescale=\"1\" duration=\"${YouTubeCaptionSegments.DURATION_SECONDS}\" startNumber=\"0\" media=\"http://127.0.0.1:$port/yt/cap/$videoId/$index/\$Number\$.vtt\"/>"
++                } else {
++                    "<BaseURL>http://127.0.0.1:$port/yt/cap/$videoId/$index</BaseURL>"
++                }
+             }
+         }
+         captionUrls[videoId] = urls
+@@ -68,17 +108,97 @@ object YouTubeMpdServer {
+         return rewritten.toByteArray(Charsets.UTF_8)
+     }
+ 
++    /**
++     * YouTube's own translated caption file for [language], when it will serve it to us.
++     * The visitor cookie is what makes the translated timedtext request look like a viewer
++     * rather than an anonymous automated query.
++     */
++    fun translatedCaptionFile(videoId: String, language: String): String? {
++        val address = captionUrls[videoId]?.firstOrNull { address ->
++            Regex("[?&]tlang=([^&]+)").find(address)?.groupValues?.get(1) == language
++        } ?: return null
++        return get(videoId, address)
++    }
++
++    /** YouTube's speech-recognition captions ("kind=asr"). */
++    private fun isAutomatic(address: String) = Regex("[?&]kind=asr(&|$)").containsMatchIn(address)
++
++    /** The language the video's own captions are in, when the address says so. */
++    private fun languageOf(address: String): String? =
++        Regex("[?&]lang=([^&]+)").find(address)?.groupValues?.get(1)?.takeIf { it.isNotBlank() }
++
++    /**
++     * The language of the subtitle tracks in the manifest. A translated track's address does not always
++     * say what it is translating from, and a translator that needs the source language cannot guess it.
++     */
++    private fun subtitleLanguage(mpd: String): String? =
++        mpd.split("<AdaptationSet").firstOrNull { "timedtext" in it }
++            ?.let { Regex("lang=\"([^\"]+)\"").find(it)?.groupValues?.get(1) }
++
++    /** Where the captions being translated come from: the address first, the manifest second. */
++    private fun sourceLanguage(videoId: String, original: String): String? =
++        languageOf(original) ?: captionLanguages[videoId]?.takeIf { it.isNotBlank() }
++
++    private fun sourceCaptions(videoId: String, address: String): String? {
++        sourceCache[address]?.let { return it }
++        val source = get(videoId, address) ?: return null
++        val tidy = if (isAutomatic(address) || YouTubeAutoCaptions.looksAutomatic(source)) {
++            YouTubeAutoCaptions.tidy(source)
++        } else {
++            source
++        }
++        if (sourceCache.size >= 8) sourceCache.clear()
++        sourceCache[address] = tidy
++        return tidy
++    }
++
++    private fun fetchCaptionSegment(videoId: String, index: Int, number: Long): ByteArray? = synchronized(segmentLock) {
++        val address = captionUrls[videoId]?.getOrNull(index) ?: return@synchronized null
++        val language = Regex("[?&]tlang=([^&]+)").find(address)?.groupValues?.get(1) ?: return@synchronized null
++        val key = "$videoId/${address.hashCode()}/$number"
++        translatedCache[key]?.let { return@synchronized it }
++        Log.d(TAG, "loading caption segment $number for $videoId in $language")
++        val original = address.replace(Regex("&tlang=[^&]+"), "")
++        val source = sourceCaptions(videoId, original) ?: return@synchronized null
++        val segment = YouTubeCaptionSegments.extract(source, number)
++        // If no translator can be reached the original lines are served; untranslated captions beat none.
++        val sourceLang = sourceLanguage(videoId, original)
++        Log.d(TAG, "caption segment $number source=${sourceLang ?: "unknown"} target=$language")
++        val translated = if ("-->" in segment) translateVtt(segment, language, sourceLang) else segment
++        if (translated == segment) {
++            Log.w(TAG, "caption segment $number for $videoId could not be translated; serving the source")
++        }
++        val bytes = translated.toByteArray(Charsets.UTF_8)
++        if (translated == segment) {
++            // Nothing could be translated. Don't remember the original lines: a later request, once a
++            // translator is reachable again, should be allowed to try.
++            Log.w(TAG, "caption segment $number for $videoId is still in its original language")
++            return@synchronized bytes
++        }
++        if (translatedCache.size >= 256) translatedCache.clear()
++        bytes.also {
++            translatedCache[key] = it
++            Log.i(TAG, "caption segment $number for $videoId translated to $language")
++        }
++    }
++
+     private fun fetchTranslatedCaption(videoId: String, index: Int): Pair<ByteArray, String>? {
+         val address = captionUrls[videoId]?.getOrNull(index) ?: return null
+-        val language = Regex("[?&]tlang=([^&]+)").find(address)?.groupValues?.get(1) ?: return null
+-        val key = "$videoId/$language"
++        val language = Regex("[?&]tlang=([^&]+)").find(address)?.groupValues?.get(1)
++        val key = "$videoId/${language ?: "original"}/${address.hashCode()}"
+         translatedCache[key]?.let { return it to typeOf(it) }
+         val began = System.currentTimeMillis()
+-        // The video's own captions are served without any token. Fetch those and translate them.
++        // The video's own captions are served without any token. Fetch those, tidy them if they're automatic,
++        // and translate them when a language was asked for.
+         val original = address.replace(Regex("&tlang=[^&]+"), "")
+-        val source = get(original) ?: return null
+-        val translated = translateCaptions(source, language) ?: return null
+-        val bytes = translated.toByteArray(Charsets.UTF_8)
++        val tidy = sourceCaptions(videoId, original) ?: return null
++        val sourceLang = sourceLanguage(videoId, original)
++        val result = if (language == null) tidy else translateCaptions(tidy, language, sourceLang)
++        val bytes = result.toByteArray(Charsets.UTF_8)
++        if (language != null && result == tidy) {
++            Log.w(TAG, "captions for $key are still in their original language")
++            return bytes to typeOf(bytes)
++        }
+         translatedCache[key] = bytes
+         Log.i(TAG, "captions for $key ready in ${System.currentTimeMillis() - began} ms")
+         return bytes to typeOf(bytes)
+@@ -86,23 +206,33 @@ object YouTubeMpdServer {
+ 
+     private fun typeOf(body: ByteArray) = if (String(body, 0, minOf(body.size, 8), Charsets.UTF_8).startsWith("WEBVTT")) "text/vtt" else "application/ttml+xml"
+ 
+-    private fun get(url: String): String? = runCatching {
+-        http.newCall(Request.Builder().url(url).header("User-Agent", USER_AGENT).build()).execute().use {
++    private fun get(videoId: String, url: String): String? = runCatching {
++        val request = Request.Builder()
++            .url(url)
++            .header("User-Agent", USER_AGENT)
++            .header("Referer", "https://www.youtube.com/watch?v=$videoId")
++            .header("Origin", "https://www.youtube.com")
++            .header("Accept-Language", "en-US,en;q=0.9")
++            .apply {
++                captionCookies[videoId]?.takeIf { it.isNotBlank() }?.let { header("Cookie", it) }
++            }
++            .build()
++        http.newCall(request).execute().use {
+             if (it.isSuccessful) it.body?.string() else {
+-                Log.w(TAG, "caption request -> HTTP ${it.code}")
++                Log.w(TAG, "caption request $videoId -> HTTP ${it.code}")
+                 null
+             }
+         }
+-    }.onFailure { Log.w(TAG, "caption request failed", it) }.getOrNull()
++    }.onFailure { Log.w(TAG, "caption request for $videoId failed", it) }.getOrNull()
+ 
+     private val cue = Regex("(<p\\b[^>]*>)(.*?)(</p>)", RegexOption.DOT_MATCHES_ALL)
+ 
+     /** Translates the text of every cue in a caption file (WebVTT or TTML), keeping the timing. */
+-    private fun translateCaptions(file: String, language: String): String? =
+-        (if (file.trimStart().startsWith("WEBVTT")) translateVtt(file, language) else translateTtml(file, language))
+-            .also { if (it == null) Log.w(TAG, "couldn't translate the captions to $language") }
++    private fun translateCaptions(file: String, language: String, source: String?): String =
++        if (file.trimStart().startsWith("WEBVTT")) translateVtt(file, language, source)
++        else translateTtml(file, language, source)
+ 
+-    private fun translateVtt(vtt: String, language: String): String? {
++    private fun translateVtt(vtt: String, language: String, source: String?): String {
+         val blocks = vtt.replace("\r\n", "\n").split(Regex("\n{2,}"))
+         // Each cue is a block with a timing line; its text is whatever follows that line.
+         val timingIndex = blocks.map { block -> block.lines().indexOfFirst { "-->" in it } }
+@@ -110,8 +240,8 @@ object YouTubeMpdServer {
+             val t = timingIndex[i]
+             if (t < 0) null else plainText(blocks[i].lines().drop(t + 1).joinToString(" "))
+         }
+-        if (texts.none { it.isNotBlank() }) return null
+-        val translated = translateAll(texts, language) ?: return null
++        if (texts.none { it.isNotBlank() }) return vtt
++        val translated = translateAll(texts, language, source)
+         var n = 0
+         val rebuilt = blocks.indices.map { i ->
+             val t = timingIndex[i]
+@@ -122,10 +252,10 @@ object YouTubeMpdServer {
+         return rebuilt + "\n"
+     }
+ 
+-    private fun translateTtml(ttml: String, language: String): String? {
++    private fun translateTtml(ttml: String, language: String, source: String?): String {
+         val cues = cue.findAll(ttml).toList()
+-        if (cues.isEmpty()) return null
+-        val translated = translateAll(cues.map { plainText(it.groupValues[2]) }, language) ?: return null
++        if (cues.isEmpty()) return ttml
++        val translated = translateAll(cues.map { plainText(it.groupValues[2]) }, language, source)
+         var n = 0
+         val rebuilt = cue.replace(ttml) { m -> m.groupValues[1] + escape(translated[n++]) + m.groupValues[3] }
+         Log.i(TAG, "translated ${cues.size} caption cues to $language")
+@@ -136,8 +266,9 @@ object YouTubeMpdServer {
+      * Translates every text. YouTube's automatic captions repeat each line as the words roll in, so only the
+      * different lines are sent, and the requests go out side by side instead of one after another.
+      */
+-    private fun translateAll(texts: List<String>, language: String): List<String>? {
++    private fun translateAll(texts: List<String>, language: String, source: String?): List<String> {
+         val unique = texts.filter { it.isNotBlank() }.distinct()
++        if (unique.isEmpty()) return texts
+         val chunks = ArrayList<List<String>>()
+         var start = 0
+         while (start < unique.size) {
+@@ -152,48 +283,71 @@ object YouTubeMpdServer {
+         }
+         val began = System.currentTimeMillis()
+         val workers = Executors.newFixedThreadPool(minOf(MAX_PARALLEL, maxOf(chunks.size, 1)))
+-        val translated = try {
+-            chunks.map { chunk -> workers.submit<List<String>?> { translateChunk(chunk, language) } }
+-                .map { it.get() ?: return null }
++        val results = try {
++            chunks.map { chunk -> workers.submit<List<String>?> { translateChunk(chunk, language, source) } }
++                .map { runCatching { it.get() }.getOrNull() }
+         } finally {
+-            workers.shutdown()
++            workers.shutdownNow()
+         }
+         val byText = HashMap<String, String>()
+-        chunks.forEachIndexed { i, chunk -> chunk.forEachIndexed { j, text -> byText[text] = translated[i][j] } }
+-        Log.i(TAG, "translated ${unique.size} different lines (of ${texts.size}) in ${chunks.size} request(s), ${System.currentTimeMillis() - began} ms")
+-        return texts.map { if (it.isBlank()) it else byText[it].orEmpty() }
++        results.forEachIndexed { i, translated ->
++            if (translated == null) return@forEachIndexed
++            chunks[i].forEachIndexed { j, text -> translated.getOrNull(j)?.let { byText[text] = it } }
++        }
++        Log.i(TAG, "translated ${byText.size} of ${unique.size} different lines (of ${texts.size}) in ${chunks.size} request(s), ${System.currentTimeMillis() - began} ms")
++        if (byText.isEmpty()) Log.w(TAG, "no translator could translate to $language right now; showing the original lines")
++        // A chunk no translator could handle keeps its original lines rather than losing them.
++        return texts.map { if (it.isBlank()) it else byText[it] ?: it }
+     }
+ 
+-    /** Translates [lines] together; falls back to one at a time if the translator merges or splits lines. */
+-    private fun translateChunk(lines: List<String>, language: String): List<String>? {
+-        val joined = translate(lines.joinToString("\n"), language)?.split("\n")
+-        if (joined != null && joined.size == lines.size) return joined
+-        Log.w(TAG, "lines didn't line up (${joined?.size} vs ${lines.size}); translating one by one")
+-        return lines.map { if (it.isBlank()) it else translate(it, language) ?: return null }
++    /** Translates [lines] together; falls back to smaller groups, then one at a time. */
++    private fun translateChunk(lines: List<String>, language: String, source: String?): List<String>? {
++        val joined = translate(lines.joinToString("\n"), language, source)
++        if (joined != null) {
++            val split = joined.split("\n")
++            if (split.size == lines.size) return split
++            Log.w(TAG, "lines didn't line up (${split.size} vs ${lines.size}); translating in smaller groups")
++        } else {
++            // Too long for the translator, or it refused the whole block.
++            Log.d(TAG, "translating ${lines.size} caption lines in smaller groups")
++        }
++        val result = ArrayList<String>(lines.size)
++        for (batch in batches(lines, FALLBACK_CHUNK_CHARS)) {
++            val translated = translate(batch.joinToString("\n"), language, source)?.split("\n")
++            if (translated != null && translated.size == batch.size) {
++                // Kept one line at a time too, so a later request for the same line costs nothing.
++                batch.forEachIndexed { i, text ->
++                    YouTubeCaptionTranslation.rememberLine(language, text, translated[i])
++                    result += translated[i]
++                }
++            } else {
++                batch.forEach { text ->
++                    result += if (text.isBlank()) text else translate(text, language, source) ?: return null
++                }
++            }
++        }
++        return result
+     }
+ 
+-    private fun translate(text: String, language: String): String? = runCatching {
+-        val target = when (language) {
+-            "zh-Hans" -> "zh-CN"
+-            "zh-Hant" -> "zh-TW"
+-            "iw" -> "he"
+-            else -> language
+-        }
+-        val body = FormBody.Builder().add("q", text).build()
+-        val request = Request.Builder()
+-            .url("https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=$target&dt=t")
+-            .header("User-Agent", USER_AGENT)
+-            .post(body)
+-            .build()
+-        http.newCall(request).execute().use { response ->
+-            if (!response.isSuccessful) {
+-                Log.w(TAG, "translate -> HTTP ${response.code}")
+-                return@runCatching null
++    /** Splits [lines] into groups whose joined text fits within [limit] characters. */
++    private fun batches(lines: List<String>, limit: Int): List<List<String>> {
++        val groups = ArrayList<List<String>>()
++        var start = 0
++        while (start < lines.size) {
++            var end = start
++            var chars = 0
++            while (end < lines.size && (end == start || chars + lines[end].length + 1 <= limit)) {
++                chars += lines[end].length + 1
++                end++
+             }
+-            val parts = JSONArray(response.body?.string().orEmpty()).getJSONArray(0)
+-            buildString { for (i in 0 until parts.length()) append(parts.getJSONArray(i).optString(0)) }
++            groups += lines.subList(start, end)
++            start = end
+         }
+-    }.onFailure { Log.w(TAG, "translate failed", it) }.getOrNull()
++        return groups
++    }
++
++    private fun translate(text: String, language: String, source: String?): String? =
++        YouTubeCaptionTranslation.translate(text, language, source)
+ 
+     private fun plainText(inner: String): String =
+         inner.replace(Regex("<br\\s*/?>"), " ").replace(Regex("<[^>]+>"), "")
+@@ -231,6 +385,14 @@ object YouTubeMpdServer {
+     private fun handle(client: Socket) = client.use { c ->
+         val request = c.getInputStream().bufferedReader().readLine().orEmpty()
+         val out = c.getOutputStream()
++        val segment = Regex("""GET /yt/cap/([^/ ]+)/(\d+)/(\d+)\.vtt""").find(request)
++        if (segment != null) {
++            val index = segment.groupValues[2].toIntOrNull()
++            val number = segment.groupValues[3].toLongOrNull()
++            val result = if (index != null && number != null) fetchCaptionSegment(segment.groupValues[1], index, number) else null
++            if (result == null) reply(out, "404 Not Found", null, null) else reply(out, "200 OK", "text/vtt", result)
++            return@use
++        }
+         val caption = Regex("""GET /yt/cap/([^/ ]+)/(\d+)""").find(request)
+         if (caption != null) {
+             val result = fetchTranslatedCaption(caption.groupValues[1], caption.groupValues[2].toInt())
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeSettings.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeSettings.kt
+index fbd79cd80..390b7141d 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeSettings.kt
+@@ -25,6 +25,7 @@ object YouTubeSettings {
+     private const val KEY_HIDE_UPCOMING = "hide_upcoming"
+     private const val KEY_CODEC = "codec_preference"
+     private const val KEY_QUALITY_TOAST = "quality_toast"
++    private const val KEY_COMPATIBILITY = "compatibility_mode"
+     private const val KEY_CONTENT_REGION = "content_region"
+     private const val KEY_VIDEO_PREVIEWS = "video_previews"
+     private const val KEY_POSTER_COLUMNS = "poster_columns"
+@@ -225,10 +226,14 @@ object YouTubeSettings {
+             "vp9" -> listOf(vp9, avc, av1)
+             "av1" -> listOf(av1, vp9, avc)
+             else -> {
+-                // Same sizes, but a codec this device decodes in hardware starts faster and drops fewer frames.
+-                val order = listOf(vp9, avc, av1)
+-                val hardware = hardwareMimes
+-                order.filter { it in hardware } + order.filter { it !in hardware }
++                if (compatibilityActive(context)) {
++                    listOf(avc, vp9, av1)
++                } else {
++                    // Same sizes, but a codec this device decodes in hardware starts faster and drops fewer frames.
++                    val order = listOf(vp9, avc, av1)
++                    val hardware = hardwareMimes
++                    order.filter { it in hardware } + order.filter { it !in hardware }
++                }
+             }
+         }
+     }
+@@ -329,4 +334,109 @@ object YouTubeSettings {
+             .putStringSet(KEY_PINNED_PLAYLISTS, kept.map { "${it.first}|${it.second}" }.toSet())
+             .apply()
+     }
++
++    /**
++     * The order the settings row cycles through. On a device using compatibility, the safe
++     * capped size comes first; the higher sizes stay available but are a deliberate later choice.
++     */
++    fun qualityCycle(context: Context): List<Int> {
++        if (!compatibilityActive(context)) return qualityChoices
++        val cap = compatibilityMaxHeight(context)
++        val lower = qualityChoices.filter { it in 1 until cap }.sortedDescending()
++        val higher = qualityChoices.filter { it > cap }.sorted()
++        return listOf(0, cap) + lower + higher
++    }
++
++    /** Auto lets the detected device profile decide; On and Off force it. */
++    fun compatibilityMode(context: Context): String =
++        prefs(context).getString(KEY_COMPATIBILITY, COMPATIBILITY_AUTO)
++            ?.takeIf { it in setOf(COMPATIBILITY_AUTO, COMPATIBILITY_ON, COMPATIBILITY_OFF) }
++            ?: COMPATIBILITY_AUTO
++
++    fun setCompatibilityMode(context: Context, mode: String) {
++        val safe = mode.takeIf { it in setOf(COMPATIBILITY_AUTO, COMPATIBILITY_ON, COMPATIBILITY_OFF) }
++            ?: COMPATIBILITY_AUTO
++        prefs(context).edit().putString(KEY_COMPATIBILITY, safe).apply()
++    }
++
++    fun compatibilityActive(context: Context): Boolean = when (compatibilityMode(context)) {
++        COMPATIBILITY_ON -> true
++        COMPATIBILITY_OFF -> false
++        else -> YouTubeCompatibility.deviceProfile(context).needsCompatibility
++    }
++
++    fun compatibilityMaxHeight(context: Context): Int =
++        YouTubeCompatibility.deviceProfile(context).compatibilityHeight
++
++    fun compatibilityLabel(context: Context, mode: String = compatibilityMode(context)): String = when (mode) {
++        COMPATIBILITY_ON -> "On"
++        COMPATIBILITY_OFF -> "Off"
++        else -> if (compatibilityActive(context)) "Auto (${compatibilityMaxHeight(context)}p)" else "Auto"
++    }
++
++    fun compatibilityDescription(context: Context, mode: String = compatibilityMode(context)): String = when (mode) {
++        COMPATIBILITY_ON ->
++            "Always prefer H.264 and cap the starting quality for smoother playback."
++        COMPATIBILITY_OFF ->
++            "Full codec and quality selection. Pick Automatic to let this device choose again."
++        else -> {
++            val profile = YouTubeCompatibility.deviceProfile(context)
++            if (profile.needsCompatibility) {
++                "This device starts with H.264 and ${profile.compatibilityHeight}p (${profile.reason.lowercase()})."
++            } else {
++                "This device can use its best codecs and resolution."
++            }
++        }
++    }
++
++    /**
++     * The size the player should start at. An explicit choice always wins; Auto follows the
++     * compatibility profile.
++     */
++    fun effectivePreferredHeight(context: Context): Int {
++        val saved = preferredHeight(context)
++        val mode = compatibilityMode(context)
++        if (saved > 0) {
++            return if (mode == COMPATIBILITY_ON && saved > compatibilityMaxHeight(context)) {
++                compatibilityMaxHeight(context)
++            } else {
++                saved
++            }
++        }
++        return if (mode == COMPATIBILITY_ON || (mode == COMPATIBILITY_AUTO && compatibilityActive(context))) {
++            compatibilityMaxHeight(context)
++        } else {
++            0
++        }
++    }
++
++    /**
++     * Picking a size above the compatibility cap is an explicit request for the full quality
++     * path, so compatibility is switched off for this device from then on.
++     */
++    fun onUserSelectedQuality(context: Context, height: Int) {
++        if (height == 0) {
++            if (compatibilityMode(context) == COMPATIBILITY_OFF) setCompatibilityMode(context, COMPATIBILITY_AUTO)
++            return
++        }
++        if (height > compatibilityMaxHeight(context) && compatibilityActive(context)) {
++            setCompatibilityMode(context, COMPATIBILITY_OFF)
++        }
++    }
++
++    /** Choosing VP9/AV1 explicitly also means the user wants the full codec path. */
++    fun onUserSelectedCodec(context: Context, codec: String) {
++        when (codec) {
++            "vp9", "av1" -> if (compatibilityActive(context)) {
++                setCompatibilityMode(context, COMPATIBILITY_OFF)
++            }
++            "auto" -> if (compatibilityMode(context) == COMPATIBILITY_OFF) {
++                setCompatibilityMode(context, COMPATIBILITY_AUTO)
++            }
++        }
++    }
++
++    private const val COMPATIBILITY_AUTO = "auto"
++    private const val COMPATIBILITY_ON = "on"
++    private const val COMPATIBILITY_OFF = "off"
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeTranslatedCaptions.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeTranslatedCaptions.kt
+new file mode 100644
+index 000000000..e41519c60
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeTranslatedCaptions.kt
+@@ -0,0 +1,91 @@
++package com.nuvio.tv.youtube
++
++import android.util.Log
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import java.util.concurrent.TimeUnit
++
++/**
++ * Works out which translated caption line is showing at a given moment in a YouTube video.
++ *
++ * The player accepts the translated caption track this app serves but never turns its segments into
++ * cues, so nothing would be drawn. The lines are read from the same local server and handed to the
++ * subtitle overlay by the player screen instead. Only YouTube uses this: Live TV, On Demand and
++ * addon subtitles keep the normal path untouched.
++ */
++internal class YouTubeTranslatedCaptions(
++    private val videoId: String,
++    private val language: String
++) {
++    private var segmentNumber = -1L
++    private var cues: List<Cue> = emptyList()
++    private var wholeFileCues: List<Cue>? = null
++    private var wholeFileTried = false
++
++    private class Cue(val startMs: Long, val endMs: Long, val text: String)
++
++    /** The line showing at [positionMs], or null when nothing is said then. */
++    suspend fun lineAt(positionMs: Long): String? = withContext(Dispatchers.IO) {
++        if (!wholeFileTried) {
++            wholeFileTried = true
++            val file = YouTubeMpdServer.translatedCaptionFile(videoId, language)
++            val cleaned = file?.let {
++                if (YouTubeAutoCaptions.looksAutomatic(it)) YouTubeAutoCaptions.tidy(it) else it
++            }
++            val parsed = cleaned?.let(::parse).orEmpty()
++            if (parsed.isNotEmpty()) {
++                wholeFileCues = parsed
++                Log.i(TAG, "direct translated captions $videoId/$language cues=${parsed.size}")
++            } else {
++                Log.i(TAG, "direct translated captions $videoId/$language unavailable; using local translation")
++            }
++        }
++        wholeFileCues?.let { all ->
++            return@withContext all.firstOrNull { positionMs >= it.startMs && positionMs < it.endMs }?.text
++        }
++
++        val number = positionMs / SEGMENT_MS
++        if (number != segmentNumber) {
++            segmentNumber = number
++            cues = fetch(number)
++        }
++        val inside = positionMs - number * SEGMENT_MS
++        cues.firstOrNull { inside >= it.startMs && inside < it.endMs }?.text
++    }
++
++    private fun fetch(number: Long): List<Cue> {
++        val url = YouTubeMpdServer.segmentUrl(videoId, language, number) ?: return emptyList()
++        val body = runCatching {
++            http.newCall(Request.Builder().url(url).build()).execute().use { response ->
++                if (response.isSuccessful) response.body.string() else null
++            }
++        }.getOrNull() ?: return emptyList()
++        return parse(body)
++    }
++
++    private fun parse(vtt: String): List<Cue> {
++        val cues = ArrayList<Cue>()
++        for (block in vtt.replace("\r\n", "\n").split(Regex("\n{2,}"))) {
++            val lines = block.lines()
++            val timingIndex = lines.indexOfFirst { "-->" in it }
++            if (timingIndex < 0) continue
++            val match = timing.find(lines[timingIndex]) ?: continue
++            fun part(i: Int) = match.groupValues[i].toLongOrNull() ?: 0L
++            val start = part(1) * 3_600_000 + part(2) * 60_000 + part(3) * 1_000 + part(4)
++            val end = part(5) * 3_600_000 + part(6) * 60_000 + part(7) * 1_000 + part(8)
++            val text = lines.drop(timingIndex + 1).joinToString("\n").trim()
++            if (text.isNotEmpty()) cues += Cue(start, end, text)
++        }
++        return cues
++    }
++
++    private companion object {
++        const val TAG = "YouTubeCaptions"
++        const val SEGMENT_MS = YouTubeCaptionSegments.DURATION_SECONDS * 1_000
++        /** Hours are optional in the timing line; minutes and seconds are always there. */
++        val timing = Regex("(?:(\\d+):)?(\\d{1,2}):(\\d{2})[.,](\\d{3})\\s*-->\\s*(?:(\\d+):)?(\\d{1,2}):(\\d{2})[.,](\\d{3})")
++        val http by lazy { OkHttpClient.Builder().callTimeout(20, TimeUnit.SECONDS).build() }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
+index fa4643d8f..fa439bf14 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
+@@ -217,6 +217,7 @@ class YouTubeViewModel @Inject constructor(
+ 
+     init {
+         warmUpEngine()
++        YouTubeMpdServer.attach(context.cacheDir)
+         selectTab(YouTubeSettings.lastTab(context))
+         // The first videos of every feed are the likeliest first click, so their streams are looked up as
+         // soon as the feed shows, before any card is focused. Shorts are skipped: the Shorts player does its own.
+@@ -1527,10 +1528,10 @@ class YouTubeViewModel @Inject constructor(
+         // Download the first bytes of the stream the player will most likely start with, so OK is instant.
+         if (mpd != null && mpd.isNotEmpty() && !info.isLive) {
+             YouTubeFirstChunkCache.prefetchFromMpd(
+-                mpd, userAgent, YouTubeSettings.preferredHeight(context), YouTubeSettings.codecMimeOrder(context)
++                mpd, userAgent, YouTubeSettings.effectivePreferredHeight(context), YouTubeSettings.codecMimeOrder(context)
+             )
+         }
+-        return mpd?.takeIf { it.isNotEmpty() }?.let { YouTubeMpdServer.publish(videoId, it) }
++        return mpd?.takeIf { it.isNotEmpty() }?.let { YouTubeMpdServer.publish(videoId, it, info.visitorCookie) }
+     }
+ 
+     // ---- search suggestions and recent searches ----
