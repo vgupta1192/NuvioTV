@@ -1,0 +1,211 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
+index 7401cfa1c..0133c760c 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
+@@ -15,6 +15,8 @@ import androidx.compose.animation.fadeIn
+ import androidx.compose.animation.fadeOut
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.background
++import androidx.compose.foundation.clickable
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.CompositionLocalProvider
+ import androidx.compose.runtime.getValue
+@@ -1016,9 +1018,11 @@ private fun PlaybackNavHost(
+             val upNextListOpen = androidx.compose.runtime.remember(upNextVideoId) { androidx.compose.runtime.mutableStateOf(false) }
+             val downShowedControls = androidx.compose.runtime.remember(upNextVideoId) { androidx.compose.runtime.mutableStateOf(false) }
+             val upNextCardShown = androidx.compose.runtime.remember(upNextVideoId) { androidx.compose.runtime.mutableStateOf(false) }
++            val switchingToNext = androidx.compose.runtime.remember(upNextVideoId) { androidx.compose.runtime.mutableStateOf(false) }
+             val playUpNextNow: () -> Unit = {
+                 val ytId = upNextVideoId
+                 if (ytId != null && youtubeVm != null) {
++                    switchingToNext.value = true
+                     youtubeVm.playNext(
+                         currentVideoId = ytId,
+                         onReady = { v ->
+@@ -1026,7 +1030,10 @@ private fun PlaybackNavHost(
+                                 popUpTo(backStackEntry.destination.id) { inclusive = true }
+                             }
+                         },
+-                        onNone = { navController.popBackStack() }
++                        onNone = {
++                            switchingToNext.value = false
++                            navController.popBackStack()
++                        }
+                     )
+                 }
+             }
+@@ -1139,6 +1146,7 @@ private fun PlaybackNavHost(
+                             onVisibleChange = { upNextCardShown.value = it }
+                         )
+                         SponsorSkipCard()
++                        val pickedVideoId by youtubeVm.resolving.collectAsState()
+                         YouTubeUpNextList(
+                             videoId = upNextVideoId,
+                             viewModel = youtubeVm,
+@@ -1158,6 +1166,20 @@ private fun PlaybackNavHost(
+                                 }
+                             }
+                         )
++                        if (pickedVideoId != null || switchingToNext.value) {
++                            androidx.compose.foundation.layout.Box(
++                                androidx.compose.ui.Modifier
++                                    .fillMaxSize()
++                                    .background(androidx.compose.ui.graphics.Color.Black)
++                                    .clickable(
++                                        interactionSource = androidx.compose.runtime.remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
++                                        indication = null
++                                    ) {},
++                                contentAlignment = androidx.compose.ui.Alignment.Center
++                            ) {
++                                androidx.compose.material3.CircularProgressIndicator(color = androidx.compose.ui.graphics.Color.White)
++                            }
++                        }
+                         if (ytState.info?.liveChatKey != null && (playerUi.showControls || !playerUi.isPlaying)) {
+                             com.nuvio.tv.youtube.YouTubeLiveBadge(
+                                 androidx.compose.ui.Modifier.align(androidx.compose.ui.Alignment.TopStart)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+index 64102d69c..f031938e3 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+@@ -3458,18 +3458,6 @@ private fun PlayerControlsOverlay(
+                     val forkBtnOrder by com.nuvio.tv.data.repository.ForkTvPlayerButtons.order.collectAsState()
+                     forkBtnOrder.filter { com.nuvio.tv.data.repository.ForkTvPlayerButtons.mainOrder(hiddenBtns).contains(it) }.forEach { forkBtns[it]?.invoke() }
+ 
+-                    if (onShowPartyPanel != null) {
+-                        ControlButton(
+-                            icon = Icons.Rounded.Groups,
+-                            contentDescription = stringResource(R.string.party_title),
+-                            onClick = onShowPartyPanel,
+-                            upFocusRequester = progressUpTarget,
+-                            onDownKey = onHideControls,
+-                            onFocused = onResetHideTimer,
+-                            contentColor = if (partyActive) NuvioTheme.colors.Secondary else Color.White
+-                        )
+-                    }
+-
+                     AnimatedVisibility(
+                         visible = uiState.showMoreDialog,
+                         enter = slideInHorizontally(
+@@ -3521,16 +3509,6 @@ private fun PlayerControlsOverlay(
+                                 onFocused = onResetHideTimer
+                             )
+                             }
+-                            onOpenInExternalPlayer?.let { openInExternalPlayer ->
+-                                ControlButton(
+-                                    icon = Icons.AutoMirrored.Filled.OpenInNew,
+-                                    contentDescription = stringResource(R.string.cd_open_external_player),
+-                                    onClick = openInExternalPlayer,
+-                                    upFocusRequester = progressUpTarget,
+-                                    onDownKey = onHideControls,
+-                                    onFocused = onResetHideTimer
+-                                )
+-                            }
+                             moreBtns["info"] = {
+                             if ("info" !in hiddenBtns) ControlButton(
+                                 icon = Icons.Default.Info,
+@@ -3555,28 +3533,6 @@ private fun PlayerControlsOverlay(
+                                     onFocused = onResetHideTimer
+                                 )
+                             }
+-                            dxStatsButtonAction()?.let { toggleStats -> // Nuvio fork: stream stats
+-                                ControlButton(
+-                                    icon = dxStatsIcon,
+-                                    contentDescription = "Stream stats",
+-                                    onClick = toggleStats,
+-                                    upFocusRequester = progressUpTarget,
+-                                    onDownKey = onHideControls,
+-                                    onFocused = onResetHideTimer
+-                                )
+-                            }
+-                            if (uiState.playbackIssueReportsEnabled) {
+-                                ReportControlButton(
+-                                    reportId = uiState.playbackIssueReportId,
+-                                    showReportId = reportCodeVisible,
+-                                    onClick = onReportPlaybackIssue,
+-                                    enabled = uiState.playbackIssueReportStatus != PlaybackIssueReportStatus.Sending &&
+-                                        uiState.playbackIssueReportStatus != PlaybackIssueReportStatus.Sent,
+-                                    upFocusRequester = progressUpTarget,
+-                                    onDownKey = onHideControls,
+-                                    onFocused = onResetHideTimer
+-                                )
+-                            }
+                         }
+                     }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubePlayerPanel.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubePlayerPanel.kt
+index a13ed78ad..c58049cf5 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubePlayerPanel.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubePlayerPanel.kt
+@@ -158,10 +158,6 @@ fun BoxScope.YouTubePlayerPanel(
+                     if (info.chapters.isNotEmpty()) {
+                         add(PanelEntry("Chapters", "${info.chapters.size} sections") { mode = PanelMode.CHAPTERS })
+                     }
+-                    add(PanelEntry("Related videos", null) {
+-                        mode = PanelMode.RELATED
+-                        onLoadRelated()
+-                    })
+                     info.channelId?.let { channel ->
+                         add(PanelEntry("Open channel", info.author.takeIf(String::isNotBlank)) { onOpenChannel(channel, info.author) })
+                         add(PanelEntry("Hide this channel", "Keeps it off the YouTube page") { viewModel.hideChannel() })
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeUpNext.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeUpNext.kt
+index b7338d276..35b87c9bc 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeUpNext.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeUpNext.kt
+@@ -88,6 +88,13 @@ fun BoxScope.YouTubeUpNext(
+         if (inRange && !looping && YouTubeSettings.autoplayNext(context)) viewModel.prepareNext(videoId)
+     }
+ 
++    // Look up the first suggestions while the video plays, so a pick starts at once.
++    val suggestions by viewModel.related.collectAsState()
++    LaunchedEffect(videoId) { viewModel.loadRelated(videoId) }
++    LaunchedEffect(suggestions.firstOrNull()?.videoId) {
++        suggestions.firstOrNull { it.kind == YtKind.VIDEO }?.let { viewModel.prefetch(it, suggestions.drop(1)) }
++    }
++
+     val item = next
+     val visible = !(looping || item == null || !inRange || remaining > SHOW_WITHIN_MS || !YouTubeSettings.autoplayNext(context))
+     DisposableEffect(visible) {
+@@ -170,6 +177,11 @@ fun BoxScope.YouTubeUpNextList(
+     LaunchedEffect(related.size) {
+         if (selected > related.lastIndex) selected = related.lastIndex.coerceAtLeast(0)
+     }
++    // Look up the highlighted video and the ones after it, so OK starts it at once.
++    LaunchedEffect(selected, related.size, open) {
++        if (!open) return@LaunchedEffect
++        related.getOrNull(selected)?.let { viewModel.prefetch(it, related.drop(selected + 1)) }
++    }
+     // Keep the highlighted card in view, only scrolling when it is not fully visible.
+     LaunchedEffect(selected, related.size, gridMode) {
+         if (related.isEmpty()) return@LaunchedEffect
+@@ -190,15 +202,18 @@ fun BoxScope.YouTubeUpNextList(
+     fun SuggestionCard(index: Int, item: YtItem, modifier: Modifier) {
+         val isSelected = index == selected
+         Column(
+-            modifier,
++            modifier
++                .clip(RoundedCornerShape(12.dp))
++                .background(if (isSelected) Color(0xFF1E5BD8) else Color.Transparent)
++                .border(if (isSelected) 3.dp else 0.dp, Color.White, RoundedCornerShape(12.dp))
++                .padding(5.dp),
+             verticalArrangement = Arrangement.spacedBy(6.dp)
+         ) {
+             Box(
+                 Modifier
+                     .fillMaxWidth()
+                     .aspectRatio(16f / 9f)
+-                    .clip(RoundedCornerShape(10.dp))
+-                    .border(if (isSelected) 3.dp else 0.dp, Color.White, RoundedCornerShape(10.dp))
++                    .clip(RoundedCornerShape(8.dp))
+             ) {
+                 AsyncImage(
+                     model = item.thumbnail,
+@@ -230,7 +245,7 @@ fun BoxScope.YouTubeUpNextList(
+             )
+             Text(
+                 item.subtitle ?: item.author.orEmpty(),
+-                color = Color(0xFFAAAAAA),
++                color = if (isSelected) Color(0xFFDDE6FF) else Color(0xFFAAAAAA),
+                 fontSize = 12.sp,
+                 maxLines = 2,
+                 overflow = TextOverflow.Ellipsis,
