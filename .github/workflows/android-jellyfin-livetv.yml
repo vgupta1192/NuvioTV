@@ -1,5 +1,5 @@
 name: Build NuvioTV Jellyfin+LiveTV (upstream release sync)
-# sync-pulse: 1.1.0-beta.13 2026-11-08T11:00:00Z p64c
+# sync-pulse: 1.1.0-beta.13 2026-11-08T11:00:00Z p64d
 
 on:
   push:
@@ -266,6 +266,24 @@ jobs:
         run: |
           echo "$KS_B64" | base64 -d > nuviotv.jks
           test -s nuviotv.jks
+
+      # GitHub's release CDN sometimes answers 504 for the sherpa-onnx AAR (runs #309, #311-#313);
+      # fetch it up front with retries so autosync.gradle finds a verified file in app/libs.
+      - name: Pre-fetch sherpa-onnx AAR with retries
+        if: steps.ver.outputs.should_build == 'true'
+        run: |
+          V=1.13.8
+          SHA=633c24321e06b1fe79feafa03ea16cbc0f8a286641e2da3559bac91bdb13bd96
+          mkdir -p app/libs
+          F=app/libs/sherpa-onnx-$V.aar
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsSL --max-time 300 -o "$F" "https://github.com/k2-fsa/sherpa-onnx/releases/download/v$V/sherpa-onnx-$V.aar" \
+              && [ "$(sha256sum "$F" | cut -d' ' -f1)" = "$SHA" ]; then
+              echo "sherpa-onnx fetched on try $i"; exit 0
+            fi
+            echo "::warning::sherpa-onnx fetch try $i failed"; rm -f "$F"; sleep 30
+          done
+          echo "::warning::falling back to the Gradle download"
 
       - name: Create local.properties (self-hosted backend)
         if: steps.ver.outputs.should_build == 'true'
