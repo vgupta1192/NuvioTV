@@ -1,0 +1,720 @@
+diff --git a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
+index 80045d6a0..93c2ed34d 100644
+--- a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
++++ b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
+@@ -97,6 +97,7 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+         SentryInitializer.start(this, sentrySettingsDataStore)
+         com.nuvio.tv.core.diagnostics.ForkCrashReporter.install(this) // Nuvio fork: local crash reports, shown in Debug logs to phone
+         com.nuvio.tv.core.diagnostics.ForkStability.install(this) // Nuvio fork: breadcrumbs and main thread freeze watchdog
++        com.nuvio.tv.youtube.YouTubeContentRegion.apply(this) // Nuvio fork: YouTube content region
+         com.nuvio.tv.core.network.DohSetting.init(this) // Nuvio fork: DNS over HTTPS choice
+         com.nuvio.tv.ui.screens.player.TvForkPlayerPrefs.load(this) // Nuvio fork: player extras
+         PluginRuntimeHooks.onApplicationCreate(this)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
+index 04cc93d30..2497ec2bb 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
+@@ -1147,6 +1147,11 @@ private fun PlaybackNavHost(
+                                 }
+                             }
+                         )
++                        if (ytState.info?.liveChatKey != null && (playerUi.showControls || !playerUi.isPlaying)) {
++                            com.nuvio.tv.youtube.YouTubeLiveBadge(
++                                androidx.compose.ui.Modifier.align(androidx.compose.ui.Alignment.TopStart)
++                            )
++                        }
+                         if (chatOn.value) YouTubeChatOverlay(ytPlayerVm)
+                         if (playerUi.showYouTubePanel) {
+                             YouTubePlayerPanel(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/YouTubeSettingsContent.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/YouTubeSettingsContent.kt
+index b06398bc6..06b911b6c 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/YouTubeSettingsContent.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/YouTubeSettingsContent.kt
+@@ -68,6 +68,7 @@ internal fun YouTubeSettingsContent(
+     var hideWatched by remember { mutableStateOf(YouTubeSettings.hideWatched(context)) }
+     var hideUpcoming by remember { mutableStateOf(YouTubeSettings.hideUpcoming(context)) }
+     var codec by remember { mutableStateOf(YouTubeSettings.codecPreference(context)) }
++    var contentRegion by remember { mutableStateOf(YouTubeSettings.contentRegion(context)) }
+     var qualityToast by remember { mutableStateOf(YouTubeSettings.qualityToast(context)) }
+ 
+     Column(
+@@ -158,6 +159,17 @@ internal fun YouTubeSettingsContent(
+                     YouTubeSettings.setCodecPreference(context, codec)
+                 }
+             )
++            SettingsActionRow(
++                title = "Content region",
++                subtitle = "Which country's videos appear in News and Live",
++                value = if (contentRegion.isBlank()) "Automatic" else java.util.Locale.Builder().setRegion(contentRegion).build().getDisplayCountry(java.util.Locale.getDefault()),
++                onClick = {
++                    val choices = YouTubeSettings.regionChoices
++                    contentRegion = choices[(choices.indexOf(contentRegion).coerceAtLeast(0) + 1) % choices.size]
++                    YouTubeSettings.setContentRegion(context, contentRegion)
++                    com.nuvio.tv.youtube.YouTubeContentRegion.apply(context)
++                }
++            )
+             SettingsActionRow(
+                 title = "Default quality",
+                 subtitle = "The video size to start at. You can still change it in the player.",
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeAccountViewModel.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeAccountViewModel.kt
+index 760e19a4e..dda73ffff 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeAccountViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeAccountViewModel.kt
+@@ -39,7 +39,7 @@ data class YouTubeAccountState(
+     val error: String? = null
+ ) {
+     /** What a phone should open to enter the code; the code is filled in when YouTube allows it. */
+-    val activateLink: String? get() = code?.let { "https://www.$url?user_code=$it" }
++    val activateLink: String? get() = code?.let { "https://www.$url?user_code=${it.replace(" ", "-")}" }
+ }
+ 
+ /** Signs in to YouTube with the TV device-code flow, switches between accounts and profiles, and signs out. */
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeContentRegion.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeContentRegion.kt
+new file mode 100644
+index 000000000..a395fa527
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeContentRegion.kt
+@@ -0,0 +1,12 @@
++package com.nuvio.tv.youtube
++
++import android.content.Context
++import com.liskovsoft.googlecommon.common.locale.LocaleManager
++
++/** Which country's videos YouTube should show. Blank means the device's own region. */
++internal object YouTubeContentRegion {
++    /** Applies the saved choice before the YouTube feeds load. */
++    fun apply(context: Context) {
++        LocaleManager.setCountryOverride(YouTubeSettings.contentRegion(context).takeIf { it.isNotBlank() })
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeLiveBadge.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeLiveBadge.kt
+new file mode 100644
+index 000000000..a7fe28f2d
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeLiveBadge.kt
+@@ -0,0 +1,26 @@
++package com.nuvio.tv.youtube
++
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++
++/** The red LIVE marker shown over a live YouTube broadcast while the controls are up. */
++@Composable
++fun YouTubeLiveBadge(modifier: Modifier = Modifier) {
++    Box(
++        modifier = modifier
++            .padding(20.dp)
++            .background(Color(0xFFE50914), RoundedCornerShape(4.dp))
++            .padding(horizontal = 8.dp, vertical = 3.dp)
++    ) {
++        Text("LIVE", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeLoadingGlow.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeLoadingGlow.kt
+new file mode 100644
+index 000000000..8fae66414
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeLoadingGlow.kt
+@@ -0,0 +1,142 @@
++package com.nuvio.tv.youtube
++
++import androidx.compose.animation.core.LinearEasing
++import androidx.compose.animation.core.animateFloat
++import androidx.compose.animation.core.infiniteRepeatable
++import androidx.compose.animation.core.rememberInfiniteTransition
++import androidx.compose.animation.core.tween
++import androidx.compose.foundation.Canvas
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.geometry.CornerRadius
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.geometry.Rect
++import androidx.compose.ui.geometry.RoundRect
++import androidx.compose.ui.graphics.Brush
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.Path
++import androidx.compose.ui.graphics.StrokeCap
++import androidx.compose.ui.graphics.drawscope.Stroke
++import androidx.compose.ui.unit.dp
++import kotlin.math.PI
++import kotlin.math.cos
++import kotlin.math.sin
++
++/**
++ * A small glowing light that runs around a thumbnail's edge while its stream is looked up.
++ *
++ * The thumbnail's own outline is the track: a faint line follows it, and a hot white/yellow ball
++ * with a short ember trail races along it like the lit fuse of a firecracker. Only the one card
++ * being opened composes this, and it is one Canvas of flat circles and two small radial gradients,
++ * so the cost stays low.
++ */
++@Composable
++fun YouTubeLoadingGlow(modifier: Modifier = Modifier) {
++    val transition = rememberInfiniteTransition(label = "thumbnail-loading")
++    // Kept as a State and read inside the draw pass, so the animation does not recompose the card.
++    val progress = transition.animateFloat(
++        initialValue = 0f,
++        targetValue = 1f,
++        animationSpec = infiniteRepeatable(tween(durationMillis = 1700, easing = LinearEasing)),
++        label = "glow-progress"
++    )
++    Canvas(modifier) {
++        val corner = 10.dp.toPx()
++        // The ball rolls on a line just inside the rim, so most of its glow stays on the picture.
++        val inset = 5.dp.toPx()
++        val width = size.width - inset * 2
++        val height = size.height - inset * 2
++        val radius = corner.coerceAtMost(minOf(width, height) * 0.5f)
++
++        fun pathAt(padding: Float) = Path().apply {
++            addRoundRect(
++                RoundRect(
++                    rect = Rect(padding, padding, size.width - padding, size.height - padding),
++                    topLeft = CornerRadius(corner),
++                    topRight = CornerRadius(corner),
++                    bottomRight = CornerRadius.Zero,
++                    bottomLeft = CornerRadius.Zero
++                )
++            )
++        }
++
++        // Dim the picture a little so the running light reads on bright thumbnails.
++        drawPath(pathAt(0f), Color.Black.copy(alpha = 0.38f))
++        // The track: the edge of the thumbnail, drawn as a thin rail.
++        drawPath(
++            pathAt(inset),
++            Color.White.copy(alpha = 0.24f),
++            style = Stroke(1.dp.toPx(), cap = StrokeCap.Round)
++        )
++
++        /**
++         * A point at [t] (0..1) along the rail, clockwise from the top-left corner's arc. The shape
++         * has rounded top corners and square bottom corners, matching the card.
++         */
++        fun pointAt(t: Float): Offset {
++            val arc = (PI / 2).toFloat() * radius
++            val top = (width - 2 * radius).coerceAtLeast(0f)
++            val side = (height - radius).coerceAtLeast(0f)
++            val total = top + arc + side + width + side + arc
++            var d = ((t % 1f + 1f) % 1f) * total
++            val left = inset
++            val topY = inset
++
++            if (d <= top) return Offset(left + radius + d, topY)
++            d -= top
++            if (d <= arc) {
++                val a = -PI.toFloat() / 2 + (d / arc) * (PI.toFloat() / 2)
++                return Offset(left + width - radius + radius * cos(a), topY + radius + radius * sin(a))
++            }
++            d -= arc
++            if (d <= side) return Offset(left + width, topY + radius + d)
++            d -= side
++            if (d <= width) return Offset(left + width - d, topY + height)
++            d -= width
++            if (d <= side) return Offset(left, topY + height - d)
++            d -= side
++            val a = PI.toFloat() + (d / arc) * (PI.toFloat() / 2)
++            return Offset(left + radius + radius * cos(a), topY + radius + radius * sin(a))
++        }
++
++        val head = progress.value
++        // The ember trail: dots fading out behind the head, like a fuse burning down.
++        val trailDots = 20
++        val trailSpan = 0.12f
++        for (i in trailDots downTo 1) {
++            val fraction = 1f - i / trailDots.toFloat()
++            val dot = pointAt(head - trailSpan * (i / trailDots.toFloat()))
++            drawCircle(
++                color = Color(0xFFFFF2E4).copy(alpha = 0.42f * fraction),
++                radius = (2.4.dp.toPx() * fraction + 0.4.dp.toPx()),
++                center = dot
++            )
++        }
++
++        val ball = pointAt(head)
++        // Soft white halo first, then the hot core.
++        drawCircle(
++            brush = Brush.radialGradient(
++                colors = listOf(
++                    Color.White.copy(alpha = 0.62f),
++                    Color(0xFFE8F1FF).copy(alpha = 0.26f),
++                    Color.Transparent
++                ),
++                center = ball,
++                radius = 12.dp.toPx()
++            ),
++            radius = 12.dp.toPx(),
++            center = ball
++        )
++        drawCircle(
++            brush = Brush.radialGradient(
++                colors = listOf(Color.White, Color(0xFFF2F7FF), Color.Transparent),
++                center = ball,
++                radius = 5.5.dp.toPx()
++            ),
++            radius = 5.5.dp.toPx(),
++            center = ball
++        )
++        drawCircle(Color.White, radius = 2.dp.toPx(), center = ball)
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt
+index 748f28794..e5ec44d60 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt
+@@ -48,6 +48,7 @@ import androidx.compose.ui.focus.FocusRequester
+ import androidx.compose.ui.focus.focusProperties
+ import androidx.compose.ui.focus.focusRequester
+ import androidx.compose.ui.focus.onFocusChanged
++import androidx.compose.ui.input.key.onPreviewKeyEvent
+ import androidx.compose.ui.platform.LocalFocusManager
+ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+ import androidx.compose.ui.graphics.Color
+@@ -268,6 +269,22 @@ fun YouTubeScreen(
+             }
+         )
+     }
++    val cardMenu by viewModel.menu.collectAsState()
++    cardMenu?.let { menu ->
++        YouTubeItemMenuDialog(
++            menu = menu,
++            onClose = { viewModel.closeMenu() },
++            onOpenChannel = {
++                viewModel.closeMenu()
++                viewModel.openChannelOf(menu.item)
++            },
++            onOpenItem = {
++                viewModel.closeMenu()
++                openItem(menu.item, emptyList())
++            },
++            onBlockChannel = { viewModel.menuBlockChannel() }
++        )
++    }
+     shortsStart?.let { start ->
+         val shorts = (shortsFixed ?: state.grid).filter { it.kind == YtKind.VIDEO && it.videoId != null }
+         YouTubeShortsPlayer(
+@@ -350,9 +367,9 @@ private fun Content(
+                     }
+                     LazyRow(Modifier.padding(top = 8.dp), state = rowState, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                         items(row.items) { v ->
+-                            ItemCard(v, Modifier.width(260.dp), onFocused = {
++                            ItemCard(v, viewModel, Modifier.width(260.dp), onFocused = {
+                                 viewModel.prefetch(v, row.items.dropWhile { it !== v }.drop(1))
+-                            }) {
++                            }, onLongClick = { viewModel.openMenu(v) }) {
+                                 onOpen(v, row.items)
+                             }
+                         }
+@@ -378,9 +395,9 @@ private fun Content(
+                 verticalArrangement = Arrangement.spacedBy(16.dp)
+             ) {
+                 gridItems(state.grid) { v ->
+-                    ItemCard(v, Modifier, onFocused = {
++                    ItemCard(v, viewModel, Modifier, onFocused = {
+                         viewModel.prefetch(v, state.grid.dropWhile { it !== v }.drop(1))
+-                    }) { onOpen(v, state.grid) }
++                    }, onLongClick = { viewModel.openMenu(v) }) { onOpen(v, state.grid) }
+                 }
+             }
+         }
+@@ -520,31 +537,83 @@ private fun TabChip(label: String, selected: Boolean, onClick: () -> Unit) {
+ }
+ 
+ @Composable
+-private fun ItemCard(item: YtItem, modifier: Modifier, onFocused: () -> Unit, onClick: () -> Unit) {
++private fun ItemCard(
++    item: YtItem,
++    viewModel: YouTubeViewModel,
++    modifier: Modifier,
++    onFocused: () -> Unit,
++    onLongClick: () -> Unit,
++    onClick: () -> Unit
++) {
+     var focused by remember { mutableStateOf(false) }
++    // OK is held down on this card, and whether that already counted as a long press.
++    var held by remember(item.videoId) { mutableStateOf(false) }
++    var longFired by remember(item.videoId) { mutableStateOf(false) }
++    val longAction by androidx.compose.runtime.rememberUpdatedState(onLongClick)
++    // Some remotes never send key repeats, so the hold is timed here instead.
++    LaunchedEffect(held, longFired) {
++        if (held && !longFired) {
++            kotlinx.coroutines.delay(550)
++            if (held && !longFired) {
++                longFired = true
++                longAction()
++            }
++        }
++    }
+     val context = androidx.compose.ui.platform.LocalContext.current
+     // What this device has played, or what your account says, whichever is further along.
+     val watched = remember(item.videoId) {
+         maxOf(item.percentWatched, YouTubeProgress.localPercent(context, item.videoId))
+     }
++    val resolving by viewModel.resolving.collectAsState()
+     Column(
+         modifier
+             .clip(RoundedCornerShape(10.dp))
+             .border(3.dp, if (focused) Color.White else Color.Transparent, RoundedCornerShape(10.dp))
+             .onFocusChanged {
+                 focused = it.isFocused
++                if (!it.isFocused) {
++                    held = false
++                    longFired = false
++                }
+                 if (it.isFocused) onFocused()
+             }
++            // Holding OK opens the card's menu; a plain press still opens the card.
++            .onPreviewKeyEvent { e ->
++                val isOk = e.key == androidx.compose.ui.input.key.Key.DirectionCenter ||
++                    e.key == androidx.compose.ui.input.key.Key.Enter ||
++                    e.key == androidx.compose.ui.input.key.Key.NumPadEnter
++                if (!isOk) return@onPreviewKeyEvent false
++                when (e.type) {
++                    androidx.compose.ui.input.key.KeyEventType.KeyDown -> {
++                        if (e.nativeKeyEvent.repeatCount == 0) {
++                            held = true
++                            longFired = false
++                        }
++                    }
++                    androidx.compose.ui.input.key.KeyEventType.KeyUp -> {
++                        if (held && !longFired) onClick()
++                        held = false
++                        longFired = false
++                    }
++                    else -> {}
++                }
++                true
++            }
+             .clickable(onClick = onClick)
+             .background(CardBg)
+     ) {
+-        Box(Modifier.fillMaxWidth().aspectRatio(16f / 9f)) {
++        // Shorts keep the 16:9 card shape; the vertical thumbnail is letterboxed.
++        Box(Modifier.fillMaxWidth().aspectRatio(16f / 9f).background(Color.Black)) {
+             AsyncImage(
+                 model = item.thumbnail,
+                 contentDescription = null,
+-                contentScale = ContentScale.Crop,
++                contentScale = if (item.isShort) ContentScale.Fit else ContentScale.Crop,
+                 modifier = Modifier.fillMaxSize()
+             )
++            if (item.videoId != null && resolving == item.videoId) {
++                YouTubeLoadingGlow(Modifier.fillMaxSize())
++            }
+             if (watched > 0 && item.kind == YtKind.VIDEO && !item.isLive) {
+                 Box(
+                     Modifier
+@@ -574,6 +643,18 @@ private fun ItemCard(item: YtItem, modifier: Modifier, onFocused: () -> Unit, on
+                         .padding(horizontal = 6.dp, vertical = 2.dp)
+                 )
+             }
++            if (focused && item.kind == YtKind.VIDEO && !item.isLive && watched in 5..94) {
++                Text(
++                    "Resume",
++                    color = Color.White,
++                    fontSize = 12.sp,
++                    modifier = Modifier
++                        .align(Alignment.TopStart)
++                        .padding(6.dp)
++                        .background(Color(0xCC000000), RoundedCornerShape(4.dp))
++                        .padding(horizontal = 6.dp, vertical = 2.dp)
++                )
++            }
+         }
+         Column(Modifier.padding(10.dp)) {
+             Text(item.title, color = Color.White, fontSize = 14.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+@@ -581,3 +662,82 @@ private fun ItemCard(item: YtItem, modifier: Modifier, onFocused: () -> Unit, on
+         }
+     }
+ }
++
++@Composable
++private fun YouTubeItemMenuDialog(
++    menu: YtItemMenu,
++    onClose: () -> Unit,
++    onOpenChannel: () -> Unit,
++    onOpenItem: () -> Unit,
++    onBlockChannel: () -> Unit
++) {
++    val firstRow = remember { FocusRequester() }
++    val menuKey = menu.item.videoId ?: menu.item.channelId ?: menu.item.title
++    LaunchedEffect(menuKey) {
++        kotlinx.coroutines.yield()
++        runCatching { firstRow.requestFocus() }
++    }
++    val isVideo = menu.item.kind == YtKind.VIDEO
++    val isChannel = menu.item.kind == YtKind.CHANNEL
++    val hasChannel = menu.item.channelId != null
++    com.nuvio.tv.ui.components.NuvioDialog(
++        onDismiss = onClose,
++        title = menu.item.title,
++        subtitle = if (isChannel) menu.item.author?.takeIf { it.isNotBlank() } ?: menu.item.title else menu.item.author,
++        width = 480.dp
++    ) {
++        Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
++            if (isVideo && !hasChannel && menu.loadingChannel) {
++                Text("Looking up the channel…", color = Color.Gray, fontSize = 14.sp)
++            }
++            if (isVideo && hasChannel) MenuRow("Open channel", firstRow, onClick = onOpenChannel)
++            if (isChannel) MenuRow("Open channel", firstRow, onClick = onOpenItem)
++            if (menu.item.kind == YtKind.PLAYLIST) MenuRow("Open playlist", firstRow, onClick = onOpenItem)
++            if ((isVideo || isChannel) && hasChannel) MenuRow("Block this channel", onClick = onBlockChannel)
++        }
++    }
++}
++
++@Composable
++private fun MenuRow(label: String, focusRequester: FocusRequester? = null, onClick: () -> Unit) {
++    var focused by remember { mutableStateOf(false) }
++    // The OK press that opened this menu was already down when the row took focus; its release must not activate the row.
++    var pressedHere by remember { mutableStateOf(false) }
++    Text(
++        label,
++        color = Color.White,
++        fontSize = 16.sp,
++        maxLines = 1,
++        overflow = TextOverflow.Ellipsis,
++        modifier = Modifier
++            .fillMaxWidth()
++            .clip(RoundedCornerShape(8.dp))
++            .background(if (focused) Color(0xFF34343A) else Color.Transparent)
++            .border(2.dp, if (focused) Color.White else Color.Transparent, RoundedCornerShape(8.dp))
++            .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
++            .onFocusChanged {
++                focused = it.isFocused
++                if (!it.isFocused) pressedHere = false
++            }
++            .onPreviewKeyEvent { e ->
++                val isOk = e.key == androidx.compose.ui.input.key.Key.DirectionCenter ||
++                    e.key == androidx.compose.ui.input.key.Key.Enter ||
++                    e.key == androidx.compose.ui.input.key.Key.NumPadEnter
++                if (!isOk) return@onPreviewKeyEvent false
++                when (e.type) {
++                    androidx.compose.ui.input.key.KeyEventType.KeyDown -> {
++                        if (e.nativeKeyEvent.repeatCount == 0) pressedHere = true
++                        false
++                    }
++                    androidx.compose.ui.input.key.KeyEventType.KeyUp -> {
++                        val beganHere = pressedHere
++                        pressedHere = false
++                        !beganHere
++                    }
++                    else -> false
++                }
++            }
++            .clickable(onClick = onClick)
++            .padding(horizontal = 12.dp, vertical = 10.dp)
++    )
++}
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeSettings.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeSettings.kt
+index ac89d7d7f..850642f2e 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeSettings.kt
+@@ -25,6 +25,7 @@ object YouTubeSettings {
+     private const val KEY_HIDE_UPCOMING = "hide_upcoming"
+     private const val KEY_CODEC = "codec_preference"
+     private const val KEY_QUALITY_TOAST = "quality_toast"
++    private const val KEY_CONTENT_REGION = "content_region"
+ 
+     /** SponsorBlock's segment types, in the order they're listed. */
+     val sponsorCategories: List<Pair<String, String>> = listOf(
+@@ -46,6 +47,15 @@ object YouTubeSettings {
+     private fun prefs(context: Context) =
+         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+ 
++    /** The country whose videos show in News and Live; blank follows the device region. */
++    fun contentRegion(context: Context): String = prefs(context).getString(KEY_CONTENT_REGION, "") ?: ""
++
++    fun setContentRegion(context: Context, region: String) =
++        prefs(context).edit().putString(KEY_CONTENT_REGION, region.trim().uppercase()).apply()
++
++    /** Regions the settings row cycles through; blank is automatic. */
++    val regionChoices = listOf("", "US", "GB", "IN", "CA", "AU", "DE", "FR", "ES", "IT", "BR", "MX", "JP", "KR", "ID", "TR", "SA", "AE")
++
+     fun sponsorBlockEnabled(context: Context) = prefs(context).getBoolean(KEY_SPONSORBLOCK, true)
+ 
+     fun setSponsorBlockEnabled(context: Context, enabled: Boolean) {
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
+index 01e879cfb..390837dd4 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
+@@ -129,6 +129,13 @@ data class YtPlayable(
+     val isFresh: Boolean get() = android.os.SystemClock.elapsedRealtime() - lookedUpAt < 20 * 60 * 1000L
+ }
+ 
++/** The card whose long-press menu is open. */
++data class YtItemMenu(
++    val item: YtItem,
++    /** A feed card often arrives without its channel ID; the menu is looking it up. */
++    val loadingChannel: Boolean = false
++)
++
+ /**
+  * The YouTube section's data. Everything here is shown only inside the YouTube page; nothing is
+  * handed to Home, Continue Watching or the library.
+@@ -160,6 +167,13 @@ class YouTubeViewModel @Inject constructor(
+     private val _state = MutableStateFlow(YtUiState())
+     val state: StateFlow<YtUiState> = _state.asStateFlow()
+ 
++    /** The video being looked up after a press, so its card can show a loading light. */
++    private val _resolving = MutableStateFlow<String?>(null)
++    val resolving: StateFlow<String?> = _resolving.asStateFlow()
++
++    private val _menu = MutableStateFlow<YtItemMenu?>(null)
++    val menu: StateFlow<YtItemMenu?> = _menu.asStateFlow()
++
+     private val _error = MutableStateFlow<String?>(null)
+     val error: StateFlow<String?> = _error.asStateFlow()
+ 
+@@ -1132,15 +1146,71 @@ class YouTubeViewModel @Inject constructor(
+             open(item)
+             return
+         }
++        val id = item.videoId
++        // A second press while this video is already being looked up is the same request.
++        if (id != null && _resolving.value == id) return
+         seedResume(item)
+         // What was on screen with it becomes the list that plays on from here.
+         queue = from.filter { it.kind == YtKind.VIDEO }
+         played.clear()
+         prefetchJob?.cancel()
++        _resolving.value = id
+         viewModelScope.launch {
+-            lookup(item).await().fold(
+-                onSuccess = onReady,
+-                onFailure = { _error.value = it.message ?: "Couldn't play this video" }
++            try {
++                val result = lookup(item).await()
++                if (id != null && _resolving.value != id) return@launch
++                result.fold(
++                    onSuccess = onReady,
++                    onFailure = { _error.value = it.message ?: "Couldn't play this video" }
++                )
++            } finally {
++                if (_resolving.value == id) _resolving.value = null
++            }
++        }
++    }
++
++    /** Opens the long-press menu for [item]; a card without a channel ID looks it up first. */
++    fun openMenu(item: YtItem) {
++        if (item.kind == YtKind.PLAYLIST) {
++            _menu.value = YtItemMenu(item)
++            return
++        }
++        _menu.value = YtItemMenu(item, loadingChannel = item.channelId == null && item.videoId != null)
++        val videoId = item.videoId
++        if (item.channelId == null && videoId != null) {
++            viewModelScope.launch {
++                val meta = withContext(Dispatchers.IO) {
++                    runCatching { service.mediaItemService.getMetadataObserve(videoId).blockingFirst() }.getOrNull()
++                }
++                _menu.update { menu ->
++                    if (menu?.item?.videoId != videoId) menu
++                    else menu.copy(
++                        item = if (!meta?.channelId.isNullOrBlank()) menu.item.copy(channelId = meta?.channelId) else menu.item,
++                        loadingChannel = false
++                    )
++                }
++            }
++        }
++    }
++
++    fun closeMenu() {
++        _menu.value = null
++    }
++
++    /** Hides the channel of the card whose menu is open, and drops its cards from the page. */
++    fun menuBlockChannel() {
++        val item = _menu.value?.item ?: return
++        val channelId = item.channelId ?: return
++        val name = item.author?.takeIf { it.isNotBlank() } ?: item.title
++        YouTubeSettings.hideChannel(context, channelId, name)
++        refreshHidden()
++        closeMenu()
++        _state.update { st ->
++            st.copy(
++                rows = st.rows
++                    .map { row -> row.copy(items = row.items.filter { it.channelId != channelId }) }
++                    .filter { it.items.isNotEmpty() },
++                grid = st.grid.filter { it.channelId != channelId }
+             )
+         }
+     }
+diff --git a/mediaservicecore/youtubeapi/src/main/java/com/liskovsoft/googlecommon/common/locale/LocaleManager.java b/mediaservicecore/youtubeapi/src/main/java/com/liskovsoft/googlecommon/common/locale/LocaleManager.java
+index fdc098ba0..99964c1b2 100644
+--- a/mediaservicecore/youtubeapi/src/main/java/com/liskovsoft/googlecommon/common/locale/LocaleManager.java
++++ b/mediaservicecore/youtubeapi/src/main/java/com/liskovsoft/googlecommon/common/locale/LocaleManager.java
+@@ -1,6 +1,9 @@
+ package com.liskovsoft.googlecommon.common.locale;
+ 
++import android.content.res.Configuration;
++import android.content.res.Resources;
+ import android.os.Build.VERSION;
++import android.os.LocaleList;
+ import com.liskovsoft.sharedutils.locale.LocaleUpdater;
+ import com.liskovsoft.sharedutils.locale.LocaleUtility;
+ import com.liskovsoft.sharedutils.prefs.GlobalPreferences;
+@@ -11,6 +14,8 @@ import java.util.TimeZone;
+ 
+ public class LocaleManager {
+     private static LocaleManager sInstance;
++    /** A region chosen for YouTube's feeds; null follows the device. */
++    private static String sCountryOverride;
+     private String mLang;
+     private String mCountry;
+     private int mOffsetFromUtcMinutes;
+@@ -44,7 +49,12 @@ public class LocaleManager {
+     }
+ 
+     public String getCountry() {
+-        return mCountry;
++        return sCountryOverride != null && !sCountryOverride.isEmpty() ? sCountryOverride : mCountry;
++    }
++
++    /** A region for YouTube's feeds, or null to follow the device. */
++    public static void setCountryOverride(String country) {
++        sCountryOverride = country;
+     }
+ 
+     /**
+@@ -69,7 +79,29 @@ public class LocaleManager {
+             mLang = locale.getLanguage();
+         }
+ 
+-        mCountry = locale.getCountry();
++        // The app's language can have no region (for example "es" or "es-419"), which made YouTube
++        // fall back to a country such as Spain for News and Live. The device's own region is the
++        // better default; a region chosen in YouTube settings overrides it in getCountry().
++        mCountry = getSystemCountry();
++        if (mCountry.isEmpty()) {
++            mCountry = locale.getCountry();
++        }
++    }
++
++    private String getSystemCountry() {
++        try {
++            Configuration configuration = Resources.getSystem().getConfiguration();
++            if (VERSION.SDK_INT >= 24) {
++                LocaleList locales = configuration.getLocales();
++                if (!locales.isEmpty()) {
++                    return locales.get(0).getCountry();
++                }
++            } else {
++                return configuration.locale.getCountry();
++            }
++        } catch (Exception ignored) {
++        }
++        return "";
+     }
+ 
+     private void initUtcOffset() {
