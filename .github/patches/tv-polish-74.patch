@@ -1,0 +1,413 @@
+diff --git a/app/src/full/java/com/nuvio/tv/updater/ApkDownloader.kt b/app/src/full/java/com/nuvio/tv/updater/ApkDownloader.kt
+index 974289df4..273a1cd2e 100644
+--- a/app/src/full/java/com/nuvio/tv/updater/ApkDownloader.kt
++++ b/app/src/full/java/com/nuvio/tv/updater/ApkDownloader.kt
+@@ -4,6 +4,7 @@ import okhttp3.OkHttpClient
+ import okhttp3.Request
+ import java.io.File
+ import java.io.FileOutputStream
++import java.security.MessageDigest
+ import javax.inject.Inject
+ import javax.inject.Singleton
+ 
+@@ -15,6 +16,8 @@ class ApkDownloader @Inject constructor(
+     suspend fun download(
+         url: String,
+         destinationFile: File,
++        expectedSha256: String? = null,
++        expectedSize: Long? = null,
+         onProgress: (downloadedBytes: Long, totalBytes: Long?) -> Unit
+     ): Result<File> {
+         return runCatching {
+@@ -31,22 +34,35 @@ class ApkDownloader @Inject constructor(
+                 }
+ 
+                 val body = response.body ?: error("Empty download body")
+-                val total = body.contentLength().takeIf { it > 0 }
++                val total = body.contentLength().takeIf { it > 0 } ?: expectedSize?.takeIf { it > 0 }
++                val digest = MessageDigest.getInstance("SHA-256")
+ 
+                 body.byteStream().use { input ->
+                     FileOutputStream(destinationFile).use { output ->
+                         val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                         var downloaded = 0L
++                        var lastReportAt = 0L
+                         while (true) {
+                             val read = input.read(buffer)
+                             if (read <= 0) break
+                             output.write(buffer, 0, read)
++                            digest.update(buffer, 0, read)
+                             downloaded += read
+-                            onProgress(downloaded, total)
++                            val now = android.os.SystemClock.elapsedRealtime()
++                            if (now - lastReportAt >= 100L) {
++                                lastReportAt = now
++                                onProgress(downloaded, total)
++                            }
+                         }
+                         output.flush()
++                        onProgress(downloaded, total)
+                     }
+                 }
++
++                if (!Checksum.matches(expectedSha256, Checksum.toHex(digest.digest()))) {
++                    destinationFile.delete()
++                    error("The downloaded update didn't pass its safety check, so it was not installed. Please try again.")
++                }
+             }
+ 
+             destinationFile
+diff --git a/app/src/full/java/com/nuvio/tv/updater/UpdateDownloadStore.kt b/app/src/full/java/com/nuvio/tv/updater/UpdateDownloadStore.kt
+index 684cd78e2..895cf16c8 100644
+--- a/app/src/full/java/com/nuvio/tv/updater/UpdateDownloadStore.kt
++++ b/app/src/full/java/com/nuvio/tv/updater/UpdateDownloadStore.kt
+@@ -55,7 +55,7 @@ class UpdateDownloadStore @Inject constructor(
+     ): Result<File> = downloadMutex.withLock {
+         downloadedFileFor(update)?.let { return@withLock Result.success(it) }
+         val destination = destinationFor(update)
+-        apkDownloader.download(update.assetUrl, destination, onProgress)
++        apkDownloader.download(update.assetUrl, destination, update.assetSha256, update.assetSizeBytes, onProgress)
+             .onSuccess { file ->
+                 updatesDir.listFiles()?.filter { it != file }?.forEach { it.delete() }
+                 updatePreferences.setDownloadedUpdate(update.tag, file.absolutePath)
+diff --git a/app/src/full/java/com/nuvio/tv/updater/UpdateRepository.kt b/app/src/full/java/com/nuvio/tv/updater/UpdateRepository.kt
+index 1d4fd3401..0338bde75 100644
+--- a/app/src/full/java/com/nuvio/tv/updater/UpdateRepository.kt
++++ b/app/src/full/java/com/nuvio/tv/updater/UpdateRepository.kt
+@@ -35,7 +35,8 @@ class UpdateRepository @Inject constructor(
+                 releaseUrl = forkRelease.htmlUrl,
+                 assetName = forkAsset.name,
+                 assetUrl = forkAsset.browserDownloadUrl,
+-                assetSizeBytes = forkAsset.size
++                assetSizeBytes = forkAsset.size,
++                assetSha256 = Checksum.fromDigest(forkAsset.digest)
+             )
+ 
+             @Suppress("UNREACHABLE_CODE")
+@@ -76,7 +77,8 @@ class UpdateRepository @Inject constructor(
+                 releaseUrl = dto.htmlUrl,
+                 assetName = asset.name,
+                 assetUrl = asset.browserDownloadUrl,
+-                assetSizeBytes = asset.size
++                assetSizeBytes = asset.size,
++                assetSha256 = Checksum.fromDigest(asset.digest)
+             )
+         }
+     }
+diff --git a/app/src/full/java/com/nuvio/tv/updater/model/AppUpdate.kt b/app/src/full/java/com/nuvio/tv/updater/model/AppUpdate.kt
+index 32aebc778..b7f2b93d8 100644
+--- a/app/src/full/java/com/nuvio/tv/updater/model/AppUpdate.kt
++++ b/app/src/full/java/com/nuvio/tv/updater/model/AppUpdate.kt
+@@ -7,5 +7,6 @@ data class AppUpdate(
+     val releaseUrl: String?,
+     val assetName: String,
+     val assetUrl: String,
+-    val assetSizeBytes: Long?
++    val assetSizeBytes: Long?,
++    val assetSha256: String? = null
+ )
+diff --git a/app/src/main/java/com/nuvio/tv/MainActivity.kt b/app/src/main/java/com/nuvio/tv/MainActivity.kt
+index 138679dff..522ffe5a2 100644
+--- a/app/src/main/java/com/nuvio/tv/MainActivity.kt
++++ b/app/src/main/java/com/nuvio/tv/MainActivity.kt
+@@ -1912,7 +1912,7 @@ private fun LegacySidebarButton(
+                 .offset(x = 13.dp)
+         )
+         if (expanded) {
+-            com.nuvio.tv.ui.components.AutoResizeText(
++            SidebarLabel(
+                 text = label,
+                 color = contentColor,
+                 textAlign = TextAlign.Start,
+diff --git a/app/src/main/java/com/nuvio/tv/ModernSidebarBlurPanel.kt b/app/src/main/java/com/nuvio/tv/ModernSidebarBlurPanel.kt
+index c6416816e..d348aabef 100644
+--- a/app/src/main/java/com/nuvio/tv/ModernSidebarBlurPanel.kt
++++ b/app/src/main/java/com/nuvio/tv/ModernSidebarBlurPanel.kt
+@@ -414,7 +414,7 @@ private fun SidebarNavigationItem(
+         }
+         Spacer(modifier = Modifier.width(SidebarContentGap))
+ 
+-        AutoResizeText(
++        SidebarLabel(
+             text = label,
+             color = contentColor,
+             modifier = Modifier
+diff --git a/app/src/main/java/com/nuvio/tv/SidebarLabels.kt b/app/src/main/java/com/nuvio/tv/SidebarLabels.kt
+new file mode 100644
+index 000000000..f1bb97f7d
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/SidebarLabels.kt
+@@ -0,0 +1,88 @@
++package com.nuvio.tv
++
++import androidx.compose.foundation.layout.BoxWithConstraints
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.mutableStateMapOf
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.text.rememberTextMeasurer
++import androidx.compose.ui.text.style.TextAlign
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.Constraints
++import androidx.compose.ui.unit.TextUnit
++import androidx.compose.ui.unit.TextUnitType
++import androidx.compose.ui.unit.sp
++import androidx.tv.material3.LocalTextStyle
++import androidx.tv.material3.Text
++import kotlin.math.floor
++
++/**
++ * Live TV fork: one text size for every label in the side menu.
++ *
++ * Each label works out the largest size at which it fits its space; every label then uses the
++ * smallest of those, so they all match and none is cut off ("Live…", "On Dem…") or shrunk on
++ * its own (which left labels in all different sizes). Labels from both the main menu and the
++ * Live TV list count, so the two lists match each other too.
++ */
++internal object SidebarLabelSizes {
++    /** Label -> the largest size (sp) at which it fits. */
++    private val fits = mutableStateMapOf<String, Float>()
++
++    fun report(key: String, sp: Float) {
++        if (fits[key] != sp) fits[key] = sp
++    }
++
++    /** The size every label uses: no bigger than [max], and small enough for all of them. */
++    fun shared(max: TextUnit): TextUnit {
++        val smallest = fits.values.minOrNull() ?: return max
++        return minOf(smallest, max.value).sp
++    }
++}
++
++private const val MIN_LABEL_SP = 11f
++
++@Composable
++internal fun SidebarLabel(
++    text: String,
++    color: Color,
++    modifier: Modifier = Modifier,
++    /** Tells apart labels with the same text in different places (e.g. with an arrow beside it). */
++    key: String = text,
++    textAlign: TextAlign? = null
++) {
++    val style = LocalTextStyle.current
++    val maxSize = if (style.fontSize.type == TextUnitType.Sp) style.fontSize else 16.sp
++    val measurer = rememberTextMeasurer()
++    BoxWithConstraints(modifier) {
++        val avail = constraints.maxWidth
++        val fit = remember(text, avail, maxSize, style) {
++            if (avail <= 0 || avail == Constraints.Infinity) maxSize.value
++            else {
++                val width = measurer.measure(
++                    text = text,
++                    style = style.copy(fontSize = maxSize),
++                    maxLines = 1,
++                    softWrap = false
++                ).size.width
++                // Rounded down to half sizes, so tiny width changes don't keep resizing everything.
++                if (width <= avail) maxSize.value
++                else (floor(maxSize.value * avail / width.toFloat() * 2f) / 2f).coerceAtLeast(MIN_LABEL_SP)
++            }
++        }
++        DisposableEffect(key, fit) {
++            SidebarLabelSizes.report(key, fit)
++            onDispose { }
++        }
++        Text(
++            text = text,
++            color = color,
++            style = style.copy(fontSize = SidebarLabelSizes.shared(maxSize)),
++            maxLines = 1,
++            softWrap = false,
++            overflow = TextOverflow.Ellipsis,
++            textAlign = textAlign
++        )
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt b/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
+index 312bc4093..067d811c4 100644
+--- a/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
++++ b/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
+@@ -334,6 +334,7 @@ data class PlayerSettings(
+     val postPlayRecommendationsEnabled: Boolean = true,
+     val postPlayMovieThresholdPercent: Int = DEFAULT_POST_PLAY_MOVIE_THRESHOLD_PERCENT,
+     val streamAutoPlayNextEpisodeEnabled: Boolean = false,
++    val ratePromptAfterMovie: Boolean = false,
+     val streamAutoPlayNextEpisodeFallbackEnabled: Boolean = true,
+     val streamAutoPlayPreferBingeGroupForNextEpisode: Boolean = true,
+     val streamAutoPlayReuseBingeGroup: Boolean = false,
+@@ -665,6 +666,7 @@ class PlayerSettingsDataStore @Inject constructor(
+     private val postPlayRecommendationsEnabledKey = booleanPreferencesKey("post_play_recommendations_enabled")
+     private val postPlayMovieThresholdPercentKey = intPreferencesKey("post_play_movie_threshold_percent")
+     private val streamAutoPlayNextEpisodeEnabledKey = booleanPreferencesKey("stream_auto_play_next_episode_enabled")
++    private val ratePromptAfterMovieKey = booleanPreferencesKey("rate_prompt_after_movie")
+     private val streamAutoPlayNextEpisodeFallbackEnabledKey = booleanPreferencesKey("stream_auto_play_next_episode_fallback_enabled")
+     private val streamAutoPlayPreferBingeGroupForNextEpisodeKey = booleanPreferencesKey("stream_auto_play_prefer_bingegroup_next_episode")
+     private val streamAutoPlayReuseBingeGroupKey = booleanPreferencesKey("stream_auto_play_reuse_binge_group")
+@@ -1090,6 +1092,7 @@ class PlayerSettingsDataStore @Inject constructor(
+                     PlayerSettings.MAX_POST_PLAY_MOVIE_THRESHOLD_PERCENT
+                 ),
+                 streamAutoPlayNextEpisodeEnabled = prefs[streamAutoPlayNextEpisodeEnabledKey] ?: false,
++                ratePromptAfterMovie = prefs[ratePromptAfterMovieKey] ?: false,
+                 streamAutoPlayNextEpisodeFallbackEnabled = prefs[streamAutoPlayNextEpisodeFallbackEnabledKey] ?: true,
+                 streamAutoPlayPreferBingeGroupForNextEpisode =
+                     prefs[streamAutoPlayPreferBingeGroupForNextEpisodeKey] ?: true,
+@@ -1497,6 +1500,8 @@ class PlayerSettingsDataStore @Inject constructor(
+         }
+     }
+ 
++    suspend fun setRatePromptAfterMovie(enabled: Boolean) { store().edit { it[ratePromptAfterMovieKey] = enabled } }
++
+     suspend fun setStreamAutoPlayNextEpisodeEnabled(enabled: Boolean) {
+         store().edit { prefs ->
+             prefs[streamAutoPlayNextEpisodeEnabledKey] = enabled
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
+index 70a265b82..4d062d35c 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
+@@ -2026,6 +2026,15 @@ private fun MetaDetailsContent(
+     val ratedImdbId = remember(meta.id, meta.imdbId) { ratingImdbId(meta.id, meta.imdbId) }
+     val ratingContext = androidx.compose.ui.platform.LocalContext.current
+     var showUserRatingDialog by remember { mutableStateOf(false) }
++    val ratePrompt by com.nuvio.tv.ui.screens.player.MovieRatingPromptBus.request.collectAsStateWithLifecycle()
++    val ratePromptEnabled by ratingViewModel.promptEnabled.collectAsStateWithLifecycle()
++    LaunchedEffect(ratePrompt, ratePromptEnabled, ratedImdbId) {
++        val request = ratePrompt ?: return@LaunchedEffect
++        if (request.contentId == meta.id && ratePromptEnabled && ratedImdbId != null && ratingViewModel.canRate()) {
++            showUserRatingDialog = true
++        }
++        com.nuvio.tv.ui.screens.player.MovieRatingPromptBus.consume()
++    }
+     // Tracks whether the initial auto-scroll to the "next to play" episode has fired.
+     // Once it fires, no more auto-scrolls happen for the lifetime of this detail screen.
+     var initialEpisodeScrollDone by remember(meta.id) { mutableStateOf(false) }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/UserRating.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/UserRating.kt
+index a2e9ae4f1..afeb24963 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/UserRating.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/UserRating.kt
+@@ -32,13 +32,21 @@ import com.nuvio.tv.ui.components.NuvioDialog
+ import com.nuvio.tv.ui.theme.NuvioTheme
+ import dagger.hilt.android.lifecycle.HiltViewModel
+ import javax.inject.Inject
++import kotlinx.coroutines.flow.SharingStarted
+ import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.map
++import kotlinx.coroutines.flow.stateIn
+ import kotlinx.coroutines.launch
+ 
+ @HiltViewModel
+ class UserRatingViewModel @Inject constructor(
+-    private val repository: UserRatingsRepository
++    private val repository: UserRatingsRepository,
++    playerSettingsDataStore: com.nuvio.tv.data.local.PlayerSettingsDataStore
+ ) : ViewModel() {
++    val promptEnabled: StateFlow<Boolean> = playerSettingsDataStore.playerSettings
++        .map { it.ratePromptAfterMovie }
++        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
++
+     val ratings: StateFlow<Map<String, Int>> = repository.ratings
+ 
+     fun canRate(): Boolean = repository.canRate()
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/MovieRatingPromptBus.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/MovieRatingPromptBus.kt
+new file mode 100644
+index 000000000..33ac4ec4d
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/MovieRatingPromptBus.kt
+@@ -0,0 +1,21 @@
++package com.nuvio.tv.ui.screens.player
++
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++
++/** Carries "this movie just finished" from the player to the detail screen, which decides whether to ask. */
++object MovieRatingPromptBus {
++    data class Request(val contentId: String)
++
++    private val _request = MutableStateFlow<Request?>(null)
++    val request: StateFlow<Request?> = _request.asStateFlow()
++
++    fun request(contentId: String) {
++        if (contentId.isNotBlank()) _request.value = Request(contentId.trim())
++    }
++
++    fun consume() {
++        _request.value = null
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
+index 0d3eed591..96eeb1dfe 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
+@@ -893,6 +893,9 @@ internal fun PlayerRuntimeController.handleNaturalPlaybackEnded() {
+     } else {
+         saveWatchProgress()
+     }
++    if (contentType.equals("movie", ignoreCase = true)) {
++        contentId?.let(MovieRatingPromptBus::request)
++    }
+     resetPostPlayStateAfterPlaybackEnded()
+ }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackAutoPlaySettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackAutoPlaySettings.kt
+index 2ef0dd10c..18b2d1097 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackAutoPlaySettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackAutoPlaySettings.kt
+@@ -197,6 +197,13 @@ internal fun PlaybackUpNextSection(
+         onToggle = { onUpdate { setStreamAutoPlayNextEpisodeEnabled(!settings.streamAutoPlayNextEpisodeEnabled) } }
+     )
+ 
++    SettingsToggleRow(
++        title = "Ask for a rating after a movie",
++        subtitle = "When a movie ends, the rating dialog opens on its page. Needs a connected Trakt, Simkl or MDBList account.",
++        checked = settings.ratePromptAfterMovie,
++        onToggle = { onUpdate { setRatePromptAfterMovie(!settings.ratePromptAfterMovie) } }
++    )
++
+     if (settings.streamAutoPlayNextEpisodeEnabled && settings.streamAutoPlayMode == StreamAutoPlayMode.MANUAL) {
+         SettingsToggleRow(
+             title = stringResource(R.string.autoplay_next_episode_fallback),
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSettingsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSettingsViewModel.kt
+index ac106efc7..6e545b241 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSettingsViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSettingsViewModel.kt
+@@ -534,6 +534,10 @@ class PlaybackSettingsViewModel @Inject constructor(
+         playerSettingsDataStore.setPostPlayMovieThresholdPercent(percent)
+     }
+ 
++    suspend fun setRatePromptAfterMovie(enabled: Boolean) {
++        playerSettingsDataStore.setRatePromptAfterMovie(enabled)
++    }
++
+     suspend fun setStreamAutoPlayNextEpisodeEnabled(enabled: Boolean) {
+         playerSettingsDataStore.setStreamAutoPlayNextEpisodeEnabled(enabled)
+     }
+diff --git a/app/src/main/java/com/nuvio/tv/updater/Checksum.kt b/app/src/main/java/com/nuvio/tv/updater/Checksum.kt
+new file mode 100644
+index 000000000..fb476917d
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/updater/Checksum.kt
+@@ -0,0 +1,21 @@
++package com.nuvio.tv.updater
++
++/** SHA-256 helpers for checking a downloaded update before it is installed. */
++internal object Checksum {
++    private const val HEX_LENGTH = 64
++
++    /** Accepts GitHub's "sha256:<hex>" (or a bare hex string) and returns lower-case hex, or null if it isn't a SHA-256. */
++    fun fromDigest(digest: String?): String? {
++        val value = digest?.trim()?.lowercase().orEmpty()
++        val hex = if (value.startsWith("sha256:")) value.removePrefix("sha256:") else value
++        return hex.takeIf { it.length == HEX_LENGTH && it.all { c -> c in '0'..'9' || c in 'a'..'f' } }
++    }
++
++    fun toHex(bytes: ByteArray): String = buildString(bytes.size * 2) {
++        bytes.forEach { b -> append("%02x".format(b.toInt() and 0xff)) }
++    }
++
++    /** True when nothing is expected (older releases) or the file's hash is the expected one. */
++    fun matches(expected: String?, actualHex: String): Boolean =
++        expected == null || expected.equals(actualHex, ignoreCase = true)
++}
