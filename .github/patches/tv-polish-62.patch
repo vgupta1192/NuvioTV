@@ -1,0 +1,241 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/LiveHlsRepair.kt b/app/src/main/java/com/nuvio/tv/core/player/LiveHlsRepair.kt
+new file mode 100644
+index 000000000..c6c387633
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/player/LiveHlsRepair.kt
+@@ -0,0 +1,103 @@
++package com.nuvio.tv.core.player
++
++import android.net.Uri
++import androidx.annotation.OptIn
++import androidx.media3.common.ParserException
++import androidx.media3.common.util.UnstableApi
++import androidx.media3.exoplayer.hls.playlist.DefaultHlsPlaylistParserFactory
++import androidx.media3.exoplayer.hls.playlist.HlsMediaPlaylist
++import androidx.media3.exoplayer.hls.playlist.HlsMultivariantPlaylist
++import androidx.media3.exoplayer.hls.playlist.HlsPlaylist
++import androidx.media3.exoplayer.hls.playlist.HlsPlaylistParserFactory
++import androidx.media3.exoplayer.upstream.ParsingLoadable
++import java.io.ByteArrayInputStream
++import java.io.InputStream
++
++/**
++ * Reads providers' HLS playlists the forgiving way other IPTV players do. The player is strict:
++ * a playlist with a byte-order mark or blank lines before "#EXTM3U", or a stream list line
++ * without BANDWIDTH (common on providers' "5.1 / 50fps" channels), is "malformed" and won't play
++ * at all, though TiviMate and VLC play it. Those small things are put right before it's read.
++ * Something that isn't a playlist at all (the provider sending plain TS on an HLS link) is still
++ * "malformed", so the TS fallback in [LiveTvPlaybackController] takes over.
++ */
++@OptIn(UnstableApi::class)
++internal class LenientHlsPlaylistParserFactory : HlsPlaylistParserFactory {
++    private val inner = DefaultHlsPlaylistParserFactory()
++
++    override fun createPlaylistParser(): ParsingLoadable.Parser<HlsPlaylist> = wrap(inner.createPlaylistParser())
++
++    override fun createPlaylistParser(
++        multivariantPlaylist: HlsMultivariantPlaylist,
++        previousMediaPlaylist: HlsMediaPlaylist?
++    ): ParsingLoadable.Parser<HlsPlaylist> = wrap(inner.createPlaylistParser(multivariantPlaylist, previousMediaPlaylist))
++
++    private fun wrap(parser: ParsingLoadable.Parser<HlsPlaylist>): ParsingLoadable.Parser<HlsPlaylist> =
++        ParsingLoadable.Parser { uri: Uri, input: InputStream ->
++            val bytes = readLimited(input)
++                ?: throw ParserException.createForMalformedManifest("Not a playlist (too big: a stream sent on a playlist link?)", null)
++            val text = HlsRepair.fix(bytes)
++                ?: throw ParserException.createForMalformedManifest("Not a playlist (no #EXTM3U)", null)
++            parser.parse(uri, ByteArrayInputStream(text.toByteArray(Charsets.UTF_8)))
++        }
++
++    /** The playlist, or null when it's far bigger than any playlist (a video stream, endlessly). */
++    private fun readLimited(input: InputStream): ByteArray? {
++        val out = java.io.ByteArrayOutputStream()
++        val buf = ByteArray(16 * 1024)
++        while (true) {
++            val n = input.read(buf)
++            if (n < 0) return out.toByteArray()
++            out.write(buf, 0, n)
++            if (out.size() > MAX_BYTES) return null
++        }
++    }
++
++    private companion object {
++        const val MAX_BYTES = 4 * 1024 * 1024
++    }
++}
++
++/** The repairs themselves (plain text in, plain text out: no player parts, so they can be checked anywhere). */
++internal object HlsRepair {
++    /** The playlist put right, or null when it isn't an HLS playlist at all. */
++    fun fix(bytes: ByteArray): String? {
++        // A TS stream starts with 0x47 every 188 bytes: certainly not a playlist.
++        if (bytes.size >= 189 && bytes[0] == 0x47.toByte() && bytes[188] == 0x47.toByte()) return null
++        var text = String(bytes, Charsets.UTF_8).removePrefix("﻿")
++        val start = text.indexOf("#EXTM3U")
++        text = when {
++            // Junk (blank lines, spaces, a byte-order mark) before the header: dropped.
++            start in 1..2048 && text.substring(0, start).isBlank() -> text.substring(start)
++            start == 0 -> text
++            // No header but plainly a playlist: give it one.
++            start < 0 && (text.contains("#EXTINF") || text.contains("#EXT-X-")) -> "#EXTM3U\n" + text.trimStart()
++            start < 0 -> return null
++            else -> text
++        }
++        if (!text.contains("#EXT-X-STREAM-INF") && !text.contains("#EXT-X-MEDIA:")) return text
++        return text.lineSequence().joinToString("\n") { line -> fixLine(line) }
++    }
++
++    private fun fixLine(line: String): String {
++        val l = line.trimEnd()
++        return when {
++            // Every stream in the list needs a BANDWIDTH; some providers leave it out.
++            (l.startsWith("#EXT-X-STREAM-INF:") || l.startsWith("#EXT-X-I-FRAME-STREAM-INF:")) && !HAS_BANDWIDTH.containsMatchIn(l) -> {
++                val colon = l.indexOf(':')
++                l.substring(0, colon + 1) + "BANDWIDTH=$DEFAULT_BANDWIDTH" + (if (l.length > colon + 1) "," + l.substring(colon + 1) else "")
++            }
++            // An audio or subtitle choice needs a NAME and a GROUP-ID.
++            l.startsWith("#EXT-X-MEDIA:") -> {
++                var out = l
++                if (!Regex("""[:,]\s*NAME=""").containsMatchIn(out)) out += ",NAME=\"Main\""
++                if (!Regex("""[:,]\s*GROUP-ID=""").containsMatchIn(out)) out += ",GROUP-ID=\"default\""
++                out
++            }
++            else -> line
++        }
++    }
++
++    private val HAS_BANDWIDTH = Regex("""[:,]\s*BANDWIDTH=""")
++    private const val DEFAULT_BANDWIDTH = 5_000_000
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/TvLiveMediaSourceFactory.kt b/app/src/main/java/com/nuvio/tv/core/player/TvLiveMediaSourceFactory.kt
+index a10e265d4..a9838a50f 100644
+--- a/app/src/main/java/com/nuvio/tv/core/player/TvLiveMediaSourceFactory.kt
++++ b/app/src/main/java/com/nuvio/tv/core/player/TvLiveMediaSourceFactory.kt
+@@ -102,6 +102,7 @@ object TvLiveMediaSourceFactory {
+         return when {
+             isHls -> {
+                 HlsMediaSource.Factory(dataSourceFactory)
++                    .setPlaylistParserFactory(LenientHlsPlaylistParserFactory())
+                     .setAllowChunklessPreparation(true)
+                     .setLoadErrorHandlingPolicy(LiveTvRobustness.loadErrorHandlingPolicy)
+                     .createMediaSource(mediaItem)
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeAudioTracks.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeAudioTracks.kt
+new file mode 100644
+index 000000000..d65a2e4ed
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeAudioTracks.kt
+@@ -0,0 +1,101 @@
++package com.nuvio.tv.youtube
++
++import org.w3c.dom.Element
++import org.w3c.dom.Node
++import java.io.ByteArrayInputStream
++import java.io.StringWriter
++import java.util.Locale
++import javax.xml.parsers.DocumentBuilderFactory
++import javax.xml.transform.TransformerFactory
++import javax.xml.transform.dom.DOMSource
++import javax.xml.transform.stream.StreamResult
++
++/**
++ * Puts YouTube's sound tracks in order. Its manifest names each track's language like "en-US (original)" or
++ * "es-US (dubbed-auto)": not a language code, so players list every track as "Unknown", can't tell English from
++ * the rest, and just play whichever comes first (often a computer-made dub). Here each track gets a proper
++ * language code and a readable name ("English (United States) · original"), and the one that plays by
++ * default is the original, or else English, or else the first.
++ */
++internal object YouTubeAudioTracks {
++    private const val ROLE_SCHEME = "urn:mpeg:DASH:role:2011"
++
++    enum class Kind(val label: String) { ORIGINAL("original"), DUBBED("dubbed"), AUTO("auto-dubbed"), DESCRIPTIVE("audio description"), UNKNOWN("") }
++
++    class Track(val code: String, val kind: Kind)
++
++    /** "en-US (original)", "es-US (dubbed-auto)" or "de-DE.10" into a language code and what sort of track it is. */
++    fun parse(raw: String): Track {
++        val text = raw.trim()
++        Regex("""^(.*?)\s*\((.*)\)\s*$""").find(text)?.let { m ->
++            val note = m.groupValues[2].lowercase()
++            val kind = when {
++                "auto" in note -> Kind.AUTO
++                "original" in note -> Kind.ORIGINAL
++                "descript" in note -> Kind.DESCRIPTIVE
++                "dub" in note -> Kind.DUBBED
++                else -> Kind.UNKNOWN
++            }
++            return Track(m.groupValues[1].ifBlank { "und" }, kind)
++        }
++        // "de-DE.10": the number says which kind (4 is the original, 2 an audio description).
++        Regex("""^([A-Za-z]{2,3}(?:-[A-Za-z0-9]+)*)\.(\d+)$""").find(text)?.let { m ->
++            val kind = when (m.groupValues[2]) { "4" -> Kind.ORIGINAL; "2" -> Kind.DESCRIPTIVE; else -> Kind.DUBBED }
++            return Track(m.groupValues[1], kind)
++        }
++        return Track(text.ifBlank { "und" }, Kind.UNKNOWN)
++    }
++
++    private fun language(code: String): String {
++        val locale = Locale.forLanguageTag(code)
++        return locale.getDisplayName(Locale.ENGLISH).takeIf { it.isNotBlank() && !it.equals(code, true) } ?: code
++    }
++
++    /** The manifest with its sound tracks named and ordered; the manifest as it was if anything goes wrong. */
++    fun tidy(manifest: ByteArray): ByteArray = runCatching {
++        val doc = DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(ByteArrayInputStream(manifest))
++        val period = doc.getElementsByTagName("Period").item(0) ?: return@runCatching manifest
++        fun kids(n: Node, name: String) = (0 until n.childNodes.length).map { n.childNodes.item(it) }.filter { it.nodeName == name }
++        fun attr(n: Node, a: String) = (n as? Element)?.getAttribute(a).orEmpty()
++        val audioSets = kids(period, "AdaptationSet").filter { s ->
++            attr(s, "mimeType").startsWith("audio") || kids(s, "Representation").any { attr(it, "mimeType").startsWith("audio") }
++        }
++        if (audioSets.isEmpty()) return@runCatching manifest
++        val parsed = audioSets.associateWith { parse(attr(it, "lang")) }
++        // The default: the original; else English; else the first.
++        val defaultTrack = parsed.entries.firstOrNull { it.value.kind == Kind.ORIGINAL }?.value
++            ?: parsed.entries.firstOrNull { it.value.code.startsWith("en", ignoreCase = true) && it.value.kind != Kind.DESCRIPTIVE && it.value.kind != Kind.AUTO }?.value
++            ?: parsed.entries.firstOrNull { it.value.kind != Kind.DESCRIPTIVE }?.value
++            ?: parsed.values.first()
++        fun isDefault(t: Track) = t.code.equals(defaultTrack.code, ignoreCase = true) && t.kind == defaultTrack.kind
++        for ((set, track) in parsed) {
++            val element = set as Element
++            element.setAttribute("lang", track.code)
++            // A readable name, and the roles: "main" is what plays by default; the others are alternatives.
++            kids(set, "Label").forEach { set.removeChild(it) }
++            kids(set, "Role").forEach { set.removeChild(it) }
++            val label = doc.createElement("Label").apply {
++                textContent = language(track.code) + (track.kind.label.takeIf { it.isNotBlank() }?.let { " \u00B7 $it" } ?: "")
++            }
++            val role = doc.createElement("Role").apply {
++                setAttribute("schemeIdUri", ROLE_SCHEME)
++                setAttribute("value", when {
++                    isDefault(track) -> "main"
++                    track.kind == Kind.DESCRIPTIVE -> "description"
++                    track.kind == Kind.DUBBED || track.kind == Kind.AUTO -> "dub"
++                    else -> "alternate"
++                })
++            }
++            set.insertBefore(role, set.firstChild)
++            set.insertBefore(label, set.firstChild)
++        }
++        // The default tracks go first.
++        val first = audioSets.firstOrNull { isDefault(parsed.getValue(it)) }
++        val firstAudio = audioSets.first()
++        if (first != null && first !== firstAudio) period.insertBefore(first, firstAudio)
++        audioSets.filter { it !== first && isDefault(parsed.getValue(it)) }.forEach { period.insertBefore(it, firstAudio) }
++        val out = StringWriter()
++        TransformerFactory.newInstance().newTransformer().transform(DOMSource(doc), StreamResult(out))
++        out.toString().toByteArray(Charsets.UTF_8)
++    }.getOrDefault(manifest)
++}
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeMpdServer.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeMpdServer.kt
+index 1c0c46521..6c88bbe5b 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeMpdServer.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeMpdServer.kt
+@@ -41,7 +41,7 @@ object YouTubeMpdServer {
+     fun publish(videoId: String, mpd: ByteArray): String {
+         // Kept at least as long as the view model keeps its cached lookups.
+         if (manifests.size > 64) manifests.clear()
+-        manifests[videoId] = rewriteTranslatedCaptions(videoId, mpd)
++        manifests[videoId] = rewriteTranslatedCaptions(videoId, YouTubeAudioTracks.tidy(mpd))
+         return "http://127.0.0.1:${ensureStarted().localPort}/yt/$videoId.mpd"
+     }
+ 
