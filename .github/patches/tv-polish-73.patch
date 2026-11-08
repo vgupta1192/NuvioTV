@@ -1,0 +1,286 @@
+diff --git a/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt b/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
+index 00571fffc..312bc4093 100644
+--- a/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
++++ b/app/src/main/java/com/nuvio/tv/data/local/PlayerSettingsDataStore.kt
+@@ -156,8 +156,14 @@ data class SubtitleStyleSettings(
+     val outlineWidth: Int = 2, // 1-5
+     val hdrStyleEnabled: Boolean = false,
+     val hdrTextColor: Int = Color.White.toArgb(),
+-    val hdrBrightness: Int = HDR_BRIGHTNESS_DEFAULT // 0-100, see hdrBrightnessFactor
++    val hdrBrightness: Int = HDR_BRIGHTNESS_DEFAULT, // 0-100, see hdrBrightnessFactor
++    val hdrDimPlayerControls: Boolean = false
+ ) {
++    fun playerControlsBrightness(isHdrVideo: Boolean): Float {
++        if (!isHdrVideo || !hdrStyleEnabled || !hdrDimPlayerControls) return 1f
++        return hdrBrightnessFactor(hdrBrightness)
++    }
++
+     /**
+      * The style to render with: on HDR/Dolby Vision video with the override enabled, the HDR text
+      * color replaces the text color and every subtitle color is dimmed by the HDR brightness.
+@@ -715,6 +721,7 @@ class PlayerSettingsDataStore @Inject constructor(
+     private val subtitleHdrStyleEnabledKey = booleanPreferencesKey("subtitle_hdr_style_enabled")
+     private val subtitleHdrTextColorKey = intPreferencesKey("subtitle_hdr_text_color")
+     private val subtitleHdrBrightnessKey = intPreferencesKey("subtitle_hdr_brightness")
++    private val subtitleHdrDimPlayerControlsKey = booleanPreferencesKey("subtitle_hdr_dim_player_controls")
+ 
+     // Buffer settings keys
+     private val minBufferMsKey = intPreferencesKey("min_buffer_ms")
+@@ -1183,7 +1190,8 @@ class PlayerSettingsDataStore @Inject constructor(
+                         outlineWidth = prefs[subtitleOutlineWidthKey] ?: 2,
+                         hdrStyleEnabled = prefs[subtitleHdrStyleEnabledKey] ?: false,
+                         hdrTextColor = prefs[subtitleHdrTextColorKey] ?: Color.White.toArgb(),
+-                        hdrBrightness = prefs[subtitleHdrBrightnessKey] ?: SubtitleStyleSettings.HDR_BRIGHTNESS_DEFAULT
++                        hdrBrightness = prefs[subtitleHdrBrightnessKey] ?: SubtitleStyleSettings.HDR_BRIGHTNESS_DEFAULT,
++                        hdrDimPlayerControls = prefs[subtitleHdrDimPlayerControlsKey] ?: false
+                     )
+                 },
+                 bufferSettings = BufferSettings(
+@@ -1788,6 +1796,7 @@ class PlayerSettingsDataStore @Inject constructor(
+     suspend fun setSubtitleOutlineWidth(width: Int) { store().edit { it[subtitleOutlineWidthKey] = width.coerceIn(1, 5) } }
+     suspend fun setSubtitleHdrStyleEnabled(enabled: Boolean) { store().edit { it[subtitleHdrStyleEnabledKey] = enabled } }
+     suspend fun setSubtitleHdrTextColor(color: Int) { store().edit { it[subtitleHdrTextColorKey] = color } }
++    suspend fun setSubtitleHdrDimPlayerControls(enabled: Boolean) { store().edit { it[subtitleHdrDimPlayerControlsKey] = enabled } }
+     suspend fun setSubtitleHdrBrightness(brightness: Int) {
+         store().edit {
+             it[subtitleHdrBrightnessKey] = brightness.coerceIn(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerControlsBrightness.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerControlsBrightness.kt
+new file mode 100644
+index 000000000..7b6d9c7ab
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerControlsBrightness.kt
+@@ -0,0 +1,39 @@
++package com.nuvio.tv.ui.screens.player
++
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.drawWithCache
++import androidx.compose.ui.geometry.toRect
++import androidx.compose.ui.graphics.ColorFilter
++import androidx.compose.ui.graphics.ColorMatrix
++import androidx.compose.ui.graphics.Paint
++import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
++import androidx.compose.ui.unit.dp
++
++/**
++ * Scales the RGB of everything this node draws by [factor], keeping alpha, so player controls
++ * drawn over HDR video are not rendered at full graphics brightness. A factor of 1 or more
++ * leaves the node untouched and adds no offscreen layer.
++ */
++internal fun Modifier.playerControlsBrightness(factor: Float): Modifier {
++    if (factor >= 1f) return this
++    val scale = factor.coerceIn(0f, 1f)
++    return this.drawWithCache {
++        val paint = Paint().apply {
++            colorFilter = ColorFilter.colorMatrix(
++                ColorMatrix().apply { setToScale(scale, scale, scale, 1f) }
++            )
++        }
++        // Focused controls scale up and cast glows past their own bounds; the layer has to
++        // cover that overflow or it gets clipped. The canvas clip still bounds the allocation.
++        val layerBounds = size.toRect().inflate(LAYER_OVERFLOW.toPx())
++        onDrawWithContent {
++            drawIntoCanvas { canvas ->
++                canvas.saveLayer(layerBounds, paint)
++                drawContent()
++                canvas.restore()
++            }
++        }
++    }
++}
++
++private val LAYER_OVERFLOW = 48.dp
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+index 4f5f24b5b..c13503e7c 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+@@ -754,6 +754,8 @@ fun PlayerScreen(
+         onDispose { PlayerWindowBackdrop.releaseTransparent() }
+     }
+ 
++    val playerControlsDim = Modifier.playerControlsBrightness(uiState.playerControlsBrightness)
++
+     Box(
+         modifier = Modifier
+             .fillMaxSize()
+@@ -1485,6 +1487,7 @@ fun PlayerScreen(
+             modifier = Modifier
+                 .fillMaxSize()
+                 .zIndex(2.6f)
++                .then(playerControlsDim)
+         )
+ 
+         if (uiState.playerStatsHudEnabled && uiState.playerStatsHudButtonAvailable && uiState.error == null) {
+@@ -1603,6 +1606,7 @@ fun PlayerScreen(
+                 .align(Alignment.BottomStart)
+                 .padding(start = NuvioTheme.spacing.xxl, bottom = skipButtonBottomPadding)
+                 .zIndex(2.1f)
++                .then(playerControlsDim)
+                 .reportSubtitleClearance(subtitleClearanceGapPx) { skipClearancePx = it }
+         )
+         val skipFeedbackInterval = uiState.skipFeedbackInterval
+@@ -1643,6 +1647,7 @@ fun PlayerScreen(
+                 .align(Alignment.BottomEnd)
+                 .padding(end = 26.dp, bottom = if (uiState.showControls) 122.dp else 30.dp)
+                 .zIndex(2.1f)
++                .then(playerControlsDim)
+                 .reportSubtitleClearance(subtitleClearanceGapPx) { postPlayClearancePx = it },
+         )
+ 
+@@ -1702,7 +1707,8 @@ fun PlayerScreen(
+         AnimatedVisibility(
+             visible = playerControlsVisible,
+             enter = fadeIn(animationSpec = tween(PLAYER_CONTROLS_FADE_DURATION_MS)),
+-            exit = fadeOut(animationSpec = tween(PLAYER_CONTROLS_FADE_DURATION_MS))
++            exit = fadeOut(animationSpec = tween(PLAYER_CONTROLS_FADE_DURATION_MS)),
++            modifier = playerControlsDim
+         ) {
+             val context = LocalContext.current
+             PlayerControlsOverlay(
+@@ -1955,7 +1961,7 @@ fun PlayerScreen(
+             exit = slideOutHorizontally(animationSpec = tween(220), targetOffsetX = { it })
+         ) {
+             val chaptersTimeline by viewModel.playbackTimeline.collectAsState()
+-            Box(modifier = Modifier.fillMaxSize()) {
++            Box(modifier = Modifier.fillMaxSize().then(playerControlsDim)) {
+                 ChaptersSidePanel(
+                     chapters = uiState.chapters,
+                     positionMs = chaptersTimeline.currentPosition,
+@@ -1994,7 +2000,7 @@ fun PlayerScreen(
+                 targetOffsetX = { it }
+             )
+         ) {
+-            Box(modifier = Modifier.fillMaxSize()) {
++            Box(modifier = Modifier.fillMaxSize().then(playerControlsDim)) {
+                 EpisodesSidePanel(
+                     uiState = uiState,
+                     episodesFocusRequester = episodesFocusRequester,
+@@ -2036,7 +2042,7 @@ fun PlayerScreen(
+                 targetOffsetX = { it }
+             )
+         ) {
+-            Box(modifier = Modifier.fillMaxSize()) {
++            Box(modifier = Modifier.fillMaxSize().then(playerControlsDim)) {
+                 StreamSourcesSidePanel(
+                     uiState = uiState,
+                     streamsFocusRequester = sourceStreamsFocusRequester,
+@@ -2079,7 +2085,7 @@ fun PlayerScreen(
+                 targetOffsetX = { it }
+             )
+         ) {
+-            Box(modifier = Modifier.fillMaxSize()) {
++            Box(modifier = Modifier.fillMaxSize().then(playerControlsDim)) {
+                 PartyPanel(
+                     state = partyState,
+                     profile = partyProfile,
+@@ -2144,7 +2150,7 @@ fun PlayerScreen(
+             )
+         ) {
+             Box(
+-                modifier = Modifier.fillMaxSize()
++                modifier = Modifier.fillMaxSize().then(playerControlsDim)
+             ) {
+                 val isCurrentSubtitleAss = run {
+                     val addon = uiState.selectedAddonSubtitle
+@@ -2216,7 +2222,8 @@ fun PlayerScreen(
+             onDismiss = { viewModel.onEvent(PlayerEvent.OnDismissTransientOverlay) },
+             modifier = Modifier
+                 .fillMaxSize()
+-                .zIndex(2.6f),
++                .zIndex(2.6f)
++                .then(playerControlsDim),
+             exoPlayer = viewModel.exoPlayer
+         )
+ 
+@@ -2245,6 +2252,7 @@ fun PlayerScreen(
+             modifier = Modifier
+                 .fillMaxSize()
+                 .zIndex(2.6f)
++                .then(playerControlsDim)
+         )
+ 
+         PlayerOverlayScaffold(
+@@ -2264,7 +2272,8 @@ fun PlayerScreen(
+             onDismiss = { viewModel.onEvent(PlayerEvent.OnDismissSubtitleTimingDialog) },
+             modifier = Modifier
+                 .fillMaxSize()
+-                .zIndex(2.35f),
++                .zIndex(2.35f)
++                .then(playerControlsDim),
+             captureKeys = false,
+             contentPadding = PaddingValues(top = 44.dp)
+         ) {
+@@ -2289,7 +2298,8 @@ fun PlayerScreen(
+             SpeedSelectionDialog(
+                 currentSpeed = uiState.playbackSpeed,
+                 onSpeedSelected = { viewModel.onEvent(PlayerEvent.OnSetPlaybackSpeed(it)) },
+-                onDismiss = { viewModel.onEvent(PlayerEvent.OnDismissTransientOverlay) }
++                onDismiss = { viewModel.onEvent(PlayerEvent.OnDismissTransientOverlay) },
++                brightness = uiState.playerControlsBrightness
+             )
+         }
+     }
+@@ -4682,7 +4692,8 @@ internal fun PlayerOverlayButton(
+ private fun SpeedSelectionDialog(
+     currentSpeed: Float,
+     onSpeedSelected: (Float) -> Unit,
+-    onDismiss: () -> Unit
++    onDismiss: () -> Unit,
++    brightness: Float = 1f
+ ) {
+     val selectedIndex = remember(currentSpeed) {
+         PLAYBACK_SPEEDS.indices.minByOrNull { index ->
+@@ -4704,6 +4715,7 @@ private fun SpeedSelectionDialog(
+                 .width(300.dp)
+                 .clip(RoundedCornerShape(NuvioTheme.radii.xl))
+                 .background(NuvioTheme.colors.BackgroundElevated)
++                .playerControlsBrightness(brightness)
+         ) {
+             Column(
+                 modifier = Modifier.padding(NuvioTheme.spacing.xl)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt
+index 65ca47350..7c0afaa12 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt
+@@ -250,6 +250,9 @@ data class PlayerUiState(
+     val hideTorrentStats: Boolean = true,
+     val isLive: Boolean = false
+ ) {
++    val playerControlsBrightness: Float
++        get() = subtitleStyle.playerControlsBrightness(isHdrVideo)
++
+     /** Subtitle style to render with, after applying the HDR override for the current video. */
+     val effectiveSubtitleStyle: SubtitleStyleSettings
+         get() = subtitleStyle.forVideo(isHdrVideo)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSettingsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSettingsViewModel.kt
+index 5c8560123..ac106efc7 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSettingsViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSettingsViewModel.kt
+@@ -336,6 +336,10 @@ class PlaybackSettingsViewModel @Inject constructor(
+         playerSettingsDataStore.setSubtitleHdrTextColor(color)
+     }
+ 
++    suspend fun setSubtitleHdrDimPlayerControls(enabled: Boolean) {
++        playerSettingsDataStore.setSubtitleHdrDimPlayerControls(enabled)
++    }
++
+     suspend fun setSubtitleHdrBrightness(brightness: Int) {
+         playerSettingsDataStore.setSubtitleHdrBrightness(brightness)
+     }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSubtitleSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSubtitleSettings.kt
+index 4743744f3..53068af97 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSubtitleSettings.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSubtitleSettings.kt
+@@ -186,6 +186,13 @@ internal fun PlaybackSubtitlesSection(
+             onValueChange = { brightness -> onUpdate { setSubtitleHdrBrightness(brightness) } },
+             enabled = enabled
+         )
++        SettingsToggleRow(
++            title = "Dim player controls on HDR",
++            subtitle = "Apply the HDR brightness to the player controls and menus shown over HDR and Dolby Vision video",
++            checked = style.hdrDimPlayerControls,
++            onToggle = { onUpdate { setSubtitleHdrDimPlayerControls(!style.hdrDimPlayerControls) } },
++            enabled = enabled
++        )
+     }
+ 
+     SettingsSectionLabel(text = stringResource(R.string.sub_advanced_section))
