@@ -1,0 +1,173 @@
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubePlayerPanel.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubePlayerPanel.kt
+index 4e702ed7d..a13ed78ad 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubePlayerPanel.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubePlayerPanel.kt
+@@ -56,6 +56,7 @@ private class PanelEntry(
+     val title: String,
+     val detail: String?,
+     val titleLines: Int = 2,
++    val onLongClick: (() -> Unit)? = null,
+     val onClick: () -> Unit = {}
+ )
+ 
+@@ -173,10 +174,12 @@ fun BoxScope.YouTubePlayerPanel(
+                     PanelEntry(
+                         title = c.text,
+                         detail = listOfNotNull(
++                            "Liked  ✓".takeIf { c.liked },
+                             c.author, c.published, c.likes?.let { "$it likes" },
+                             c.replyCount?.let { if (c.replyKey == null) null else if (it.any { ch -> ch.isLetter() }) it else "$it replies" }
+                         ).joinToString("  ·  "),
+                         titleLines = 6,
++                        onLongClick = { viewModel.toggleCommentLike(c) },
+                         onClick = {
+                             // A comment with replies opens them; the list keeps its place for the way back.
+                             val key = c.replyKey
+@@ -309,6 +312,8 @@ private fun NavigableList(
+     val focus = remember { FocusRequester() }
+     var selected by remember { mutableIntStateOf(startAt.coerceAtLeast(0)) }
+     var onHeader by remember { mutableStateOf(false) }
++    var pressed by remember { mutableStateOf(false) }
++    var longFired by remember { mutableStateOf(false) }
+ 
+     // This list keeps the remote for as long as it's showing.
+     LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
+@@ -332,9 +337,28 @@ private fun NavigableList(
+             .focusRequester(focus)
+             .focusable()
+             .onPreviewKeyEvent { e ->
++                // OK presses the row when it is let go; holding it does the row's other action, if it has one.
++                // A release with no press seen here (the press opened this list) is ignored.
++                if (e.key == Key.DirectionCenter || e.key == Key.Enter || e.key == Key.NumPadEnter) {
++                    if (e.type == KeyEventType.KeyDown) {
++                        if (e.nativeKeyEvent.repeatCount == 0) {
++                            pressed = true
++                            longFired = false
++                        } else if (pressed && !longFired && !onHeader) {
++                            entries.getOrNull(selected)?.onLongClick?.let { onLong ->
++                                longFired = true
++                                onLong()
++                            }
++                        }
++                    } else if (e.type == KeyEventType.KeyUp) {
++                        if (pressed && !longFired && !onHeader) entries.getOrNull(selected)?.onClick?.invoke()
++                        pressed = false
++                        longFired = false
++                    }
++                    return@onPreviewKeyEvent true
++                }
+                 val handled = when (e.key) {
+-                    Key.DirectionDown, Key.DirectionUp, Key.DirectionLeft, Key.DirectionRight,
+-                    Key.DirectionCenter, Key.Enter, Key.NumPadEnter -> true
++                    Key.DirectionDown, Key.DirectionUp, Key.DirectionLeft, Key.DirectionRight -> true
+                     else -> false
+                 }
+                 if (handled && e.type == KeyEventType.KeyDown) {
+@@ -354,8 +378,6 @@ private fun NavigableList(
+                         }
+                         Key.DirectionLeft -> if (onHeader) onHeaderStep(-1)
+                         Key.DirectionRight -> if (onHeader) onHeaderStep(1)
+-                        Key.DirectionCenter, Key.Enter, Key.NumPadEnter ->
+-                            if (!onHeader) entries.getOrNull(selected)?.onClick?.invoke()
+                         else -> Unit
+                     }
+                 }
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubePlayerViewModel.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubePlayerViewModel.kt
+index 8b3e20f42..847562a50 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubePlayerViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubePlayerViewModel.kt
+@@ -51,8 +51,18 @@ data class YtComment(
+     val published: String?,
+     /** What opens this comment's replies, if it has any. */
+     val replyKey: String?,
+-    val replyCount: String?
+-)
++    val replyCount: String?,
++    /** You have liked this comment. */
++    val liked: Boolean = false
++) {
++    /** This comment after its like is flipped, with the count moved by one when it is a plain number. */
++    fun withLikeFlipped(): YtComment {
++        val now = !liked
++        val count = likes?.trim()?.toIntOrNull()?.let { (it + if (now) 1 else -1).coerceAtLeast(0).toString() }
++            ?: if (now && likes.isNullOrBlank()) "1" else likes
++        return copy(liked = now, likes = count)
++    }
++}
+ 
+ data class YtChatLine(val id: String, val author: String, val message: String)
+ 
+@@ -277,6 +287,38 @@ class YouTubePlayerViewModel @Inject constructor(
+         fetchComments(key, gen)
+     }
+ 
++    /** Likes a comment, or takes the like back, from holding OK on it. */
++    fun toggleCommentLike(comment: YtComment) {
++        if (!_state.value.signedIn) {
++            _state.update { it.copy(message = "Sign in to YouTube first, with the account button on the YouTube page.") }
++            return
++        }
++        val key = comment.replyKey
++        if (key == null) {
++            _state.update { it.copy(message = "This comment can't be liked from here.") }
++            return
++        }
++        viewModelScope.launch {
++            val result = withContext(Dispatchers.IO) {
++                runCatching { service.commentsService.toggleLikeObserve(key).ignoreElements().blockingAwait() }
++            }
++            result.fold(
++                onSuccess = {
++                    _state.update { s ->
++                        s.copy(
++                            comments = s.comments.map { if (it.replyKey == key) it.withLikeFlipped() else it },
++                            message = if (comment.liked) "Like removed" else "Liked"
++                        )
++                    }
++                },
++                onFailure = {
++                    Log.e(TAG, "comment like failed", it)
++                    _state.update { s -> s.copy(message = "That didn't go through. Try again.") }
++                }
++            )
++        }
++    }
++
+     fun loadMoreComments() {
+         val key = nextCommentsKey ?: return
+         if (_state.value.commentsLoading) return
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
+index b794e3bdc..0e823ef20 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
+@@ -258,7 +258,7 @@ class YouTubeViewModel @Inject constructor(
+             if (tab.needsSignIn && !signed) return@load Feed.Nothing
+             withRetry {
+             when (tab) {
+-                YtTab.HOME -> rowStream(content.homeObserve)
++                YtTab.HOME -> rowStream(content.homeObserve, ordered = true)
+                 YtTab.LIVE -> rowStream(content.liveObserve)
+                 YtTab.MUSIC -> rowStream(content.musicObserve)
+                 YtTab.GAMING -> rowStream(content.gamingObserve)
+@@ -622,9 +622,19 @@ class YouTubeViewModel @Inject constructor(
+      * YouTube sends rows page by page: the first page now, more as it's asked. This waits for the
+      * first page only; [streamRest] reads the others while you browse.
+      */
+-    private fun rowStream(source: Observable<List<MediaGroup>>): Feed {
++    private fun rowStream(source: Observable<List<MediaGroup>>, ordered: Boolean = false): Feed {
+         val iterator = source.blockingIterable().iterator()
+-        return Feed.Rows(toRows(iterator.next()), iterator)
++        val first = toRows(iterator.next())
++        return Feed.Rows(if (ordered) orderedHomeRows(first) else first, iterator)
++    }
++
++    /** Home follows SmartTube's useful order; rows it does not know keep their place after the known ones. */
++    private fun orderedHomeRows(rows: List<YtRow>): List<YtRow> {
++        val priority = listOf("recommended", "recently uploaded", "continue watching", "trending", "live", "music")
++        return rows.sortedBy { row ->
++            val title = row.title.lowercase()
++            priority.indexOfFirst { title.contains(it) }.let { if (it < 0) priority.size else it }
++        }
+     }
+ 
+     private var restJob: Job? = null
