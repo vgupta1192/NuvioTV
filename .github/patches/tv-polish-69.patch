@@ -1,0 +1,341 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewState.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewState.kt
+index 51468b73c..e955a4afd 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewState.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewState.kt
+@@ -13,6 +13,9 @@ import com.nuvio.tv.ui.screens.player.seekpreview.local.LocalPreviewTrack
+ import com.nuvio.tv.ui.screens.player.seekpreview.local.LocalSeekPreviewSettings
+ import com.nuvio.tv.ui.screens.player.seekpreview.local.localSeekPreviewCacheKey
+ import androidx.media3.exoplayer.SeekParameters
++import com.liskovsoft.mediaserviceinterfaces.data.MediaItemStoryboard
++import com.nuvio.tv.youtube.YouTubeProgress
++import com.nuvio.tv.youtube.YouTubeStoryboards
+ import java.lang.ref.WeakReference
+ import java.util.WeakHashMap
+ import kotlinx.coroutines.CoroutineScope
+@@ -186,8 +189,38 @@ class SeekPreviewState internal constructor(
+             }
+             .stateIn(scope, SharingStarted.Eagerly, null)
+ 
++    /** YouTube videos carry their own sprite-sheet storyboard, so they need no other source. */
++    @OptIn(ExperimentalCoroutinesApi::class)
++    private val youtubeTrack: StateFlow<SeekPreviewTrack?> =
++        YouTubeStoryboards.version
++            .map {
++                val videoId = controller.contentId
++                    ?.takeIf { YouTubeProgress.isYouTubeId(it) }
++                    ?.removePrefix(YouTubeProgress.ID_PREFIX)
++                    ?.takeIf { it.isNotBlank() }
++                val storyboard = videoId?.let { YouTubeStoryboards.get(it) }
++                if (videoId != null && storyboard == null) YouTubeStoryboards.ensure(videoId)
++                if (videoId != null && storyboard != null) videoId to storyboard else null
++            }
++            .distinctUntilChanged()
++            .transformLatest<Pair<String, MediaItemStoryboard>?, SeekPreviewTrack?> { pair ->
++                if (pair == null) {
++                    emit(null)
++                    return@transformLatest
++                }
++                val opened = YouTubeStoryboardTrack(controller.context, pair.second, pair.first)
++                try {
++                    emit(opened)
++                    awaitCancellation()
++                } finally {
++                    opened.close()
++                }
++            }
++            .stateIn(scope, SharingStarted.Eagerly, null)
++
+     val previewTrack: StateFlow<SeekPreviewTrack?> =
+-        combine(localTrack, track, cloudTrack) { local, seekr, cloud ->
++        combine(localTrack, track, cloudTrack, youtubeTrack) { local, seekr, cloud, youtube ->
++            if (youtube != null) return@combine youtube
+             val remote: SeekPreviewTrack? = cloud ?: seekr?.let { SeekrPreviewTrack(it) }
+             when {
+                 local != null && remote != null -> HybridSeekPreviewTrack(local, remote)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/YouTubeStoryboardTrack.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/YouTubeStoryboardTrack.kt
+new file mode 100644
+index 000000000..206e45266
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/YouTubeStoryboardTrack.kt
+@@ -0,0 +1,156 @@
++package com.nuvio.tv.ui.screens.player.seekpreview
++
++import android.content.Context
++import android.graphics.Bitmap
++import android.graphics.BitmapFactory
++import android.graphics.BitmapRegionDecoder
++import android.graphics.Rect
++import android.util.Log
++import android.util.LruCache
++import com.liskovsoft.mediaserviceinterfaces.data.MediaItemStoryboard
++import java.io.File
++import java.util.concurrent.TimeUnit
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++import okhttp3.OkHttpClient
++import okhttp3.Request
++
++private const val TAG = "StoryboardPreview"
++private const val MAX_DISK_BYTES = 24L * 1024 * 1024
++private const val MEMORY_SHEETS = 8
++private const val MEMORY_TILES = 24
++private const val USER_AGENT =
++    "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
++
++/**
++ * Sprite sheets are written under cacheDir and deleted when the track closes. The 24 MB cap is
++ * only a safety ceiling for very long videos.
++ */
++internal object YouTubeStoryboardCache {
++    private const val DIR = "youtube-storyboards"
++
++    fun cleanup(context: Context) {
++        runCatching { File(context.cacheDir, DIR).deleteRecursively() }
++    }
++
++    fun directory(context: Context, videoId: String): File =
++        File(File(context.cacheDir, DIR), videoId)
++}
++
++/** Seek previews for YouTube videos: a tile cut from YouTube's own sprite sheet, no decoder needed. */
++internal class YouTubeStoryboardTrack(
++    context: Context,
++    private val storyboard: MediaItemStoryboard,
++    videoId: String,
++) : SeekPreviewTrack {
++    override var offsetMs: Long = 0L
++
++    private val directory = YouTubeStoryboardCache.directory(context, videoId)
++    private val sheets = LruCache<String, ByteArray>(MEMORY_SHEETS)
++    private val tiles = LruCache<String, Bitmap>(MEMORY_TILES)
++    private val http by lazy {
++        OkHttpClient.Builder()
++            .connectTimeout(10, TimeUnit.SECONDS)
++            .readTimeout(10, TimeUnit.SECONDS)
++            .followRedirects(true)
++            .build()
++    }
++
++    @Volatile
++    private var closed = false
++
++    override suspend fun thumbnailFor(positionMs: Long): SeekPreviewThumbnail? =
++        withContext(Dispatchers.IO) { tileAt(positionMs + offsetMs) }
++
++    private fun tileAt(positionMs: Long): SeekPreviewThumbnail? {
++        if (closed) return null
++        val size = runCatching { storyboard.groupSize }.getOrNull() ?: return null
++        val width = size.width
++        val height = size.height
++        val columns = size.colCount.coerceAtLeast(1)
++        val rows = size.rowCount.coerceAtLeast(1)
++        if (width <= 0 || height <= 0) return null
++
++        val groupDurationMs = storyboard.groupDurationMS.toLong().coerceAtLeast(1L)
++        val tileDurationMs = size.durationEachMS.toLong().coerceAtLeast(1L)
++        val safePosition = positionMs.coerceAtLeast(0L)
++        val group = (safePosition / groupDurationMs).toInt()
++        val groupStart = group.toLong() * groupDurationMs
++        val tile = ((safePosition - groupStart) / tileDurationMs).toInt().coerceIn(0, rows * columns - 1)
++        val cueStart = groupStart + tile * tileDurationMs
++        val key = "$group/$tile"
++        tiles.get(key)?.let { return SeekPreviewThumbnail(it, cueStart, cueStart + tileDurationMs) }
++
++        val url = runCatching { storyboard.getGroupUrl(group) }.getOrNull() ?: return null
++        val bytes = sheets.get(url) ?: loadSheet(group, url) ?: return null
++        val x = (tile % columns) * width
++        val y = (tile / columns) * height
++        val decoder = runCatching { BitmapRegionDecoder.newInstance(bytes, 0, bytes.size, false) }.getOrNull()
++            ?: return null
++        val decoded: Bitmap? = try {
++            decoder.decodeRegion(
++                Rect(x, y, x + width, y + height),
++                BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
++            )
++        } catch (error: Throwable) {
++            Log.w(TAG, "could not decode tile $group/$tile", error)
++            null
++        } finally {
++            decoder.recycle()
++        }
++        val bitmap = decoded ?: return null
++        tiles.put(key, bitmap)
++        return SeekPreviewThumbnail(bitmap, cueStart, cueStart + tileDurationMs)
++    }
++
++    private fun loadSheet(group: Int, url: String): ByteArray? {
++        val file = File(directory, "g$group.jpg")
++        if (file.isFile && file.length() > 0) {
++            runCatching { file.readBytes() }.getOrNull()?.let { cached ->
++                sheets.put(url, cached)
++                return cached
++            }
++        }
++        val bytes = runCatching {
++            http.newCall(Request.Builder().url(url).header("User-Agent", USER_AGENT).build())
++                .execute().use { response ->
++                    if (!response.isSuccessful) {
++                        Log.w(TAG, "sheet $group -> HTTP ${response.code}")
++                        null
++                    } else {
++                        response.body?.bytes()
++                    }
++                }
++        }.onFailure { Log.w(TAG, "sheet $group request failed", it) }.getOrNull() ?: return null
++
++        sheets.put(url, bytes)
++        runCatching {
++            directory.mkdirs()
++            val temp = File(directory, "g$group.tmp")
++            temp.writeBytes(bytes)
++            if (!temp.renameTo(file)) {
++                file.writeBytes(bytes)
++                temp.delete()
++            }
++            trimDiskCache()
++        }.onFailure { Log.w(TAG, "could not cache sheet $group", it) }
++        return bytes
++    }
++
++    private fun trimDiskCache() {
++        val files = directory.listFiles()?.filter { it.isFile }?.sortedBy { it.lastModified() } ?: return
++        var total = files.sumOf { it.length() }
++        for (file in files) {
++            if (total <= MAX_DISK_BYTES) break
++            total -= file.length()
++            file.delete()
++        }
++    }
++
++    override fun close() {
++        closed = true
++        sheets.evictAll()
++        tiles.evictAll()
++        runCatching { directory.deleteRecursively() }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeStoryboards.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeStoryboards.kt
+new file mode 100644
+index 000000000..2d65e1aac
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeStoryboards.kt
+@@ -0,0 +1,92 @@
++package com.nuvio.tv.youtube
++
++import android.util.Log
++import com.liskovsoft.mediaserviceinterfaces.data.MediaItemStoryboard
++import com.liskovsoft.youtubeapi.formatbuilders.storyboard.YouTubeStoryParser
++import com.liskovsoft.youtubeapi.service.data.YouTubeMediaItemStoryboard
++import com.liskovsoft.youtubeapi.videoinfo.V2.VideoInfoService
++import java.util.concurrent.ConcurrentHashMap
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.launch
++
++/**
++ * The storyboard spec that came back with a video's playback info. The spec is just sprite-sheet
++ * URLs and tile geometry; the images themselves are fetched on demand by the seek preview.
++ *
++ * The playback client used for the actual stream (VISIONOS in practice) does not always include
++ * storyboards. In that case [ensure] asks the older MediaServiceCore video-info path, which also
++ * repairs missing storyboards from its HLS response. That request runs in the background, once per
++ * video, so it never delays playback.
++ */
++object YouTubeStoryboards {
++    private const val TAG = "YouTubeStoryboards"
++    private const val MAX_ENTRIES = 32
++    private const val LEGACY_FETCH_DELAY_MS = 1_000L
++
++    private val entries = ConcurrentHashMap<String, MediaItemStoryboard>()
++    private val attempted = ConcurrentHashMap.newKeySet<String>()
++    private val fetching = ConcurrentHashMap<String, Boolean>()
++    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++
++    private val _version = MutableStateFlow(0)
++    /** Increments whenever a storyboard arrives or is removed, so the player can recompose. */
++    val version: StateFlow<Int> = _version.asStateFlow()
++
++    fun put(videoId: String, storyboard: MediaItemStoryboard?) {
++        if (storyboard == null) {
++            entries.remove(videoId)
++            _version.value++
++            return
++        }
++        if (entries.size >= MAX_ENTRIES) entries.clear()
++        entries[videoId] = storyboard
++        attempted.remove(videoId)
++        _version.value++
++        Log.i(TAG, "storyboard ready video=$videoId")
++    }
++
++    fun get(videoId: String): MediaItemStoryboard? = entries[videoId]
++
++    fun clear(videoId: String) {
++        entries.remove(videoId)
++        attempted.remove(videoId)
++        _version.value++
++    }
++
++    /**
++     * Fetches a missing storyboard once, in the background. Safe to call from composition: it
++     * returns immediately and never repeats the request for the same video in this session.
++     */
++    fun ensure(videoId: String) {
++        if (entries.containsKey(videoId)) return
++        if (!attempted.add(videoId)) return
++        if (fetching.putIfAbsent(videoId, true) != null) return
++        scope.launch {
++            try {
++                // Give playback a moment to start before the extra video-info request.
++                delay(LEGACY_FETCH_DELAY_MS)
++                val storyboard = fetchLegacy(videoId)
++                Log.i(TAG, "legacy storyboard video=$videoId available=${storyboard != null}")
++                if (storyboard != null) put(videoId, storyboard)
++            } finally {
++                fetching.remove(videoId)
++            }
++        }
++    }
++
++    private fun fetchLegacy(videoId: String): MediaItemStoryboard? = runCatching {
++        val videoInfo = VideoInfoService.instance().getVideoInfo(videoId, null) ?: return@runCatching null
++        val spec = videoInfo.storyboardSpec ?: return@runCatching null
++        val parser = YouTubeStoryParser.from(spec)
++        parser.setSegmentDurationUs(videoInfo.segmentDurationUs)
++        parser.setStartSegmentNum(videoInfo.startSegmentNum)
++        val story = parser.extractStory() ?: return@runCatching null
++        YouTubeMediaItemStoryboard.from(story)
++    }.onFailure { Log.w(TAG, "legacy storyboard failed video=$videoId", it) }.getOrNull()
++}
+diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
+index fa439bf14..b794e3bdc 100644
+--- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
+@@ -218,6 +218,7 @@ class YouTubeViewModel @Inject constructor(
+     init {
+         warmUpEngine()
+         YouTubeMpdServer.attach(context.cacheDir)
++        com.nuvio.tv.ui.screens.player.seekpreview.YouTubeStoryboardCache.cleanup(context)
+         selectTab(YouTubeSettings.lastTab(context))
+         // The first videos of every feed are the likeliest first click, so their streams are looked up as
+         // soon as the feed shows, before any card is focused. Shorts are skipped: the Shorts player does its own.
+@@ -990,6 +991,14 @@ class YouTubeViewModel @Inject constructor(
+             Log.i(TAG, "lookup with client=${info.clientInfo?.clientName} at ${since()}ms")
+         }
+         if (info.isUnplayable) error(friendlyReason(info.playabilityReason))
++        // The seek preview uses YouTube's sprite sheets; clients that omit them are asked again in the background.
++        if (info.isLive) {
++            YouTubeStoryboards.clear(videoId)
++        } else {
++            val directStoryboard = runCatching { info.createStoryboard() }.getOrNull()
++            YouTubeStoryboards.put(videoId, directStoryboard)
++            if (directStoryboard == null) YouTubeStoryboards.ensure(videoId)
++        }
+         Log.i(TAG, "formats video=$videoId dash=${info.containsDashFormats()} " +
+             "sabr=${info.containsSabrFormats()} hls=${info.containsHlsUrl()} " +
+             "adaptive=${info.adaptiveFormats?.size} live=${info.isLive} client=${info.clientInfo?.clientName}")
