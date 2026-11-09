@@ -585,6 +585,94 @@ index 000000000..36a0ff47c
 +        else -> null
 +    }
 +}
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/TvMixSession.kt b/app/src/main/java/com/nuvio/tv/core/player/TvMixSession.kt
+new file mode 100644
+index 000000000..e94934fc4
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/player/TvMixSession.kt
+@@ -0,0 +1,34 @@
++package com.nuvio.tv.core.player
++
++import com.nuvio.tv.domain.model.TvMixSelection
++import kotlinx.coroutines.flow.MutableStateFlow
++import java.util.UUID
++import javax.inject.Inject
++import javax.inject.Singleton
++
++/** Ephemeral, explicitly scoped to a profile and the exact selected episode. */
++@Singleton
++class TvMixSession @Inject constructor() {
++    data class Playing(val profileId: Int, val mixId: String, val selection: TvMixSelection,
++        val token: String = UUID.randomUUID().toString(), val continuation: Boolean = false,
++        val preferredBingeGroup: String? = null)
++    data class ExternalReturn(val playing: Playing, val completed: Boolean, val autoplay: Boolean)
++    val externalReturn = MutableStateFlow<ExternalReturn?>(null)
++    val sourceFailures = MutableStateFlow<Playing?>(null)
++    fun reportSourceUnavailable(expected: Playing): Boolean {
++        if (playing.value !== expected) return false
++        sourceFailures.value = expected
++        return true
++    }
++    fun returnedExternally(completed: Boolean, autoplay: Boolean, expected: Playing? = playing.value) {
++        expected?.takeIf { playing.value === it }?.let { externalReturn.value = ExternalReturn(it, completed, autoplay) }
++    }
++    val playing = MutableStateFlow<Playing?>(null)
++    fun matches(profileId: Int, contentId: String?, videoId: String?) = playing.value?.let {
++        it.profileId == profileId && it.selection.meta.id == contentId && it.selection.video.id == videoId
++    } == true
++    fun continuationFor(profileId: Int, contentId: String?, videoId: String?) = playing.value?.takeIf {
++        it.continuation && it.profileId == profileId && it.selection.meta.id == contentId && it.selection.video.id == videoId
++    }
++    fun end() { playing.value = null; externalReturn.value = null; sourceFailures.value = null }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/sync/HomeCatalogSyncSupport.kt b/app/src/main/java/com/nuvio/tv/core/sync/HomeCatalogSyncSupport.kt
+index 82e102fe2..fadb07e3d 100644
+--- a/app/src/main/java/com/nuvio/tv/core/sync/HomeCatalogSyncSupport.kt
++++ b/app/src/main/java/com/nuvio/tv/core/sync/HomeCatalogSyncSupport.kt
+@@ -3,6 +3,7 @@ package com.nuvio.tv.core.sync
+ import com.nuvio.tv.data.mediaserver.ServerCatalog
+ import com.nuvio.tv.domain.model.catalogTypeKey
+ import com.nuvio.tv.domain.model.catalogRowLegacyKey
++import com.nuvio.tv.domain.model.TvMixHomeCatalog
+ import com.nuvio.tv.domain.model.Addon
+ import com.nuvio.tv.domain.model.CatalogDescriptor
+ import com.nuvio.tv.domain.model.Collection
+@@ -71,6 +72,16 @@ internal fun buildHomeCatalogSyncPayload(
+     collections: List<Collection>,
+     localState: LocalHomeCatalogSettingsState
+ ): SyncHomeCatalogPayload {
++    val mixKey = TvMixHomeCatalog.key
++    val hasMixSettings = mixKey in localState.orderKeys || mixKey in localState.disabledKeys ||
++        mixKey in localState.customTitles
++    val mixEntries = if (hasMixSettings) listOf(HomeCatalogSyncEntry(
++        key = mixKey,
++        addonId = TvMixHomeCatalog.ADDON_ID,
++        type = TvMixHomeCatalog.TYPE,
++        catalogId = TvMixHomeCatalog.CATALOG_ID,
++        catalogName = TvMixHomeCatalog.TITLE
++    )) else emptyList()
+     val catalogEntries = buildCatalogEntries(addons)
+     val collectionEntries = collections.map { collection ->
+         HomeCatalogSyncEntry(
+@@ -79,7 +90,7 @@ internal fun buildHomeCatalogSyncPayload(
+             collectionId = collection.id
+         )
+     }
+-    val entryByKey = (catalogEntries + collectionEntries).associateBy { it.key }
++    val entryByKey = (catalogEntries + collectionEntries + mixEntries).associateBy { it.key }
+     val catalogKeys = catalogEntries.map { it.key }
+     val collectionKeys = collectionEntries.map { it.key }
+ 
+@@ -91,7 +102,8 @@ internal fun buildHomeCatalogSyncPayload(
+     val savedSet = savedValid.toSet()
+     val mergedOrder = savedValid +
+         catalogKeys.filterNot { it in savedSet } +
+-        collectionKeys.filterNot { it in savedSet }
++        collectionKeys.filterNot { it in savedSet } +
++        mixEntries.map { it.key }.filterNot { it in savedSet }
+ 
+     val items = mergedOrder.mapIndexedNotNull { index, key ->
+         val entry = entryByKey[key] ?: return@mapIndexedNotNull null
 diff --git a/app/src/main/java/com/nuvio/tv/core/tmdb/TmdbCredentialStore.kt b/app/src/main/java/com/nuvio/tv/core/tmdb/TmdbCredentialStore.kt
 new file mode 100644
 index 000000000..3a8426d8f
@@ -973,6 +1061,76 @@ index 000000000..f834b44ba
 +            runCatching { saved.id.isNotBlank() && saved.name.isNotBlank() && saved.query.validationError() == null }.getOrDefault(false)
 +        }.distinctBy { it.id }
 +    }.getOrDefault(emptyList())
++}
+diff --git a/app/src/main/java/com/nuvio/tv/data/local/TvMixStore.kt b/app/src/main/java/com/nuvio/tv/data/local/TvMixStore.kt
+new file mode 100644
+index 000000000..6f39d5b51
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/local/TvMixStore.kt
+@@ -0,0 +1,64 @@
++package com.nuvio.tv.data.local
++
++import androidx.datastore.preferences.core.edit
++import androidx.datastore.preferences.core.stringPreferencesKey
++import com.google.gson.Gson
++import com.nuvio.tv.core.profile.ProfileManager
++import com.nuvio.tv.domain.model.TvMix
++import com.nuvio.tv.domain.model.TvMixShow
++import kotlinx.coroutines.ExperimentalCoroutinesApi
++import kotlinx.coroutines.flow.flatMapLatest
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.flow.map
++import javax.inject.Inject
++import javax.inject.Singleton
++
++internal fun decodeTvMix(raw: String): TvMix {
++    val mix = Gson().fromJson(raw, TvMix::class.java)
++    require(mix.id.isNotBlank() && mix.name.isNotBlank() && mix.name.length <= 100)
++    require(mix.shows.all { it.id.isNotBlank() && it.name.isNotBlank() && it.type in listOf("series", "tv", "anime") })
++    require(mix.shows.indices.all { i -> mix.shows.take(i).none { it.sameShow(mix.shows[i]) } })
++    return mix
++}
++
++@Singleton
++@OptIn(ExperimentalCoroutinesApi::class)
++class TvMixStore @Inject constructor(private val factory: ProfileDataStoreFactory, private val profiles: ProfileManager) {
++    private val gson = Gson()
++    private fun store(id: Int) = factory.get(id, "tv_mix")
++    fun observe(id: Int) = store(id).data.map { prefs ->
++        prefs.asMap().mapNotNull { (key, value) ->
++            if (!key.name.startsWith("mix:")) null else runCatching { decodeTvMix(value as String) }.getOrNull()
++        }.sortedWith(compareBy<TvMix> { it.name.lowercase() }.thenBy { it.id })
++    }
++    val mixes = profiles.activeProfileId.flatMapLatest(::observe)
++    suspend fun save(profileId: Int, mix: TvMix) {
++        val raw = gson.toJson(mix)
++        decodeTvMix(raw)
++        store(profileId).edit { it[stringPreferencesKey("mix:${mix.id}")] = raw }
++    }
++    suspend fun add(profileId: Int, mixId: String, show: TvMixShow) {
++        store(profileId).edit { prefs ->
++            val key = stringPreferencesKey("mix:$mixId")
++            val current = prefs[key]?.let(::decodeTvMix) ?: error("Mix no longer exists")
++            val updated = current.adding(show)
++            val raw = gson.toJson(updated)
++            decodeTvMix(raw)
++            prefs[key] = raw
++        }
++    }
++    suspend fun delete(profileId: Int, id: String) { store(profileId).edit { it.remove(stringPreferencesKey("mix:$id")) } }
++    suspend fun export(profileId: Int): Map<String, String> = store(profileId).data.first().asMap()
++        .mapNotNull { (key, value) -> if (key.name.startsWith("mix:")) key.name to (value as String) else null }.toMap()
++    suspend fun restore(profileId: Int, values: Map<String, String>) {
++        validateTvMixBackup(values)
++        store(profileId).edit { prefs ->
++            prefs.clear()
++            values.forEach { (key, value) -> prefs[stringPreferencesKey(key)] = value }
++        }
++    }
++}
++
++internal fun validateTvMixBackup(values: Map<String, String>) {
++    values.forEach { (key, value) -> require(key == "mix:${decodeTvMix(value).id}") { "Invalid TV Mix backup" } }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/data/remote/api/TmdbApi.kt b/app/src/main/java/com/nuvio/tv/data/remote/api/TmdbApi.kt
 index c057d17d3..bf9971beb 100644
@@ -2520,6 +2678,108 @@ index 000000000..e62ff5bcf
 +
 +@Keep
 +data class SavedDiscovery(val id: String, val name: String, val query: DiscoveryQuery)
+diff --git a/app/src/main/java/com/nuvio/tv/domain/model/TvMix.kt b/app/src/main/java/com/nuvio/tv/domain/model/TvMix.kt
+new file mode 100644
+index 000000000..8f67e4322
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/domain/model/TvMix.kt
+@@ -0,0 +1,69 @@
++package com.nuvio.tv.domain.model
++
++import java.net.URLEncoder
++import kotlin.random.Random
++
++/** A profile-owned collection. Episode metadata and streams are deliberately not persisted. */
++data class TvMixShow(
++    val id: String,
++    val name: String,
++    val poster: String? = null,
++    val type: String = "series",
++    val imdbId: String? = null,
++    val addonBaseUrl: String? = null
++) {
++    fun sameShow(other: TvMixShow) = id == other.id ||
++        (!imdbId.isNullOrBlank() && imdbId == other.imdbId) || id == other.imdbId || imdbId == other.id
++}
++
++data class TvMix(
++    val id: String,
++    val name: String,
++    val shows: List<TvMixShow> = emptyList(),
++    val unwatchedOnly: Boolean = false
++) {
++    fun adding(show: TvMixShow): TvMix = if (shows.any { it.sameShow(show) }) this else copy(shows = shows + show)
++    fun preview(): MetaPreview {
++        val art = "tvmix-art:" + shows.mapNotNull { it.poster?.takeIf(String::isNotBlank) }.distinct().take(4)
++            .joinToString("|") { URLEncoder.encode(it, "UTF-8") }
++        return MetaPreview("tvmix:$id", ContentType.UNKNOWN, "tvmix", name, art, PosterShape.POSTER,
++            art, null, null, null, null, emptyList())
++    }
++}
++
++data class TvMixSelection(val meta: Meta, val video: Video) {
++    val key: Pair<String, String> get() = meta.id to video.id
++}
++
++/** A uniform permutation gives each eligible show equal probability, regardless of episode count.
++ * Metadata is resolved serially, stopping as soon as a candidate is found. */
++internal suspend fun selectTvMixEpisode(
++    shows: List<TvMixShow>,
++    previous: Pair<String, String>?,
++    random: Random = Random.Default,
++    lastPlayed: Pair<String, String>? = null,
++    candidates: suspend (TvMixShow) -> Pair<Meta, List<Video>>?
++): TvMixSelection? {
++    var previewFallback: TvMixSelection? = null
++    var playedFallback: TvMixSelection? = null
++    for (show in shows.shuffled(random)) {
++        val (meta, episodes) = candidates(show) ?: continue
++        val alternatives = episodes.filterNot { meta.id to it.id == previous || meta.id to it.id == lastPlayed }
++        // Use the same episode picker and availability/identity rules as episode shuffle.
++        val video = RandomEpisodePicker(meta.id, alternatives, emptySet(), emptyMap(), random).pick(true)
++        if (video != null) return TvMixSelection(meta, video)
++        if (previewFallback == null) previous?.takeIf { it.first == meta.id && it != lastPlayed }?.let { key ->
++            RandomEpisodePicker(meta.id, episodes, emptySet(), emptyMap(), random).find(key.second, true)?.let {
++                previewFallback = TvMixSelection(meta, it)
++            }
++        }
++        if (playedFallback == null) lastPlayed?.takeIf { it.first == meta.id }?.let { key ->
++            RandomEpisodePicker(meta.id, episodes, emptySet(), emptyMap(), random).find(key.second, true)?.let {
++                playedFallback = TvMixSelection(meta, it)
++            }
++        }
++    }
++    // A two-episode mix can have only the current preview left after excluding the
++    // episode just played. Keep that preview rather than immediately replaying it.
++    return previewFallback ?: playedFallback
++}
+diff --git a/app/src/main/java/com/nuvio/tv/domain/model/TvMixHomeCatalog.kt b/app/src/main/java/com/nuvio/tv/domain/model/TvMixHomeCatalog.kt
+new file mode 100644
+index 000000000..315366993
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/domain/model/TvMixHomeCatalog.kt
+@@ -0,0 +1,21 @@
++package com.nuvio.tv.domain.model
++
++/** Keep the saved order key identical to the existing TV Mix row identity. */
++internal object TvMixHomeCatalog {
++    const val ADDON_ID = "reseq-tv-mix"
++    const val TYPE = "tvmix"
++    const val CATALOG_ID = "tv-mix"
++    const val TITLE = "TV Mix"
++    val key = catalogRowLegacyKey(ADDON_ID, TYPE, CATALOG_ID)
++
++    /** Preserve this local row when an addon-only editor submits its catalog list. */
++    fun retainPosition(order: List<String>, previousOrder: List<String>): List<String> {
++        val index = previousOrder.indexOf(key)
++        if (index < 0) return order
++        return order.filterNot { it == key }.toMutableList().apply { add(index.coerceAtMost(size), key) }
++    }
++}
++
++/** Rows that can move between addon blocks while following addon manifest order. */
++internal fun isStandaloneHomeRowKey(key: String): Boolean =
++    key.startsWith("collection_") || key == TvMixHomeCatalog.key
 diff --git a/app/src/main/java/com/nuvio/tv/domain/model/TvdbStreamCacheKeys.kt b/app/src/main/java/com/nuvio/tv/domain/model/TvdbStreamCacheKeys.kt
 new file mode 100644
 index 000000000..ced09ff8d
@@ -2880,6 +3140,127 @@ index 000000000..ebb44bdbf
 +        modifier = modifier
 +    )
 +}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/components/ContentCard.kt b/app/src/main/java/com/nuvio/tv/ui/components/ContentCard.kt
+index aa87e6ee8..45c30125c 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/components/ContentCard.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/components/ContentCard.kt
+@@ -130,7 +130,7 @@ fun ContentCard(
+     }
+     // Landscape cards are already 16:9 — expanded width equals base width (no size change).
+     val expandedCardWidth = if (globalLandscape) baseCardWidth else baseCardHeight * BACKDROP_ASPECT_RATIO
+-    val effectiveExpandEnabled = focusedPosterBackdropExpandEnabled
++    val effectiveExpandEnabled = focusedPosterBackdropExpandEnabled && item.apiType != "tvmix"
+ 
+     var isFocused by remember { mutableStateOf(false) }
+     var longPressTriggered by remember { mutableStateOf(false) }
+@@ -416,6 +416,8 @@ fun ContentCard(
+                                 backgroundColor = NuvioTheme.colors.BackgroundCard
+                             )
+                     )
++                } else if (item.apiType == "tvmix") {
++                    com.nuvio.tv.ui.screens.tvmix.TvMixArtwork(item.poster.orEmpty(), item.name, Modifier.fillMaxSize())
+                 } else if (!imageUrl.isNullOrBlank()) {
+                     AsyncImage(
+                         model = imageModel,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/components/ContinueWatchingSection.kt b/app/src/main/java/com/nuvio/tv/ui/components/ContinueWatchingSection.kt
+index e3ec81c32..afac3a73f 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/components/ContinueWatchingSection.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/components/ContinueWatchingSection.kt
+@@ -1,5 +1,7 @@
+ package com.nuvio.tv.ui.components
+ 
++import com.nuvio.tv.ui.screens.home.tvMixPreview
++
+ import com.nuvio.tv.ui.screens.home.shuffleFocusKey
+ 
+ import android.view.KeyEvent as AndroidKeyEvent
+@@ -69,6 +71,7 @@ import androidx.tv.material3.Button
+ import androidx.tv.material3.ButtonDefaults
+ import androidx.tv.material3.Text
+ import com.nuvio.tv.ui.screens.home.ContinueWatchingItem
++import com.nuvio.tv.ui.screens.home.canMarkWatched
+ import com.nuvio.tv.ui.theme.NuvioTheme
+ import androidx.compose.ui.platform.LocalContext
+ import coil3.compose.AsyncImage
+@@ -131,6 +134,7 @@ fun ContinueWatchingSection(
+     onStartFromBeginning: (ContinueWatchingItem) -> Unit = {},
+     showManualPlayOption: Boolean = false,
+     onPlayManually: (ContinueWatchingItem) -> Unit = {},
++    onMarkWatched: (ContinueWatchingItem) -> Unit = {},
+     modifier: Modifier = Modifier,
+     title: String? = null,
+     focusedItemIndex: Int = -1,
+@@ -317,6 +321,11 @@ fun ContinueWatchingSection(
+             onPlayManually = {
+                 onPlayManually(menuItem)
+                 optionsItem = null
++            },
++            onMarkWatched = {
++                pendingFocusIndex = if (items.size <= 1) null else minOf(lastFocusedIndex, items.lastIndex)
++                onMarkWatched(menuItem)
++                optionsItem = null
+             }
+         )
+     }
+@@ -477,9 +486,9 @@ fun ContinueWatchingCard(
+     }
+     val nextUp = remember(item) { (item as? ContinueWatchingItem.NextUp)?.info }
+     val cardContext = LocalContext.current
+-    val episodeStr = remember(progress, nextUp, cardContext) {
+-        val season = progress?.season ?: nextUp?.season
+-        val episode = progress?.episode ?: nextUp?.episode
++    val episodeStr = remember(item, progress, nextUp, cardContext) {
++        val season = (item as? ContinueWatchingItem.InProgress)?.displaySeason ?: nextUp?.displaySeason ?: progress?.season ?: nextUp?.season
++        val episode = (item as? ContinueWatchingItem.InProgress)?.displayEpisode ?: nextUp?.displayEpisode ?: progress?.episode ?: nextUp?.episode
+         if (season != null && episode != null) {
+             cardContext.getString(R.string.season_episode_format, season, episode)
+         } else {
+@@ -1166,7 +1175,8 @@ fun ContinueWatchingOptionsDialog(
+     onDetails: () -> Unit,
+     onStartFromBeginning: () -> Unit = {},
+     showPlayManually: Boolean = false,
+-    onPlayManually: () -> Unit = {}
++    onPlayManually: () -> Unit = {},
++    onMarkWatched: () -> Unit = {}
+ ) {
+     val isPlayEnabled = LocalPlaybackAvailability.current.canStream(item)
+     val title = when (item) {
+@@ -1224,6 +1234,20 @@ fun ContinueWatchingOptionsDialog(
+             }
+         }
+ 
++        remember(item) { item.tvMixPreview() }?.let { com.nuvio.tv.ui.screens.tvmix.AddToMixAction(it) }
++        if (item.canMarkWatched()) {
++            Button(
++                onClick = onMarkWatched,
++                colors = ButtonDefaults.colors(
++                    containerColor = NuvioTheme.colors.BackgroundCard,
++                    contentColor = NuvioTheme.colors.TextPrimary
++                ),
++                modifier = Modifier.fillMaxWidth()
++            ) {
++                Text(stringResource(R.string.hero_mark_watched))
++            }
++        }
++
+         Button(
+             onClick = onRemove,
+             colors = ButtonDefaults.colors(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/components/GridContentCard.kt b/app/src/main/java/com/nuvio/tv/ui/components/GridContentCard.kt
+index edaa95106..5182d84cd 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/components/GridContentCard.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/components/GridContentCard.kt
+@@ -232,7 +232,9 @@ fun GridContentCard(
+                     }
+                     builder.build()
+                 }
+-                if (effectiveImageUrl.isNullOrBlank()) {
++                if (item.apiType == "tvmix") {
++                    com.nuvio.tv.ui.screens.tvmix.TvMixArtwork(item.poster.orEmpty(), item.name, Modifier.fillMaxSize())
++                } else if (effectiveImageUrl.isNullOrBlank()) {
+                     MonochromePosterPlaceholder(contentDescription = item.name)
+                 } else {
+                     AsyncImage(
 diff --git a/app/src/main/java/com/nuvio/tv/ui/components/HeroCarousel.kt b/app/src/main/java/com/nuvio/tv/ui/components/HeroCarousel.kt
 index 71eab26ba..b6188518e 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/components/HeroCarousel.kt
@@ -2999,8 +3380,47 @@ index 000000000..82d950af6
 +        } else false
 +    }
 +}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/components/posteroptions/PosterOptionsDialog.kt b/app/src/main/java/com/nuvio/tv/ui/components/posteroptions/PosterOptionsDialog.kt
+index bae6b3c0e..606c740c3 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/components/posteroptions/PosterOptionsDialog.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/components/posteroptions/PosterOptionsDialog.kt
+@@ -31,6 +31,7 @@ import androidx.tv.material3.ExperimentalTvMaterial3Api
+ import androidx.tv.material3.MaterialTheme
+ import androidx.tv.material3.Text
+ import com.nuvio.tv.R
++import com.nuvio.tv.domain.model.MetaPreview
+ import com.nuvio.tv.core.tracking.TrackingMembershipRemovalImpact
+ import com.nuvio.tv.core.tracking.TrackingMembershipRemovalConfirmation
+ import com.nuvio.tv.core.tracking.LOCAL_LIBRARY_LIST_KEY
+@@ -54,7 +55,8 @@ fun PosterOptionsDialog(
+     onDismiss: () -> Unit,
+     onDetails: () -> Unit,
+     onToggleLibrary: () -> Unit,
+-    onToggleWatched: () -> Unit
++    onToggleWatched: () -> Unit,
++    mixItem: MetaPreview? = null
+ ) {
+     val primaryFocusRequester = remember { FocusRequester() }
+ 
+@@ -102,6 +104,8 @@ fun PosterOptionsDialog(
+             )
+         }
+ 
++        if (isSeries && mixItem != null) com.nuvio.tv.ui.screens.tvmix.AddToMixAction(mixItem)
++
+         if (isMovie || isSeries) {
+             Button(
+                 onClick = onToggleWatched,
+@@ -221,6 +225,7 @@ fun PosterOptionsHost(
+             target.apiType.equals("tv", ignoreCase = true) ||
+             target.apiType.equals("anime", ignoreCase = true)
+         PosterOptionsDialog(
++            mixItem = target.copy(sourceAddonBaseUrl = state.addonBaseUrl.takeIf { it.isNotBlank() } ?: target.sourceAddonBaseUrl),
+             title = target.name,
+             isInLibrary = state.isInLibrary,
+             isLibraryPending = state.isLibraryPending,
 diff --git a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
-index ee43f4351..5db370527 100644
+index ee43f4351..e96848434 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
 @@ -15,6 +15,8 @@ import androidx.compose.animation.fadeIn
@@ -3012,7 +3432,61 @@ index ee43f4351..5db370527 100644
  import androidx.compose.runtime.Composable
  import androidx.compose.runtime.CompositionLocalProvider
  import androidx.compose.runtime.getValue
-@@ -1016,9 +1018,11 @@ private fun PlaybackNavHost(
+@@ -28,6 +30,7 @@ import androidx.navigation.NavType
+ import androidx.navigation.compose.NavHost
+ import androidx.navigation.compose.composable
+ import androidx.navigation.navArgument
++import com.nuvio.tv.ui.screens.tvmix.streamRoute
+ import com.nuvio.tv.core.build.AppFeaturePolicy
+ import com.nuvio.tv.core.intro.PlaybackIntroState
+ import com.nuvio.tv.core.party.PartyMedia
+@@ -99,6 +102,13 @@ fun NuvioNavHost(
+     startDestination: String = Screen.Home.route,
+     hideBuiltInHeaders: Boolean = false
+ ) {
++    val mixViewModel: com.nuvio.tv.ui.screens.tvmix.TvMixViewModel = androidx.hilt.navigation.compose.hiltViewModel()
++    val mixActivity = androidx.activity.compose.LocalActivity.current
++    androidx.compose.runtime.DisposableEffect(mixViewModel) {
++        onDispose {
++            if (mixActivity?.isChangingConfigurations != true) mixViewModel.end()
++        }
++    }
+     PlaybackAvailabilityProvider {
+         // The NavController keeps its back stack ViewModels in the store of the owner it is
+         // composed under, so use the session store when MainActivity provides one.
+@@ -257,6 +267,23 @@ private fun PlaybackNavHost(
+             )
+         }
+ 
++        composable(
++            com.nuvio.tv.ui.screens.tvmix.TV_MIX_ROUTE,
++            arguments = listOf(
++                navArgument("mixId") { type = NavType.StringType },
++                navArgument("manage") { type = NavType.BoolType; defaultValue = false }
++            )
++        ) { entry ->
++            com.nuvio.tv.ui.screens.tvmix.TvMixScreen(
++                id = entry.arguments?.getString("mixId").orEmpty(),
++                manageOnOpen = entry.arguments?.getBoolean("manage") == true,
++                viewModel = mixViewModel,
++                onBack = { navController.popBackStack() },
++                onPlay = { selection ->
++                    navController.navigate(selection.streamRoute(mixViewModel.session.playing.value?.profileId))
++                }
++            )
++        }
+         composable(Screen.Home.route) {
+             fun createContinueWatchingRoute(
+                 item: ContinueWatchingItem,
+@@ -310,6 +337,7 @@ private fun PlaybackNavHost(
+             }
+ 
+             HomeScreen(
++                onNavigateToMix = { id, manage -> navController.navigate("tv-mix/$id?manage=$manage") },
+                 onNavigateToDetail = { itemId, itemType, addonBaseUrl ->
+                     val heroBackdrop = HeroBackdropState.consumeAndClear()
+                     navController.navigate(
+@@ -1016,9 +1044,11 @@ private fun PlaybackNavHost(
              val upNextListOpen = androidx.compose.runtime.remember(upNextVideoId) { androidx.compose.runtime.mutableStateOf(false) }
              val downShowedControls = androidx.compose.runtime.remember(upNextVideoId) { androidx.compose.runtime.mutableStateOf(false) }
              val upNextCardShown = androidx.compose.runtime.remember(upNextVideoId) { androidx.compose.runtime.mutableStateOf(false) }
@@ -3024,7 +3498,7 @@ index ee43f4351..5db370527 100644
                      youtubeVm.playNext(
                          currentVideoId = ytId,
                          onReady = { v ->
-@@ -1026,7 +1030,10 @@ private fun PlaybackNavHost(
+@@ -1026,7 +1056,10 @@ private fun PlaybackNavHost(
                                  popUpTo(backStackEntry.destination.id) { inclusive = true }
                              }
                          },
@@ -3036,7 +3510,7 @@ index ee43f4351..5db370527 100644
                      )
                  }
              }
-@@ -1139,6 +1146,7 @@ private fun PlaybackNavHost(
+@@ -1139,6 +1172,7 @@ private fun PlaybackNavHost(
                              onVisibleChange = { upNextCardShown.value = it }
                          )
                          SponsorSkipCard()
@@ -3044,7 +3518,7 @@ index ee43f4351..5db370527 100644
                          YouTubeUpNextList(
                              videoId = upNextVideoId,
                              viewModel = youtubeVm,
-@@ -1158,6 +1166,20 @@ private fun PlaybackNavHost(
+@@ -1158,6 +1192,20 @@ private fun PlaybackNavHost(
                                  }
                              }
                          )
@@ -3065,7 +3539,7 @@ index ee43f4351..5db370527 100644
                          if (ytState.info?.liveChatKey != null && (playerUi.showControls || !playerUi.isPlaying)) {
                              com.nuvio.tv.youtube.YouTubeLiveBadge(
                                  androidx.compose.ui.Modifier.align(androidx.compose.ui.Alignment.TopStart)
-@@ -1184,6 +1206,20 @@ private fun PlaybackNavHost(
+@@ -1184,6 +1232,20 @@ private fun PlaybackNavHost(
                                  onOpenChannel = { channelId, name ->
                                      youtubeVm.openChannel(channelId, name)
                                      navController.popBackStack()
@@ -3086,7 +3560,7 @@ index ee43f4351..5db370527 100644
                                  }
                              )
                          }
-@@ -1551,13 +1587,15 @@ private fun PlaybackNavHost(
+@@ -1551,13 +1613,15 @@ private fun PlaybackNavHost(
                          Screen.CatalogSeeAll.createRoute(catalogId, addonId, type, fromSearch = true)
                      )
                  },
@@ -3103,7 +3577,7 @@ index ee43f4351..5db370527 100644
                  onNavigateToDetail = { itemId, itemType, addonBaseUrl ->
                      val heroBackdrop = HeroBackdropState.consumeAndClear()
                      navController.navigate(
-@@ -1572,6 +1610,19 @@ private fun PlaybackNavHost(
+@@ -1572,6 +1636,19 @@ private fun PlaybackNavHost(
              )
          }
  
@@ -3232,6 +3706,376 @@ index 7bd23e2ed..861b3e329 100644
                          running = server
                          if (server == null) {
                              DebugLogQrState(null, null, context.getString(R.string.error_server_ports_unavailable))
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerViewModel.kt
+index 3fda3b3b0..e28515566 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerViewModel.kt
+@@ -34,6 +34,7 @@ import com.nuvio.tv.core.server.TraktSourceSearchResultInfo
+ import com.nuvio.tv.core.profile.ProfileManager
+ import com.nuvio.tv.core.tmdb.TmdbCollectionSourceResolver
+ import com.nuvio.tv.core.trakt.TraktPublicListSourceResolver
++import com.nuvio.tv.core.util.readAppLogoBytes
+ import com.nuvio.tv.data.local.CollectionsDataStore
+ import com.nuvio.tv.data.local.ExperienceModeDataStore
+ import com.nuvio.tv.data.local.LayoutPreferenceDataStore
+@@ -64,6 +65,7 @@ import javax.inject.Inject
+ @HiltViewModel
+ class AddonManagerViewModel @Inject constructor(
+     private val addonRepository: AddonRepository,
++    private val iptvSources: com.nuvio.tv.livetv.ondemand.IptvStreamSources,
+     private val layoutPreferenceDataStore: LayoutPreferenceDataStore,
+     private val experienceModeDataStore: ExperienceModeDataStore,
+     private val collectionsDataStore: CollectionsDataStore,
+@@ -93,7 +95,7 @@ class AddonManagerViewModel @Inject constructor(
+     }
+ 
+     private var server: AddonConfigServer? = null
+-    private var logoBytes: ByteArray? = null
++    private val logoBytes: ByteArray? by lazy { context.readAppLogoBytes() }
+     private var homeCatalogOrderKeys: List<String> = emptyList()
+     private var disabledHomeCatalogKeys: Set<String> = emptySet()
+     private var followAddonsOrderEnabled: Boolean = false
+@@ -103,20 +105,12 @@ class AddonManagerViewModel @Inject constructor(
+         observeInstalledAddons()
+         observeCatalogPreferences()
+         observeCollections()
+-        loadLogoBytes()
+     }
+ 
+     fun requestAddonSyncNow() {
+         startupSyncService.requestAddonSyncNow()
+     }
+ 
+-    private fun loadLogoBytes() {
+-        try {
+-            val inputStream = context.resources.openRawResource(R.drawable.app_logo_wordmark)
+-            logoBytes = inputStream.use { it.readBytes() }
+-        } catch (_: Exception) { }
+-    }
+-
+     fun onInstallUrlChange(url: String) {
+         _uiState.update { it.copy(installUrl = url, error = null) }
+     }
+@@ -216,7 +210,7 @@ class AddonManagerViewModel @Inject constructor(
+ 
+     fun setAddonEnabled(baseUrl: String, enabled: Boolean) {
+         viewModelScope.launch {
+-            addonRepository.setAddonEnabled(baseUrl, enabled)
++            iptvSources.setEnabled(baseUrl, enabled)
+         }
+     }
+ 
+@@ -242,7 +236,7 @@ class AddonManagerViewModel @Inject constructor(
+         }
+ 
+         viewModelScope.launch {
+-            addonRepository.setAddonOrder(reordered.map { it.baseUrl })
++            iptvSources.setOrder(reordered)
+         }
+     }
+ 
+@@ -259,7 +253,7 @@ class AddonManagerViewModel @Inject constructor(
+             context = context,
+             webConfigMode = webConfigMode,
+             currentPageStateProvider = {
+-                val addons = _uiState.value.installedAddons
++                val addons = _uiState.value.installedAddons.filterNot { com.nuvio.tv.livetv.ondemand.IptvStreamSources.isPlaylist(it.baseUrl) }
+                 val orderedCatalogs = buildOrderedCatalogEntries(
+                     addons = addons.enabledAddons(),
+                     savedOrderKeys = homeCatalogOrderKeys,
+@@ -493,7 +487,8 @@ class AddonManagerViewModel @Inject constructor(
+     }
+ 
+     private fun handleChangeProposed(change: PendingAddonChange) {
+-        val currentUrls = _uiState.value.installedAddons.map { normalizeUrlForComparison(it.baseUrl) }.toSet()
++        val realAddons = _uiState.value.installedAddons.filterNot { com.nuvio.tv.livetv.ondemand.IptvStreamSources.isPlaylist(it.baseUrl) }
++        val currentUrls = realAddons.map { normalizeUrlForComparison(it.baseUrl) }.toSet()
+         val proposedNormalized = change.proposedUrls.map { normalizeUrlForComparison(it) }.toSet()
+         val currentCatalogEntries = buildOrderedCatalogEntries(
+             addons = _uiState.value.installedAddons.enabledAddons(),
+@@ -508,7 +503,7 @@ class AddonManagerViewModel @Inject constructor(
+         }
+ 
+         val added = change.proposedUrls.filter { normalizeUrlForComparison(it) !in currentUrls }
+-        val removed = _uiState.value.installedAddons
++        val removed = realAddons
+             .map { it.baseUrl }
+             .filter { normalizeUrlForComparison(it) !in proposedNormalized }
+         val resolvedProposedCatalogOrderKeys = if (change.proposedCatalogOrderKeys.isEmpty()) {
+@@ -675,8 +670,12 @@ class AddonManagerViewModel @Inject constructor(
+             .distinct()
+             .toList()
+ 
+-        layoutPreferenceDataStore.setHomeCatalogOrderKeys(validCatalogOrder)
+-        layoutPreferenceDataStore.setDisabledHomeCatalogKeys(validDisabledCatalogs)
++        // The addon web editor does not list TV Mix; keep its existing row preferences.
++        layoutPreferenceDataStore.setHomeCatalogOrderKeys(
++            com.nuvio.tv.domain.model.TvMixHomeCatalog.retainPosition(validCatalogOrder, homeCatalogOrderKeys)
++        )
++        layoutPreferenceDataStore.setDisabledHomeCatalogKeys(validDisabledCatalogs +
++            disabledHomeCatalogKeys.filter { it == com.nuvio.tv.domain.model.TvMixHomeCatalog.key })
+         homeCatalogSettingsSyncService.triggerPush()
+     }
+ 
+@@ -795,7 +794,7 @@ class AddonManagerViewModel @Inject constructor(
+             if (_uiState.value.installedAddons.isEmpty()) {
+                 _uiState.update { it.copy(isLoading = true) }
+             }
+-            addonRepository.getInstalledAddons()
++            iptvSources.sources()
+                 .catch { error ->
+                     _uiState.update { it.copy(isLoading = false, error = error.message) }
+                 }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/addon/CatalogOrderViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/addon/CatalogOrderViewModel.kt
+index c6f1a9256..d66f227b1 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/addon/CatalogOrderViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/addon/CatalogOrderViewModel.kt
+@@ -6,10 +6,13 @@ import com.nuvio.tv.core.sync.HomeCatalogSettingsSyncService
+ import com.nuvio.tv.core.sync.homeCatalogKey
+ import com.nuvio.tv.core.sync.homeLegacyDisabledCatalogKey
+ import com.nuvio.tv.data.local.CollectionsDataStore
++import com.nuvio.tv.data.local.TvMixStore
+ import com.nuvio.tv.data.local.LayoutPreferenceDataStore
+ import com.nuvio.tv.data.mediaserver.ServerCatalog
+ import com.nuvio.tv.domain.model.Addon
+ import com.nuvio.tv.domain.model.Collection
++import com.nuvio.tv.domain.model.TvMixHomeCatalog
++import com.nuvio.tv.domain.model.isStandaloneHomeRowKey
+ import com.nuvio.tv.domain.model.enabledAddons
+ import com.nuvio.tv.domain.repository.AddonRepository
+ import dagger.hilt.android.lifecycle.HiltViewModel
+@@ -19,6 +22,8 @@ import kotlinx.coroutines.flow.asStateFlow
+ import kotlinx.coroutines.flow.collectLatest
+ import kotlinx.coroutines.flow.combine
+ import kotlinx.coroutines.flow.update
++import kotlinx.coroutines.flow.map
++import kotlinx.coroutines.flow.distinctUntilChanged
+ import kotlinx.coroutines.launch
+ import javax.inject.Inject
+ 
+@@ -28,7 +33,8 @@ class CatalogOrderViewModel @Inject constructor(
+     private val collectionsDataStore: CollectionsDataStore,
+     private val layoutPreferenceDataStore: LayoutPreferenceDataStore,
+     private val homeCatalogSettingsSyncService: HomeCatalogSettingsSyncService,
+-    private val serverCatalog: ServerCatalog
++    private val serverCatalog: ServerCatalog,
++    private val tvMixStore: TvMixStore
+ ) : ViewModel() {
+ 
+     private val _uiState = MutableStateFlow(CatalogOrderUiState())
+@@ -41,7 +47,7 @@ class CatalogOrderViewModel @Inject constructor(
+ 
+     fun moveUp(key: String) {
+         if (_uiState.value.followAddonsOrder) {
+-            moveCollectionBetweenAddons(key, -1)
++            moveStandaloneRowBetweenAddons(key, -1)
+         } else {
+             moveCatalog(key, -1)
+         }
+@@ -49,7 +55,7 @@ class CatalogOrderViewModel @Inject constructor(
+ 
+     fun moveDown(key: String) {
+         if (_uiState.value.followAddonsOrder) {
+-            moveCollectionBetweenAddons(key, 1)
++            moveStandaloneRowBetweenAddons(key, 1)
+         } else {
+             moveCatalog(key, 1)
+         }
+@@ -91,12 +97,12 @@ class CatalogOrderViewModel @Inject constructor(
+     }
+ 
+     /**
+-     * When followAddonsOrder is enabled, collections jump between addon boundaries.
++     * When followAddonsOrder is enabled, collections and TV Mix jump between addon boundaries.
+      * Moving up means jumping above the previous addon block (all catalogs from one addon).
+      * Moving down means jumping below the next addon block.
+      */
+-    private fun moveCollectionBetweenAddons(key: String, direction: Int) {
+-        if (!key.startsWith("collection_")) return
++    private fun moveStandaloneRowBetweenAddons(key: String, direction: Int) {
++        if (!isStandaloneHomeRowKey(key)) return
+ 
+         val items = _uiState.value.items
+         val currentIndex = items.indexOfFirst { it.key == key }
+@@ -104,19 +110,28 @@ class CatalogOrderViewModel @Inject constructor(
+ 
+         val currentKeys = items.map { it.key }
+ 
++        // TV Mix can also swap with an adjacent collection, including when no
++        // addons are installed. Addon catalogs still move only as whole blocks.
++        val adjacentIndex = currentIndex + direction
++        if (key == TvMixHomeCatalog.key && adjacentIndex in currentKeys.indices &&
++            isStandaloneHomeRowKey(currentKeys[adjacentIndex])) {
++            moveCatalog(key, direction)
++            return
++        }
++
+         val newIndex: Int
+         if (direction < 0) {
+             // Moving up: find the start of the previous addon block
+             // Skip any adjacent collections above
+             var scanIdx = currentIndex - 1
+-            while (scanIdx >= 0 && currentKeys[scanIdx].startsWith("collection_")) {
++            while (scanIdx >= 0 && isStandaloneHomeRowKey(currentKeys[scanIdx])) {
+                 scanIdx--
+             }
+             if (scanIdx < 0) return // already at top
+ 
+             // scanIdx is now pointing at an addon catalog. Find the start of its addon block.
+             val targetAddonName = items[scanIdx].addonName
+-            while (scanIdx > 0 && !currentKeys[scanIdx - 1].startsWith("collection_") &&
++            while (scanIdx > 0 && !isStandaloneHomeRowKey(currentKeys[scanIdx - 1]) &&
+                 items[scanIdx - 1].addonName == targetAddonName) {
+                 scanIdx--
+             }
+@@ -124,14 +139,14 @@ class CatalogOrderViewModel @Inject constructor(
+         } else {
+             // Moving down: find the end of the next addon block
+             var scanIdx = currentIndex + 1
+-            while (scanIdx < currentKeys.size && currentKeys[scanIdx].startsWith("collection_")) {
++            while (scanIdx < currentKeys.size && isStandaloneHomeRowKey(currentKeys[scanIdx])) {
+                 scanIdx++
+             }
+             if (scanIdx >= currentKeys.size) return // already at bottom
+ 
+             // scanIdx is now pointing at an addon catalog. Find the end of its addon block.
+             val targetAddonName = items[scanIdx].addonName
+-            while (scanIdx < currentKeys.lastIndex && !currentKeys[scanIdx + 1].startsWith("collection_") &&
++            while (scanIdx < currentKeys.lastIndex && !isStandaloneHomeRowKey(currentKeys[scanIdx + 1]) &&
+                 items[scanIdx + 1].addonName == targetAddonName) {
+                 scanIdx++
+             }
+@@ -167,7 +182,8 @@ class CatalogOrderViewModel @Inject constructor(
+                 layoutPreferenceDataStore.homeCatalogOrderKeys,
+                 layoutPreferenceDataStore.disabledHomeCatalogKeys,
+                 layoutPreferenceDataStore.customCatalogTitles,
+-                layoutPreferenceDataStore.followAddonsOrder
++                layoutPreferenceDataStore.followAddonsOrder,
++                tvMixStore.mixes.map { it.isNotEmpty() }.distinctUntilChanged()
+             ) { values ->
+                 @Suppress("UNCHECKED_CAST")
+                 val addons = values[0] as List<Addon>
+@@ -187,7 +203,8 @@ class CatalogOrderViewModel @Inject constructor(
+                     savedOrderKeys = savedOrderKeys,
+                     disabledKeys = disabledKeys,
+                     customTitles = customTitles,
+-                    followAddonsOrder = followAddons
++                    followAddonsOrder = followAddons,
++                    hasTvMixes = values[6] as Boolean
+                 )
+                 Pair(items, followAddons)
+             }.collectLatest { (orderedItems, followAddons) ->
+@@ -209,7 +226,8 @@ class CatalogOrderViewModel @Inject constructor(
+         savedOrderKeys: List<String>,
+         disabledKeys: Set<String>,
+         customTitles: Map<String, String> = emptyMap(),
+-        followAddonsOrder: Boolean = false
++        followAddonsOrder: Boolean = false,
++        hasTvMixes: Boolean = false
+     ): List<CatalogOrderItem> {
+         val defaultEntries = buildDefaultCatalogEntries(addons)
+         val collectionEntries = collections.map { collection ->
+@@ -221,7 +239,16 @@ class CatalogOrderViewModel @Inject constructor(
+                 typeLabel = "collection"
+             )
+         }
+-        val allEntries = defaultEntries + collectionEntries
++        val standaloneEntries = collectionEntries + if (hasTvMixes) listOf(
++            CatalogOrderEntry(
++                key = TvMixHomeCatalog.key,
++                disableKey = TvMixHomeCatalog.key,
++                catalogName = TvMixHomeCatalog.TITLE,
++                addonName = "ReSeq",
++                typeLabel = ""
++            )
++        ) else emptyList()
++        val allEntries = defaultEntries + standaloneEntries
+         val availableMap = allEntries.associateBy { it.key }
+         val defaultOrderKeys = allEntries.map { it.key }
+ 
+@@ -230,7 +257,7 @@ class CatalogOrderViewModel @Inject constructor(
+             // In follow mode, addon catalogs stay in manifest order.
+             // Collections are positioned based on their relative position in savedOrderKeys.
+             val addonKeys = defaultEntries.map { it.key }
+-            val collectionKeys = collectionEntries.map { it.key }.toSet()
++            val collectionKeys = standaloneEntries.map { it.key }.toSet()
+ 
+             val savedValid = savedOrderKeys.filter { it in availableMap }.distinct()
+ 
+@@ -277,7 +304,7 @@ class CatalogOrderViewModel @Inject constructor(
+                 }
+                 // Normalize: ensure collections sit at addon block boundaries, not mid-block.
+                 // If a collection is between two catalogs of the same addon, push it after that block.
+-                effectiveOrder = normalizeCollectionPositions(result, availableMap)
++                effectiveOrder = normalizeStandalonePositions(result, availableMap)
+             } else {
+                 // No saved order - addon manifest order + collections at end
+                 effectiveOrder = addonKeys + collectionKeys.toList()
+@@ -297,12 +324,12 @@ class CatalogOrderViewModel @Inject constructor(
+         return effectiveOrder.mapIndexedNotNull { index, key ->
+             val entry = availableMap[key] ?: return@mapIndexedNotNull null
+             val displayName = customTitles[key]?.takeIf { it.isNotBlank() } ?: entry.catalogName
+-            val isCollection = key.startsWith("collection_")
++            val isStandalone = isStandaloneHomeRowKey(key)
+ 
+             val canMoveUp: Boolean
+             val canMoveDown: Boolean
+             if (followAddonsOrder) {
+-                if (isCollection) {
++                if (isStandalone) {
+                     canMoveUp = index > 0
+                     canMoveDown = index < effectiveOrder.lastIndex
+                 } else {
+@@ -329,11 +356,11 @@ class CatalogOrderViewModel @Inject constructor(
+     }
+ 
+     /**
+-     * Ensures collections are positioned at addon block boundaries.
++     * Ensures collections and TV Mix are positioned at addon block boundaries.
+      * If a collection ended up between two catalogs of the same addon,
+      * push it to the end of that addon's block.
+      */
+-    private fun normalizeCollectionPositions(
++    private fun normalizeStandalonePositions(
+         order: List<String>,
+         availableMap: Map<String, CatalogOrderEntry>
+     ): List<String> {
+@@ -344,7 +371,7 @@ class CatalogOrderViewModel @Inject constructor(
+             var i = 0
+             while (i < result.size) {
+                 val key = result[i]
+-                if (!key.startsWith("collection_")) {
++                if (!isStandaloneHomeRowKey(key)) {
+                     i++
+                     continue
+                 }
+@@ -354,7 +381,7 @@ class CatalogOrderViewModel @Inject constructor(
+                     result.removeAt(i)
+                     var insertPos = i
+                     while (insertPos < result.size &&
+-                        !result[insertPos].startsWith("collection_") &&
++                        !isStandaloneHomeRowKey(result[insertPos]) &&
+                         availableMap[result[insertPos]]?.addonName == prevAddon
+                     ) {
+                         insertPos++
+@@ -376,7 +403,7 @@ class CatalogOrderViewModel @Inject constructor(
+         availableMap: Map<String, CatalogOrderEntry>
+     ): String? {
+         for (j in index - 1 downTo 0) {
+-            if (!order[j].startsWith("collection_")) {
++            if (!isStandaloneHomeRowKey(order[j])) {
+                 return availableMap[order[j]]?.addonName
+             }
+         }
+@@ -389,7 +416,7 @@ class CatalogOrderViewModel @Inject constructor(
+         availableMap: Map<String, CatalogOrderEntry>
+     ): String? {
+         for (j in index + 1 until order.size) {
+-            if (!order[j].startsWith("collection_")) {
++            if (!isStandaloneHomeRowKey(order[j])) {
+                 return availableMap[order[j]]?.addonName
+             }
+         }
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt
 index b66ee4185..cada448fb 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt
@@ -3531,6 +4375,131 @@ index af5b146a3..5ea64f685 100644
                          episodeTitle = selected.title, episodeDescription = selected.overview,
                          thumbnail = selected.thumbnail, released = selected.released,
                          hasAired = true, airDateLabel = null, releaseTimestamp = null,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeScreen.kt
+index 5e6c7da8a..3aa108915 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeScreen.kt
+@@ -95,6 +95,7 @@ fun HomeScreen(
+     onContinueWatchingStartFromBeginning: (ContinueWatchingItem) -> Unit = onContinueWatchingClick,
+     onContinueWatchingPlayManually: (ContinueWatchingItem) -> Unit = onContinueWatchingClick,
+     onNavigateToCatalogSeeAll: (String, String, String) -> Unit = { _, _, _ -> },
++    onNavigateToMix: (String, Boolean) -> Unit = { _, _ -> },
+     onNavigateToFolderDetail: (String, String) -> Unit = { _, _ -> },
+     /** Genres fork: opens the Genres page with a bucket preselected (the old Genres tab's row). */
+     onNavigateToGenres: (String) -> Unit = {}
+@@ -126,7 +127,7 @@ fun HomeScreen(
+         initialValue = false
+     )
+     val hasCatalogContent = uiState.catalogRows.any { it.items.isNotEmpty() }
+-    val hasCollectionContent = uiState.homeRows.any { it is HomeRow.CollectionRow }
++    val hasCollectionContent = uiState.homeRows.any { it is HomeRow.CollectionRow || (it is HomeRow.Catalog && it.row.apiType == "tvmix") }
+     val hasHeroContent = uiState.heroItems.isNotEmpty()
+     val modernPresentationReady =
+         uiState.homeLayout != HomeLayout.MODERN ||
+@@ -159,14 +160,19 @@ fun HomeScreen(
+     val isCatalogItemWatched: (MetaPreview) -> Boolean = remember {
+         { item: MetaPreview -> latestMovieWatchedStatus.value[homeItemStatusKey(item.id, item.apiType)] == true }
+     }
+-    val onCatalogItemLongPress: (MetaPreview, String) -> Unit = remember {
++    val onCatalogItemLongPress: (MetaPreview, String) -> Unit = remember(onNavigateToMix) {
+         { item, addonBaseUrl ->
+-            posterOptionsTarget = HomePosterOptionsTarget(item, addonBaseUrl)
+-            viewModel.refreshPosterLibraryStatus(item)
++            if (item.apiType == "tvmix") onNavigateToMix(item.id.removePrefix("tvmix:"), true)
++            else {
++                posterOptionsTarget = HomePosterOptionsTarget(item, addonBaseUrl)
++                viewModel.refreshPosterLibraryStatus(item)
++            }
+         }
+     }
+ 
+-    val onNavigateToDetailStable = remember(onNavigateToDetail) { onNavigateToDetail }
++    val onNavigateToDetailStable: (String, String, String) -> Unit = remember(onNavigateToDetail, onNavigateToMix) {
++        { id, type, addon -> if (type == "tvmix") onNavigateToMix(id.removePrefix("tvmix:"), false) else onNavigateToDetail(id, type, addon) }
++    }
+     val onContinueWatchingClickStable = remember(onContinueWatchingClick) { onContinueWatchingClick }
+     val onContinueWatchingStartFromBeginningStable = remember(onContinueWatchingStartFromBeginning) { onContinueWatchingStartFromBeginning }
+     val onContinueWatchingPlayManuallyStable = remember(onContinueWatchingPlayManually) { onContinueWatchingPlayManually }
+@@ -461,6 +467,7 @@ fun HomeScreen(
+             item.apiType.equals("tv", ignoreCase = true) ||
+             item.apiType.equals("anime", ignoreCase = true)
+         HomePosterOptionsDialog(
++            mixItem = item.copy(sourceAddonBaseUrl = selectedPoster.addonBaseUrl.takeIf { it.isNotBlank() } ?: item.sourceAddonBaseUrl),
+             title = item.name,
+             isInLibrary = uiState.posterLibraryMembership[statusKey] == true,
+             isLibraryPending = statusKey in uiState.posterLibraryPending,
+@@ -755,6 +762,7 @@ private fun ModernHomeRoute(
+ @OptIn(ExperimentalTvMaterial3Api::class)
+ @Composable
+ private fun HomePosterOptionsDialog(
++    mixItem: MetaPreview? = null,
+     title: String,
+     isInLibrary: Boolean,
+     isLibraryPending: Boolean,
+@@ -814,6 +822,8 @@ private fun HomePosterOptionsDialog(
+             )
+         }
+ 
++        if (isSeries && mixItem != null) com.nuvio.tv.ui.screens.tvmix.AddToMixAction(mixItem)
++
+         if (isMovie || isSeries) {
+             Button(
+                 onClick = onToggleWatched,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeTvMix.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeTvMix.kt
+new file mode 100644
+index 000000000..3ca7c3f7c
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeTvMix.kt
+@@ -0,0 +1,49 @@
++package com.nuvio.tv.ui.screens.home
++
++import com.nuvio.tv.domain.model.CatalogRow
++import com.nuvio.tv.domain.model.ContentType
++import com.nuvio.tv.domain.model.TvMix
++import com.nuvio.tv.domain.model.MetaPreview
++import com.nuvio.tv.domain.model.PosterShape
++import com.nuvio.tv.domain.model.TvMixHomeCatalog
++import com.nuvio.tv.domain.model.legacyKey
++
++/** Reuse catalog cards, stable item keys and all three home layouts' focus restoration. */
++internal fun List<HomeRow>.withTvMixes(
++    mixes: List<TvMix>,
++    orderKeys: List<String> = emptyList(),
++    disabledKeys: Set<String> = emptySet()
++): List<HomeRow> {
++    val rows = filterNot { it is HomeRow.Catalog && it.row.apiType == "tvmix" }
++    if (mixes.isEmpty() || TvMixHomeCatalog.key in disabledKeys) return rows
++    val mixRow = HomeRow.Catalog(CatalogRow(
++        addonId = TvMixHomeCatalog.ADDON_ID, addonName = "", addonBaseUrl = "", catalogId = TvMixHomeCatalog.CATALOG_ID,
++        catalogName = TvMixHomeCatalog.TITLE, type = ContentType.UNKNOWN, rawType = TvMixHomeCatalog.TYPE,
++        items = mixes.map { it.preview() }, hasMore = false
++    ))
++    // Anchor to the next visible row, including unloaded catalog placeholders.
++    // Pinned collections retain their existing priority above ordered catalogs.
++    val followingKeys = orderKeys.dropWhile { it != TvMixHomeCatalog.key }.drop(1).toSet()
++    val insertAt = rows.indexOfFirst { row ->
++        when (row) {
++            is HomeRow.Catalog -> row.row.legacyKey() in followingKeys
++            is HomeRow.PlaceholderCatalog -> row.catalogKey in followingKeys
++            is HomeRow.CollectionRow -> !row.collection.pinToTop && "collection_${row.collection.id}" in followingKeys
++        }
++    }.takeIf { it >= 0 } ?: rows.size
++    return rows.toMutableList().apply { add(insertAt, mixRow) }
++}
++
++internal fun ContinueWatchingItem.tvMixPreview(): MetaPreview? {
++    fun preview(id: String, type: String, name: String, poster: String?, background: String?, logo: String?): MetaPreview? {
++        if (type.lowercase() !in listOf("series", "tv", "anime")) return null
++        return MetaPreview(id, ContentType.fromString(type), type, name, poster, PosterShape.POSTER,
++            background, logo, null, null, null, emptyList(), imdbId = id.takeIf { it.startsWith("tt") })
++    }
++    return when (this) {
++        is ContinueWatchingItem.InProgress -> preview(progress.contentId, progress.contentType, progress.name,
++            originalPoster ?: progress.poster, progress.backdrop, progress.logo)
++        is ContinueWatchingItem.NextUp -> preview(info.contentId, info.contentType, info.name,
++            originalPoster ?: info.poster, info.backdrop, info.logo)
++    }
++}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeUiState.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeUiState.kt
 index 64f05d957..662717dfc 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeUiState.kt
@@ -3761,6 +4730,147 @@ index 909f51e33..f879ee3cf 100644
      private fun observeCollections() = observeCollectionsPipeline()
  
      private fun observeInstalledAddons() = observeInstalledAddonsPipeline()
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogPipeline.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogPipeline.kt
+index b59b5a3a3..9d825cfc6 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogPipeline.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogPipeline.kt
+@@ -816,7 +816,7 @@ internal suspend fun HomeViewModel.updateCatalogRowsPipeline() {
+                 }
+             }
+         }
+-    }
++    }.withTvMixes(tvMixes, orderedKeys, disabledHomeCatalogKeys)
+ 
+     val nextGridItems = if (currentLayout == HomeLayout.GRID) {
+         val posterCardWidthDp = _uiState.value.posterCardWidthDp
+@@ -846,8 +846,8 @@ internal suspend fun HomeViewModel.updateCatalogRowsPipeline() {
+                             ))
+                             // Show "See All" if there are more items than fit in the
+                             // displayed rows, or the API indicates more pages exist.
+-                            val showSeeAll = row.hasMore || row.items.size > maxDisplaySlots
+-                            val rawMax = if (showSeeAll) maxDisplaySlots - 1 else maxDisplaySlots
++                            val showSeeAll = row.apiType != "tvmix" && (row.hasMore || row.items.size > maxDisplaySlots)
++                            val rawMax = if (row.apiType == "tvmix") row.items.size else if (showSeeAll) maxDisplaySlots - 1 else maxDisplaySlots
+                             val displayItems = row.items.take(rawMax)
+                             displayItems.forEach { item ->
+                                 add(GridItem.Content(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogUtils.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogUtils.kt
+index ed0b50a8a..8b8387f49 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogUtils.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogUtils.kt
+@@ -1,5 +1,7 @@
+ package com.nuvio.tv.ui.screens.home
+ 
++import com.nuvio.tv.domain.model.TvMixHomeCatalog
++import com.nuvio.tv.domain.model.isStandaloneHomeRowKey
+ import com.nuvio.tv.domain.model.catalogTypeKey
+ import com.nuvio.tv.domain.model.catalogRowLegacyKey
+ import com.nuvio.tv.domain.model.Addon
+@@ -14,8 +16,28 @@ internal fun HomeViewModel.catalogKey(addonId: String, type: String, catalogId:
+ }
+ 
+ internal fun HomeViewModel.buildHomeCatalogLoadSignature(addons: List<Addon>): String {
++    return buildHomeCatalogLoadSignature(addons, disabledHomeCatalogKeys)
++}
++
++internal fun buildHomeCatalogLoadSignature(addons: List<Addon>, disabled: Set<String>): String {
+     val addonCatalogSignature = addons
+         .flatMap { addon ->
++            val addonSignature = listOf(
++                addon.id,
++                addon.baseUrl,
++                addon.version,
++                addon.configVersion?.toString().orEmpty(),
++                addon.manifestLanguage.orEmpty(),
++                addon.rawTypes.joinToString("|"),
++                addon.resources.joinToString("|") { resource ->
++                    listOf(
++                        resource.name,
++                        resource.types.joinToString("/"),
++                        resource.idPrefixes.orEmpty().joinToString("/")
++                    ).joinToString(":")
++                },
++                addon.idPrefixes.joinToString("|")
++            ).joinToString("|")
+             addon.catalogs.map { catalog ->
+                 val extraSignature = catalog.extra.joinToString(";") { extra ->
+                     listOf(
+@@ -27,20 +49,7 @@ internal fun HomeViewModel.buildHomeCatalogLoadSignature(addons: List<Addon>): S
+                     ).joinToString(":")
+                 }
+                 listOf(
+-                    addon.id,
+-                    addon.baseUrl,
+-                    addon.version,
+-                    addon.configVersion?.toString().orEmpty(),
+-                    addon.manifestLanguage.orEmpty(),
+-                    addon.rawTypes.joinToString("|"),
+-                    addon.resources.joinToString("|") { resource ->
+-                        listOf(
+-                            resource.name,
+-                            resource.types.joinToString("/"),
+-                            resource.idPrefixes.orEmpty().joinToString("/")
+-                        ).joinToString(":")
+-                    },
+-                    addon.idPrefixes.joinToString("|"),
++                    addonSignature,
+                     catalog.apiType,
+                     catalog.id,
+                     catalog.name,
+@@ -55,7 +64,7 @@ internal fun HomeViewModel.buildHomeCatalogLoadSignature(addons: List<Addon>): S
+         }
+         .sorted()
+         .joinToString(separator = ",")
+-    val disabledSignature = disabledHomeCatalogKeys
++    val disabledSignature = disabled
+         .asSequence()
+         .sorted()
+         .joinToString(separator = ",")
+@@ -231,7 +240,8 @@ internal fun HomeViewModel.removeTruncatedRowCacheEntry(key: String) {
+ 
+ internal fun HomeViewModel.rebuildCatalogOrder(addons: List<Addon>) {
+     val defaultOrder = buildDefaultCatalogOrder(addons)
+-    val collectionKeys = collectionsCache.map { "collection_${it.id}" }
++    val collectionKeys = collectionsCache.map { "collection_${it.id}" } +
++        if (tvMixes.isNotEmpty()) listOf(TvMixHomeCatalog.key) else emptyList()
+     val allAvailable = (defaultOrder + collectionKeys).toSet()
+ 
+     if (followAddonsOrderEnabled) {
+@@ -401,7 +411,7 @@ private fun normalizeCollectionBoundaries(
+         var i = 0
+         while (i < result.size) {
+             val key = result[i]
+-            if (!key.startsWith("collection_")) {
++            if (!isStandaloneHomeRowKey(key)) {
+                 i++
+                 continue
+             }
+@@ -412,7 +422,7 @@ private fun normalizeCollectionBoundaries(
+                 result.removeAt(i)
+                 var insertPos = i
+                 while (insertPos < result.size &&
+-                    !result[insertPos].startsWith("collection_") &&
++                    !isStandaloneHomeRowKey(result[insertPos]) &&
+                     addonKeyToOwner[result[insertPos]] == prevOwner
+                 ) {
+                     insertPos++
+@@ -430,14 +440,14 @@ private fun normalizeCollectionBoundaries(
+ 
+ private fun findOwnerBefore(order: List<String>, index: Int, owners: Map<String, String>): String? {
+     for (j in index - 1 downTo 0) {
+-        if (!order[j].startsWith("collection_")) return owners[order[j]]
++        if (!isStandaloneHomeRowKey(order[j])) return owners[order[j]]
+     }
+     return null
+ }
+ 
+ private fun findOwnerAfter(order: List<String>, index: Int, owners: Map<String, String>): String? {
+     for (j in index + 1 until order.size) {
+-        if (!order[j].startsWith("collection_")) return owners[order[j]]
++        if (!isStandaloneHomeRowKey(order[j])) return owners[order[j]]
+     }
+     return null
+ }
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelContinueWatching.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelContinueWatching.kt
 index 5d8d4d063..0de2c426d 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelContinueWatching.kt
@@ -4456,6 +5566,85 @@ index a82d49754..d339c0f80 100644
                  modifier = Modifier.graphicsLayer { alpha = metaAlpha }
              )
          }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeModels.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeModels.kt
+index 03447d156..7968594cf 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeModels.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeModels.kt
+@@ -325,8 +325,8 @@ internal fun buildContinueWatchingItem(
+     val heroPreview = when (item) {
+         is ContinueWatchingItem.InProgress -> {
+             val isSeries = isSeriesType(item.progress.contentType)
+-            val s = item.progress.season
+-            val e = item.progress.episode
++            val s = item.displaySeason ?: item.progress.season
++            val e = item.displayEpisode ?: item.progress.episode
+             val episodeCode = if (s != null && e != null) {
+                 context.getString(R.string.season_episode_format, s, e)
+             } else {
+@@ -364,8 +364,8 @@ internal fun buildContinueWatchingItem(
+         is ContinueWatchingItem.NextUp -> {
+             val episodeCode = context.getString(
+                 R.string.season_episode_format,
+-                item.info.season,
+-                item.info.episode
++                item.info.displaySeason ?: item.info.season,
++                item.info.displayEpisode ?: item.info.episode
+             )
+             val episodeTitle = item.info.episodeTitle?.takeIf { it.isNotBlank() }?.localizeEpisodeTitle(context)
+             val episodeLabel = if (episodeTitle != null) "$episodeCode · $episodeTitle" else episodeCode
+@@ -428,8 +428,8 @@ internal fun buildContinueWatchingItem(
+         },
+         subtitle = when (item) {
+             is ContinueWatchingItem.InProgress -> {
+-                val ps = item.progress.season
+-                val pe = item.progress.episode
++                val ps = item.displaySeason ?: item.progress.season
++                val pe = item.displayEpisode ?: item.progress.episode
+                 if (ps != null && pe != null) {
+                     context.getString(R.string.season_episode_format, ps, pe)
+                 } else {
+@@ -439,8 +439,8 @@ internal fun buildContinueWatchingItem(
+             is ContinueWatchingItem.NextUp -> {
+                 val code = context.getString(
+                     R.string.season_episode_format,
+-                    item.info.season,
+-                    item.info.episode
++                    item.info.displaySeason ?: item.info.season,
++                    item.info.displayEpisode ?: item.info.episode
+                 )
+                 if (item.info.hasAired) {
+                     code
+@@ -607,7 +607,7 @@ internal fun catalogRowTitle(
+     strTypeSeries: String = ""
+ ): String {
+     val catalogName = row.catalogName.replaceFirstChar { it.uppercase() }
+-    if (!showCatalogTypeSuffix) return catalogName
++    if (!showCatalogTypeSuffix || row.apiType == "tvmix") return catalogName
+     val typeLabel = when (row.apiType.lowercase()) {
+         "movie" -> strTypeMovie.ifBlank { row.apiType.replaceFirstChar { it.uppercase() } }
+         "series" -> strTypeSeries.ifBlank { row.apiType.replaceFirstChar { it.uppercase() } }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeRows.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeRows.kt
+index 64b042b45..7b08d18d0 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeRows.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeRows.kt
+@@ -1417,6 +1417,8 @@ private fun ModernCarouselCard(
+                                 .fillMaxSize()
+                                 .placeholderCardShimmer(effectivePlaceholderShimmerOffsetState)
+                         )
++                    } else if (item.metaPreview?.apiType == "tvmix") {
++                        com.nuvio.tv.ui.screens.tvmix.TvMixArtwork(item.metaPreview.poster.orEmpty(), item.title, Modifier.fillMaxSize())
+                     } else if (hasImage) {
+                         AsyncImage(
+                             model = imageModel,
+@@ -1502,7 +1504,7 @@ private fun ModernCarouselCard(
+                         contentScale = ContentScale.Fit,
+                         alignment = Alignment.CenterStart
+                     )
+-                } else if ((useLandscapeOverlayTreatment || isBackdropExpanded) && !isCollectionFolder && !(useLandscapeAsExpanded && !trailerFirstFrameRendered) && (effectiveIgnoreLandscapePoster || item.metaPreview?.landscapePoster.isNullOrBlank() || customPosterLoadFailed)) {
++                } else if (item.metaPreview?.apiType != "tvmix" && (useLandscapeOverlayTreatment || isBackdropExpanded) && !isCollectionFolder && !(useLandscapeAsExpanded && !trailerFirstFrameRendered) && (effectiveIgnoreLandscapePoster || item.metaPreview?.landscapePoster.isNullOrBlank() || customPosterLoadFailed)) {
+                     Text(
+                         text = item.title,
+                         style = titleStyle.copy(
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/TvdbContinueWatching.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/TvdbContinueWatching.kt
 new file mode 100644
 index 000000000..429eab0f4
@@ -5408,20 +6597,6 @@ index f89d47511..64c4734b7 100644
          if (validTexts.isEmpty()) return emptyList()
  
          val hasSpanned = validTexts.any { it is Spanned }
-diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt
-index 65ca47350..7c0afaa12 100644
---- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt
-+++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt
-@@ -250,6 +250,9 @@ data class PlayerUiState(
-     val hideTorrentStats: Boolean = true,
-     val isLive: Boolean = false
- ) {
-+    val playerControlsBrightness: Float
-+        get() = subtitleStyle.playerControlsBrightness(isHdrVideo)
-+
-     /** Subtitle style to render with, after applying the HDR override for the current video. */
-     val effectiveSubtitleStyle: SubtitleStyleSettings
-         get() = subtitleStyle.forVideo(isHdrVideo)
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/TvdbPlayerProjection.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/TvdbPlayerProjection.kt
 new file mode 100644
 index 000000000..90d7466e0
@@ -7111,24 +8286,6 @@ index 50d47fe04..ffa1e367a 100644
      }
      Row(
          modifier = Modifier
-diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackAutoPlaySettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackAutoPlaySettings.kt
-index 2ef0dd10c..18b2d1097 100644
---- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackAutoPlaySettings.kt
-+++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackAutoPlaySettings.kt
-@@ -197,6 +197,13 @@ internal fun PlaybackUpNextSection(
-         onToggle = { onUpdate { setStreamAutoPlayNextEpisodeEnabled(!settings.streamAutoPlayNextEpisodeEnabled) } }
-     )
- 
-+    SettingsToggleRow(
-+        title = "Ask for a rating after a movie",
-+        subtitle = "When a movie ends, the rating dialog opens on its page. Needs a connected Trakt, Simkl or MDBList account.",
-+        checked = settings.ratePromptAfterMovie,
-+        onToggle = { onUpdate { setRatePromptAfterMovie(!settings.ratePromptAfterMovie) } }
-+    )
-+
-     if (settings.streamAutoPlayNextEpisodeEnabled && settings.streamAutoPlayMode == StreamAutoPlayMode.MANUAL) {
-         SettingsToggleRow(
-             title = stringResource(R.string.autoplay_next_episode_fallback),
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSettingsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSettingsViewModel.kt
 index 5c8560123..6e545b241 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackSettingsViewModel.kt
@@ -7797,6 +8954,452 @@ index 2139981bb..2d871035d 100644
          }
      }
      return SportsHub(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvmix/TvMixNavigation.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvmix/TvMixNavigation.kt
+new file mode 100644
+index 000000000..c34781fbf
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvmix/TvMixNavigation.kt
+@@ -0,0 +1,18 @@
++package com.nuvio.tv.ui.screens.tvmix
++
++import com.nuvio.tv.domain.model.TvMixSelection
++import com.nuvio.tv.domain.model.resolveContentLanguage
++import com.nuvio.tv.domain.model.tvdbPlaybackContext
++import com.nuvio.tv.ui.navigation.Screen
++
++internal const val TV_MIX_ROUTE = "tv-mix/{mixId}?manage={manage}"
++
++/** Forward the original video identity to the normal source and tracker pipelines. */
++internal fun TvMixSelection.streamRoute(profileId: Int?) = Screen.Stream.createRoute(
++    videoId = video.id, contentType = meta.apiType, title = meta.name,
++    poster = meta.poster, backdrop = meta.backdropUrl, logo = meta.logo,
++    season = video.season, episode = video.episode, episodeName = video.title,
++    contentId = meta.id, contentName = meta.name, runtime = video.runtime,
++    startFromBeginning = true, contentLanguage = meta.resolveContentLanguage(),
++    profileId = profileId, tvdbContext = video.tvdbPlaybackContext()?.encode()
++)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvmix/TvMixScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvmix/TvMixScreen.kt
+new file mode 100644
+index 000000000..2a45a9a55
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvmix/TvMixScreen.kt
+@@ -0,0 +1,227 @@
++package com.nuvio.tv.ui.screens.tvmix
++
++import androidx.activity.compose.BackHandler
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.*
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.LazyRow
++import androidx.compose.foundation.lazy.items
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.OutlinedTextFieldDefaults
++import androidx.compose.foundation.text.KeyboardActions
++import androidx.compose.foundation.text.KeyboardOptions
++import androidx.compose.ui.focus.FocusDirection
++import androidx.compose.ui.platform.LocalFocusManager
++import androidx.compose.ui.platform.LocalSoftwareKeyboardController
++import androidx.compose.ui.text.input.ImeAction
++import com.nuvio.tv.ui.components.tvTextFieldNavigation
++import androidx.compose.runtime.*
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.focus.focusRestorer
++import com.nuvio.tv.LocalContentFocusRequester
++import androidx.compose.ui.layout.ContentScale
++import androidx.compose.ui.unit.dp
++import androidx.hilt.navigation.compose.hiltViewModel
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import androidx.tv.material3.*
++import coil3.compose.AsyncImage
++import com.nuvio.tv.domain.model.*
++import com.nuvio.tv.ui.components.MonochromePosterPlaceholder
++import com.nuvio.tv.ui.components.NuvioDialog
++import com.nuvio.tv.ui.theme.NuvioTheme
++import java.net.URLDecoder
++
++/** Uses the app's shared Coil loader/cache; no generated composite bitmaps are stored. */
++@Composable
++fun TvMixArtwork(encoded: String, title: String, modifier: Modifier = Modifier) {
++    val covers = remember(encoded) { encoded.removePrefix("tvmix-art:").split('|')
++        .filter(String::isNotBlank).mapNotNull { runCatching { URLDecoder.decode(it, "UTF-8") }.getOrNull() }.take(4) }
++    Box(modifier.background(NuvioTheme.colors.BackgroundCard)) {
++        if (covers.isEmpty()) MonochromePosterPlaceholder(contentDescription = title)
++        else Row(Modifier.fillMaxSize()) {
++            covers.chunked(if (covers.size <= 2) 1 else 2).forEach { column ->
++                Column(Modifier.weight(1f).fillMaxHeight()) {
++                    column.forEach { cover ->
++                        Box(Modifier.weight(1f).fillMaxWidth()) {
++                            MonochromePosterPlaceholder(contentDescription = null)
++                            AsyncImage(model = cover, contentDescription = title,
++                                modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
++                        }
++                    }
++                }
++            }
++        }
++        Text(title, modifier = Modifier.align(Alignment.BottomStart).fillMaxWidth()
++            .background(NuvioTheme.colors.Background.copy(alpha = 0.8f)).padding(10.dp),
++            color = NuvioTheme.colors.TextPrimary, maxLines = 2)
++    }
++}
++
++@Composable
++internal fun TvMixNameField(value: String, onChange: (String) -> Unit, modifier: Modifier = Modifier) {
++    val focus = LocalFocusManager.current
++    val keyboard = LocalSoftwareKeyboardController.current
++    OutlinedTextField(value = value, onValueChange = { onChange(it.take(100)) }, singleLine = true,
++        label = { Text("Mix name", color = NuvioTheme.colors.TextSecondary) },
++        modifier = modifier.tvTextFieldNavigation(),
++        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
++        keyboardActions = KeyboardActions(onDone = { keyboard?.hide(); focus.moveFocus(FocusDirection.Down) }),
++        colors = OutlinedTextFieldDefaults.colors(focusedTextColor = NuvioTheme.colors.TextPrimary,
++            unfocusedTextColor = NuvioTheme.colors.TextPrimary, cursorColor = NuvioTheme.colors.FocusRing,
++            focusedBorderColor = NuvioTheme.colors.FocusRing))
++}
++
++@OptIn(ExperimentalTvMaterial3Api::class)
++@Composable
++fun AddToMixAction(item: MetaPreview) {
++    var picker by remember { mutableStateOf(false) }
++    Button(onClick = { picker = true }, modifier = Modifier.fillMaxWidth()) { Text("Add to mix") }
++    if (picker) TvMixPicker(item, onDismiss = { picker = false })
++}
++
++@OptIn(ExperimentalTvMaterial3Api::class)
++@Composable
++private fun TvMixPicker(item: MetaPreview, onDismiss: () -> Unit, viewModel: TvMixViewModel = hiltViewModel()) {
++    var creating by remember { mutableStateOf(false) }
++    var name by remember { mutableStateOf("") }
++    val mixes by viewModel.mixes.collectAsStateWithLifecycle()
++    val state by viewModel.state.collectAsStateWithLifecycle()
++    val focus = remember { FocusRequester() }
++    LaunchedEffect(creating) { focus.requestFocus() }
++    NuvioDialog(title = "Add ${item.name} to mix", onDismiss = { onDismiss() }) {
++        if (state.error != null) Text(state.error!!)
++        if (creating) {
++            TvMixNameField(name, { name = it }, Modifier.fillMaxWidth().focusRequester(focus))
++            Button(onClick = { viewModel.add(item, null, name) { onDismiss() } },
++                enabled = name.isNotBlank() && !state.saving) { Text("Save and add show") }
++        } else {
++            Button(onClick = { creating = true }, modifier = Modifier.fillMaxWidth().focusRequester(focus)) { Text("Create new mix") }
++            LazyColumn(Modifier.heightIn(max = 300.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
++                items(mixes, key = { it.id }) { mix ->
++                    val included = mix.shows.any { it.sameShow(TvMixShow(item.id, item.name, imdbId = item.imdbId)) }
++                    Button(onClick = { viewModel.add(item, mix.id, "") { onDismiss() } },
++                        enabled = !included && !state.saving, modifier = Modifier.fillMaxWidth()) {
++                        Text(mix.name + if (included) " (already added)" else "")
++                    }
++                }
++            }
++        }
++    }
++}
++
++@OptIn(ExperimentalTvMaterial3Api::class)
++@Composable
++fun TvMixScreen(id: String, manageOnOpen: Boolean, viewModel: TvMixViewModel,
++    onPlay: (TvMixSelection) -> Unit, onBack: () -> Unit) {
++    val mixes by viewModel.mixes.collectAsStateWithLifecycle()
++    val state by viewModel.state.collectAsStateWithLifecycle()
++    val mix = mixes.firstOrNull { it.id == id }
++    var managing by remember(id) { mutableStateOf(manageOnOpen) }
++    var renaming by remember { mutableStateOf(false) }
++    var name by remember(mix?.name) { mutableStateOf(mix?.name.orEmpty()) }
++    var remove by remember { mutableStateOf<TvMixShow?>(null) }
++    var deleting by remember { mutableStateOf(false) }
++    val focus = remember { FocusRequester() }
++    val manageFocusRequester = remember { FocusRequester() }
++    val contentFocusRequester = LocalContentFocusRequester.current
++    val leave = { viewModel.end(); onBack() }
++    BackHandler { leave() }
++    LaunchedEffect(id) {
++        viewModel.open(id)
++        withFrameNanos { }
++        manageFocusRequester.requestFocus()
++    }
++    LaunchedEffect(id, state.continuePrompt, state.loading) {
++        if (!state.loading && state.selection != null) {
++            withFrameNanos { }
++            focus.requestFocus()
++        }
++    }
++    LaunchedEffect(state.autoStart, state.selection) {
++        if (state.autoStart && state.selection != null) viewModel.play()?.let(onPlay)
++    }
++    LazyColumn(Modifier.fillMaxSize().focusRequester(contentFocusRequester).focusRestorer()
++        .background(NuvioTheme.colors.Background).padding(48.dp),
++        verticalArrangement = Arrangement.spacedBy(20.dp)) {
++        item { Text(mix?.name ?: "TV Mix", style = MaterialTheme.typography.headlineLarge) }
++        item { Text(if (state.continuePrompt) "Continue mix?" else "Next random episode", style = MaterialTheme.typography.titleLarge) }
++        item {
++            val selected = state.selection
++            if (state.loading) Text("Choosing an episode…")
++            else if (selected != null) Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                Text(selected.meta.name, style = MaterialTheme.typography.headlineSmall)
++                val video = selected.video
++                Text("S${video.displaySeason ?: video.season} E${video.displayEpisode ?: video.episode} · ${video.title}")
++                video.overview?.takeIf(String::isNotBlank)?.let { Text(it, maxLines = 3) }
++            }
++            state.error?.let { Text(it) }
++        }
++        item {
++            Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
++                Button(onClick = { viewModel.play()?.let(onPlay) }, enabled = state.selection != null && !state.loading,
++                    modifier = Modifier.focusRequester(focus)) { Text(if (state.continuePrompt) "Yes" else "Play") }
++                Button(onClick = { viewModel.remix() }, enabled = !state.loading) { Text("Remix") }
++                if (state.continuePrompt) Button(onClick = leave) { Text("No") }
++                Button(onClick = { managing = true }, modifier = Modifier.focusRequester(manageFocusRequester)) { Text("Manage mix") }
++                Button(onClick = leave) { Text("Back") }
++            }
++        }
++        item { Text("Included shows · ${mix?.shows?.size ?: 0}", style = MaterialTheme.typography.titleLarge) }
++        item {
++            LazyRow(horizontalArrangement = Arrangement.spacedBy(20.dp)) {
++                items(mix?.shows.orEmpty(), key = { it.id }) { show ->
++                    Column(Modifier.width(140.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                        Card(onClick = { if (managing) remove = show }, onLongClick = { remove = show }) {
++                            Box(Modifier.size(140.dp, 210.dp)) {
++                                MonochromePosterPlaceholder(contentDescription = show.name)
++                                AsyncImage(model = show.poster, contentDescription = show.name,
++                                    modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
++                            }
++                        }
++                        Text(show.name, maxLines = 2)
++                    }
++                }
++            }
++        }
++        if (mix?.shows.isNullOrEmpty()) item { Text("Long-press a TV show anywhere in Nuvio and choose Add to mix.") }
++    }
++    if (managing && mix != null) {
++        val manageFocus = remember { FocusRequester() }
++        LaunchedEffect(renaming) { manageFocus.requestFocus() }
++        NuvioDialog(title = "Manage ${mix.name}", onDismiss = { managing = false; renaming = false }) {
++            if (renaming) {
++                TvMixNameField(name, { name = it }, Modifier.fillMaxWidth().focusRequester(manageFocus))
++                Button(onClick = { viewModel.save(mix.copy(name = name.trim())) { renaming = false } },
++                    enabled = name.isNotBlank() && !state.saving) { Text("Save name") }
++                Button(onClick = { renaming = false }) { Text("Cancel") }
++            } else {
++                Button(onClick = { renaming = true }, modifier = Modifier.focusRequester(manageFocus)) { Text("Rename mix") }
++                Button(onClick = { viewModel.save(mix.copy(unwatchedOnly = !mix.unwatchedOnly)) { viewModel.remix() } }) {
++                    Text(if (mix.unwatchedOnly) "Episodes: unwatched only" else "Episodes: include watched")
++                }
++                Text("Add shows from their long-press menu. Select a show below to remove it.")
++                LazyColumn(Modifier.heightIn(max = 130.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                    items(mix.shows, key = { it.id }) { show ->
++                        Button(onClick = { remove = show }, modifier = Modifier.fillMaxWidth()) { Text("Remove ${show.name}") }
++                    }
++                }
++                Button(onClick = { deleting = true }) { Text("Delete mix") }
++                Button(onClick = { managing = false; renaming = false }) { Text("Done") }
++            }
++            state.error?.let { Text(it) }
++        }
++    }
++    if (remove != null && mix != null) NuvioDialog(title = "Remove ${remove!!.name}?", onDismiss = { remove = null }) {
++        Button(onClick = { viewModel.save(mix.copy(shows = mix.shows.filterNot { it.id == remove?.id })) {
++            remove = null; viewModel.remix()
++        } }) { Text("Remove show") }
++        Button(onClick = { remove = null }) { Text("Cancel") }
++    }
++    if (deleting && mix != null) NuvioDialog(title = "Delete ${mix.name}?", onDismiss = { deleting = false }) {
++        Button(onClick = { viewModel.delete(mix.id) { leave() } }) { Text("Delete mix") }
++        Button(onClick = { deleting = false }) { Text("Cancel") }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvmix/TvMixViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvmix/TvMixViewModel.kt
+new file mode 100644
+index 000000000..368e2058d
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvmix/TvMixViewModel.kt
+@@ -0,0 +1,183 @@
++package com.nuvio.tv.ui.screens.tvmix
++
++import androidx.lifecycle.ViewModel
++import androidx.lifecycle.viewModelScope
++import com.nuvio.tv.core.network.NetworkResult
++import com.nuvio.tv.core.player.EpisodeShufflePlayback
++import com.nuvio.tv.core.player.TvMixSession
++import com.nuvio.tv.core.profile.ProfileManager
++import com.nuvio.tv.data.local.TvMixStore
++import com.nuvio.tv.data.tvdb.reconcileTvdbVideoProgress
++import com.nuvio.tv.domain.model.*
++import com.nuvio.tv.domain.repository.MetaRepository
++import com.nuvio.tv.domain.repository.WatchProgressRepository
++import dagger.hilt.android.lifecycle.HiltViewModel
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.flow.*
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withTimeoutOrNull
++import java.util.UUID
++import javax.inject.Inject
++
++data class TvMixUiState(
++    val mixId: String? = null,
++    val selection: TvMixSelection? = null,
++    val loading: Boolean = false,
++    val saving: Boolean = false,
++    val error: String? = null,
++    val continuePrompt: Boolean = false,
++    val autoStart: Boolean = false
++)
++
++@HiltViewModel
++class TvMixViewModel @Inject constructor(
++    private val store: TvMixStore,
++    private val profiles: ProfileManager,
++    private val metadata: MetaRepository,
++    private val shuffle: EpisodeShufflePlayback,
++    private val progress: WatchProgressRepository,
++    private val discovery: com.nuvio.tv.data.repository.DiscoveryRepository,
++    val session: TvMixSession
++) : ViewModel() {
++    val mixes = store.mixes.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
++    private val _state = MutableStateFlow(TvMixUiState())
++    val state = _state.asStateFlow()
++    private var request: Job? = null
++    private var previous: Pair<String, String>? = null
++    private var lastPlayed: Pair<String, String>? = null
++    private var preferredBingeGroup: String? = null
++    private val failedSourceShows = mutableSetOf<String>()
++    init {
++        viewModelScope.launch { profiles.activeProfileId.drop(1).collect {
++            request?.cancel(); session.end(); previous = null; lastPlayed = null; preferredBingeGroup = null; failedSourceShows.clear(); _state.value = TvMixUiState()
++        } }
++    }
++
++    fun open(id: String) {
++        if (_state.value.mixId == id) return
++        session.end(); previous = null; lastPlayed = null; preferredBingeGroup = null; failedSourceShows.clear()
++        _state.value = TvMixUiState(mixId = id)
++        remix()
++    }
++
++    fun remix() {
++        failedSourceShows.clear()
++        selectNext()
++    }
++
++    private fun selectNext() {
++        val id = _state.value.mixId ?: return
++        val profileId = profiles.activeProfileId.value
++        previous = _state.value.selection?.key ?: previous
++        request?.cancel()
++        _state.update { it.copy(selection = null, loading = true, error = null) }
++        request = viewModelScope.launch {
++            try {
++                val mix = store.observe(profileId).first().firstOrNull { it.id == id }
++                val selected = mix?.let { selectTvMixEpisode(it.shows.filterNot { show ->
++                    show.id in failedSourceShows || show.imdbId in failedSourceShows
++                }, previous, lastPlayed = lastPlayed) { show ->
++                    // A failed provider is bounded; cancellation/profile switching still cancels the selection.
++                    withTimeoutOrNull(20_000) {
++                        try {
++                            val lookup = lookupId(show.id, show.imdbId, show.type)
++                            // Saved entries contain a cover/name, not the source catalog's full
++                            // metadata. Skip the catalog-sufficient shortcut and resolve episodes.
++                            val result = metadata.getMetaFromAllAddons(show.type, lookup)
++                                .first { result -> result !is NetworkResult.Loading }
++                            val meta = (result as? NetworkResult.Success)?.data ?: return@withTimeoutOrNull null
++                            if (meta.id in failedSourceShows) return@withTimeoutOrNull null
++                            val state = shuffle.observe(profileId, meta.id, meta.apiType).first()
++                            val reconciled = reconcileTvdbVideoProgress(meta.videos, state.progress)
++                            val native = meta.videos.any { video -> video.episodeIdentity != null }
++                            val watched = if (native) reconciled.filterValues { p -> p.isCompleted() }.keys else state.watched
++                            val remote = if (mix.unwatchedOnly && !native) meta.videos.filter { video ->
++                                video.episode?.let { ep -> progress.isWatchedByVideoId(video.id, ep) } == true
++                            }.mapNotNull { video -> video.season?.let { season -> season to video.episode!! } }.toSet() else emptySet()
++                            val picker = RandomEpisodePicker(meta.id, meta.videos, watched + remote, reconciled)
++                            meta to picker.eligibleVideos(!mix.unwatchedOnly)
++                        } catch (e: CancellationException) { throw e }
++                        catch (_: Exception) { null }
++                    }
++                } }
++                if (profiles.activeProfileId.value == profileId) _state.update { it.copy(
++                    selection = selected, loading = false,
++                    error = if (selected == null) {
++                        if (failedSourceShows.isNotEmpty()) "No playable sources found for the remaining shows in this mix. Try again or change sources."
++                        else "No eligible episodes available. Try another selection or change the mix."
++                    } else null,
++                    autoStart = it.autoStart && selected != null
++                ) }
++            } catch (e: CancellationException) { throw e }
++            catch (_: Exception) { _state.update { it.copy(loading = false, autoStart = false, error = "Could not load this mix. Try again.") } }
++        }
++    }
++
++    fun play(): TvMixSelection? {
++        val s = _state.value
++        val selected = s.selection ?: return null
++        session.playing.value = TvMixSession.Playing(profiles.activeProfileId.value, s.mixId ?: return null, selected,
++            continuation = s.autoStart || s.continuePrompt, preferredBingeGroup = preferredBingeGroup)
++        preferredBingeGroup = null
++        _state.update { it.copy(continuePrompt = false, autoStart = false) }
++        return selected
++    }
++
++    fun completed(autoplay: Boolean, bingeGroup: String? = null) {
++        val playing = session.playing.value ?: return
++        previous = playing.selection.key
++        lastPlayed = playing.selection.key
++        preferredBingeGroup = bingeGroup
++        session.end()
++        _state.update { it.copy(mixId = playing.mixId, selection = null, continuePrompt = !autoplay, autoStart = autoplay) }
++        remix()
++    }
++
++    /** A source timeout skips the show without marking its episode played or watched. */
++    fun sourceUnavailable(expected: TvMixSession.Playing): Boolean {
++        if (session.playing.value !== expected || profiles.activeProfileId.value != expected.profileId ||
++            _state.value.mixId != expected.mixId) return false
++        failedSourceShows += expected.selection.meta.id
++        previous = expected.selection.key
++        preferredBingeGroup = expected.preferredBingeGroup
++        session.end()
++        _state.update { it.copy(mixId = expected.mixId, selection = null, continuePrompt = false, autoStart = true) }
++        selectNext()
++        return true
++    }
++
++    fun end() {
++        request?.cancel(); session.end(); previous = null; lastPlayed = null; preferredBingeGroup = null; failedSourceShows.clear(); _state.value = TvMixUiState()
++    }
++
++    fun save(mix: TvMix, onSaved: () -> Unit = {}) = write { profile -> store.save(profile, mix); onSaved() }
++    fun delete(id: String, onDeleted: () -> Unit) = write { profile -> store.delete(profile, id); onDeleted() }
++    fun add(item: MetaPreview, mixId: String?, name: String, onSaved: () -> Unit) = write { profile ->
++        val id = lookupId(item.id, item.imdbId, item.apiType)
++        val show = TvMixShow(id, item.name, item.rawPosterUrl ?: item.poster, item.apiType,
++            id.takeIf { it.startsWith("tt") } ?: item.imdbId, item.sourceAddonBaseUrl)
++        if (mixId == null) store.save(profile, TvMix(UUID.randomUUID().toString(), name.trim()).adding(show))
++        else store.add(profile, mixId, show)
++        onSaved()
++    }
++    private suspend fun lookupId(id: String, imdb: String?, type: String): String {
++        // Native/server/addon IDs select their own metadata and episode ordering.
++        // IMDb is an alias for duplicate detection; only Discovery's TMDB IDs need normalization.
++        if (!id.startsWith("tmdb:")) return id
++        if (!imdb.isNullOrBlank()) return imdb
++        val numeric = id.substringAfter(':').substringBefore(':').toIntOrNull() ?: return id
++        return withTimeoutOrNull(5_000) { discovery.imdbId(numeric, type in listOf("series", "tv", "anime")) }?.takeIf(String::isNotBlank) ?: id
++    }
++    private fun write(action: suspend (Int) -> Unit) {
++        if (_state.value.saving) return
++        val profile = profiles.activeProfileId.value
++        _state.update { it.copy(saving = true, error = null) }
++        viewModelScope.launch {
++            try { action(profile) }
++            catch (e: CancellationException) { throw e }
++            catch (_: Exception) { if (profiles.activeProfileId.value == profile) _state.update { it.copy(error = "Could not save changes. Please try again.") } }
++            finally { if (profiles.activeProfileId.value == profile) _state.update { it.copy(saving = false) } }
++        }
++    }
++}
 diff --git a/app/src/main/java/com/nuvio/tv/updater/Checksum.kt b/app/src/main/java/com/nuvio/tv/updater/Checksum.kt
 new file mode 100644
 index 000000000..fb476917d
