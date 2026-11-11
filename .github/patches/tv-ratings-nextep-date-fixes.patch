@@ -1,0 +1,109 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/util/EpisodeReleaseDateParser.kt b/app/src/main/java/com/nuvio/tv/core/util/EpisodeReleaseDateParser.kt
+index 96561183a..6a61100c3 100644
+--- a/app/src/main/java/com/nuvio/tv/core/util/EpisodeReleaseDateParser.kt
++++ b/app/src/main/java/com/nuvio/tv/core/util/EpisodeReleaseDateParser.kt
+@@ -10,6 +10,9 @@ import java.time.ZoneOffset
+ import java.time.ZonedDateTime
+ 
+ private val ISO_DATE_PATTERN = Regex("(?<!\\d)\\d{4}-\\d{2}-\\d{2}(?!\\d)")
++private const val PLAIN_DATE_LENGTH = 10
++// Every java.time ISO parser used below needs this start; anything else would only throw.
++private val ISO_DATE_START = Regex("^[+-]?\\d{4,}-\\d{2}-\\d{2}")
+ 
+ /**
+  * Converts timestamped episode releases into the viewer's local calendar date. Plain dates have
+@@ -17,12 +20,13 @@ private val ISO_DATE_PATTERN = Regex("(?<!\\d)\\d{4}-\\d{2}-\\d{2}(?!\\d)")
+  */
+ internal fun parseEpisodeReleaseLocalDate(
+     raw: String?,
+-    zoneId: ZoneId = ZoneId.systemDefault()
++    zoneId: ZoneId? = null
+ ): LocalDate? {
+     val value = raw?.trim()?.takeIf { it.isNotEmpty() } ?: return null
++    if (!ISO_DATE_START.containsMatchIn(value)) return parseEmbeddedReleaseDate(value)
+ 
+     return runCatching { LocalDate.parse(value) }.getOrNull()
+-        ?: parseExplicitReleaseInstant(value)?.atZone(zoneId)?.toLocalDate()
++        ?: parseExplicitReleaseInstant(value)?.atZone(zoneId ?: ZoneId.systemDefault())?.toLocalDate()
+         ?: runCatching { LocalDateTime.parse(value).toLocalDate() }.getOrNull()
+         ?: parseEmbeddedReleaseDate(value)
+ }
+@@ -42,12 +46,18 @@ internal fun isEpisodeReleaseAired(
+ 
+ internal fun parseEpisodeReleaseInstant(
+     raw: String?,
+-    zoneId: ZoneId = ZoneId.systemDefault()
++    zoneId: ZoneId? = null
+ ): Instant? {
+     val value = raw?.trim()?.takeIf { it.isNotEmpty() } ?: return null
++    if (!ISO_DATE_START.containsMatchIn(value)) {
++        return parseEmbeddedReleaseDate(value)?.atStartOfDay(ZoneOffset.UTC)?.toInstant()
++    }
++    if (value.length == PLAIN_DATE_LENGTH) {
++        runCatching { LocalDate.parse(value) }.getOrNull()?.let { return it.atStartOfDay(ZoneOffset.UTC).toInstant() }
++    }
+ 
+     return parseExplicitReleaseInstant(value)
+-        ?: runCatching { LocalDateTime.parse(value).atZone(zoneId).toInstant() }.getOrNull()
++        ?: runCatching { LocalDateTime.parse(value).atZone(zoneId ?: ZoneId.systemDefault()).toInstant() }.getOrNull()
+         ?: runCatching { LocalDate.parse(value).atStartOfDay(ZoneOffset.UTC).toInstant() }.getOrNull()
+         ?: parseEmbeddedReleaseDate(value)?.atStartOfDay(ZoneOffset.UTC)?.toInstant()
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/components/MDBListRatingsRow.kt b/app/src/main/java/com/nuvio/tv/ui/components/MDBListRatingsRow.kt
+index dcb749f4f..0d2fd190e 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/components/MDBListRatingsRow.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/components/MDBListRatingsRow.kt
+@@ -22,6 +22,7 @@ import com.nuvio.tv.domain.model.RottenTomatoesStatus
+ import com.nuvio.tv.ui.theme.NuvioTheme
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.unit.Dp
++import kotlin.math.roundToInt
+ 
+ @Composable
+ fun MDBListRatingsRow(
+@@ -114,7 +115,9 @@ private fun RatingBadge(
+         Text(
+             text = formatMDBListRating(provider, rating),
+             style = MaterialTheme.typography.labelMedium,
+-            color = com.nuvio.tv.ui.screens.detail.forkRatingValueColor(provider) ?: NuvioTheme.extendedColors.textSecondary
++            color = com.nuvio.tv.ui.screens.detail.forkRatingValueColor(provider) ?: NuvioTheme.extendedColors.textSecondary,
++            maxLines = 1,
++            softWrap = false
+         )
+     }
+ }
+@@ -131,9 +134,11 @@ private fun getRatingValue(ratings: MDBListRatings, provider: String): Double? =
+     else -> null
+ }
+ 
+-private fun formatMDBListRating(provider: String, rating: Double): String {
++internal fun formatMDBListRating(provider: String, rating: Double): String {
+     return when (provider) {
+-        "imdb", "tmdb", "letterboxd" -> String.format("%.1f", rating)
++        // MDBList sends TMDB out of 100; a fractional value under 10 is out of 10. Whole number like the details hero.
++        "tmdb" -> (if (rating < 10.0 && rating % 1.0 != 0.0) rating * 10.0 else rating).roundToInt().toString()
++        "imdb", "letterboxd" -> String.format("%.1f", rating)
+         else -> {
+             if (rating % 1.0 == 0.0) rating.toInt().toString() else String.format("%.1f", rating)
+         }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerNextEpisodeRules.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerNextEpisodeRules.kt
+index 9c0859a59..d49884e41 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerNextEpisodeRules.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerNextEpisodeRules.kt
+@@ -63,14 +63,8 @@ object PlayerNextEpisodeRules {
+                 val userTriggerMs = userThresholdPositionMs(
+                     durationMs, thresholdMode, thresholdPercent, thresholdMinutesBeforeEnd
+                 )
+-                val isHeuristic = postCreditsScene.provider == "heuristic"
+-                val sceneDurationMs = sceneEndMs - (postCreditsScene.startTime * 1_000.0).toLong()
+-                val userThresholdFromEndMs = durationMs - userTriggerMs
+-                return if (isHeuristic && sceneDurationMs < userThresholdFromEndMs) {
+-                    // Short heuristic scene (shorter than user threshold window):
+-                    // card is not needed - autoplay will handle it at playback end.
+-                    false
+-                } else if (isHeuristic) {
++                // A guessed scene is only the time left after the credits, so the user's threshold decides.
++                return if (postCreditsScene.provider == "heuristic") {
+                     positionMs >= userTriggerMs
+                 } else {
+                     positionMs >= maxOf(sceneEndMs, userTriggerMs)
