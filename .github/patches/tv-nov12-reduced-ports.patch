@@ -1,0 +1,582 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/auth/AuthManager.kt b/app/src/main/java/com/nuvio/tv/core/auth/AuthManager.kt
+index 2a7b20b..35d0652 100644
+--- a/app/src/main/java/com/nuvio/tv/core/auth/AuthManager.kt
++++ b/app/src/main/java/com/nuvio/tv/core/auth/AuthManager.kt
+@@ -266,6 +266,11 @@ class AuthManager @Inject constructor(
+             else -> null
+         }
+ 
++    fun hasLiveSession(): Boolean {
++        val userId = currentUserId ?: return false
++        return auth.currentUserOrNull()?.id == userId
++    }
++
+     /**
+      * Returns the effective user ID for data operations.
+      * For sync-linked devices, this returns the sync owner's user ID.
+@@ -426,14 +431,14 @@ class AuthManager @Inject constructor(
+         val refreshToken = auth.currentSessionOrNull()?.refreshToken?.takeIf { it.isNotBlank() }
+             ?: run {
+                 Log.w(TAG, "JWT expired but no refresh token available; cannot refresh session")
+-                clearInvalidRemoteSession(error)
+                 return false
+             }
+         val outcome = refreshCurrentSessionSerialized(
+             observedRefreshToken = refreshToken,
+             reason = "JWT expired"
+         )
+-        if (outcome.result == SessionRefreshResult.INVALID_SESSION) {
++        // Only a refusal from the server ends the session; a session the library is not holding right now is kept.
++        if (outcome.result == SessionRefreshResult.INVALID_SESSION && outcome.error != null) {
+             clearInvalidRemoteSession(outcome.error)
+         }
+         return outcome.result == SessionRefreshResult.REFRESHED
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/DolbyVisionExtractorsFactory.kt b/app/src/main/java/com/nuvio/tv/core/player/DolbyVisionExtractorsFactory.kt
+index 5edfd36..32fcfcd 100644
+--- a/app/src/main/java/com/nuvio/tv/core/player/DolbyVisionExtractorsFactory.kt
++++ b/app/src/main/java/com/nuvio/tv/core/player/DolbyVisionExtractorsFactory.kt
+@@ -297,7 +297,7 @@ private class NativeOptimizedVideoTrackOutput(
+         val rewriteSamples = converting && !(profile == 5 && !config.convertDv5Rpu)
+         val shouldStripDovi = stripDvRpu && strippedCodecs != null && strippedCodecs != format.codecs
+         
+-        shouldProcess = rewriteSamples || shouldStripDovi || stripHdr10PlusSei
++        shouldProcess = carriesHevc(format) && (rewriteSamples || shouldStripDovi || stripHdr10PlusSei)
+         codecs = outFormat.codecs
+         delegate.format(outFormat)
+     }
+@@ -395,6 +395,14 @@ private class NativeOptimizedVideoTrackOutput(
+             return m.groupValues[1].toIntOrNull()
+         }
+ 
++        // The sample rewrite reads every NAL as HEVC.
++        fun carriesHevc(format: Format): Boolean = when (format.sampleMimeType) {
++            MimeTypes.VIDEO_H265 -> true
++            MimeTypes.VIDEO_DOLBY_VISION ->
++                Regex("^(?:dvhe|dvh1)\\.").containsMatchIn(format.codecs.orEmpty().trim().lowercase())
++            else -> false
++        }
++
+         fun rewriteDvCodecString(codecs: String?): String? {
+             if (codecs.isNullOrBlank()) return null
+             return Regex("(?i)(dvhe|dvav|dvh1|dva1)\\.0[57]\\.")
+diff --git a/app/src/main/java/com/nuvio/tv/core/sync/StartupSyncService.kt b/app/src/main/java/com/nuvio/tv/core/sync/StartupSyncService.kt
+index 538df26..37b9d06 100644
+--- a/app/src/main/java/com/nuvio/tv/core/sync/StartupSyncService.kt
++++ b/app/src/main/java/com/nuvio/tv/core/sync/StartupSyncService.kt
+@@ -109,6 +109,7 @@ class StartupSyncService @Inject constructor(
+             authManager.authState.collect { state ->
+                 when (state) {
+                     is AuthState.FullAccount -> {
++                        profileManager.activeProfileReady.first { it }
+                         val force = forceSyncRequested
+                         val includeProfileSettings = if (force) forceSyncIncludesProfileSettings else true
+                         val started = scheduleStartupPull(
+diff --git a/app/src/main/java/com/nuvio/tv/core/sync/WatchProgressSyncService.kt b/app/src/main/java/com/nuvio/tv/core/sync/WatchProgressSyncService.kt
+index da18392..fedef0b 100644
+--- a/app/src/main/java/com/nuvio/tv/core/sync/WatchProgressSyncService.kt
++++ b/app/src/main/java/com/nuvio/tv/core/sync/WatchProgressSyncService.kt
+@@ -60,6 +60,8 @@ class WatchProgressSyncService @Inject constructor(
+         watchProgressPreferences.advanceLastSuccessfulPushMs(now, profileId)
+     }
+     private suspend fun <T> withJwtRefreshRetry(block: suspend () -> T): T {
++        // Without a session the request would go out as an anonymous caller.
++        if (!authManager.hasLiveSession()) throw IllegalStateException("No signed-in session for watch progress sync")
+         return try {
+             block()
+         } catch (e: Exception) {
+diff --git a/app/src/main/java/com/nuvio/tv/core/sync/WatchedItemsSyncService.kt b/app/src/main/java/com/nuvio/tv/core/sync/WatchedItemsSyncService.kt
+index b0bfc1c..ad743f0 100644
+--- a/app/src/main/java/com/nuvio/tv/core/sync/WatchedItemsSyncService.kt
++++ b/app/src/main/java/com/nuvio/tv/core/sync/WatchedItemsSyncService.kt
+@@ -63,6 +63,8 @@ class WatchedItemsSyncService @Inject constructor(
+     }
+ 
+     private suspend fun <T> withJwtRefreshRetry(block: suspend () -> T): T {
++        // Without a session the request would go out as an anonymous caller.
++        if (!authManager.hasLiveSession()) throw IllegalStateException("No signed-in session for watched items sync")
+         return try {
+             block()
+         } catch (e: Exception) {
+diff --git a/app/src/main/java/com/nuvio/tv/core/tracking/TrackingProgressProvider.kt b/app/src/main/java/com/nuvio/tv/core/tracking/TrackingProgressProvider.kt
+index fe1a626..aa45455 100644
+--- a/app/src/main/java/com/nuvio/tv/core/tracking/TrackingProgressProvider.kt
++++ b/app/src/main/java/com/nuvio/tv/core/tracking/TrackingProgressProvider.kt
+@@ -22,6 +22,7 @@ interface TrackingProgressProvider {
+         get() = flowOf(emptyList())
+ 
+     fun episodeProgress(contentId: String): Flow<Map<Pair<Int, Int>, WatchProgress>>
++    fun loadedEpisodeProgress(contentId: String): Map<Pair<Int, Int>, WatchProgress>? = null
+     fun airedEpisodeOrder(contentId: String): Flow<List<Pair<Int, Int>>>
+     fun isWatched(
+         contentId: String,
+diff --git a/app/src/main/java/com/nuvio/tv/core/tracking/TrackingSourceController.kt b/app/src/main/java/com/nuvio/tv/core/tracking/TrackingSourceController.kt
+index f39346b..fdbefb0 100644
+--- a/app/src/main/java/com/nuvio/tv/core/tracking/TrackingSourceController.kt
++++ b/app/src/main/java/com/nuvio/tv/core/tracking/TrackingSourceController.kt
+@@ -10,8 +10,10 @@ import com.nuvio.tv.data.local.WatchProgressSource
+ import com.nuvio.tv.data.local.WatchedItemsPreferences
+ import com.nuvio.tv.data.local.WatchedSeriesStateHolder
+ import com.nuvio.tv.domain.model.LibrarySourceMode
++import android.util.Log
+ import javax.inject.Inject
+ import javax.inject.Singleton
++import kotlinx.coroutines.CancellationException
+ import kotlinx.coroutines.sync.Mutex
+ import kotlinx.coroutines.sync.withLock
+ 
+@@ -108,7 +110,7 @@ class TrackingSourceController @Inject constructor(
+             }
+             watchedItemsPreferences.clearAll(profileId)
+             watchedSeriesStateHolder.update(emptySet())
+-            provider.refresh(TrackingRefreshIntent.USER_INITIATED)
++            refreshAfterSwitch { provider.refresh(TrackingRefreshIntent.USER_INITIATED) }
+         } else if (source == WatchProgressSource.NUVIO_SYNC) {
+             repopulateWatchedItemsFromNuvioSync(profileId)
+             if (profileManager.activeProfileId.value == profileId) {
+@@ -120,7 +122,19 @@ class TrackingSourceController @Inject constructor(
+     private suspend fun applyLibrarySourceMode(mode: LibrarySourceMode, profileId: Int) {
+         settingsDataStore.setLibrarySourceMode(mode, profileId)
+         if (profileManager.activeProfileId.value != profileId) return
+-        mode.providerId?.let(libraryProviders::provider)?.refresh(TrackingRefreshIntent.USER_INITIATED)
++        val provider = mode.providerId?.let(libraryProviders::provider) ?: return
++        refreshAfterSwitch { provider.refresh(TrackingRefreshIntent.USER_INITIATED) }
++    }
++
++    // The choice is already saved; a tracker that is rate limited or offline shows its own error and is retried later.
++    private suspend fun refreshAfterSwitch(refresh: suspend () -> Unit) {
++        try {
++            refresh()
++        } catch (error: CancellationException) {
++            throw error
++        } catch (error: Exception) {
++            Log.w("TrackingSource", "Refresh after a source switch failed: ${error.message}")
++        }
+     }
+ 
+     private suspend fun repopulateWatchedItemsFromNuvioSync(profileId: Int) {
+diff --git a/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListAuthRepository.kt b/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListAuthRepository.kt
+index 00c30da..51130fd 100644
+--- a/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListAuthRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListAuthRepository.kt
+@@ -1,5 +1,6 @@
+ package com.nuvio.tv.data.mdblist
+ 
++import android.util.Log
+ import kotlinx.coroutines.CancellationException
+ import kotlinx.coroutines.NonCancellable
+ import kotlinx.coroutines.sync.Mutex
+@@ -107,21 +108,56 @@ class MdbListAuthRepository(
+         if (rejectedAccessToken == null && current.tokens.expiresAtEpochMs - nowEpochMs() > 60_000L) {
+             return@withLock current
+         }
++        Log.d(
++            TAG,
++            "refresh start profile=${scope.profileId} gen=${scope.generation} " +
++                "reason=${if (rejectedAccessToken != null) "rejected" else "expiring"} " +
++                "secondsLeft=${(current.tokens.expiresAtEpochMs - nowEpochMs()) / 1_000L}"
++        )
+         withContext(NonCancellable) {
+-            val response = oauth(
+-                "/oauth/token/",
+-                mapOf("grant_type" to "refresh_token", "refresh_token" to current.tokens.refreshToken),
+-                scope
+-            )
++            val response = try {
++                oauth(
++                    "/oauth/token/",
++                    mapOf("grant_type" to "refresh_token", "refresh_token" to current.tokens.refreshToken),
++                    scope
++                )
++            } catch (error: CancellationException) {
++                Log.w(TAG, "refresh dropped reason=${if (store.isCurrent(scope)) "cancelled" else "scope-changed"}")
++                throw error
++            } catch (error: MdbListApiException) {
++                Log.w(TAG, "refresh failed status=${error.status} code=${error.code} result=kept")
++                throw error
++            }
+             if (response.status !in 200..299) {
+                 if (response.errorCode() in setOf("invalid_grant", "invalid_token")) {
+-                    store.clearAuth(scope, MdbListAuthError.AUTHORIZATION_REVOKED, current.tokens.accessToken)
++                    val cleared =
++                        store.clearAuth(scope, MdbListAuthError.AUTHORIZATION_REVOKED, current.tokens.accessToken)
++                    Log.w(
++                        TAG,
++                        "refresh failed status=${response.status} code=${response.errorCode()} " +
++                            "result=${if (cleared) "signed-out" else "kept"}"
++                    )
+                     throw MdbListAuthException(MdbListAuthError.AUTHORIZATION_REVOKED)
+                 }
++                Log.w(TAG, "refresh failed status=${response.status} code=${response.errorCode()} result=kept")
+                 throw MdbListApiException(response.status, response.errorCode())
+             }
+-            val tokens = tokensFrom(response, current.tokens.refreshToken)
+-            if (!store.refreshTokens(tokens, current)) scopeChanged()
++            val tokens = try {
++                tokensFrom(response, current.tokens.refreshToken)
++            } catch (error: MdbListAuthException) {
++                Log.w(TAG, "refresh dropped reason=invalid-response:${rejectedTokenField(response.body)}")
++                throw error
++            }
++            if (!store.refreshTokens(tokens, current)) {
++                Log.w(TAG, "refresh dropped reason=${if (store.isCurrent(scope)) "token-changed" else "scope-changed"}")
++                scopeChanged()
++            }
++            Log.d(
++                TAG,
++                "refresh stored profile=${scope.profileId} " +
++                    "expiresIn=${(tokens.expiresAtEpochMs - nowEpochMs() + 500L) / 1_000L} " +
++                    "newRefreshToken=${tokens.refreshToken != current.tokens.refreshToken}"
++            )
+             MdbListAuthorization(scope, tokens)
+         }
+     }
+@@ -174,6 +210,16 @@ class MdbListAuthRepository(
+         return MdbListTokens(accessToken, refreshToken, expiresAt(payload.expiresIn, nowEpochMs()))
+     }
+ 
++    private fun rejectedTokenField(body: String): String {
++        val payload = runCatching { json.decodeFromString<MdbListTokenResponse>(body) }.getOrNull() ?: return "body"
++        return when {
++            payload.accessToken.isNullOrBlank() -> "access_token"
++            !payload.tokenType.equals("Bearer", ignoreCase = true) -> "token_type"
++            payload.scope != null && "write" !in payload.scope.split(Regex("\\s+")) -> "scope"
++            else -> "expires_in"
++        }
++    }
++
+     private fun verificationUrl(value: String?) = value?.toHttpUrlOrNull()
+         ?.takeIf { it.isHttps && it.host == "mdblist.com" && it.username.isEmpty() && it.password.isEmpty() }
+         ?: invalidResponse()
+@@ -187,4 +233,8 @@ class MdbListAuthRepository(
+ 
+     private fun invalidResponse(): Nothing = throw MdbListAuthException(MdbListAuthError.INVALID_RESPONSE)
+     private fun scopeChanged(): Nothing = throw CancellationException("MDBList account changed")
++
++    private companion object {
++        const val TAG = "MdbListAuth"
++    }
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListSyncRepository.kt b/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListSyncRepository.kt
+index 44974d0..bc2e2d2 100644
+--- a/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListSyncRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListSyncRepository.kt
+@@ -29,9 +29,11 @@ class MdbListSyncRepository(
+     private val coroutineScope: CoroutineScope,
+     private val now: () -> Long = System::currentTimeMillis,
+     private val dispatcher: CoroutineDispatcher = Dispatchers.IO,
++    private val playerOpen: () -> Boolean = { false },
++    private val encode: (MdbListSyncSnapshot) -> String = { defaultJson.encodeToString(it) },
+     private val remote: (MdbListAuthScope) -> MdbListSyncRemote = { MdbListHttpSyncRemote(api, it) }
+ ) {
+-    private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
++    private val json = defaultJson
+     private val mutex = Mutex()
+     private val gate = TrackingRefreshGate()
+     private val mutableState = MutableStateFlow(MdbListSyncState())
+@@ -94,7 +96,8 @@ class MdbListSyncRepository(
+                         scope = scope,
+                         isLoading = false,
+                         error = error.toMdbListSyncError(),
+-                        retryAtEpochMs = (error as? MdbListApiException)?.retryAtEpochMs,
++                        retryAtEpochMs = (error as? MdbListApiException)?.retryAtEpochMs
++                            ?: (attemptedAt + AUTOMATIC_INTERVAL_MS).takeIf { error is MdbListSaveMemoryException },
+                         attemptedAtEpochMs = attemptedAt
+                     )
+                 }
+@@ -187,7 +190,11 @@ class MdbListSyncRepository(
+             )
+             storage.savePlayback(scope.profileId, playbackPayload) { checkScope(scope) }
+         } else {
+-            val payload = json.encodeToString(storedSnapshot)
++            val payload = try {
++                encode(storedSnapshot)
++            } catch (_: OutOfMemoryError) {
++                throw MdbListSaveMemoryException()
++            }
+             storage.save(scope.profileId, payload) { checkScope(scope) }
+         }
+         checkScope(scope)
+@@ -218,6 +225,7 @@ class MdbListSyncRepository(
+         val now = now()
+         if (current.retryAtEpochMs?.let { it > now } == true) return false
+         if (intent != TrackingRefreshIntent.AUTOMATIC) return true
++        if (playerOpen()) return false
+         if (current.error != null) return current.attemptedAtEpochMs?.let { now - it !in 0 until ERROR_RETRY_MS } ?: true
+         if (current.snapshot?.invalidatedBuckets?.isNotEmpty() == true) return true
+         return current.snapshot?.checkedAtEpochMs?.let { now - it !in 0 until AUTOMATIC_INTERVAL_MS } ?: true
+@@ -239,6 +247,7 @@ class MdbListSyncRepository(
+     }
+ 
+     companion object {
++        private val defaultJson = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+         const val AUTOMATIC_INTERVAL_MS = 15L * 60 * 1_000
+         const val ERROR_RETRY_MS = 60_000L
+     }
+@@ -250,3 +259,5 @@ private data class MdbListPlaybackOverride(
+     val storageRevision: String? = null,
+     val playback: List<MdbListPlayback>
+ )
++
++internal class MdbListSaveMemoryException : Exception("Not enough memory to save MDBList data")
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/TraktProgressService.kt b/app/src/main/java/com/nuvio/tv/data/repository/TraktProgressService.kt
+index d935273..b86cadc 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/TraktProgressService.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/TraktProgressService.kt
+@@ -647,6 +647,12 @@ class TraktProgressService @Inject constructor(
+             .distinctUntilChanged()
+     }
+ 
++    /** The show's episode map once Trakt has answered for it in full; null before that. */
++    fun loadedEpisodeProgress(contentId: String): Map<Pair<Int, Int>, WatchProgress>? =
++        episodeProgressState.value[canonicalLookupKey(contentId)]
++            ?.takeIf { it.hasCompletedSnapshot }
++            ?.progress
++
+     suspend fun getEpisodeProgressSnapshot(
+         contentId: String
+     ): Map<Pair<Int, Int>, WatchProgress> {
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/TraktTrackingProgressProvider.kt b/app/src/main/java/com/nuvio/tv/data/repository/TraktTrackingProgressProvider.kt
+index bd2c20c..310ec92 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/TraktTrackingProgressProvider.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/TraktTrackingProgressProvider.kt
+@@ -43,6 +43,8 @@ class TraktTrackingProgressProvider @Inject constructor(
+ 
+     override fun episodeProgress(contentId: String) = service.observeEpisodeProgress(contentId)
+ 
++    override fun loadedEpisodeProgress(contentId: String) = service.loadedEpisodeProgress(contentId)
++
+     override fun airedEpisodeOrder(contentId: String) = service.observeAiredEpisodes(contentId)
+ 
+     override fun isWatched(
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/WatchProgressRepositoryImpl.kt b/app/src/main/java/com/nuvio/tv/data/repository/WatchProgressRepositoryImpl.kt
+index 89662bb..338c4fe 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/WatchProgressRepositoryImpl.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/WatchProgressRepositoryImpl.kt
+@@ -1203,6 +1203,11 @@ class WatchProgressRepositoryImpl @Inject constructor(
+             ?.let(trackingProgressProviders::provider)
+             ?.ownsCompletedHistoryProjection == true
+ 
++    override fun activeProviderLoadedEpisodeProgress(contentId: String): Map<Pair<Int, Int>, WatchProgress>? =
++        activeProgressProviderId
++            ?.let(trackingProgressProviders::provider)
++            ?.loadedEpisodeProgress(contentId)
++
+     override fun activeProviderContinueWatchingCutoffEpochMs(
+         daysCap: Int,
+         nowEpochMs: Long
+diff --git a/app/src/main/java/com/nuvio/tv/data/simkl/SimklSameTypeEnrichment.kt b/app/src/main/java/com/nuvio/tv/data/simkl/SimklSameTypeEnrichment.kt
+new file mode 100644
+index 0000000..9e41c79
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/simkl/SimklSameTypeEnrichment.kt
+@@ -0,0 +1,18 @@
++package com.nuvio.tv.data.simkl
++
++import com.nuvio.tv.core.tracking.TrackingMediaKind
++import com.nuvio.tv.core.tracking.TrackingMediaReference
++
++/**
++ * A film and a show can share a TMDB or TVDB number, so a library match that turns a film into a
++ * show or back is not trusted. Anime references carry no film or show type and are left alone.
++ */
++internal fun SimklSyncSnapshot.enrichMediaReferenceOfSameType(
++    reference: TrackingMediaReference,
++    entryIndex: SimklEntryIndex?
++): TrackingMediaReference {
++    val enriched = enrichMediaReference(reference, entryIndex)
++    val wasFilm = reference.kind == TrackingMediaKind.MOVIE
++    val isFilm = enriched.kind == TrackingMediaKind.MOVIE
++    return if (reference.kind != TrackingMediaKind.ANIME && wasFilm != isFilm) reference else enriched
++}
+diff --git a/app/src/main/java/com/nuvio/tv/data/simkl/SimklTrackingHistoryWriter.kt b/app/src/main/java/com/nuvio/tv/data/simkl/SimklTrackingHistoryWriter.kt
+index 7bde128..ee54897 100644
+--- a/app/src/main/java/com/nuvio/tv/data/simkl/SimklTrackingHistoryWriter.kt
++++ b/app/src/main/java/com/nuvio/tv/data/simkl/SimklTrackingHistoryWriter.kt
+@@ -32,7 +32,7 @@ class SimklTrackingHistoryWriter @Inject constructor(
+         val entryIndex = syncRepository.currentEntryIndex()
+         return service.addToHistory(
+             pushableItems.map { item ->
+-                val enriched = snapshot.enrichMediaReference(item.media, entryIndex)
++                val enriched = snapshot.enrichMediaReferenceOfSameType(item.media, entryIndex)
+                 item.copy(media = enriched.resolveAnimeEpisodeForSimkl())
+             }
+         )
+@@ -48,7 +48,7 @@ class SimklTrackingHistoryWriter @Inject constructor(
+         val entryIndex = syncRepository.currentEntryIndex()
+         return service.removeFromHistory(
+             items.map { ref ->
+-                snapshot.enrichMediaReference(ref, entryIndex).resolveAnimeEpisodeForSimkl()
++                snapshot.enrichMediaReferenceOfSameType(ref, entryIndex).resolveAnimeEpisodeForSimkl()
+             }
+         )
+     }
+diff --git a/app/src/main/java/com/nuvio/tv/data/simkl/SimklTrackingProvider.kt b/app/src/main/java/com/nuvio/tv/data/simkl/SimklTrackingProvider.kt
+index 2dffcd6..10eb49c 100644
+--- a/app/src/main/java/com/nuvio/tv/data/simkl/SimklTrackingProvider.kt
++++ b/app/src/main/java/com/nuvio/tv/data/simkl/SimklTrackingProvider.kt
+@@ -48,7 +48,7 @@ class SimklTrackingScrobbler @Inject constructor(
+         val entryIndex = syncRepository.currentEntryIndex()
+         val enrichedEvent = event.copy(
+             media = syncRepository.state.value.snapshot
+-                .enrichMediaReference(event.media, entryIndex)
++                .enrichMediaReferenceOfSameType(event.media, entryIndex)
+                 .resolveAnimeEpisodeForSimkl()
+         )
+         Log.d(
+diff --git a/app/src/main/java/com/nuvio/tv/domain/repository/WatchProgressRepository.kt b/app/src/main/java/com/nuvio/tv/domain/repository/WatchProgressRepository.kt
+index c73b779..b700cc5 100644
+--- a/app/src/main/java/com/nuvio/tv/domain/repository/WatchProgressRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/domain/repository/WatchProgressRepository.kt
+@@ -170,6 +170,7 @@ interface WatchProgressRepository {
+ 
+     fun hasActiveTrackingProgressProvider(): Boolean
+     fun activeProviderOwnsCompletedHistoryProjection(): Boolean
++    fun activeProviderLoadedEpisodeProgress(contentId: String): Map<Pair<Int, Int>, WatchProgress>? = null
+     fun activeProviderContinueWatchingCutoffEpochMs(daysCap: Int, nowEpochMs: Long): Long?
+     fun shouldUseAsNextUpSeed(progress: WatchProgress, nowEpochMs: Long): Boolean
+     suspend fun normalizeParentContentId(parentContentId: String, videoId: String?): String
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt
+index a3e3028..bc792d4 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt
+@@ -545,11 +545,10 @@ class MetaDetailsViewModel @Inject constructor(
+                 .first()
+             if (profileManager.activeProfileId.value != profileId) return@launch
+             if (localWatched.isEmpty()) return@launch
++            val loadedProgress = watchProgressRepository.activeProviderLoadedEpisodeProgress(contentId)
++                ?: return@launch
+ 
+-            val staleEpisodes = localWatched.filter { (season, episode) ->
+-                val providerEntry = providerProgressMap[season to episode]
+-                providerEntry == null || !providerEntry.isCompleted()
+-            }
++            val staleEpisodes = staleLocalWatchedEpisodes(localWatched, providerProgressMap, loadedProgress)
+ 
+             if (staleEpisodes.isNotEmpty()) {
+                 Log.d(TAG, "revalidateWatchedEpisodes: pruning ${staleEpisodes.size} stale entries for $contentId")
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/StaleLocalWatchedEpisodes.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/StaleLocalWatchedEpisodes.kt
+new file mode 100644
+index 0000000..ceedb63
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/StaleLocalWatchedEpisodes.kt
+@@ -0,0 +1,17 @@
++package com.nuvio.tv.ui.screens.detail
++
++import com.nuvio.tv.domain.model.WatchProgress
++
++/**
++ * Local watched ticks the tracker no longer has. [loadedProgress] is the tracker's full answer for the
++ * show; specials are kept because that answer leaves them out.
++ */
++internal fun staleLocalWatchedEpisodes(
++    localWatched: Set<Pair<Int, Int>>,
++    providerProgress: Map<Pair<Int, Int>, WatchProgress>,
++    loadedProgress: Map<Pair<Int, Int>, WatchProgress>
++): List<Pair<Int, Int>> = localWatched.filter { key ->
++    key.first != 0 &&
++        providerProgress[key]?.isCompleted() != true &&
++        loadedProgress[key]?.isCompleted() != true
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/SubtitleSelectionOverlay.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/SubtitleSelectionOverlay.kt
+index f804384..aa86842 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/SubtitleSelectionOverlay.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/SubtitleSelectionOverlay.kt
+@@ -1647,7 +1647,7 @@ private fun ColorChipRow(
+             val focusKey = "$focusKeyPrefix:${color.toArgb()}"
+             ColorChip(
+                 color = if (enabled) color else color.copy(alpha = 0.35f),
+-                isSelected = color.toArgb() == selectedColor,
++                isSelected = (color.toArgb() and 0xFFFFFF) == (selectedColor and 0xFFFFFF),
+                 enabled = enabled,
+                 onMoveLeft = if (color == colors.firstOrNull()) onMoveLeft else null,
+                 focusRequester = focusRequesters[focusKey],
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncExtractorsFactory.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncExtractorsFactory.kt
+index ef238f0..4dca730 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncExtractorsFactory.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncExtractorsFactory.kt
+@@ -101,7 +101,7 @@ private class ObservingTextTrackOutput(
+     }
+ 
+     override fun sampleData(input: DataReader, length: Int, allowEndOfInput: Boolean, sampleDataPart: Int): Int {
+-        if (sampleDataPart != TrackOutput.SAMPLE_DATA_PART_MAIN) {
++        if (sampleDataPart != TrackOutput.SAMPLE_DATA_PART_MAIN || isPgs()) {
+             return delegate.sampleData(input, length, allowEndOfInput, sampleDataPart)
+         }
+         val bytes = ByteArray(length)
+@@ -117,7 +117,7 @@ private class ObservingTextTrackOutput(
+     }
+ 
+     override fun sampleData(data: ParsableByteArray, length: Int, sampleDataPart: Int) {
+-        if (sampleDataPart == TrackOutput.SAMPLE_DATA_PART_MAIN) append(data.data, data.position, length)
++        if (sampleDataPart == TrackOutput.SAMPLE_DATA_PART_MAIN && !isPgs()) append(data.data, data.position, length)
+         delegate.sampleData(data, length, sampleDataPart)
+     }
+ 
+@@ -131,6 +131,8 @@ private class ObservingTextTrackOutput(
+         }
+     }
+ 
++    private fun isPgs(): Boolean = format?.sampleMimeType.equals("application/pgs", ignoreCase = true)
++
+     private fun observe(timeUs: Long, size: Int, offset: Int) {
+         if (timeUs == C.TIME_UNSET || size <= 0) return
+         val sampleStart = end - offset - size
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncSubtitleTextRetimer.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncSubtitleTextRetimer.kt
+index 645c9c9..ef5c3f2 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncSubtitleTextRetimer.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncSubtitleTextRetimer.kt
+@@ -112,9 +112,8 @@ internal object AutoSyncSubtitleTextRetimer {
+                     if (parts.size <= maxOf(startIndex, endIndex)) continue
+                     val start = parseTimestamp(parts[startIndex].trim()) ?: continue
+                     val end = parseTimestamp(parts[endIndex].trim()) ?: continue
+-                    val startMs = mapper.mapStartMs(start.ms)
+-                    val endMs = mapper.mapEndMs(end.ms.coerceAtLeast(start.ms + 1L))
+-                        .coerceAtLeast(startMs + ASS_MIN_DURATION_MS)
++                    val (startMs, mappedEndMs) = mapper.mapEventMs(start.ms, end.ms.coerceAtLeast(start.ms + 1L))
++                    val endMs = mappedEndMs.coerceAtLeast(startMs + ASS_MIN_DURATION_MS)
+                     parts[startIndex] = parts[startIndex].leadingWhitespace() + formatAss(startMs)
+                     parts[endIndex] = parts[endIndex].leadingWhitespace() + formatAss(endMs)
+                     lines[index] = line.substring(0, colon + 1) + parts.joinToString(",")
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncTimelineTimeMapper.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncTimelineTimeMapper.kt
+index 8ba7c13..bb5969d 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncTimelineTimeMapper.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncTimelineTimeMapper.kt
+@@ -24,6 +24,38 @@ internal class AutoSyncTimelineTimeMapper(private val timeline: AutoSyncTimeline
+ 
+     fun mapEndMs(originalMs: Long): Long = mapTime(originalMs, endBoundaries)
+ 
++    /**
++     * Start and end of one event. An event that is not a timeline cue moves as a whole by the shift
++     * of the nearest cue start, so it keeps its length.
++     */
++    fun mapEventMs(originalStartMs: Long, originalEndMs: Long): Pair<Long, Long> {
++        val nearestStart = nearestBoundary(startBoundaries, originalStartMs)
++        if (nearestStart?.originalMs == originalStartMs &&
++            nearestBoundary(endBoundaries, originalEndMs)?.originalMs == originalEndMs
++        ) {
++            return mapStartMs(originalStartMs) to mapEndMs(originalEndMs)
++        }
++        val startMs = if (nearestStart == null) {
++            mapStartMs(originalStartMs)
++        } else {
++            boundaryMapped++
++            (originalStartMs + nearestStart.retimedMs - nearestStart.originalMs).coerceAtLeast(0L)
++        }
++        return startMs to startMs + (originalEndMs - originalStartMs)
++    }
++
++    private fun nearestBoundary(boundaries: List<TimingBoundary>, originalMs: Long): TimingBoundary? {
++        var low = 0
++        var high = boundaries.size
++        while (low < high) {
++            val mid = (low + high) ushr 1
++            if (boundaries[mid].originalMs < originalMs) low = mid + 1 else high = mid
++        }
++        return listOfNotNull(boundaries.getOrNull(low - 1), boundaries.getOrNull(low))
++            .minByOrNull { abs(it.originalMs - originalMs) }
++            ?.takeIf { abs(it.originalMs - originalMs) <= BOUNDARY_TOLERANCE_MS }
++    }
++
+     private fun mapTime(originalMs: Long, boundaries: List<TimingBoundary>): Long {
+         if (boundaries.isNotEmpty()) {
+             var low = 0
