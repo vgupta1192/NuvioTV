@@ -1,0 +1,548 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/debrid/DirectDebridResolver.kt b/app/src/main/java/com/nuvio/tv/core/debrid/DirectDebridResolver.kt
+index 6e9bb6a2a..52c20fae4 100644
+--- a/app/src/main/java/com/nuvio/tv/core/debrid/DirectDebridResolver.kt
++++ b/app/src/main/java/com/nuvio/tv/core/debrid/DirectDebridResolver.kt
+@@ -115,7 +115,7 @@ class DirectDebridResolver @Inject constructor(
+             is DirectDebridResolveResult.Success -> DirectDebridPlayableResult.Success(stream.withResolvedDebridUrl(result))
+             DirectDebridResolveResult.MissingApiKey -> DirectDebridPlayableResult.MissingApiKey
+             DirectDebridResolveResult.NotCached -> DirectDebridPlayableResult.NotCached
+-            DirectDebridResolveResult.Stale -> DirectDebridPlayableResult.Stale
++            DirectDebridResolveResult.Stale, is DirectDebridResolveResult.Busy -> DirectDebridPlayableResult.Stale
+             DirectDebridResolveResult.Error -> DirectDebridPlayableResult.Error
+         }
+     }
+diff --git a/app/src/main/java/com/nuvio/tv/core/debrid/PremiumizeDirectDebridResolver.kt b/app/src/main/java/com/nuvio/tv/core/debrid/PremiumizeDirectDebridResolver.kt
+index e559f6256..a20d58ff0 100644
+--- a/app/src/main/java/com/nuvio/tv/core/debrid/PremiumizeDirectDebridResolver.kt
++++ b/app/src/main/java/com/nuvio/tv/core/debrid/PremiumizeDirectDebridResolver.kt
+@@ -34,7 +34,7 @@ class PremiumizeDirectDebridResolver @Inject constructor(
+             if (!response.isSuccessful) {
+                 return when (response.code()) {
+                     401, 403 -> DirectDebridResolveResult.Error
+-                    else -> DirectDebridResolveResult.Stale
++                    else -> DirectDebridResolveResult.busyOrStale(response.code())
+                 }
+             }
+             val body = response.body() ?: return DirectDebridResolveResult.Stale
+diff --git a/app/src/main/java/com/nuvio/tv/core/debrid/RealDebridDirectDebridResolver.kt b/app/src/main/java/com/nuvio/tv/core/debrid/RealDebridDirectDebridResolver.kt
+index 7bb18e354..f2ce9aa4c 100644
+--- a/app/src/main/java/com/nuvio/tv/core/debrid/RealDebridDirectDebridResolver.kt
++++ b/app/src/main/java/com/nuvio/tv/core/debrid/RealDebridDirectDebridResolver.kt
+@@ -58,7 +58,7 @@ class RealDebridDirectDebridResolver @Inject constructor(
+                 val link = infoAfter.body()?.firstDownloadLink()
+                     ?: return DirectDebridResolveResult.Stale
+                 val unrestrict = api.unrestrictLink(authorization, link)
+-                if (!unrestrict.isSuccessful) return DirectDebridResolveResult.Stale
++                if (!unrestrict.isSuccessful) return DirectDebridResolveResult.busyOrStale(unrestrict.code())
+                 val url = unrestrict.body()?.download?.takeIf { it.isNotBlank() }
+                     ?: return DirectDebridResolveResult.Stale
+                 resolved = true
+@@ -82,7 +82,7 @@ class RealDebridDirectDebridResolver @Inject constructor(
+     private fun retrofit2.Response<com.nuvio.tv.data.remote.dto.RealDebridAddTorrentDto>.toFailureForAdd(): DirectDebridResolveResult {
+         return when (code()) {
+             401, 403 -> DirectDebridResolveResult.Error
+-            else -> DirectDebridResolveResult.Stale
++            else -> DirectDebridResolveResult.busyOrStale(code())
+         }
+     }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/core/debrid/TorboxDirectDebridResolver.kt b/app/src/main/java/com/nuvio/tv/core/debrid/TorboxDirectDebridResolver.kt
+index 83ae5092c..3d90471cd 100644
+--- a/app/src/main/java/com/nuvio/tv/core/debrid/TorboxDirectDebridResolver.kt
++++ b/app/src/main/java/com/nuvio/tv/core/debrid/TorboxDirectDebridResolver.kt
+@@ -56,7 +56,7 @@ class TorboxDirectDebridResolver @Inject constructor(
+                 bypassCache = true
+             )
+             Log.d(TAG, "resolve: getTorrent done in ${System.currentTimeMillis() - getTorrentStartMs}ms code=${torrent.code()}")
+-            if (!torrent.isSuccessful) return DirectDebridResolveResult.Stale
++            if (!torrent.isSuccessful) return DirectDebridResolveResult.busyOrStale(torrent.code())
+             val files = torrent.body()?.data?.files.orEmpty()
+             val file = fileSelector.selectFile(files, resolve, season, episode)
+                 ?: return DirectDebridResolveResult.Stale
+@@ -74,7 +74,7 @@ class TorboxDirectDebridResolver @Inject constructor(
+                 appendName = false
+             )
+             Log.d(TAG, "resolve: requestDownloadLink done in ${System.currentTimeMillis() - linkStartMs}ms code=${link.code()}")
+-            if (!link.isSuccessful) return DirectDebridResolveResult.Stale
++            if (!link.isSuccessful) return DirectDebridResolveResult.busyOrStale(link.code())
+             val url = link.body()?.data?.takeIf { it.isNotBlank() }
+                 ?: return DirectDebridResolveResult.Stale
+ 
+@@ -124,7 +124,7 @@ class TorboxDirectDebridResolver @Inject constructor(
+         return when (code()) {
+             401, 403 -> DirectDebridResolveResult.Error
+             409 -> DirectDebridResolveResult.NotCached
+-            else -> DirectDebridResolveResult.Stale
++            else -> DirectDebridResolveResult.busyOrStale(code())
+         }
+     }
+ 
+@@ -158,4 +158,12 @@ sealed class DirectDebridResolveResult {
+     data object NotCached : DirectDebridResolveResult()
+     data object Stale : DirectDebridResolveResult()
+     data object Error : DirectDebridResolveResult()
++
++    /** The service answered "too many requests" or a server fault: the link itself may be fine. */
++    data class Busy(val httpStatus: Int) : DirectDebridResolveResult()
++
++    companion object {
++        fun busyOrStale(httpStatus: Int): DirectDebridResolveResult =
++            if (httpStatus == 429 || httpStatus in 500..599) Busy(httpStatus) else Stale
++    }
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/FrameRateUtils.kt b/app/src/main/java/com/nuvio/tv/core/player/FrameRateUtils.kt
+index cd85cedda..9ccb4273b 100644
+--- a/app/src/main/java/com/nuvio/tv/core/player/FrameRateUtils.kt
++++ b/app/src/main/java/com/nuvio/tv/core/player/FrameRateUtils.kt
+@@ -762,9 +762,17 @@ object FrameRateUtils {
+         return false
+     }
+ 
++    /** True 23.976 reads slightly under 23.988; anything from there up snaps to 24.000 and must stay there. */
++    fun prefers23976(rawFps: Float): Boolean = rawFps in 23.95f..23.988f
++
+     fun snapToStandardRate(formatFrameRate: Float): Float {
+         if (formatFrameRate <= 0f) return formatFrameRate
+         return when {
++            // Frame durations rounded to whole milliseconds: 42 ms (23.810), 33 ms (30.303), 17 ms (58.824).
++            // Each could be either member of its pair; the 1000/1001 rate is by far the common one.
++            formatFrameRate in 23.80f..23.82f -> NTSC_FILM_FPS
++            formatFrameRate in 30.29f..30.32f -> 30000f / 1001f
++            formatFrameRate in 58.81f..58.84f -> 60000f / 1001f
+             formatFrameRate in 23.90f..23.988f -> NTSC_FILM_FPS
+             formatFrameRate in 23.988f..24.1f -> CINEMA_24_FPS
+             formatFrameRate in 24.9f..25.1f -> 25f
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/dvmkv/MatroskaExtractor.java b/app/src/main/java/com/nuvio/tv/core/player/dvmkv/MatroskaExtractor.java
+index ff8409c2a..e13af8a89 100644
+--- a/app/src/main/java/com/nuvio/tv/core/player/dvmkv/MatroskaExtractor.java
++++ b/app/src/main/java/com/nuvio/tv/core/player/dvmkv/MatroskaExtractor.java
+@@ -3287,6 +3287,17 @@ public class MatroskaExtractor implements Extractor {
+     public boolean requiresDolbyVisionTransform;
+     public boolean isHevc;
+ 
++    static boolean dolbyVisionProfileMatchesCodec(String codecId, int profile) {
++      switch (codecId) {
++        case CODEC_ID_AV1:
++          return profile == 10;
++        case CODEC_ID_H264:
++          return profile == 9;
++        default:
++          return true;
++      }
++    }
++
+     /** Builds the {@link Format} for the track. */
+     @RequiresNonNull("codecId")
+     public void initializeFormat(
+@@ -3504,7 +3515,16 @@ public class MatroskaExtractor implements Extractor {
+         DolbyVisionConfig dolbyVisionConfig =
+             DolbyVisionConfig.parse(new ParsableByteArray(this.dolbyVisionConfigBytes));
+         if (dolbyVisionConfig != null) {
+-          if (DolbyVisionCompatibility.isStaleContainerDolbyVisionConfig(
++          if (!dolbyVisionProfileMatchesCodec(codecId, dolbyVisionConfig.profile)) {
++            Log.i(
++                TAG,
++                "Ignoring Dolby Vision profile "
++                    + dolbyVisionConfig.profile
++                    + " on a "
++                    + codecId
++                    + " track");
++            dolbyVisionConfigBytes = null;
++          } else if (DolbyVisionCompatibility.isStaleContainerDolbyVisionConfig(
+               hasColorInfo, colorTransfer)) {
+             Log.i(
+                 TAG,
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/TraktProgressService.kt b/app/src/main/java/com/nuvio/tv/data/repository/TraktProgressService.kt
+index b86cadce9..97e80229b 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/TraktProgressService.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/TraktProgressService.kt
+@@ -53,6 +53,7 @@ import kotlinx.coroutines.flow.filterNotNull
+ import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.flow.firstOrNull
+ import kotlinx.coroutines.flow.flow
++import kotlinx.coroutines.flow.flowOn
+ import kotlinx.coroutines.flow.map
+ import kotlinx.coroutines.flow.merge
+ import kotlinx.coroutines.flow.onStart
+@@ -556,6 +557,7 @@ class TraktProgressService @Inject constructor(
+         }
+             .filterNotNull()
+             .distinctUntilChanged()
++            .flowOn(Dispatchers.Default)
+     }
+ 
+     fun observeRemoteProgressLoaded(): Flow<Boolean> {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/components/ContinueWatchingSection.kt b/app/src/main/java/com/nuvio/tv/ui/components/ContinueWatchingSection.kt
+index e3ec81c32..7274c11a9 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/components/ContinueWatchingSection.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/components/ContinueWatchingSection.kt
+@@ -50,9 +50,7 @@ import androidx.compose.foundation.lazy.LazyListState
+ import androidx.compose.foundation.lazy.LazyRow
+ import androidx.compose.foundation.lazy.itemsIndexed
+ import androidx.compose.foundation.lazy.rememberLazyListState
+-import androidx.compose.ui.draw.drawWithContent
+-import androidx.compose.ui.graphics.CompositingStrategy
+-import androidx.compose.ui.graphics.graphicsLayer
++import androidx.compose.ui.draw.drawWithCache
+ import androidx.compose.foundation.ExperimentalFoundationApi
+ import androidx.compose.foundation.focusGroup
+ import androidx.compose.foundation.gestures.BringIntoViewSpec
+@@ -500,7 +498,10 @@ fun ContinueWatchingCard(
+     val useShortLabels = isPosterStyle || isWideStyle
+     val effectiveNextUpLabel = if (useShortLabels) strNextUpShort else strNextUp
+     val effectiveNewEpisodeLabel = if (useShortLabels) strNewEpisodeShort else strNewEpisode
+-    val nextUpBadgeText = nextUp?.let { info ->
++    val epochDay = java.time.LocalDate.now().toEpochDay()
++    val nextUpBadgeText = remember(
++        nextUp, useShortLabels, strNewSeason, effectiveNewEpisodeLabel, effectiveNextUpLabel, strUpcoming, epochDay
++    ) { nextUp?.let { info ->
+         if (info.isReleaseAlert) {
+             if (info.isNewSeasonRelease) strNewSeason else effectiveNewEpisodeLabel
+         } else if (!info.hasAired) {
+@@ -513,7 +514,7 @@ fun ContinueWatchingCard(
+         } else {
+             effectiveNextUpLabel
+         }
+-    }
++    } }
+     val remainingText = progress?.let {
+         remember(it.position, it.duration, it.progressPercent) {
+             formatContinueWatchingProgressLabel(
+@@ -541,18 +542,16 @@ fun ContinueWatchingCard(
+             else -> firstNonBlank(progress?.backdrop, progress?.poster)
+         }
+     }
+-    var usesFallbackImage by remember { mutableStateOf(false) }
+-    // Reset fallback state when the item changes
+-    LaunchedEffect(imageModel) { usesFallbackImage = false }
++    var usesFallbackImage by remember(imageModel) { mutableStateOf(false) }
+ 
+     val effectiveImageModel = if (usesFallbackImage) fallbackImageModel else imageModel
+     val titleText = remember(progress, nextUp) { progress?.name ?: nextUp?.name.orEmpty() }
+     val context = LocalContext.current
+-    val strAirsDateForEpisode = computeAirDateBadgeText(context, nextUp?.released, nextUp?.airDateLabel)
+-    val episodeTitle = remember(progress, nextUp, context, strAirsDateForEpisode) {
++    val episodeTitle = remember(progress, nextUp, context, epochDay) {
+         when {
+             progress != null -> progress.episodeTitle?.localizeEpisodeTitle(context)
+-            nextUp != null && !nextUp.hasAired -> nextUp.episodeTitle?.localizeEpisodeTitle(context) ?: strAirsDateForEpisode
++            nextUp != null && !nextUp.hasAired -> nextUp.episodeTitle?.localizeEpisodeTitle(context)
++                ?: computeAirDateBadgeText(context, nextUp.released, nextUp.airDateLabel)
+             else -> nextUp?.episodeTitle?.localizeEpisodeTitle(context)
+         }
+     }
+@@ -581,10 +580,9 @@ fun ContinueWatchingCard(
+     }
+ 
+     // Hold the title still until focus has settled, then let it scroll if it overflows.
+-    var titleMarqueeActive by remember { mutableStateOf(false) }
+-    LaunchedEffect(isFocused, titleText) {
+-        titleMarqueeActive = false
+-        if (isFocused) {
++    var titleMarqueeActive by remember(isFocused, titleText) { mutableStateOf(false) }
++    if (isFocused) {
++        LaunchedEffect(titleText) {
+             delay(TITLE_MARQUEE_DELAY_MS)
+             titleMarqueeActive = true
+         }
+@@ -671,10 +669,8 @@ fun ContinueWatchingCard(
+         focusedBorder = if (textBelowArtwork) {
+             Border.None
+         } else {
+-            Border(
+-                border = NuvioTheme.focusRing.border(NuvioTheme.spacing.xxs),
+-                shape = cwCardShape
+-            )
++            val ring = NuvioTheme.focusRing.border(NuvioTheme.spacing.xxs)
++            remember(ring, cwCardShape) { Border(border = ring, shape = cwCardShape) }
+         }
+     ) {
+         if (isWideStyle) {
+@@ -758,34 +754,32 @@ fun ContinueWatchingCard(
+                         contentDescription = null,
+                         modifier = Modifier
+                             .fillMaxSize()
+-                            .graphicsLayer {
+-                                compositingStrategy =
+-                                    CompositingStrategy.Offscreen
+-                            }
+-                            .clip(cwClipShape)
+-
+-                            // Gradient overlay for text legibility, only needed when text sits on the artwork.
+-                            .drawWithContent {
+-                                drawContent()
+-                                if (textBelowArtwork) return@drawWithContent
+-
+-                                val startYPos = size.height * 0.45f
+-                                val gradient = Brush.verticalGradient(
+-                                    colorStops = arrayOf(
+-                                        0.0f to Color.Transparent,
+-                                        0.6f to bgColor.copy(alpha = 0.7f),
+-                                        1.0f to bgColor.copy(alpha = 0.95f)
+-                                    ),
+-                                    startY = startYPos,
+-                                    endY = size.height
+-                                )
+-
+-                                drawRect(
+-                                    brush = gradient,
+-                                    topLeft = Offset(-2f, startYPos),
+-                                    size = Size(size.width + 4f, (size.height - startYPos) + 4f)
+-                                )
+-                            },
++                            .then(
++                                if (textBelowArtwork) {
++                                    Modifier
++                                } else {
++                                    Modifier.drawWithCache {
++                                        val startYPos = size.height * 0.45f
++                                        val gradient = Brush.verticalGradient(
++                                            colorStops = arrayOf(
++                                                0.0f to Color.Transparent,
++                                                0.6f to bgColor.copy(alpha = 0.7f),
++                                                1.0f to bgColor.copy(alpha = 0.95f)
++                                            ),
++                                            startY = startYPos,
++                                            endY = size.height
++                                        )
++                                        onDrawWithContent {
++                                            drawContent()
++                                            drawRect(
++                                                brush = gradient,
++                                                topLeft = Offset(-2f, startYPos),
++                                                size = Size(size.width + 4f, (size.height - startYPos) + 4f)
++                                            )
++                                        }
++                                    }
++                                }
++                            ),
+                         placeholder = backgroundPainter,
+                         error = backgroundPainter,
+                         fallback = backgroundPainter,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/components/LightweightCard.kt b/app/src/main/java/com/nuvio/tv/ui/components/LightweightCard.kt
+index 5f1627cb4..6a966c030 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/components/LightweightCard.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/components/LightweightCard.kt
+@@ -2,7 +2,6 @@ package com.nuvio.tv.ui.components
+ 
+ import android.os.Build
+ import android.view.KeyEvent as AndroidKeyEvent
+-import androidx.compose.animation.core.animateFloatAsState
+ import androidx.compose.foundation.background
+ import androidx.compose.foundation.focusable
+ import androidx.compose.foundation.interaction.MutableInteractionSource
+@@ -77,10 +76,6 @@ fun LightweightCard(
+     val interactionSource = remember { MutableInteractionSource() }
+     val focused by interactionSource.collectIsFocusedAsState()
+     val pressed by interactionSource.collectIsPressedAsState()
+-    val zIndex = animateFloatAsState(
+-        targetValue = if (focused) FOCUSED_Z_INDEX else NON_FOCUSED_Z_INDEX,
+-        label = "zIndex"
+-    )
+     val border = if (focused || pressed) focusedBorder else Border.None
+     val glow = if (focused && !pressed) focusedGlow else Glow.None
+     val glowColor = if (glow.elevationColor == MaterialTheme.colorScheme.surface) {
+@@ -137,7 +132,7 @@ fun LightweightCard(
+                 .layout { measurable, constraints ->
+                     val placeable = measurable.measure(constraints)
+                     layout(placeable.width, placeable.height) {
+-                        placeable.place(0, 0, zIndex = zIndex.value)
++                        placeable.place(0, 0, zIndex = if (focused) FOCUSED_Z_INDEX else NON_FOCUSED_Z_INDEX)
+                     }
+                 }
+                 .then(if (border != Border.None) CardBorderElement(shape, border) else Modifier)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlaybackConnectionEvents.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlaybackConnectionEvents.kt
+index e1221aaa4..2bf276717 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlaybackConnectionEvents.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlaybackConnectionEvents.kt
+@@ -151,7 +151,8 @@ internal class PlaybackConnectionEventListener(
+             "headers=${headersMs}ms total=${totalMs}ms " +
+             "preDns=${preDnsMs}ms route=${routeMs}ms ttfb=${ttfbMs}ms acqToHdr=${acqToHdrMs}ms " +
+             "inflight=$inflightAtStart hostInflight=$hostInflightAtStart " +
+-            "code=$code proto=$protoLabel range=$rangeLabel host=$currentHost"
++            "code=$code proto=$protoLabel range=$rangeLabel host=$currentHost" +
++            (if (callT0 > 0L) " start=${PlaybackConnectionEvents.sinceSessionStart(callT0)}ms" else "")
+         PlaybackConnectionEvents.recordEvent(logLine)
+     }
+ }
+@@ -177,7 +178,13 @@ internal object PlaybackConnectionEvents : EventListener.Factory {
+     }
+ 
+     fun recentEvents(): List<String> = recentLogs.toList()
++    @Volatile private var sessionStartMs = android.os.SystemClock.elapsedRealtime()
++
++    /** Call start against the last [clear], so lines of one playback can be put in start order. Warm-up calls show negative. */
++    fun sinceSessionStart(elapsedRealtimeMs: Long): Long = elapsedRealtimeMs - sessionStartMs
++
+     fun clear() {
++        sessionStartMs = android.os.SystemClock.elapsedRealtime()
+         recentLogs.clear()
+         resolvedServingHost = null
+         inflightTotal.set(0)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAfrPreflight.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAfrPreflight.kt
+index 92d3e5760..deed7dccc 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAfrPreflight.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAfrPreflight.kt
+@@ -89,7 +89,7 @@ internal suspend fun PlayerRuntimeController.runAfrPreflightIfEnabled(
+                     detectedFrameRateSource = FrameRateSource.PROBE
+                 )
+             }
+-            val prefer23976ProbeBias = cached.raw in 23.95f..23.999f
++            val prefer23976ProbeBias = FrameRateUtils.prefers23976(cached.raw)
+             val targetFrameRate = FrameRateUtils.refineFrameRateForDisplay(
+                 activity = activity,
+                 detectedFps = cached.snapped,
+@@ -223,7 +223,7 @@ internal suspend fun PlayerRuntimeController.runAfrPreflightIfEnabled(
+             )
+         }
+ 
+-        val prefer23976ProbeBias = detection.raw in 23.95f..23.999f
++        val prefer23976ProbeBias = FrameRateUtils.prefers23976(detection.raw)
+         val targetFrameRate = FrameRateUtils.refineFrameRateForDisplay(
+             activity = activity,
+             detectedFps = detection.snapped,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
+index 96eeb1dfe..fee87140d 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
+@@ -23,6 +23,8 @@ import com.nuvio.tv.data.repository.PlaybackIssueReportInput
+ import com.nuvio.tv.data.repository.SkipInterval
+ import com.nuvio.tv.domain.model.WatchProgress
+ import java.io.IOException
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.NonCancellable
+ import kotlinx.coroutines.delay
+ import com.nuvio.tv.data.repository.ForkTvPreferences
+ import kotlinx.coroutines.flow.update
+@@ -953,8 +955,10 @@ internal fun PlayerRuntimeController.saveWatchProgressInternal(position: Long, d
+ 
+     val progress = currentWatchProgress(parentContentId, parentContentType, position, duration, System.currentTimeMillis())
+         .copy(progressPercent = fallbackPercent)
++    val plan = watchProgressSavePlan(progress.isCompleted(), hasMarkedCurrentEpisodeCompleted)
++    if (plan == WatchProgressSavePlan.MARK_COMPLETED) hasMarkedCurrentEpisodeCompleted = true
+ 
+-    scope.launch(kotlinx.coroutines.NonCancellable) {
++    scope.launch(NonCancellable + watchProgressSaveDispatcher) {
+         try {
+             val effectiveContentId = watchProgressRepository.normalizeParentContentId(
+                 parentContentId = progress.contentId,
+@@ -962,9 +966,8 @@ internal fun PlayerRuntimeController.saveWatchProgressInternal(position: Long, d
+                 profileId = profileId
+             )
+             val normalizedProgress = progress.copy(contentId = effectiveContentId)
+-            if (normalizedProgress.isCompleted()) {
+-                if (!hasMarkedCurrentEpisodeCompleted) {
+-                    hasMarkedCurrentEpisodeCompleted = true
++            if (plan == WatchProgressSavePlan.MARK_COMPLETED || plan == WatchProgressSavePlan.ALREADY_COMPLETED) {
++                if (plan == WatchProgressSavePlan.MARK_COMPLETED) {
+                     watchProgressRepository.markAsCompleted(
+                         normalizedProgress,
+                         profileId = profileId,
+@@ -972,7 +975,7 @@ internal fun PlayerRuntimeController.saveWatchProgressInternal(position: Long, d
+                     )
+                 }
+                 runCatching { tvRecommendationManager.onProgressRemoved(normalizedProgress.contentId) }
+-            } else if (!hasMarkedCurrentEpisodeCompleted) {
++            } else if (plan == WatchProgressSavePlan.SAVE_IN_PROGRESS) {
+                 // Only save in-progress when the episode has not already been
+                 // marked as completed during this playback session.  After
+                 // natural playback completion the player can report stale
+@@ -992,6 +995,18 @@ internal fun PlayerRuntimeController.saveWatchProgressInternal(position: Long, d
+     }
+ }
+ 
++private val watchProgressSaveDispatcher = Dispatchers.IO.limitedParallelism(1)
++
++internal enum class WatchProgressSavePlan { MARK_COMPLETED, ALREADY_COMPLETED, SAVE_IN_PROGRESS, SKIP }
++
++internal fun watchProgressSavePlan(completed: Boolean, alreadyMarkedCompleted: Boolean): WatchProgressSavePlan =
++    when {
++        completed && !alreadyMarkedCompleted -> WatchProgressSavePlan.MARK_COMPLETED
++        completed -> WatchProgressSavePlan.ALREADY_COMPLETED
++        !alreadyMarkedCompleted -> WatchProgressSavePlan.SAVE_IN_PROGRESS
++        else -> WatchProgressSavePlan.SKIP
++    }
++
+ private fun PlayerRuntimeController.saveCloudLibraryProgress(
+     position: Long,
+     duration: Long,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerSubtitleUtils.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerSubtitleUtils.kt
+index 64c4734b7..2b513f97b 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerSubtitleUtils.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerSubtitleUtils.kt
+@@ -5,6 +5,7 @@ import android.text.Spanned
+ import androidx.media3.common.MimeTypes
+ import androidx.media3.common.text.Cue
+ import com.nuvio.tv.ui.util.LANGUAGE_OVERRIDES
++import com.nuvio.tv.ui.util.LANGUAGE_WHITESPACE_RUN
+ import com.nuvio.tv.ui.util.resolveLanguageNameAlias
+ 
+ internal object PlayerSubtitleUtils {
+@@ -17,7 +18,7 @@ internal object PlayerSubtitleUtils {
+             .replace('-', ' ')
+             .replace('.', ' ')
+             .replace('/', ' ')
+-            .replace(Regex("\\s+"), " ")
++            .replace(LANGUAGE_WHITESPACE_RUN, " ")
+             .trim()
+ 
+         fun containsAny(vararg values: String): Boolean = values.any { value ->
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
+index 880893bbd..6b3f7707d 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
+@@ -1503,6 +1503,10 @@ class StreamScreenViewModel @Inject constructor(
+                 showDirectDebridPlaybackError(context.getString(R.string.debrid_stale_stream), refreshStreams = true)
+                 null
+             }
++            is DirectDebridResolveResult.Busy -> {
++                showDirectDebridPlaybackError(context.getString(R.string.debrid_busy, result.httpStatus), refreshStreams = false)
++                null
++            }
+             DirectDebridResolveResult.Error -> {
+                 showDirectDebridPlaybackError(context.getString(R.string.debrid_resolution_failed), refreshStreams = false)
+                 null
+diff --git a/app/src/main/java/com/nuvio/tv/ui/util/LanguageUtils.kt b/app/src/main/java/com/nuvio/tv/ui/util/LanguageUtils.kt
+index 9e67c3963..bce6c984b 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/util/LanguageUtils.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/util/LanguageUtils.kt
+@@ -219,11 +219,16 @@ internal val LANGUAGE_NAME_ALIASES = mapOf(
+     "zulu" to "zu"
+ )
+ 
++internal val LANGUAGE_WHITESPACE_RUN = Regex("\\s+")
++
++private val LANGUAGE_NAME_ALIASES_LONGEST_FIRST =
++    LANGUAGE_NAME_ALIASES.entries.sortedByDescending { it.key.length }
++
+ internal fun resolveLanguageNameAlias(tokenized: String): String? {
+     if (tokenized.isBlank()) return null
+     LANGUAGE_NAME_ALIASES[tokenized]?.let { return it }
+-    return LANGUAGE_NAME_ALIASES.entries
+-        .sortedByDescending { it.key.length }
++    if (' ' !in tokenized) return null
++    return LANGUAGE_NAME_ALIASES_LONGEST_FIRST
+         .firstOrNull { (name, _) ->
+             tokenized == name ||
+                 tokenized.startsWith("$name ") ||
+@@ -245,7 +250,7 @@ fun languageCodeToName(code: String): String {
+         .replace('-', ' ')
+         .replace('.', ' ')
+         .replace('/', ' ')
+-        .replace(Regex("\\s+"), " ")
++        .replace(LANGUAGE_WHITESPACE_RUN, " ")
+         .trim()
+     val bcp47 = LANGUAGE_OVERRIDES[lowerCode]
+         ?: resolveLanguageNameAlias(tokenized)
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index b235e9641..53d08a030 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1804,6 +1804,7 @@
+     <string name="debrid_missing_api_key">Add a Debrid API key in Settings.</string>
+     <string name="debrid_not_cached">Not cached on this service.</string>
+     <string name="debrid_resolution_failed">Could not resolve this Debrid stream.</string>
++    <string name="debrid_busy">The Debrid service is busy right now (HTTP %1$d). The link may still work in a moment.</string>
+     <string name="youtube_resolving_stream">Loading YouTube video</string>
+     <string name="youtube_resolution_failed">Could not load this YouTube video.</string>
+     <string name="stream_type_torrent">Torrent</string>
