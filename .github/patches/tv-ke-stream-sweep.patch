@@ -1,0 +1,1081 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/network/StreamSpeedTester.kt b/app/src/main/java/com/nuvio/tv/core/network/StreamSpeedTester.kt
+index 130418f9d..2633f0f7f 100644
+--- a/app/src/main/java/com/nuvio/tv/core/network/StreamSpeedTester.kt
++++ b/app/src/main/java/com/nuvio/tv/core/network/StreamSpeedTester.kt
+@@ -13,7 +13,9 @@ import okhttp3.Request
+ @UnstableApi
+ object StreamSpeedTester {
+ 
+-    private const val WARMUP_BYTES = 8L * 1024 * 1024
++    // internal so StreamSweepEngine can charge the sweep's whole-run byte budget
++    // for each cell's warm-up phase without duplicating the constant.
++    internal const val WARMUP_BYTES = 8L * 1024 * 1024
+     private const val WARMUP_MAX_MS = 750L
+     private const val MEASURE_BYTES = 64L * 1024 * 1024
+     private const val MEASURE_MAX_MS = 8_000L
+@@ -24,12 +26,24 @@ object StreamSpeedTester {
+         val mbps: Double,
+         val subWindowMbps: List<Double> = emptyList(),
+         val failureReason: String? = null,
+-        val clampTrips: Int = 0
++        val clampTrips: Int = 0,
++        /**
++         * Network bytes transferred during the measurement window (excludes the
++         * warm-up phase; the TransferListener count spans both). 0 on failure.
++         * StreamSweepEngine charges the sweep's whole-run byte budget from this.
++         */
++        val networkBytes: Long = 0L
+     )
+ 
+     suspend fun runBaselineTest(
+         url: String,
+-        headers: Map<String, String>
++        headers: Map<String, String>,
++        /**
++         * Optional byte cap for the measurement window; defaults to the classic
++         * [MEASURE_BYTES] budget. StreamSweepEngine passes a smaller cap so the
++         * whole sweep stays inside its ~200 MB whole-run budget.
++         */
++        measureBytes: Long = MEASURE_BYTES
+     ): Double = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+         try {
+             val request = Request.Builder().url(url).apply {
+@@ -54,7 +68,7 @@ object StreamSpeedTester {
+                 var totalBytes = 0L
+                 val tStart = System.currentTimeMillis()
+                 val tDeadline = tStart + MEASURE_MAX_MS
+-                while (totalBytes < MEASURE_BYTES && System.currentTimeMillis() < tDeadline) {
++                while (totalBytes < measureBytes && System.currentTimeMillis() < tDeadline) {
+                     val read = inputStream.read(buffer)
+                     if (read == -1) break
+                     totalBytes += read
+@@ -75,7 +89,19 @@ object StreamSpeedTester {
+         headers: Map<String, String>,
+         chunkSizeBytes: Long,
+         parallelConnections: Int,
+-        prefetchDepthChunks: Int = parallelConnections + 1
++        prefetchDepthChunks: Int = parallelConnections + 1,
++        /**
++         * Optional byte cap for the measurement window (defaults to the classic
++         * [MEASURE_BYTES]). StreamSweepEngine passes an equal-share slice of the
++         * sweep's whole-run budget so the ladder fits inside ~200 MB.
++         */
++        measureBytes: Long = MEASURE_BYTES,
++        /**
++         * Optional minimum measurement duration (defaults to [MEASURE_MIN_MS]).
++         * StreamSweepEngine passes 0 so the byte cap stays the binding stop
++         * condition on fast links instead of the duration floor overshooting it.
++         */
++        minMeasureMs: Long = MEASURE_MIN_MS
+     ): ParallelPassResult = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+         val totalBytesDownloaded = java.util.concurrent.atomic.AtomicLong(0L)
+ 
+@@ -142,8 +168,8 @@ object StreamSpeedTester {
+             }
+             sampler = samplerJob
+             while (!eof &&
+-                (totalBytesDownloaded.get() - networkAtMeasureStart < MEASURE_BYTES ||
+-                    System.currentTimeMillis() - tStart < MEASURE_MIN_MS) &&
++                (totalBytesDownloaded.get() - networkAtMeasureStart < measureBytes ||
++                    System.currentTimeMillis() - tStart < minMeasureMs) &&
+                 System.currentTimeMillis() < tDeadline
+             ) {
+                 val read = dataSource.read(buffer, 0, buffer.size)
+@@ -162,7 +188,8 @@ object StreamSpeedTester {
+             return@withContext ParallelPassResult(
+                 mbps = (networkDelta * 8.0) / (elapsed * 1000.0),
+                 subWindowMbps = subWindowMbps.toList(),
+-                clampTrips = clampTrips
++                clampTrips = clampTrips,
++                networkBytes = networkDelta
+             )
+         } catch (e: kotlinx.coroutines.CancellationException) {
+             throw e
+diff --git a/app/src/main/java/com/nuvio/tv/core/network/StreamSweepEngine.kt b/app/src/main/java/com/nuvio/tv/core/network/StreamSweepEngine.kt
+new file mode 100644
+index 000000000..f85ba3d87
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/network/StreamSweepEngine.kt
+@@ -0,0 +1,592 @@
++package com.nuvio.tv.core.network
++
++import androidx.media3.common.util.UnstableApi
++import kotlinx.coroutines.currentCoroutineContext
++import kotlinx.coroutines.ensureActive
++
++/**
++ * The adaptive "deep" stream sweep, ported from Nuvio-KE's StreamSweepEngine and
++ * reduced to its four-stage greedy climb so it can sit beside the quick test in
++ * the network settings as a second mode. It answers one question: how many
++ * parallel connections can this box pull, and at what bitrate.
++ *
++ * Algorithm:
++ *   Stage 1  Baseline (single connection) via [StreamSpeedTester.runBaselineTest].
++ *            The sweep target is [TARGET_BITRATE_MULTIPLE] x the last title's
++ *            bitrate. If the baseline already meets the target the verdict is
++ *            "leave parallel off" and the sweep ends — parallel connections
++ *            only help when one connection cannot feed the title.
++ *   Stage 2  Chunk climb: 8 -> 16 -> 32 MB chunks (capped by the RAM tier's
++ *            chunk ceiling, 16 MB on low-RAM) at [CHUNK_CLIMB_CONNECTIONS]
++ *            connections. A rung is kept while throughput holds; the first
++ *            regression ends the limb.
++ *   Stage 3  Connection climb at the best chunk: 3 -> 4 -> 8 -> 16 (rungs
++ *            above the standard setting limit are measured but flagged as
++ *            requiring Performance Mode). Again, stop at the first regression.
++ *   Verdict  Cheapest configuration that meets the target, else the fastest
++ *            configuration found (marginal vs cannot-sustain), else none.
++ *
++ * Deviations from the KE original (deliberate, kept small on purpose):
++ *   - KE's neighbour refinement, below-target cross-check and h2 A/B stages
++ *     are not ported; the feature here is the plain greedy climb.
++ *   - KE's asymmetric stop rule (one grace step through a regression while
++ *     below target) is reduced to "stop at the first regression" as specified.
++ *   - KE's retry/pause ladder for rate-limited cells is not ported; a refused
++ *     cell is reported as a void row and the climb rules decide what it means
++ *     (continue in the chunk limb, end the limb in the connection climb —
++ *     rate limiting tracks request rate, so a refusal at N connections all but
++ *     guarantees one at N+1).
++ *
++ * Budgets: the whole sweep is capped at ~200 MB of transfer and 90 s of wall
++ * clock, checked as hard stops between cells (each cell is additionally
++ * bounded by the tester's own 8 s deadline). The byte budget is divided into
++ * equal per-cell shares with rollover — cells that are skipped or transfer
++ * less than their share leave it for later rungs, so the whole ladder fits
++ * under the cap regardless of link speed.
++ *
++ * Purity: this object holds the climb policy only — no Context, no resources,
++ * no player state. Results are the immutable [SweepRow] / [SweepResult] types
++ * below; the settings screen renders them with network_sweep_* strings. The
++ * caller must not start a sweep while playback is active (the screen gates on
++ * PlayerSessionTracker.isSessionOpen), and cancellation works by simply
++ * cancelling the calling coroutine (the screen's rememberCoroutineScope dies
++ * on navigation): checkpoints between cells rethrow CancellationException and
++ * the tester rethrows it mid-cell.
++ *
++ * Threading: run() executes on the caller's dispatcher and suspends into IO
++ * inside StreamSpeedTester for the transfers, so [onRowAdded] fires on the
++ * caller's context and can update Compose state directly.
++ */
++@UnstableApi
++object StreamSweepEngine {
++
++    // ── Climb policy ──────────────────────────────────────────────────────
++
++    /**
++     * The sweep target: this multiple of the last title's bitrate. Parallel
++     * configurations are judged against it (with [SUFFICIENCY_TOLERANCE]).
++     */
++    const val TARGET_BITRATE_MULTIPLE = 2.0
++
++    /**
++     * Sufficiency is judged with a near-miss tolerance: single-sample passes on
++     * noisy links make a 1-2% shortfall against the 2x bar indistinguishable
++     * from passing. [inferred] initial value, field-tunable.
++     */
++    const val SUFFICIENCY_TOLERANCE = 0.95
++
++    /**
++     * First-regression stop bar: a rung holds only when its Mbps is at least
++     * [REGRESSION_BAR] x the previous rung's. 1.0 means any drop ends the limb.
++     */
++    const val REGRESSION_BAR = 1.0
++
++    /** Chunk ladder for stage 2, filtered by the RAM tier's chunk ceiling. */
++    val CHUNK_LADDER_MB = listOf(8, 16, 32)
++
++    /** Connection ladder for stage 3, filtered by what the device can apply. */
++    val CONNECTION_LADDER = listOf(3, 4, 8, 16)
++
++    /** The chunk-climb limb runs at this fixed connection count: the setting minimum. */
++    const val CHUNK_CLIMB_CONNECTIONS = 2
++
++    /**
++     * Void-cell floor (KE N3d-a3): a cell that transferred essentially nothing
++     * measured a refusal, not its configuration. The floor is relative to the
++     * baseline so it is link-agnostic, with an absolute guard.
++     */
++    const val VOID_FLOOR_OF_BASELINE = 0.05
++    const val VOID_FLOOR_ABSOLUTE_MBPS = 1.0
++
++    /**
++     * Absolute guard on one cell's concurrent transfer (connections x chunkMb).
++     * Cells beyond it are refused without measuring, regardless of the device's
++     * native-memory limits — the sweep is a measurement tool, not a stress test.
++     */
++    const val MAX_CELL_CONCURRENT_MB = 512
++
++    // ── Sweep budget ──────────────────────────────────────────────────────
++
++    /** Whole-run transfer cap (measure + warm-up), the task's ~200 MB. */
++    const val SWEEP_MAX_TRANSFER_BYTES = 200L * 1024 * 1024
++
++    /**
++     * Smallest measurement window worth spending a cell on; when a cell's
++     * budget share cannot fund this, the sweep stops as budget-exhausted.
++     */
++    const val SWEEP_MIN_CELL_MEASURE_BYTES = 8L * 1024 * 1024
++
++    /**
++     * Upper bound on a single cell's measurement window. Ordinarily the
++     * equal-share slice below is smaller; this only binds when skipped cells
++     * roll their shares forward onto a late rung.
++     */
++    const val SWEEP_MAX_CELL_MEASURE_BYTES = 64L * 1024 * 1024
++
++    /** Whole-run wall-clock hard stop, checked between cells. */
++    const val SWEEP_WALL_CLOCK_MAX_MS = 90_000L
++
++    /**
++     * Pass cap after the baseline. Secondary guard: at the tester's 8 s
++     * deadline per cell, 1 baseline + 8 cells is ~79 s, inside the wall clock.
++     */
++    const val SWEEP_MAX_PARALLEL_PASSES = 8
++
++    /**
++     * Buffer slots beyond the connections themselves that the parallel data
++     * source keeps. Matches MemoryBudget.parallelOverheadMb's buffer count
++     * (connections + 2) so the sweep's gate agrees with the settings UI's
++     * model of the same allocation; inlined here because the engine lives in
++     * core/network and must not import the UI package.
++     */
++    private const val OVERHEAD_BUFFER_SLOTS = 2
++
++    // ── Result types (immutable; the UI renders these) ────────────────────
++
++    enum class StageKind { BASELINE, CHUNK_CLIMB, CONNECTION_CLIMB }
++
++    enum class NoteKind {
++        /** Not run: estimated overhead over the device's warning limit. */
++        SKIPPED_BUDGET,
++        /** Not run: connections x chunkMb over [MAX_CELL_CONCURRENT_MB]. */
++        SKIPPED_CAP,
++        /** Ran but was rate-limited (clamp trips) — a refusal, not a measurement. */
++        RATE_LIMITED,
++        /** Ran but transferred below the void floor — treated as a refusal. */
++        NO_TRANSFER,
++        /** Ran and failed; [SweepNote.detail] carries the tester's reason. */
++        FAILED,
++        /** Measured, but the count needs Performance Mode to apply at runtime. */
++        ABOVE_STANDARD_LIMIT,
++        /** Measured, but the configuration sits between safe and warning budget. */
++        NEAR_BUDGET
++    }
++
++    /**
++     * Why a row is not a plain measurement. [overheadMb] / [limitMb] feed the
++     * budget-note strings; [detail] carries a technical reason verbatim.
++     */
++    data class SweepNote(
++        val kind: NoteKind,
++        val overheadMb: Int = -1,
++        val limitMb: Int = -1,
++        val detail: String? = null
++    )
++
++    /** One measured (or refused/skipped) rung. [connections] is 1 and [chunkMb] 0 for the baseline. */
++    data class SweepRow(
++        val stage: StageKind,
++        val connections: Int,
++        val chunkMb: Int,
++        /** Null when the cell was skipped or its result was voided. */
++        val mbps: Double?,
++        val note: SweepNote? = null
++    )
++
++    enum class VerdictKind {
++        /** Baseline alone met the 2x target — parallel connections stay off. */
++        LEAVE_PARALLEL_OFF,
++        /** Cheapest configuration that meets the target. */
++        RECOMMEND_CONFIG,
++        /** Nothing met 2x, but the fastest pass beats the title's own bitrate. */
++        MARGINAL,
++        /** The fastest pass is below the title's own bitrate. */
++        CANNOT_SUSTAIN,
++        /** No bitrate known — fastest measured configuration reported. */
++        FASTEST_NO_BITRATE,
++        /** Sweep ended without a usable recommendation. */
++        NONE
++    }
++
++    enum class StopReason { BUDGET, TIME, PASS_CAP }
++
++    enum class ErrorKind { CONNECTION, UNEXPECTED }
++
++    data class Recommendation(
++        val connections: Int,
++        val chunkMb: Int,
++        val mbps: Double,
++        val meetsTarget: Boolean,
++        /** Overhead model fits the device's safe native-memory limit. */
++        val fitsSafeBudget: Boolean
++    )
++
++    /** Device-shaped policy inputs, computed by the caller from tree primitives. */
++    data class SweepConfig(
++        /**
++         * Connection-count climb ceiling = what this device can actually apply:
++         * 16 with Performance Mode (native memory, API 26+), else
++         * PlayerSettings.MAX_PARALLEL_CONNECTION_COUNT.
++         */
++        val maxConnectionCount: Int,
++        /** The standard (non-Performance-Mode) limit; rows above it are flagged. */
++        val standardConnectionCount: Int,
++        /** RAM tier chunk ceiling: MemoryBudget.tierMaxChunkMb. */
++        val tierMaxChunkMb: Int,
++        /** NuvioExoPlayerPerformanceHelper.getSafeNativeMemoryLimitMb(context). */
++        val safeLimitMb: Int,
++        /** NuvioExoPlayerPerformanceHelper.getWarningNativeMemoryLimitMb(context). */
++        val warningLimitMb: Int
++    )
++
++    data class SweepResult(
++        val verdictKind: VerdictKind,
++        val baselineMbps: Double,
++        val targetMbps: Double?,
++        val rows: List<SweepRow>,
++        val recommendation: Recommendation?,
++        val stoppedEarly: StopReason?,
++        val errorKind: ErrorKind?,
++        /** Technical detail for [ErrorKind.UNEXPECTED]; not UI copy. */
++        val errorDetail: String?,
++        val elapsedMs: Long
++    )
++
++    /**
++     * Runs the sweep. [estimatedBitrate] is the last title's bitrate in bits/s
++     * (null when unknown — the verdict then reports the fastest configuration).
++     * The full row list is pushed to [onRows] whenever it changes — a pending
++     * row (mbps null, no note) appears before its cell starts and is replaced
++     * in place when the cell completes — so the screen can render progress;
++     * the final [SweepResult] is the return value.
++     */
++    suspend fun run(
++        streamUrl: String,
++        headers: Map<String, String>,
++        estimatedBitrate: Long?,
++        config: SweepConfig,
++        onRows: (List<SweepRow>) -> Unit
++    ): SweepResult {
++        val startMs = System.currentTimeMillis()
++        val rows = mutableListOf<SweepRow>()
++        var remainingBytes = SWEEP_MAX_TRANSFER_BYTES
++        var stopReason: StopReason? = null
++        var parallelPasses = 0
++        var baselineMbps = 0.0
++        val targetMbps = estimatedBitrate?.takeIf { it > 0 }
++            ?.let { it * TARGET_BITRATE_MULTIPLE / 1_000_000.0 }
++
++        val chunkLadder = CHUNK_LADDER_MB
++            .filter { it <= config.tierMaxChunkMb }
++            .ifEmpty { listOf(CHUNK_LADDER_MB.first()) }
++        val connLadder = CONNECTION_LADDER.filter { it <= config.maxConnectionCount }
++        // Budget plan: one share per cell that will run. Skipped cells never
++        // advance the index, so their share rolls over to later rungs.
++        val plannedCells = 1 + chunkLadder.size + connLadder.size
++        var nextCellIndex = 0
++
++        fun overheadMb(connections: Int, chunkMb: Int): Int =
++            (connections + OVERHEAD_BUFFER_SLOTS) * chunkMb
++
++        fun voidFloorMbps(): Double =
++            maxOf(VOID_FLOOR_ABSOLUTE_MBPS, baselineMbps * VOID_FLOOR_OF_BASELINE)
++
++        suspend fun checkpoint() {
++            currentCoroutineContext().ensureActive()
++        }
++
++        fun emitRows() {
++            onRows(rows.toList())
++        }
++
++        fun mayContinue(): Boolean {
++            if (stopReason != null) return false
++            when {
++                parallelPasses >= SWEEP_MAX_PARALLEL_PASSES -> stopReason = StopReason.PASS_CAP
++                System.currentTimeMillis() - startMs >= SWEEP_WALL_CLOCK_MAX_MS ->
++                    stopReason = StopReason.TIME
++                remainingBytes < StreamSpeedTester.WARMUP_BYTES + SWEEP_MIN_CELL_MEASURE_BYTES ->
++                    stopReason = StopReason.BUDGET
++            }
++            return stopReason == null
++        }
++
++        fun rejectNote(connections: Int, chunkMb: Int): SweepNote? = when {
++            overheadMb(connections, chunkMb) > config.warningLimitMb -> SweepNote(
++                NoteKind.SKIPPED_BUDGET,
++                overheadMb = overheadMb(connections, chunkMb),
++                limitMb = config.warningLimitMb
++            )
++            connections * chunkMb > MAX_CELL_CONCURRENT_MB -> SweepNote(
++                NoteKind.SKIPPED_CAP,
++                overheadMb = connections * chunkMb,
++                limitMb = MAX_CELL_CONCURRENT_MB
++            )
++            else -> null
++        }
++
++        // KE N3d-a3 void rule, one home: a clamped cell ran on ONE connection
++        // (not the labelled count) and a starved cell transferred essentially
++        // nothing — both are refusals by the source, not measurements.
++        fun voidNote(pass: StreamSpeedTester.ParallelPassResult): SweepNote? = when {
++            pass.failureReason != null -> SweepNote(NoteKind.FAILED, detail = pass.failureReason)
++            pass.clampTrips > 0 -> SweepNote(NoteKind.RATE_LIMITED)
++            pass.mbps < voidFloorMbps() -> SweepNote(NoteKind.NO_TRANSFER)
++            else -> null
++        }
++
++        fun nextCellMeasureBytes(): Long? {
++            val remainingPlanned = plannedCells - nextCellIndex
++            if (remainingPlanned <= 0) return null
++            val share = remainingBytes / remainingPlanned
++            val measure = share - StreamSpeedTester.WARMUP_BYTES
++            if (measure < SWEEP_MIN_CELL_MEASURE_BYTES) return null
++            return measure.coerceAtMost(SWEEP_MAX_CELL_MEASURE_BYTES)
++        }
++
++        fun addRow(row: SweepRow) {
++            rows += row
++            emitRows()
++        }
++
++        fun startPending(stage: StageKind, connections: Int, chunkMb: Int) {
++            rows += SweepRow(stage, connections, chunkMb, null, null)
++            emitRows()
++        }
++
++        fun completePending(row: SweepRow) {
++            rows[rows.lastIndex] = row
++            emitRows()
++        }
++
++        fun dropPending() {
++            if (rows.isNotEmpty() && rows.last().mbps == null && rows.last().note == null) {
++                rows.removeAt(rows.lastIndex)
++                emitRows()
++            }
++        }
++
++        /**
++         * Runs one parallel cell: emits a pending row, transfers, then replaces
++         * it with the completed row (mbps null when void). Returns null when
++         * the budget can no longer fund a meaningful cell — callers treat that
++         * as a budget stop. Budgets are charged from the tester's actual
++         * network byte count (plus the warm-up allowance), with the pre-cell
++         * share only used as the cell's byte cap.
++         */
++        suspend fun measureCell(stage: StageKind, connections: Int, chunkMb: Int): SweepRow? {
++            startPending(stage, connections, chunkMb)
++            val cellBytes = nextCellMeasureBytes() ?: run {
++                if (stopReason == null) stopReason = StopReason.BUDGET
++                dropPending()
++                return null
++            }
++            parallelPasses += 1
++            nextCellIndex += 1
++            val pass = containCellFailure {
++                StreamSpeedTester.runParallelChunkTest(
++                    streamUrl,
++                    headers,
++                    chunkSizeBytes = chunkMb * 1024L * 1024L,
++                    parallelConnections = connections,
++                    measureBytes = cellBytes,
++                    // The byte cap must stay the binding stop condition on fast
++                    // links; the tester's 2.5 s duration floor would overshoot it.
++                    minMeasureMs = 0L
++                )
++            }
++            remainingBytes = (
++                remainingBytes -
++                    StreamSpeedTester.WARMUP_BYTES -
++                    pass.networkBytes
++                ).coerceAtLeast(0L)
++            val note = rejectNote(connections, chunkMb)
++                ?: voidNote(pass)
++                ?: when {
++                    connections > config.standardConnectionCount ->
++                        SweepNote(NoteKind.ABOVE_STANDARD_LIMIT)
++                    overheadMb(connections, chunkMb) > config.safeLimitMb -> SweepNote(
++                        NoteKind.NEAR_BUDGET,
++                        overheadMb = overheadMb(connections, chunkMb),
++                        limitMb = config.safeLimitMb
++                    )
++                    else -> null
++                }
++            val voided = when (note?.kind) {
++                NoteKind.SKIPPED_BUDGET, NoteKind.SKIPPED_CAP,
++                NoteKind.RATE_LIMITED, NoteKind.NO_TRANSFER, NoteKind.FAILED -> true
++                else -> false
++            }
++            val row = SweepRow(
++                stage = stage,
++                connections = connections,
++                chunkMb = chunkMb,
++                mbps = if (voided) null else pass.mbps,
++                note = note
++            )
++            completePending(row)
++            return row
++        }
++
++        fun outcome(
++            verdictKind: VerdictKind,
++            recommendation: Recommendation? = null,
++            errorKind: ErrorKind? = null,
++            errorDetail: String? = null
++        ): SweepResult = SweepResult(
++            verdictKind = verdictKind,
++            baselineMbps = baselineMbps,
++            targetMbps = targetMbps,
++            rows = rows.toList(),
++            recommendation = recommendation,
++            stoppedEarly = stopReason,
++            errorKind = errorKind,
++            errorDetail = errorDetail,
++            elapsedMs = System.currentTimeMillis() - startMs
++        )
++
++        return try {
++            // ── Stage 1 — baseline ────────────────────────────────────────
++            checkpoint()
++            startPending(StageKind.BASELINE, 1, 0)
++            val baselineCellBytes = (
++                nextCellMeasureBytes()
++                    ?: SWEEP_MIN_CELL_MEASURE_BYTES
++                ).coerceAtMost(SWEEP_MAX_CELL_MEASURE_BYTES)
++            nextCellIndex += 1
++            // Conservative charge: the baseline primitive returns only Mbps, so
++            // charge the configured cap instead of an actual byte count.
++            remainingBytes = (
++                remainingBytes -
++                    StreamSpeedTester.WARMUP_BYTES -
++                    baselineCellBytes
++                ).coerceAtLeast(0L)
++            val baselineMbpsMeasured = containBaselineFailure {
++                StreamSpeedTester.runBaselineTest(streamUrl, headers, baselineCellBytes)
++            }
++            baselineMbps = baselineMbpsMeasured
++            completePending(SweepRow(StageKind.BASELINE, 1, 0, baselineMbpsMeasured))
++
++            if (baselineMbps <= 0.0) {
++                return outcome(VerdictKind.NONE, errorKind = ErrorKind.CONNECTION)
++            }
++            if (targetMbps != null && baselineMbps >= targetMbps * SUFFICIENCY_TOLERANCE) {
++                return outcome(VerdictKind.LEAVE_PARALLEL_OFF)
++            }
++
++            // ── Stage 2 — chunk climb at CHUNK_CLIMB_CONNECTIONS ─────────
++            var bestChunkMb = -1
++            var bestMbps = -1.0
++            var prevMbps = -1.0
++            for (chunkMb in chunkLadder) {
++                checkpoint()
++                if (!mayContinue()) break
++                val reject = rejectNote(CHUNK_CLIMB_CONNECTIONS, chunkMb)
++                if (reject != null) {
++                    // Chunk sizes only grow, so the first refused rung ends the
++                    // ladder; rungs above it are deliberately not reported.
++                    addRow(SweepRow(StageKind.CHUNK_CLIMB, CHUNK_CLIMB_CONNECTIONS, chunkMb, null, reject))
++                    break
++                }
++                val row = measureCell(StageKind.CHUNK_CLIMB, CHUNK_CLIMB_CONNECTIONS, chunkMb)
++                    ?: break // budget exhausted
++                val mbps = row.mbps
++                // A refusal says nothing about THIS chunk size (larger chunks mean
++                // fewer requests per second), so carry on without touching prev.
++                if (mbps == null) continue
++                if (mbps > bestMbps) { bestMbps = mbps; bestChunkMb = chunkMb }
++                if (prevMbps > 0 && mbps < prevMbps * REGRESSION_BAR) break // first regression
++                prevMbps = mbps
++            }
++            if (bestChunkMb < 0) {
++                return outcome(VerdictKind.NONE) // no usable parallel measurement
++            }
++
++            // ── Stage 3 — connection climb at the best chunk ─────────────
++            prevMbps = bestMbps
++            for (connections in connLadder) {
++                checkpoint()
++                if (!mayContinue()) break
++                val reject = rejectNote(connections, bestChunkMb)
++                if (reject != null) {
++                    // The chunk already ran at 2 connections, so a rejection here
++                    // is connection-driven; larger counts refuse the same way.
++                    addRow(SweepRow(StageKind.CONNECTION_CLIMB, connections, bestChunkMb, null, reject))
++                    break
++                }
++                val row = measureCell(StageKind.CONNECTION_CLIMB, connections, bestChunkMb)
++                    ?: break // budget exhausted
++                // A refusal at N connections all but guarantees one at N+1
++                // (rate limiting tracks request rate) — end the climb.
++                val mbps = row.mbps ?: break
++                if (mbps > bestMbps) { bestMbps = mbps }
++                if (mbps < prevMbps * REGRESSION_BAR) break // first regression
++                prevMbps = mbps
++            }
++
++            // ── Verdict ──────────────────────────────────────────────────
++            val measuredConfigs = rows.filter {
++                it.stage != StageKind.BASELINE && it.mbps != null && it.mbps > 0.0
++            }
++            if (measuredConfigs.isEmpty()) {
++                return outcome(VerdictKind.NONE)
++            }
++            fun recommendationOf(row: SweepRow, meetsTarget: Boolean) = Recommendation(
++                connections = row.connections,
++                chunkMb = row.chunkMb,
++                mbps = row.mbps ?: 0.0,
++                meetsTarget = meetsTarget,
++                fitsSafeBudget = overheadMb(row.connections, row.chunkMb) <= config.safeLimitMb
++            )
++            if (targetMbps != null) {
++                val sufficient = measuredConfigs.filter { it.mbps!! >= targetMbps * SUFFICIENCY_TOLERANCE }
++                val cheapest = sufficient.minByOrNull { overheadMb(it.connections, it.chunkMb) }
++                if (cheapest != null) {
++                    return outcome(
++                        VerdictKind.RECOMMEND_CONFIG,
++                        recommendation = recommendationOf(cheapest, meetsTarget = true)
++                    )
++                }
++                // Below 2x is not the same as unplayable: above the title's own
++                // bitrate playback should work with thin headroom; below it the
++                // stream cannot be sustained.
++                val fastest = measuredConfigs.maxByOrNull { it.mbps!! }!!
++                val marginal = fastest.mbps!! >= targetMbps / TARGET_BITRATE_MULTIPLE
++                return outcome(
++                    if (marginal) VerdictKind.MARGINAL else VerdictKind.CANNOT_SUSTAIN,
++                    recommendation = recommendationOf(fastest, meetsTarget = false)
++                )
++            }
++            val fastest = measuredConfigs.maxByOrNull { it.mbps!! }!!
++            outcome(
++                VerdictKind.FASTEST_NO_BITRATE,
++                recommendation = recommendationOf(fastest, meetsTarget = false)
++            )
++        } catch (e: kotlinx.coroutines.CancellationException) {
++            // Aborting the sweep (navigating away) must propagate, not
++            // masquerade as an error verdict.
++            throw e
++        } catch (t: Throwable) {
++            outcome(
++                VerdictKind.NONE,
++                errorKind = ErrorKind.UNEXPECTED,
++                errorDetail = t.localizedMessage ?: t.javaClass.simpleName
++            )
++        }
++    }
++
++    // Crash-hardening backstop (KE leg 1): a cell may die — OutOfMemoryError
++    // included — and the sweep must survive it and keep its measurements.
++    // CancellationException stays transparent so aborting keeps working.
++    private inline fun containCellFailure(
++        cell: () -> StreamSpeedTester.ParallelPassResult
++    ): StreamSpeedTester.ParallelPassResult = try {
++        cell()
++    } catch (e: kotlinx.coroutines.CancellationException) {
++        throw e
++    } catch (t: Throwable) {
++        StreamSpeedTester.ParallelPassResult(
++            0.0,
++            emptyList(),
++            failureReason = t.javaClass.simpleName
++        )
++    }
++
++    private inline fun containBaselineFailure(cell: () -> Double): Double = try {
++        cell()
++    } catch (e: kotlinx.coroutines.CancellationException) {
++        throw e
++    } catch (t: Throwable) {
++        0.0
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
+index ffa1e367a..662554c98 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
+@@ -1,4 +1,4 @@
+-@file:OptIn(ExperimentalTvMaterial3Api::class)
++@file:OptIn(ExperimentalTvMaterial3Api::class, androidx.media3.common.util.UnstableApi::class)
+ 
+ 
+ package com.nuvio.tv.ui.screens.settings
+@@ -68,6 +68,9 @@ import androidx.tv.material3.MaterialTheme
+ import androidx.tv.material3.Text
+ import com.nuvio.tv.R
+ import com.nuvio.tv.ui.reshaped.debuglog.DebugLogQrDialog
++import com.nuvio.tv.core.network.StreamSweepEngine
++import com.nuvio.tv.core.player.PlayerSessionTracker
++import com.nuvio.tv.ui.screens.player.NuvioExoPlayerPerformanceHelper
+ import com.nuvio.tv.data.local.Dv7HandlingMode
+ import com.nuvio.tv.data.local.InternalPlayerEngine
+ import com.nuvio.tv.domain.model.ExperienceMode
+@@ -321,6 +324,75 @@ fun AdvancedSettingsContent(
+         }
+     }
+ 
++    // ── Deep sweep (adaptive connection/bitrate climb) ─────────────────────
++    // Second mode beside the quick test: StreamSweepEngine runs the greedy
++    // chunk/connection climb against 2x the last title's bitrate and this
++    // screen only renders its rows + recommendation. The sweep never runs
++    // while playback is active (PlayerSessionTracker gate below) and is
++    // cancellable by navigating away: rememberCoroutineScope cancels the
++    // coroutine, the engine checkpoints between cells and the tester rethrows
++    // mid-cell.
++    var deepTestRunning by remember { mutableStateOf(false) }
++    var deepRows by remember { mutableStateOf<List<StreamSweepEngine.SweepRow>>(emptyList()) }
++    var deepResult by remember { mutableStateOf<StreamSweepEngine.SweepResult?>(null) }
++    var deepApplied by remember { mutableStateOf(false) }
++
++    val playerSessionOpen by PlayerSessionTracker.isSessionOpen.collectAsStateWithLifecycle(
++        initialValue = false
++    )
++
++    fun runDeepSweep() {
++        val sweepUrl = lastStreamUrl ?: return
++        val quickRunning = streamTestState != "Idle" &&
++                streamTestState != "Done" && streamTestState != "Error"
++        if (deepTestRunning || quickRunning || playerSessionOpen) return
++        scope.launch {
++            deepTestRunning = true
++            deepRows = emptyList()
++            deepResult = null
++            deepApplied = false
++            try {
++                val sweepConfig = StreamSweepEngine.SweepConfig(
++                    maxConnectionCount =
++                        if (dvPlayerSettings.nuvioPerformanceModeEnabled &&
++                            android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O
++                        ) 16 else com.nuvio.tv.data.local.PlayerSettings.MAX_PARALLEL_CONNECTION_COUNT,
++                    standardConnectionCount =
++                        com.nuvio.tv.data.local.PlayerSettings.MAX_PARALLEL_CONNECTION_COUNT,
++                    tierMaxChunkMb = com.nuvio.tv.ui.screens.settings.MemoryBudget.tierMaxChunkMb,
++                    safeLimitMb =
++                        NuvioExoPlayerPerformanceHelper.getSafeNativeMemoryLimitMb(context),
++                    warningLimitMb =
++                        NuvioExoPlayerPerformanceHelper.getWarningNativeMemoryLimitMb(context)
++                )
++                deepResult = StreamSweepEngine.run(
++                    streamUrl = sweepUrl,
++                    headers = lastHeadersMap,
++                    estimatedBitrate = estimatedBitrate,
++                    config = sweepConfig,
++                    onRows = { rows -> deepRows = rows }
++                )
++            } catch (e: kotlinx.coroutines.CancellationException) {
++                // Navigation away cancels the sweep; let the scope die quietly.
++                throw e
++            } catch (e: Exception) {
++                deepResult = StreamSweepEngine.SweepResult(
++                    verdictKind = StreamSweepEngine.VerdictKind.NONE,
++                    baselineMbps = 0.0,
++                    targetMbps = null,
++                    rows = emptyList(),
++                    recommendation = null,
++                    stoppedEarly = null,
++                    errorKind = StreamSweepEngine.ErrorKind.UNEXPECTED,
++                    errorDetail = e.localizedMessage ?: unknownError,
++                    elapsedMs = 0L
++                )
++            } finally {
++                deepTestRunning = false
++            }
++        }
++    }
++
+     fun runSpeedTest() {
+         scope.launch {
+             connectionType = getConnectionType(context)
+@@ -642,8 +714,23 @@ fun AdvancedSettingsContent(
+                             else -> stringResource(R.string.stream_test_btn_running)
+                         }
+                     } else null,
+-                    enabled = hasStream && !isStreamRunning,
+-                    onClick = { if (hasStream && !isStreamRunning) runStreamDiagnostics() }
++                    enabled = hasStream && !isStreamRunning && !deepTestRunning,
++                    onClick = { if (hasStream && !isStreamRunning && !deepTestRunning) runStreamDiagnostics() }
++                )
++                // Deep test: the adaptive sweep (StreamSweepEngine). Gated on an
++                // open playback session — the sweep hammers the same host the
++                // player is streaming from, so it must never run concurrently.
++                val deepGateOpen = hasStream && !isStreamRunning && !deepTestRunning && !playerSessionOpen
++                SettingsActionRow(
++                    title = stringResource(R.string.network_sweep_card_title),
++                    subtitle = when {
++                        playerSessionOpen -> stringResource(R.string.network_sweep_playback_active)
++                        hasStream -> stringResource(R.string.network_sweep_card_subtitle)
++                        else -> stringResource(R.string.stream_test_no_stream)
++                    },
++                    value = if (deepTestRunning) stringResource(R.string.network_sweep_btn_running) else null,
++                    enabled = deepGateOpen,
++                    onClick = { if (deepGateOpen) runDeepSweep() }
+                 )
+             }
+         }
+@@ -769,6 +856,110 @@ fun AdvancedSettingsContent(
+             }
+         }
+ 
++        if (deepRows.isNotEmpty() || deepResult != null) {
++            item(key = "deep_sweep_results") {
++                SettingsGroupCard(modifier = Modifier.fillMaxWidth()) {
++                    Column(
++                        modifier = Modifier.padding(NuvioTheme.spacing.xs),
++                        verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.sm)
++                    ) {
++                        Row(
++                            modifier = Modifier.fillMaxWidth(),
++                            horizontalArrangement = Arrangement.SpaceBetween,
++                            verticalAlignment = Alignment.CenterVertically
++                        ) {
++                            Text(
++                                text = stringResource(R.string.network_sweep_section_header),
++                                style = MaterialTheme.typography.titleSmall,
++                                color = NuvioTheme.colors.TextSecondary
++                            )
++                            val sweepTargetMbps = estimatedBitrate?.takeIf { it > 0 }?.let {
++                                it.toDouble() / 1_000_000.0 * StreamSweepEngine.TARGET_BITRATE_MULTIPLE
++                            }
++                            Text(
++                                text = if (sweepTargetMbps != null) {
++                                    stringResource(
++                                        R.string.network_sweep_target_label,
++                                        "%.1f Mbps".format(sweepTargetMbps)
++                                    )
++                                } else {
++                                    stringResource(R.string.network_sweep_target_unknown)
++                                },
++                                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold),
++                                color = NuvioTheme.colors.TextPrimary
++                            )
++                        }
++
++                        Column(verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.xs)) {
++                            deepRows.forEachIndexed { index, row ->
++                                DeepSweepResultRow(
++                                    row = row,
++                                    isRunning = deepTestRunning && index == deepRows.lastIndex
++                                )
++                            }
++                        }
++
++                        val sweepResult = deepResult
++                        if (sweepResult != null) {
++                            if (sweepResult.stoppedEarly != null) {
++                                Text(
++                                    text = stringResource(
++                                        when (sweepResult.stoppedEarly) {
++                                            StreamSweepEngine.StopReason.BUDGET -> R.string.network_sweep_stopped_budget
++                                            StreamSweepEngine.StopReason.TIME -> R.string.network_sweep_stopped_time
++                                            else -> R.string.network_sweep_stopped_passes
++                                        }
++                                    ),
++                                    style = MaterialTheme.typography.bodySmall,
++                                    color = NuvioTheme.colors.TextSecondary
++                                )
++                            }
++                            Text(
++                                text = sweepVerdictText(sweepResult),
++                                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold),
++                                color = if (sweepResult.errorKind != null) {
++                                    NuvioTheme.colors.Error
++                                } else {
++                                    NuvioTheme.colors.TextPrimary
++                                }
++                            )
++
++                            val recommendation = sweepResult.recommendation
++                            if (recommendation != null &&
++                                sweepResult.verdictKind != StreamSweepEngine.VerdictKind.LEAVE_PARALLEL_OFF
++                            ) {
++                                if (deepApplied) {
++                                    Text(
++                                        text = stringResource(R.string.network_sweep_apply_saved),
++                                        style = MaterialTheme.typography.bodySmall,
++                                        color = NuvioTheme.colors.Success
++                                    )
++                                } else {
++                                    SettingsActionRow(
++                                        title = stringResource(
++                                            R.string.network_sweep_apply_title,
++                                            recommendation.connections
++                                        ),
++                                        subtitle = stringResource(R.string.network_sweep_apply_subtitle),
++                                        onClick = {
++                                            scope.launch {
++                                                // The count first (the ViewModel's budget
++                                                // logic may trim the chunk size to fit),
++                                                // then flip the parallel toggle on.
++                                                playbackVm.setParallelConnectionCount(recommendation.connections)
++                                                playbackVm.setUseParallelConnections(true)
++                                                deepApplied = true
++                                            }
++                                        }
++                                    )
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++
+         item(key = "dx_watch_stats") { DxWatchStatsSettingsCard() } // dx.bi watch stats hook
+ 
+         item(key = "clear_cw_cache") {
+@@ -956,3 +1147,114 @@ private fun StreamTestResultRow(
+         )
+     }
+ }
++
++@Composable
++private fun DeepSweepResultRow(
++    row: StreamSweepEngine.SweepRow,
++    isRunning: Boolean
++) {
++    val noteText = row.note?.let { note ->
++        when (note.kind) {
++            StreamSweepEngine.NoteKind.SKIPPED_BUDGET ->
++                stringResource(R.string.network_sweep_note_skipped_budget, note.overheadMb, note.limitMb)
++            StreamSweepEngine.NoteKind.SKIPPED_CAP ->
++                stringResource(R.string.network_sweep_note_skipped_cap, note.overheadMb, note.limitMb)
++            StreamSweepEngine.NoteKind.RATE_LIMITED ->
++                stringResource(R.string.network_sweep_note_rate_limited)
++            StreamSweepEngine.NoteKind.NO_TRANSFER ->
++                stringResource(R.string.network_sweep_note_no_transfer)
++            StreamSweepEngine.NoteKind.FAILED ->
++                stringResource(R.string.network_sweep_note_failed, note.detail ?: "")
++            StreamSweepEngine.NoteKind.ABOVE_STANDARD_LIMIT ->
++                stringResource(R.string.network_sweep_note_above_standard)
++            StreamSweepEngine.NoteKind.NEAR_BUDGET ->
++                stringResource(R.string.network_sweep_note_near_budget, note.overheadMb, note.limitMb)
++        }
++    }
++    Column(modifier = Modifier.fillMaxWidth()) {
++        Row(
++            modifier = Modifier.fillMaxWidth(),
++            horizontalArrangement = Arrangement.SpaceBetween,
++            verticalAlignment = Alignment.CenterVertically
++        ) {
++            Text(
++                text = if (row.stage == StreamSweepEngine.StageKind.BASELINE) {
++                    stringResource(R.string.network_sweep_label_baseline)
++                } else {
++                    stringResource(R.string.network_sweep_label_chunk_dyn, row.connections, row.chunkMb)
++                },
++                style = MaterialTheme.typography.bodyMedium,
++                color = NuvioTheme.colors.TextSecondary
++            )
++            Text(
++                text = when {
++                    isRunning -> stringResource(R.string.network_sweep_btn_running)
++                    row.mbps != null -> "%.1f Mbps".format(row.mbps)
++                    else -> "---"
++                },
++                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold),
++                color = if (row.mbps != null && !isRunning) {
++                    NuvioTheme.colors.TextPrimary
++                } else {
++                    NuvioTheme.colors.TextTertiary
++                }
++            )
++        }
++        if (noteText != null) {
++            Text(
++                text = noteText,
++                style = MaterialTheme.typography.bodySmall,
++                color = NuvioTheme.colors.TextTertiary
++            )
++        }
++    }
++}
++
++@Composable
++private fun sweepVerdictText(result: StreamSweepEngine.SweepResult): String {
++    when (result.errorKind) {
++        StreamSweepEngine.ErrorKind.CONNECTION ->
++            return stringResource(R.string.stream_test_error_connection)
++        StreamSweepEngine.ErrorKind.UNEXPECTED ->
++            return stringResource(R.string.network_sweep_error_unexpected, result.errorDetail ?: "")
++        null -> {}
++    }
++    val rec = result.recommendation
++    return when (result.verdictKind) {
++        StreamSweepEngine.VerdictKind.LEAVE_PARALLEL_OFF ->
++            stringResource(
++                R.string.network_sweep_verdict_leave_off,
++                "%.1f Mbps".format(result.baselineMbps)
++            )
++        StreamSweepEngine.VerdictKind.RECOMMEND_CONFIG ->
++            stringResource(
++                R.string.network_sweep_verdict_recommend,
++                rec?.connections ?: 0,
++                rec?.chunkMb ?: 0,
++                "%.1f Mbps".format(rec?.mbps ?: 0.0)
++            )
++        StreamSweepEngine.VerdictKind.MARGINAL, StreamSweepEngine.VerdictKind.CANNOT_SUSTAIN -> {
++            val titleMbps = (result.targetMbps ?: 0.0) / StreamSweepEngine.TARGET_BITRATE_MULTIPLE
++            stringResource(
++                if (result.verdictKind == StreamSweepEngine.VerdictKind.MARGINAL) {
++                    R.string.network_sweep_verdict_marginal
++                } else {
++                    R.string.network_sweep_verdict_cannot_sustain
++                },
++                rec?.connections ?: 0,
++                rec?.chunkMb ?: 0,
++                "%.1f Mbps".format(rec?.mbps ?: 0.0),
++                "%.1f Mbps".format(titleMbps)
++            )
++        }
++        StreamSweepEngine.VerdictKind.FASTEST_NO_BITRATE ->
++            stringResource(
++                R.string.network_sweep_verdict_fastest_nobitrate,
++                rec?.connections ?: 0,
++                rec?.chunkMb ?: 0,
++                "%.1f Mbps".format(rec?.mbps ?: 0.0)
++            )
++        StreamSweepEngine.VerdictKind.NONE ->
++            stringResource(R.string.network_sweep_verdict_none)
++    }
++}
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index f26eb57e5..a73b2faaf 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -3483,6 +3483,37 @@
+     <string name="stream_test_video_bitrate">Average Video Bitrate: %1$s</string>
+     <string name="stream_test_error_connection">Connection failed. The last played stream link may have expired or is unreachable. Please play the video again and retry.</string>
+ 
++    <!-- Deep stream sweep (adaptive connection/bitrate climb) -->
++    <string name="network_sweep_card_title">Run Deep Stream Sweep</string>
++    <string name="network_sweep_card_subtitle">Adaptive test: climbs chunk size and parallel connections against 2x the last title bitrate. Runs up to 90 s and about 200 MB of data.</string>
++    <string name="network_sweep_btn_running">Sweeping…</string>
++    <string name="network_sweep_playback_active">Playback is active. Stop playback to run the sweep.</string>
++    <string name="network_sweep_section_header">Deep Sweep Results</string>
++    <string name="network_sweep_target_label">Target: %1$s (2x title bitrate)</string>
++    <string name="network_sweep_target_unknown">Target: title bitrate unknown</string>
++    <string name="network_sweep_label_baseline">Single connection (baseline)</string>
++    <string name="network_sweep_label_chunk_dyn">%1$d connections, %2$d MB chunks</string>
++    <string name="network_sweep_note_skipped_budget">Skipped: needs %1$d MB, over the %2$d MB memory limit</string>
++    <string name="network_sweep_note_skipped_cap">Skipped: %1$d MB concurrent transfer, over the %2$d MB cap</string>
++    <string name="network_sweep_note_rate_limited">Rate-limited by server; rung not measured</string>
++    <string name="network_sweep_note_no_transfer">No usable transfer; treated as a refusal, not a measurement</string>
++    <string name="network_sweep_note_failed">Failed: %1$s</string>
++    <string name="network_sweep_note_above_standard">Requires Performance Mode at runtime</string>
++    <string name="network_sweep_note_near_budget">Near the safe memory budget (%1$d MB of %2$d MB)</string>
++    <string name="network_sweep_stopped_budget">Stopped early: transfer budget reached</string>
++    <string name="network_sweep_stopped_time">Stopped early: time budget reached</string>
++    <string name="network_sweep_stopped_passes">Stopped early: measurement pass cap reached</string>
++    <string name="network_sweep_verdict_leave_off">Baseline (%1$s) already sustains 2x the title bitrate — leave parallel connections off.</string>
++    <string name="network_sweep_verdict_recommend">Recommended: %1$d connections with %2$d MB chunks (%3$s).</string>
++    <string name="network_sweep_verdict_marginal">Best found: %1$d connections, %2$d MB chunks at %3$s — above the title bitrate (%4$s) but below the 2x target.</string>
++    <string name="network_sweep_verdict_cannot_sustain">Best found: %1$d connections, %2$d MB chunks at %3$s — below the title bitrate (%4$s); the stream cannot be sustained.</string>
++    <string name="network_sweep_verdict_fastest_nobitrate">Title bitrate unknown. Fastest measured: %1$d connections, %2$d MB chunks at %3$s.</string>
++    <string name="network_sweep_verdict_none">Sweep finished without a usable recommendation.</string>
++    <string name="network_sweep_error_unexpected">Sweep error: %1$s</string>
++    <string name="network_sweep_apply_title">Apply recommended (%1$d connections)</string>
++    <string name="network_sweep_apply_subtitle">Enables parallel connections and saves the count. Chunk size stays as configured.</string>
++    <string name="network_sweep_apply_saved">Recommended setting saved.</string>
++
+     <string name="random_episode_title">Shuffle</string>
+     <string name="layout_random_episode_sub">Shuffle episodes from any series. Turning this off pauses shuffle.</string>
+     <string name="random_episode_unwatched">Unwatched episodes</string>

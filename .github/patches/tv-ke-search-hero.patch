@@ -1,0 +1,332 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/search/SearchResultsHero.kt b/app/src/main/java/com/nuvio/tv/ui/screens/search/SearchResultsHero.kt
+new file mode 100644
+index 000000000..536a5e2b9
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/search/SearchResultsHero.kt
+@@ -0,0 +1,256 @@
++package com.nuvio.tv.ui.screens.search
++
++import androidx.compose.animation.Crossfade
++import androidx.compose.animation.core.tween
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.lazy.LazyListState
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.Stable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.runtime.snapshotFlow
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.focus.focusProperties
++import androidx.compose.ui.graphics.Brush
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.layout.ContentScale
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import androidx.tv.material3.MaterialTheme
++import androidx.tv.material3.Text
++import coil3.compose.AsyncImage
++import coil3.request.ImageRequest
++import com.nuvio.tv.domain.model.CatalogRow
++import com.nuvio.tv.domain.model.MetaPreview
++import com.nuvio.tv.ui.screens.home.MODERN_HERO_FOCUS_DEBOUNCE_MS
++import com.nuvio.tv.ui.theme.NuvioMotion
++import com.nuvio.tv.ui.theme.NuvioTheme
++import com.nuvio.tv.ui.util.localizedContentType
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.collectLatest
++import kotlinx.coroutines.flow.first
++
++/**
++ * Search results hero (Nuvio-KE port). The KE screens draw the results hero as a full-bleed
++ * backdrop under a band-geometry layout; this tree renders the results as rows in one list, so
++ * the concept is adapted: a fixed-height backdrop panel that sits above the result rows as a
++ * list item. What is kept from KE is the settle model — the hero never changes while the user
++ * types or scrolls, and it only settles on the focused card (else the top result) after the
++ * settle delay and once the results list has stopped scrolling.
++ */
++
++/** Skeleton results (the screens' "__placeholder_" ids) never seed, settle or show the hero. */
++internal const val SEARCH_HERO_PLACEHOLDER_PREFIX = "__placeholder_"
++
++/** KE's settle timing: focus changes within this window are rapid D-pad travel. */
++private const val SEARCH_HERO_RAPID_NAV_THRESHOLD_MS = 130L
++
++/** KE's settle timing: rapid travel settles slightly faster than the base debounce. */
++private const val SEARCH_HERO_RAPID_NAV_SETTLE_MS = 400L
++
++/** The settle delay for a focus change at [nowMs]; [lastNavAtMs] is the previous change (0 = none). */
++internal fun searchHeroSettleDelayMs(lastNavAtMs: Long, nowMs: Long): Long {
++    val sinceLast = nowMs - lastNavAtMs
++    return if (lastNavAtMs != 0L && sinceLast in 1 until SEARCH_HERO_RAPID_NAV_THRESHOLD_MS) {
++        SEARCH_HERO_RAPID_NAV_SETTLE_MS
++    } else {
++        MODERN_HERO_FOCUS_DEBOUNCE_MS
++    }
++}
++
++/**
++ * Which result the hero shows. [focusedKey] is written per card focus (no settle without one for
++ * focus moves); the settle effect in [rememberSearchHeroSettle] waits the debounce and for the
++ * list to stop scrolling before writing [displayedKey]. The hero draws the result for
++ * [displayedKey] and falls back to the seed (the top result) while nothing has settled.
++ */
++@Stable
++internal class SearchHeroSettle {
++    /** The card the settle is waiting on, cleared when a new query's results start. */
++    var focusedKey by mutableStateOf<String?>(null)
++        private set
++    /** What the hero draws. Only the settle effect writes it, after the debounce and scroll-idle. */
++    var displayedKey by mutableStateOf<String?>(null)
++        private set
++    var settleDelayMs: Long = MODERN_HERO_FOCUS_DEBOUNCE_MS
++        private set
++    private var lastNavAtMs = 0L
++
++    /** A result card took focus: KE's rule — rapid D-pad travel shortens the next settle. */
++    fun onFocused(key: String) {
++        if (key == focusedKey) return
++        val now = System.currentTimeMillis()
++        settleDelayMs = searchHeroSettleDelayMs(lastNavAtMs, now)
++        lastNavAtMs = now
++        focusedKey = key
++    }
++
++    internal fun settle(key: String) {
++        displayedKey = key
++    }
++
++    /** New results (a query change): focus bookkeeping drops and the settle restarts (KE's reset). */
++    fun reset() {
++        focusedKey = null
++        lastNavAtMs = 0L
++        settleDelayMs = MODERN_HERO_FOCUS_DEBOUNCE_MS
++    }
++}
++
++/**
++ * The search results hero's settle state. The settle target is the focused card while one is
++ * recorded, else [seedKey] (the top result). Every target change restarts the debounce — a
++ * keystroke's new results change the seed, so the settle also waits for the query to stop
++ * changing — and then waits for [listState] to stop scrolling before it lands. KE's reset rule:
++ * a submitted-query change drops the focus bookkeeping and the hero restarts from the seed.
++ */
++@Composable
++internal fun rememberSearchHeroSettle(
++    seedKey: String?,
++    listState: LazyListState,
++    submittedQuery: String
++): SearchHeroSettle {
++    val settle = remember { SearchHeroSettle() }
++    LaunchedEffect(settle, listState, seedKey) {
++        snapshotFlow { settle.focusedKey ?: seedKey }.collectLatest { target ->
++            if (target == null) return@collectLatest
++            delay(settle.settleDelayMs)
++            snapshotFlow { listState.isScrollInProgress }.first { !it }
++            settle.settle(target)
++        }
++    }
++    LaunchedEffect(submittedQuery) { settle.reset() }
++    return settle
++}
++
++/**
++ * The hero's result for [displayedKey] over [rows]: the settled card while it still resolves to a
++ * real (non-placeholder) result, else null — the hero keeps its last artwork while the settle is
++ * pending, so typing churn never flickers it.
++ */
++internal fun searchHeroItemOf(rows: List<CatalogRow>, displayedKey: String?): MetaPreview? {
++    val key = displayedKey ?: return null
++    return rows.asSequence()
++        .flatMap { it.items.asSequence() }
++        .firstOrNull { it.id == key && !it.id.startsWith(SEARCH_HERO_PLACEHOLDER_PREFIX) }
++}
++
++/** The hero panel's fixed height: it must not push the result rows off-screen. */
++private val SEARCH_HERO_HEIGHT = 220.dp
++
++/**
++ * The backdrop panel above the result rows: [item]'s backdrop full-bleed under a bottom scrim,
++ * the title, a type/year/rating meta line and the description. [item] is the settled result and
++ * may be null while the first settle is pending; the last non-null result stays on screen (KE's
++ * displayed-backdrop rule), so the art never blanks or churns mid-debounce. Decorative only —
++ * focus stays in the results grid.
++ */
++@Composable
++internal fun SearchResultsHero(
++    item: MetaPreview?,
++    modifier: Modifier = Modifier
++) {
++    var displayed by remember { mutableStateOf(item) }
++    if (item != null) displayed = item
++    val hero = displayed
++    Box(
++        modifier = modifier
++            .fillMaxWidth()
++            .height(SEARCH_HERO_HEIGHT)
++            .focusProperties { canFocus = false }
++            .clip(RoundedCornerShape(NuvioTheme.radii.lg))
++            .background(NuvioTheme.colors.BackgroundCard)
++    ) {
++        if (hero != null) {
++            val context = LocalContext.current
++            val imageModel = remember(context, hero.backdropUrl) {
++                hero.backdropUrl?.let { url ->
++                    ImageRequest.Builder(context).data(url).build()
++                }
++            }
++            Crossfade(
++                targetState = imageModel,
++                animationSpec = tween(durationMillis = NuvioMotion.tokens.durations.overlay),
++                label = "searchHeroBackdropCrossfade",
++                modifier = Modifier.fillMaxSize()
++            ) { model ->
++                if (model != null) {
++                    AsyncImage(
++                        model = model,
++                        contentDescription = null,
++                        contentScale = ContentScale.Crop,
++                        modifier = Modifier.fillMaxSize()
++                    )
++                }
++            }
++            Box(
++                modifier = Modifier
++                    .fillMaxSize()
++                    .background(
++                        Brush.verticalGradient(
++                            0.0f to Color.Transparent,
++                            0.55f to Color.Transparent,
++                            1.0f to Color.Black.copy(alpha = 0.78f)
++                        )
++                    )
++            )
++            val metaText = remember(context, hero.id, hero.apiType, hero.releaseInfo, hero.imdbRating) {
++                listOfNotNull(
++                    localizedContentType(context, hero.apiType),
++                    hero.releaseInfo?.trim()?.takeIf(String::isNotEmpty),
++                    hero.imdbRating?.let { String.format(java.util.Locale.US, "%.1f", it) }
++                ).joinToString(separator = " • ")
++            }
++            Column(
++                modifier = Modifier
++                    .align(Alignment.BottomStart)
++                    .fillMaxWidth()
++                    .padding(horizontal = NuvioTheme.spacing.lg, vertical = NuvioTheme.spacing.md),
++                verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.xxs)
++            ) {
++                Text(
++                    text = hero.name,
++                    style = MaterialTheme.typography.titleLarge,
++                    color = NuvioTheme.colors.TextPrimary,
++                    maxLines = 1,
++                    overflow = TextOverflow.Ellipsis
++                )
++                if (metaText.isNotEmpty()) {
++                    Text(
++                        text = metaText,
++                        style = MaterialTheme.typography.labelMedium,
++                        color = NuvioTheme.colors.TextSecondary,
++                        maxLines = 1,
++                        overflow = TextOverflow.Ellipsis
++                    )
++                }
++                hero.description?.trim()?.takeIf(String::isNotEmpty)?.let { description ->
++                    Text(
++                        text = description,
++                        style = MaterialTheme.typography.bodySmall,
++                        color = NuvioTheme.colors.TextSecondary,
++                        maxLines = 2,
++                        overflow = TextOverflow.Ellipsis
++                    )
++                }
++            }
++        } else {
++            Spacer(modifier = Modifier.fillMaxSize())
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/search/SearchScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/search/SearchScreen.kt
+index 62d51fcd2..3b1b214bd 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/search/SearchScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/search/SearchScreen.kt
+@@ -575,6 +575,25 @@ fun SearchScreen(
+     ) {
+         val listState = rememberLazyListState()
+ 
++        // Search results hero (Nuvio-KE port): a non-focusable backdrop panel above the result
++        // rows showing the settled result — the focused card once focus stops moving, else the
++        // top result. The settle lands only after the settle delay and once the list stops
++        // scrolling; every result change (a keystroke's included) restarts it, so the artwork
++        // never flickers while the user is typing or scrolling.
++        val searchHeroSeedKey = remember(visibleCatalogRows) {
++            visibleCatalogRows.asSequence()
++                .flatMap { it.items.asSequence() }
++                .firstOrNull { !it.id.startsWith(SEARCH_HERO_PLACEHOLDER_PREFIX) }
++                ?.id
++        }
++        val searchHeroSettle = rememberSearchHeroSettle(searchHeroSeedKey, listState, trimmedSubmittedQuery)
++        val searchHeroItem = remember(visibleCatalogRows, searchHeroSettle.displayedKey) {
++            searchHeroItemOf(visibleCatalogRows, searchHeroSettle.displayedKey)
++        }
++        // The hero item sits between the input field and the result rows when present; a state
++        // so the scroll effect below never scrolls with a stale offset when the results change.
++        val searchHeroListOffset = rememberUpdatedState(if (searchHeroSeedKey != null) 2 else 1)
++
+         // The row focus lands on may sit below rows that are still loading, out of view and not
+         // built yet, so bring it into view for its focus request to run.
+         LaunchedEffect(focusResults, focusTargetRowKey) {
+@@ -582,8 +601,9 @@ fun SearchScreen(
+             if (!focusResults || isDiscoverMode) return@LaunchedEffect
+             if (listState.layoutInfo.visibleItemsInfo.any { it.key == targetKey }) return@LaunchedEffect
+             val rowIndex = visibleCatalogRows.indexOfFirst { it.stableKey() == targetKey }
+-            // The input field is the first item of the list.
+-            if (rowIndex >= 0) listState.scrollToItem(rowIndex + 1)
++            // The input field is the first item of the list; the results hero sits between it
++            // and the rows when the results are up.
++            if (rowIndex >= 0) listState.scrollToItem(rowIndex + searchHeroListOffset.value)
+         }
+ 
+         // Step back within Search before falling through to the root handler.
+@@ -808,6 +828,15 @@ fun SearchScreen(
+                     }
+ 
+                     else -> {
++                        if (searchHeroSeedKey != null) {
++                            item(key = "search_hero") {
++                                SearchResultsHero(
++                                    item = searchHeroItem,
++                                    modifier = Modifier.padding(horizontal = NuvioTheme.spacing.xxxl)
++                                )
++                            }
++                        }
++
+                         itemsIndexed(
+                             items = visibleCatalogRows,
+                             key = { _, item -> item.stableKey() },
+@@ -886,6 +915,11 @@ fun SearchScreen(
+                                     focusedResultItemIndex.intValue = itemIndex
+                                     // Prefetch meta for the focused item to warm cache for detail screen.
+                                     catalogRow.items.getOrNull(itemIndex)?.let { item ->
++                                        // The hero settles on this card after the debounce;
++                                        // placeholder cards never settle it.
++                                        if (!item.id.startsWith(SEARCH_HERO_PLACEHOLDER_PREFIX)) {
++                                            searchHeroSettle.onFocused(item.id)
++                                        }
+                                         viewModel.prefetchMetaOnFocus(item.id, item.rawType)
+                                     }
+                                     lastFocusedRowKey = catalogKey

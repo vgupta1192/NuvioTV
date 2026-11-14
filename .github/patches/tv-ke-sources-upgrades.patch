@@ -1,0 +1,387 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
+index 9ff02461d..950205c95 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
+@@ -479,6 +479,9 @@ class PlayerRuntimeController(
+     internal var sourceStreamsFetchCompleted: Boolean = false
+     /** Stream URLs that already failed in this playback, so stream failover never loops. */
+     internal val failoverFailedUrls = HashSet<String>()
++    // Nuvio-KE port: every link playback gave up on this session (a superset of the failover
++    // guard above, so the sources list can mark dead rows). Bounded by the recording helper.
++    internal val sourceFailedUrls = LinkedHashSet<String>()
+     // Freeze-recovery ladder (Nuvio-KE port): per player build, reset in the ExoPlayer init
+     // block. The elapsedRealtime of the last rung-1 recovery seek (null = none), how many rung-1
+     // seeks this playback has spent, and whether rung 2 (dead-source failover) already ran.
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+index cb533bb34..0ef73007f 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+@@ -1735,6 +1735,9 @@ internal fun PlayerRuntimeController.initializePlayer(
+                             switchToInternalPlayerEngine(InternalPlayerEngine.MVP_PLAYER, reason = "auto-fatal-failover")
+                             return
+                         }
++                        // Nuvio-KE port: every recovery failed, so this link is dead for good —
++                        // mark it for the sources list.
++                        recordSourceStreamFailure(currentStreamUrl)
+                         _uiState.update {
+                             it.copy(
+                                 error = detailedError,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerServer.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerServer.kt
+index 185fb7675..df27d9af1 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerServer.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerServer.kt
+@@ -210,6 +210,24 @@ private const val SERVER_RESUME_TIMEOUT_MS = 2_000L
+ private const val MAX_STREAM_FAILOVERS = 3
+ private const val FAILOVER_LIST_WAIT_MS = 8_000L
+ 
++/** Ceiling for [recordSourceStreamFailure]: a session's dead links, oldest out. */
++private const val MAX_SOURCE_FAILURE_URLS = 64
++
++/**
++ * Nuvio-KE port: notes a link playback gave up on, for the failure marks on the sources list
++ * rows. Session-scoped (lost when the player goes away) and bounded: oldest url out at
++ * [MAX_SOURCE_FAILURE_URLS]. The mirror of KE's persistent failure memory is this set plus the
++ * tree's existing failover guard — there is no per-URL store to read back from.
++ */
++internal fun PlayerRuntimeController.recordSourceStreamFailure(url: String?) {
++    val key = url?.takeIf { it.isNotBlank() } ?: return
++    if (!sourceFailedUrls.add(key)) return
++    if (sourceFailedUrls.size > MAX_SOURCE_FAILURE_URLS) {
++        sourceFailedUrls.firstOrNull()?.let(sourceFailedUrls::remove)
++    }
++    _uiState.update { it.copy(sourceFailedStreamUrls = sourceFailedUrls.toSet()) }
++}
++
+ /**
+  * Last resort before the error screen: when the current link keeps failing, switch to the next
+  * playable link from the sources list (loading that list first when it is not there yet).
+@@ -218,6 +236,7 @@ internal fun PlayerRuntimeController.tryStreamFailover(): Boolean {
+     val failedUrl = currentStreamUrl
+     if (failedUrl.isBlank() || failoverFailedUrls.size >= MAX_STREAM_FAILOVERS) return false
+     failoverFailedUrls.add(failedUrl)
++    recordSourceStreamFailure(failedUrl)
+     errorRetryJob?.cancel()
+     errorRetryJob = scope.launch {
+         showRecoveryOverlay()
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt
+index f03dc2e92..7ce4ee8c4 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt
+@@ -179,6 +179,9 @@ data class PlayerUiState(
+     val sourceFilteredStreams: List<Stream> = emptyList(),
+     val sourceAvailableAddons: List<String> = emptyList(),
+     val sourceChips: List<SourceChipItem> = emptyList(),
++    // Nuvio-KE port: stream URLs that already failed once in this playback, for the failure marks
++    // on the sources list rows. Session-scoped, bounded in the player runtime.
++    val sourceFailedStreamUrls: Set<String> = emptySet(),
+     val showFileSizeBadges: Boolean = true,
+     val showAddonLogo: Boolean = true,
+     val streamBadgePlacement: StreamBadgePlacement = StreamBadgePlacement.BOTTOM,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamComponents.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamComponents.kt
+index 81973393a..81d0230ef 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamComponents.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamComponents.kt
+@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.height
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.layout.size
+ import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.Icon
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
+@@ -53,6 +54,8 @@ import androidx.tv.material3.Border
+ import androidx.tv.material3.Card
+ import androidx.tv.material3.CardDefaults
+ import androidx.tv.material3.ExperimentalTvMaterial3Api
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.History
+ import coil3.compose.AsyncImage
+ import coil3.request.ImageRequest
+ import coil3.request.crossfade
+@@ -84,6 +87,7 @@ internal fun StreamItem(
+     showFileSizeBadges: Boolean = true,
+     showAddonLogo: Boolean = true,
+     badgePlacement: StreamBadgePlacement = StreamBadgePlacement.BOTTOM,
++    failedBefore: Boolean = false,
+     onClick: () -> Unit,
+     onFocusChanged: ((Boolean) -> Unit)? = null,
+     onUpKey: (() -> Unit)? = null
+@@ -178,6 +182,17 @@ internal fun StreamItem(
+                             color = NuvioTheme.colors.TextPrimary
+                         )
+ 
++                        // Nuvio-KE port: the failure mark — this link already failed once in this
++                        // playback, so a retry is not worth hoping for.
++                        if (failedBefore) {
++                            Icon(
++                                imageVector = Icons.Filled.History,
++                                contentDescription = stringResource(R.string.sources_row_failed_before),
++                                tint = NuvioTheme.colors.Error,
++                                modifier = Modifier.size(NuvioTheme.spacing.md)
++                            )
++                        }
++
+                         if (isCurrentStream) {
+                             Box(
+                                 modifier = Modifier
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamSourceStatusRings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamSourceStatusRings.kt
+new file mode 100644
+index 000000000..7a3ccb328
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamSourceStatusRings.kt
+@@ -0,0 +1,174 @@
++package com.nuvio.tv.ui.screens.player
++
++import androidx.compose.animation.core.LinearEasing
++import androidx.compose.animation.core.animateFloat
++import androidx.compose.animation.core.infiniteRepeatable
++import androidx.compose.animation.core.rememberInfiniteTransition
++import androidx.compose.animation.core.tween
++import androidx.compose.foundation.horizontalScroll
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.drawBehind
++import androidx.compose.ui.geometry.Offset
++import androidx.compose.ui.geometry.Size
++import androidx.compose.ui.graphics.StrokeCap
++import androidx.compose.ui.graphics.drawscope.Stroke
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.semantics.contentDescription
++import androidx.compose.ui.semantics.semantics
++import androidx.compose.ui.unit.dp
++import com.nuvio.tv.R
++import com.nuvio.tv.domain.model.Stream
++import com.nuvio.tv.ui.components.SourceChipItem
++import com.nuvio.tv.ui.components.SourceChipStatus
++import com.nuvio.tv.ui.theme.NuvioTheme
++
++/** The per-addon status ring's size and the stroke it is drawn with. */
++private val RING_SIZE = 14.dp
++private val RING_STROKE = 3.dp
++/** The spinner arc's sweep, and the smallest fill a one-stream addon still shows. */
++private const val RING_SPIN_SWEEP = 90f
++private const val RING_MIN_SHARE = 0.06f
++
++/**
++ * One addon's resolution outcome for the sources panel's status rings (Nuvio-KE port of the
++ * per-addon circle): [status] is the chip state the tree already tracks, [resolvedCount] is the
++ * streams the addon listed for this title.
++ */
++internal data class AddonSourceRing(
++    val name: String,
++    val status: SourceChipStatus,
++    val resolvedCount: Int
++)
++
++/**
++ * A ring per addon in [orderedAddons] (the chip row's order): its chip status and the streams it
++ * contributed, counted from [allStreams] by addon name. An addon that answered with no streams
++ * stays at zero; one whose chip has not resolved yet reads as loading.
++ */
++internal fun buildAddonSourceRings(
++    orderedAddons: List<String>,
++    sourceChips: List<SourceChipItem>,
++    allStreams: List<Stream>
++): List<AddonSourceRing> {
++    if (orderedAddons.isEmpty()) return emptyList()
++    val statusByName = sourceChips.associate { it.name to it.status }
++    val countsByName = HashMap<String, Int>()
++    allStreams.forEach { stream -> countsByName.merge(stream.addonName, 1, Int::plus) }
++    return orderedAddons.map { name ->
++        AddonSourceRing(
++            name = name,
++            status = statusByName[name] ?: SourceChipStatus.SUCCESS,
++            resolvedCount = countsByName[name] ?: 0
++        )
++    }
++}
++
++/**
++ * The row of small status rings, one per addon that was asked for sources (Nuvio-KE port of the
++ * per-addon circle, sized and coloured for this tree). A resolved addon fills its ring
++ * proportionally to its share of all resolved streams in the tree's success colour; an addon
++ * still answering spins; one that failed draws a full error-coloured ring, so the problem addon
++ * reads at a glance. Not focusable: it mirrors the chip row beside it.
++ */
++@Composable
++internal fun AddonSourceRingRow(
++    rings: List<AddonSourceRing>,
++    modifier: Modifier = Modifier
++) {
++    if (rings.isEmpty()) return
++    val colors = NuvioTheme.colors
++    val spacing = NuvioTheme.spacing
++    val totalResolved = remember(rings) { rings.sumOf { it.resolvedCount } }
++    // The spin clock runs only while some addon is still answering.
++    val needsSpin = remember(rings) { rings.any { it.status == SourceChipStatus.LOADING } }
++    val spin = if (needsSpin) {
++        rememberInfiniteTransition(label = "addonSourceRings").animateFloat(
++            initialValue = 0f,
++            targetValue = 360f,
++            animationSpec = infiniteRepeatable(animation = tween(durationMillis = 1100, easing = LinearEasing)),
++            label = "addonSourceRingSpin"
++        )
++    } else {
++        null
++    }
++    Row(
++        modifier = modifier.horizontalScroll(rememberScrollState()),
++        horizontalArrangement = Arrangement.spacedBy(spacing.sm),
++        verticalAlignment = Alignment.CenterVertically
++    ) {
++        rings.forEach { ring ->
++            val description = when (ring.status) {
++                SourceChipStatus.LOADING -> stringResource(R.string.sources_ring_loading, ring.name)
++                SourceChipStatus.ERROR -> stringResource(R.string.sources_ring_failed, ring.name)
++                SourceChipStatus.SUCCESS ->
++                    "${ring.name} · " + stringResource(R.string.sources_ring_streams, ring.resolvedCount)
++            }
++            Box(
++                modifier = Modifier
++                    .size(RING_SIZE)
++                    .semantics { contentDescription = description }
++                    .drawBehind {
++                        val stroke = RING_STROKE.toPx()
++                        val topLeft = Offset(stroke / 2f, stroke / 2f)
++                        val arcSize = Size(size.width - stroke, size.height - stroke)
++                        val trackStyle = Stroke(width = stroke)
++                        // The faint track every ring carries, so an empty ring still reads as a ring.
++                        drawCircle(
++                            color = colors.TextDisabled.copy(alpha = 0.55f),
++                            radius = (size.minDimension - stroke) / 2f,
++                            style = trackStyle
++                        )
++                        when (ring.status) {
++                            SourceChipStatus.LOADING -> spin?.let { arc ->
++                                drawArc(
++                                    color = colors.TextSecondary,
++                                    startAngle = arc.value,
++                                    sweepAngle = RING_SPIN_SWEEP,
++                                    useCenter = false,
++                                    topLeft = topLeft,
++                                    size = arcSize,
++                                    style = Stroke(width = stroke, cap = StrokeCap.Round)
++                                )
++                            }
++                            SourceChipStatus.ERROR -> drawArc(
++                                color = colors.Error,
++                                startAngle = -90f,
++                                sweepAngle = 360f,
++                                useCenter = false,
++                                topLeft = topLeft,
++                                size = arcSize,
++                                style = trackStyle
++                            )
++                            SourceChipStatus.SUCCESS -> {
++                                // An addon that answered with no streams keeps its bare track.
++                                val share = if (ring.resolvedCount > 0 && totalResolved > 0) {
++                                    (ring.resolvedCount.toFloat() / totalResolved).coerceIn(RING_MIN_SHARE, 1f)
++                                } else {
++                                    0f
++                                }
++                                if (share > 0f) {
++                                    drawArc(
++                                        color = colors.Success,
++                                        startAngle = -90f,
++                                        sweepAngle = 360f * share,
++                                        useCenter = false,
++                                        topLeft = topLeft,
++                                        size = arcSize,
++                                        style = trackStyle
++                                    )
++                                }
++                            }
++                        }
++                    }
++            )
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamSourcesSidePanel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamSourcesSidePanel.kt
+index 5e39cd65d..5c0e77b94 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamSourcesSidePanel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamSourcesSidePanel.kt
+@@ -295,25 +295,33 @@ internal fun StreamSourcesSidePanel(
+                 exit = fadeOut(animationSpec = tween(120))
+             ) {
+                 Box(modifier = Modifier.onFocusChanged { chipsHasFocus = it.hasFocus }) {
+-                    AddonFilterChips(
+-                        addons = uiState.sourceAvailableAddons,
+-                        sourceChips = uiState.sourceChips,
+-                        selectedAddon = uiState.sourceSelectedAddonFilter,
+-                        isStillFetching = uiState.isLoadingSourceStreams ||
+-                            uiState.sourceChips.any { it.status == SourceChipStatus.LOADING },
+-                        onRefresh = {
+-                            userMovedFromFirstResult = false
+-                            firstResultFocusAssigned = false
+-                            onReload()
+-                        },
+-                        onAddonSelected = { onAddonFilterSelected(it) },
+-                        externalFocusRequesters = chipFocusRequesters,
+-                        externalOrderedNames = orderedAddonNames,
+-                        onUpKey = {
+-                            try { closeButtonFocusRequester.requestFocus() } catch (_: Exception) {}
+-                        },
+-                        debugTag = "SourcesSidePanel"
+-                    )
++                    Column {
++                        AddonFilterChips(
++                            addons = uiState.sourceAvailableAddons,
++                            sourceChips = uiState.sourceChips,
++                            selectedAddon = uiState.sourceSelectedAddonFilter,
++                            isStillFetching = uiState.isLoadingSourceStreams ||
++                                uiState.sourceChips.any { it.status == SourceChipStatus.LOADING },
++                            onRefresh = {
++                                userMovedFromFirstResult = false
++                                firstResultFocusAssigned = false
++                                onReload()
++                            },
++                            onAddonSelected = { onAddonFilterSelected(it) },
++                            externalFocusRequesters = chipFocusRequesters,
++                            externalOrderedNames = orderedAddonNames,
++                            onUpKey = {
++                                try { closeButtonFocusRequester.requestFocus() } catch (_: Exception) {}
++                            },
++                            debugTag = "SourcesSidePanel"
++                        )
++                        Spacer(modifier = Modifier.height(NuvioTheme.spacing.xs))
++                        AddonSourceRingRow(
++                            rings = remember(orderedAddonNames, uiState.sourceChips, uiState.sourceAllStreams) {
++                                buildAddonSourceRings(orderedAddonNames, uiState.sourceChips, uiState.sourceAllStreams)
++                            }
++                        )
++                    }
+                 }
+             }
+ 
+@@ -450,6 +458,7 @@ internal fun StreamSourcesSidePanel(
+                                 showFileSizeBadges = uiState.showFileSizeBadges,
+                                 showAddonLogo = uiState.showAddonLogo,
+                                 badgePlacement = uiState.streamBadgePlacement,
++                                failedBefore = stream.getStreamUrl() in uiState.sourceFailedStreamUrls,
+                                 onClick = { onStreamSelected(stream) },
+                                 onFocusChanged = { focused ->
+                                     if (focused) {
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index f26eb57e5..9bc31405e 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1984,6 +1984,11 @@
+     <string name="sources_close">Close</string>
+     <string name="sources_playing">Playing</string>
+     <string name="sources_no_streams">No streams found</string>
++    <!-- Nuvio-KE port: sources panel per-addon status rings and row failure marks -->
++    <string name="sources_ring_streams">%1$d streams</string>
++    <string name="sources_ring_loading">%1$s is still loading</string>
++    <string name="sources_ring_failed">%1$s failed</string>
++    <string name="sources_row_failed_before">Link failed earlier</string>
+ 
+     <string name="episodes_panel_close">Close</string>
+     <string name="episodes_panel_back">Back</string>

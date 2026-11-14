@@ -1,0 +1,1821 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/di/NetworkModule.kt b/app/src/main/java/com/nuvio/tv/core/di/NetworkModule.kt
+index 54557fb26..e817ac31a 100644
+--- a/app/src/main/java/com/nuvio/tv/core/di/NetworkModule.kt
++++ b/app/src/main/java/com/nuvio/tv/core/di/NetworkModule.kt
+@@ -45,17 +45,13 @@ import retrofit2.converter.moshi.MoshiConverterFactory
+ import com.nuvio.tv.core.network.IPv4FirstDns
+ import com.nuvio.tv.core.network.AddonHostGuard
+ import com.nuvio.tv.core.network.AddonHostGuardInterceptor
++import com.nuvio.tv.core.network.tls.AddonTlsTrust
+ import com.nuvio.tv.core.diagnostics.SentryNetworkBreadcrumbInterceptor
+ import java.io.File
+-import java.security.SecureRandom
+-import java.security.cert.X509Certificate
+ import java.util.concurrent.TimeUnit
+ import java.util.concurrent.atomic.AtomicLong
+ import javax.inject.Named
+ import javax.inject.Singleton
+-import javax.net.ssl.SSLContext
+-import javax.net.ssl.TrustManager
+-import javax.net.ssl.X509TrustManager
+ 
+ private object TraktHttpTrace {
+     private val requestCounter = AtomicLong(0L)
+@@ -152,8 +148,12 @@ object NetworkModule {
+     fun provideAddonHostGuard(): AddonHostGuard = AddonHostGuard()
+ 
+     /**
+-     * Permissive client for addon-provided URLs, including self-hosted servers with self-signed
+-     * certificates. Uses a separate cache from first-party traffic.
++     * Client for addon-provided URLs. The name `addonPermissive` is historical: since the
++     * Nuvio-KE TLS port it validates certificates ([AddonTlsTrust]) with per-host trust on
++     * first use — the platform chain and hostname must verify, or the leaf must be a pin the
++     * user explicitly trusted for that host through the consent dialog. Validation is never
++     * disabled and never auto-trusts; first-party endpoints use the base client's platform
++     * defaults and are untouched by this. Uses a separate cache from first-party traffic.
+      *
+      * Do not use for first-party endpoints.
+      *
+@@ -166,6 +166,13 @@ object NetworkModule {
+      * player traffic (ExoPlayer HttpDataSource, covered by ParallelRangeRateGate and the
+      * long-Retry-After next-source switch in PlayerMediaSourceFactory). See
+      * [AddonHostGuard]'s KDoc for how the three layers divide the work.
++     *
++     * Ordering of the KE-port layers on this one client: [AddonHostGuardInterceptor] is an
++     * application interceptor, so it wraps the whole call including the TLS handshake and a
++     * skipped call never reaches TLS; [AddonTlsTrust]'s socket factory + trust manager run
++     * below every interceptor (the pin check happens during the handshake); on a TLS refusal
++     * the exception surfaces through the guard interceptor, which classifies it into the
++     * host's certificate flag before rethrowing.
+      */
+     @Provides
+     @Singleton
+@@ -173,26 +180,19 @@ object NetworkModule {
+     fun provideAddonPermissiveOkHttpClient(
+         @ApplicationContext context: Context,
+         okHttpClient: OkHttpClient,
+-        addonHostGuard: AddonHostGuard
++        addonHostGuard: AddonHostGuard,
++        addonTls: AddonTlsTrust
+     ): OkHttpClient {
+-        val trustAllManager = object : X509TrustManager {
+-            override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
+-            override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
+-            override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+-        }
+-        val sslContext = SSLContext.getInstance("TLS").apply {
+-            init(null, arrayOf<TrustManager>(trustAllManager), SecureRandom())
+-        }
+         return okHttpClient.newBuilder()
+             .cache(Cache(File(context.cacheDir, "addon_http_cache"), 50L * 1024 * 1024))
+-            .sslSocketFactory(sslContext.socketFactory, trustAllManager)
+-            .hostnameVerifier { _, _ -> true }
++            .sslSocketFactory(addonTls.sslSocketFactory, addonTls.trustManager)
++            .hostnameVerifier(addonTls.hostnameVerifier)
+             // Addon host guard (Nuvio-KE port): pause all traffic to an addon host that
+             // answers 429/503-with-Retry-After, and trip a failure-count breaker on
+             // repeated 5xx / network errors. Blocked requests fail fast with an
+             // IOException instead of retrying into the ban. Application interceptor:
+-            // blocked calls never reach the network. Only addon hosts ride this client,
+-            // so no extra host predicate is needed.
++            // blocked calls never reach the network (and never reach TLS). Only addon
++            // hosts ride this client, so no extra host predicate is needed.
+             .addInterceptor(AddonHostGuardInterceptor(addonHostGuard))
+             .build()
+     }
+diff --git a/app/src/main/java/com/nuvio/tv/core/network/AddonHostGuard.kt b/app/src/main/java/com/nuvio/tv/core/network/AddonHostGuard.kt
+index 60a7f1c94..66ec6cced 100644
+--- a/app/src/main/java/com/nuvio/tv/core/network/AddonHostGuard.kt
++++ b/app/src/main/java/com/nuvio/tv/core/network/AddonHostGuard.kt
+@@ -2,6 +2,12 @@ package com.nuvio.tv.core.network
+ 
+ import android.os.SystemClock
+ import android.util.Log
++import com.nuvio.tv.core.network.tls.AddonCertificateSkipException
++import com.nuvio.tv.core.network.tls.addonServerOf
++import com.nuvio.tv.core.network.tls.isAddonCertificateFailure
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
+ import okhttp3.Interceptor
+ import okhttp3.Response
+ import java.io.IOException
+@@ -42,6 +48,10 @@ import javax.inject.Singleton
+  * So: this class is the first line (discovery + stream lists), layer 2 protects resolve
+  * calls, layer 3 protects playback. They share no state on purpose. (A fourth limiter,
+  * BackendRateLimitPlugin, paces the app's OWN backend API over Ktor — unrelated to addons.)
++ *
++ * Nuvio-KE TLS port: the guard also keeps, per `host:port`, whether the last real outcome was a
++ * certificate failure ([certificateFailures], in memory only — never persisted). The Addons screen
++ * reads it to offer the Certificate action; Trust and a probe that verifies clear it.
+  */
+ @Singleton
+ class AddonHostGuard(
+@@ -49,7 +59,7 @@ class AddonHostGuard(
+     private val wallNowMs: () -> Long = System::currentTimeMillis,
+ ) {
+ 
+-    enum class Admission { ALLOW, PROBE, SKIP_RATE_LIMITED, SKIP_BREAKER_OPEN }
++    enum class Admission { ALLOW, PROBE, SKIP_RATE_LIMITED, SKIP_BREAKER_OPEN, SKIP_CERTIFICATE }
+ 
+     private class HostState {
+         var pauseUntilMs = 0L
+@@ -62,6 +72,15 @@ class AddonHostGuard(
+ 
+     private val hosts = ConcurrentHashMap<String, HostState>()
+ 
++    private val certificateFailed = MutableStateFlow<Set<String>>(emptySet())
++
++    /**
++     * The `host:port` keys whose last real outcome was a certificate failure. Any answer or other
++     * network failure clears a key, as do Trust and a probe that now verifies; skips, cache hits
++     * and cancelled calls leave it.
++     */
++    val certificateFailures: StateFlow<Set<String>> = certificateFailed.asStateFlow()
++
+     private fun stateFor(host: String): HostState = hosts.computeIfAbsent(host) { HostState() }
+ 
+     /** May this request to [host] go out? [PROBE] grants a single half-open request. */
+@@ -72,7 +91,11 @@ class AddonHostGuard(
+             return when {
+                 now < state.pauseUntilMs -> Admission.SKIP_RATE_LIMITED
+                 state.openUntilMs == 0L -> Admission.ALLOW
+-                now < state.openUntilMs || state.probeInFlight -> Admission.SKIP_BREAKER_OPEN
++                now < state.openUntilMs || state.probeInFlight ->
++                    // A host whose breaker opened on its certificate fails with the certificate
++                    // error rather than the breaker's generic message, so the caller can offer
++                    // the re-prompt.
++                    if (host in certificateFailed.value) Admission.SKIP_CERTIFICATE else Admission.SKIP_BREAKER_OPEN
+                 else -> {
+                     state.probeInFlight = true
+                     Admission.PROBE
+@@ -86,6 +109,8 @@ class AddonHostGuard(
+         val state = stateFor(host)
+         synchronized(state) {
+             if (probe) state.probeInFlight = false
++            // The handshake completed: whatever the answer, the certificate is off the hook.
++            setCertificateFailure(host, false)
+             val now = nowMs()
+             if (shouldPauseAddonHost(code, retryAfter)) {
+                 val pauseMs = addonHostPauseMs(
+@@ -106,15 +131,51 @@ class AddonHostGuard(
+         }
+     }
+ 
+-    /** The call failed on the network (or ran out its call timeout). */
++    /** The call failed on the network (or ran out its call timeout) on anything but its certificate. */
+     fun onNetworkFailure(host: String, probe: Boolean) {
+         val state = stateFor(host)
+         synchronized(state) {
+             if (probe) state.probeInFlight = false
++            // A plain network failure says nothing about the certificate; only a classified
++            // certificate failure keeps the flag.
++            setCertificateFailure(host, false)
++            onFailure(state, nowMs(), probe)
++        }
++    }
++
++    /** The handshake failed on the certificate: a failure for the breaker, and the host is flagged. */
++    fun onCertificateFailure(host: String, probe: Boolean) {
++        val state = stateFor(host)
++        synchronized(state) {
++            if (probe) state.probeInFlight = false
++            setCertificateFailure(host, true)
+             onFailure(state, nowMs(), probe)
+         }
+     }
+ 
++    /**
++     * The user trusted this host's certificate: closes its breaker and clears its flag so the
++     * re-fetch goes out now. A 429 pause stays: the server asked for it.
++     */
++    fun onTrusted(host: String) {
++        hosts[host]?.let { state ->
++            synchronized(state) {
++                state.failureAtMs.clear()
++                state.openUntilMs = 0L
++                state.probeInFlight = false
++            }
++        }
++        setCertificateFailure(host, false)
++    }
++
++    /** A certificate probe found the host verifies now. */
++    fun clearCertificateFailure(host: String) = setCertificateFailure(host, false)
++
++    private fun setCertificateFailure(host: String, failed: Boolean) {
++        val current = certificateFailed.value
++        if ((host in current) != failed) certificateFailed.value = if (failed) current + host else current - host
++    }
++
+     /** No outcome (the caller cancelled it, or the cache answered): only frees a probe slot. */
+     fun onNoOutcome(host: String, probe: Boolean) {
+         if (!probe) return
+@@ -189,6 +250,10 @@ class AddonHostGuard(
+  */
+ internal fun addonGuardKey(host: String, port: Int): String = "$host:$port"
+ 
++/** [addonGuardKey] of an addon URL, the key its calls are flagged under (the Addons row reads it); null when unparseable. */
++internal fun addonGuardKeyOf(addonUrl: String): String? =
++    addonServerOf(addonUrl)?.let { addonGuardKey(it.host, it.port) }
++
+ /** Does [code] + its Retry-After header warrant pausing the whole host? */
+ internal fun shouldPauseAddonHost(code: Int, retryAfterHeader: String?): Boolean =
+     code == 429 || (code == 503 && !retryAfterHeader.isNullOrBlank())
+@@ -238,6 +303,15 @@ internal fun addonHostPauseMs(
+  * a fail-fast exception. Everything else passes through untouched: the guard is a no-op
+  * for any answer other than 429 / 503-with-Retry-After (host pause), 5xx (breaker
+  * failures) and network errors (breaker failures).
++ *
++ * TLS ordering (Nuvio-KE port): application interceptors wrap the whole call including the
++ * handshake, so this interceptor runs ABOVE the TLS layer ([AddonTlsTrust]'s socket factory and
++ * trust manager sit below every interceptor by construction). A skipped call therefore never
++ * reaches TLS; a TLS refusal surfaces here as a thrown exception and is classified
++ * ([isAddonCertificateFailure]) into [AddonHostGuard.onCertificateFailure] before rethrow, so
++ * the Addons screen can offer the certificate review. When the breaker is already open on a
++ * certificate, [SKIP_CERTIFICATE] fails the call with [AddonCertificateSkipException] so the
++ * caller sees the certificate error rather than the breaker's generic message.
+  */
+ class AddonHostGuardInterceptor(
+     private val guard: AddonHostGuard,
+@@ -251,13 +325,18 @@ class AddonHostGuardInterceptor(
+             AddonHostGuard.Admission.ALLOW, AddonHostGuard.Admission.PROBE -> Unit
+             AddonHostGuard.Admission.SKIP_RATE_LIMITED -> throw pausedException(host)
+             AddonHostGuard.Admission.SKIP_BREAKER_OPEN -> throw breakerOpenException(host)
++            // Spec 68 P6: the caller sees the certificate error the host last gave.
++            AddonHostGuard.Admission.SKIP_CERTIFICATE -> throw AddonCertificateSkipException()
+         }
+         val probe = admission == AddonHostGuard.Admission.PROBE
+         val startedAtNs = System.nanoTime()
+         val response = try {
+             chain.proceed(request)
+         } catch (t: Throwable) {
+-            if (t is IOException &&
++            if (t.isAddonCertificateFailure()) {
++                // A certificate came back: the host was reached.
++                guard.onCertificateFailure(host, probe)
++            } else if (t is IOException &&
+                 (!chain.call().isCanceled() || ranOutCallTimeout(chain, startedAtNs))
+             ) {
+                 guard.onNetworkFailure(host, probe)
+diff --git a/app/src/main/java/com/nuvio/tv/core/network/NetworkResult.kt b/app/src/main/java/com/nuvio/tv/core/network/NetworkResult.kt
+index 1ffb831fb..4dc24bf5c 100644
+--- a/app/src/main/java/com/nuvio/tv/core/network/NetworkResult.kt
++++ b/app/src/main/java/com/nuvio/tv/core/network/NetworkResult.kt
+@@ -2,7 +2,17 @@ package com.nuvio.tv.core.network
+ 
+ sealed class NetworkResult<out T> {
+     data class Success<T>(val data: T) : NetworkResult<T>()
+-    data class Error(val message: String, val code: Int? = null) : NetworkResult<Nothing>()
++
++    /**
++     * [certificate] = the addon server's certificate was refused, or the guard skipped a host whose
++     * last failure was one (Nuvio-KE TLS port); the message is fixed, and the caller can offer the
++     * certificate review instead of a retry.
++     */
++    data class Error(
++        val message: String,
++        val code: Int? = null,
++        val certificate: Boolean = false
++    ) : NetworkResult<Nothing>()
+     data object Loading : NetworkResult<Nothing>()
+ 
+     companion object {
+diff --git a/app/src/main/java/com/nuvio/tv/core/network/SafeApiCall.kt b/app/src/main/java/com/nuvio/tv/core/network/SafeApiCall.kt
+index a853bc8bc..81af05578 100644
+--- a/app/src/main/java/com/nuvio/tv/core/network/SafeApiCall.kt
++++ b/app/src/main/java/com/nuvio/tv/core/network/SafeApiCall.kt
+@@ -2,6 +2,7 @@ package com.nuvio.tv.core.network
+ 
+ import android.content.Context
+ import com.nuvio.tv.R
++import com.nuvio.tv.core.network.tls.isAddonCertificateFailure
+ import kotlinx.coroutines.CancellationException
+ import retrofit2.Response
+ 
+@@ -21,6 +22,13 @@ suspend fun <T> safeApiCall(
+     } catch (e: CancellationException) {
+         throw e
+     } catch (e: Exception) {
+-        NetworkResult.Error(e.message ?: context.getString(R.string.network_error_unknown))
++        if (e.isAddonCertificateFailure()) {
++            // Nuvio-KE TLS port: the addon server's certificate was refused (or the guard skipped
++            // a host whose last failure was one). Fixed message; [NetworkResult.Error.certificate]
++            // lets callers offer the certificate review instead of a retry.
++            NetworkResult.Error(context.getString(R.string.addon_cert_network_error), certificate = true)
++        } else {
++            NetworkResult.Error(e.message ?: context.getString(R.string.network_error_unknown))
++        }
+     }
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertFailure.kt b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertFailure.kt
+new file mode 100644
+index 000000000..11a4aea71
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertFailure.kt
+@@ -0,0 +1,44 @@
++package com.nuvio.tv.core.network.tls
++
++import java.security.cert.CertificateException
++import java.util.Collections
++import java.util.IdentityHashMap
++import javax.net.ssl.SSLHandshakeException
++import javax.net.ssl.SSLPeerUnverifiedException
++
++/**
++ * P6: thrown instead of a real call when the host's breaker is open and its last failure was a
++ * certificate, so the caller gets the certificate error rather than the guard's generic 503. A
++ * subclass of [SSLPeerUnverifiedException], so [isAddonCertificateFailure] reads it like a real one.
++ * Its message is for logs; `safeApiCall` shows `network_error_addon_certificate`.
++ */
++internal class AddonCertificateSkipException :
++    SSLPeerUnverifiedException("Skipped: the addon server's last failure was its certificate")
++
++/**
++ * P6 (shapes from S0, OkHttp 5.3.2 on Conscrypt): a wrong name is an [SSLPeerUnverifiedException]
++ * (our verifier said no); an untrusted, self-signed or expired chain is an [SSLHandshakeException]
++ * caused by a [CertificateException]. With several addresses the certificate failure may sit in
++ * `suppressed` behind another route's error, so the cause chain and `suppressed` are both walked.
++ */
++internal fun Throwable.isAddonCertificateFailure(): Boolean {
++    val seen = Collections.newSetFromMap(IdentityHashMap<Throwable, Boolean>())
++    val pending = ArrayDeque<Throwable>().apply { add(this@isAddonCertificateFailure) }
++    var handshake = false
++    var certificate = false
++    while (pending.isNotEmpty() && seen.size < MAX_WALKED) {
++        val t = pending.removeFirst()
++        if (!seen.add(t)) continue
++        when (t) {
++            is SSLPeerUnverifiedException -> return true
++            is SSLHandshakeException -> handshake = true
++            is CertificateException -> certificate = true
++        }
++        t.cause?.let(pending::addLast)
++        t.suppressed.forEach(pending::addLast)
++    }
++    return handshake && certificate
++}
++
++/** Bounds the walk on a pathological exception graph. */
++private const val MAX_WALKED = 32
+diff --git a/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertPinKeeper.kt b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertPinKeeper.kt
+new file mode 100644
+index 000000000..4a1d234ca
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertPinKeeper.kt
+@@ -0,0 +1,84 @@
++package com.nuvio.tv.core.network.tls
++
++import android.util.Log
++import dagger.Lazy
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.CoroutineDispatcher
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.flow.Flow
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
++import kotlinx.coroutines.withContext
++import okhttp3.OkHttpClient
++import javax.inject.Inject
++import javax.inject.Named
++import javax.inject.Singleton
++
++private const val TAG = "AddonCertPinKeeper"
++
++/**
++ * Ported from Nuvio-KE (`core/network/tls/AddonCertPinKeeper.kt`), reduced to what this tree needs.
++ *
++ * Every change to the trusted addon certificates goes through here, under one mutex: Trust
++ * ([trust]), Forget ([forget]) and [clear]. Whenever a pin goes away (a renewal, a forget, or an
++ * LRU eviction), the addon client's idle pooled connections are evicted, so a connection that pin
++ * vouched for is not reused; a connection busy at that moment stays until its call ends (OkHttp's
++ * `evictAll`).
++ *
++ * Deviations from KE: no prune-on-open (this tree has no per-profile stored-addon sweep and the
++ * pin store is LRU-capped instead) and no install-exemption scope (nothing prunes while an
++ * install runs).
++ */
++@Singleton
++class AddonCertPinKeeper internal constructor(
++    private val store: AddonCertPinStore,
++    private val evictConnections: () -> Unit,
++    private val io: CoroutineDispatcher
++) {
++    @Inject
++    internal constructor(
++        store: AddonCertPinStore,
++        @Named("addonPermissive") addonClient: Lazy<OkHttpClient>
++    ) : this(
++        store = store,
++        evictConnections = { addonClient.get().connectionPool.evictAll() },
++        io = Dispatchers.IO
++    )
++
++    private val mutex = Mutex()
++
++    /** Observable pins (the Addons screen reads which servers are pinned). */
++    internal fun pinsFlow(): Flow<AddonCertPins> = store.pinsFlow
++
++    /** The pins, current when this returns (the panel reads the stored pin for a `host:port`). */
++    internal suspend fun currentPins(): AddonCertPins = store.current()
++
++    /** Stores the certificate the user trusted ([pin]); refreshes an existing pin's timestamp. */
++    internal suspend fun trust(pin: AddonCertPin) {
++        mutex.withLock { if (store.put(pin)) evict() }
++    }
++
++    /** The user forgot [host]:[port]'s pin; true when one was stored and is now gone. */
++    internal suspend fun forget(host: String, port: Int): Boolean = mutex.withLock {
++        val key = pinHost(host)
++        val removed = store.removeWhere { it.host == key && it.port == port }
++        if (removed) evict()
++        removed
++    }
++
++    /** Forgets every trusted certificate. */
++    suspend fun clear() {
++        mutex.withLock {
++            try {
++                store.clear()
++            } catch (e: CancellationException) {
++                throw e
++            } catch (e: Exception) {
++                Log.w(TAG, "Pin clear skipped: ${e.javaClass.simpleName}")
++            }
++            evict()
++        }
++    }
++
++    private suspend fun evict() = withContext(io) { evictConnections() }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertPinStore.kt b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertPinStore.kt
+new file mode 100644
+index 000000000..50b82fe44
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertPinStore.kt
+@@ -0,0 +1,123 @@
++package com.nuvio.tv.core.network.tls
++
++import android.content.Context
++import android.util.Log
++import androidx.datastore.core.DataStore
++import androidx.datastore.preferences.core.Preferences
++import androidx.datastore.preferences.core.edit
++import androidx.datastore.preferences.core.emptyPreferences
++import androidx.datastore.preferences.core.stringPreferencesKey
++import androidx.datastore.preferences.preferencesDataStore
++import dagger.hilt.android.qualifiers.ApplicationContext
++import kotlinx.coroutines.flow.Flow
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.flow.map
++import kotlinx.coroutines.runBlocking
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
++import kotlinx.serialization.builtins.ListSerializer
++import kotlinx.serialization.json.Json
++import javax.inject.Inject
++import javax.inject.Singleton
++
++private const val TAG = "AddonCertPinStore"
++
++/**
++ * Ported from Nuvio-KE (`core/network/tls/AddonCertPinStore.kt`), reshaped for this tree's
++ * standalone DataStore idiom (same construction pattern as [com.nuvio.tv.data.local.DebugSettingsDataStore]).
++ *
++ * One device-scoped store: never per-profile, never synced (a trusted certificate is a property of
++ * this device's network path, not of the signed-in account). The plain `preferencesDataStore`
++ * delegate puts the file in the default `files/datastore/` directory, outside the per-profile
++ * stores that sign-out sweeps away.
++ */
++private val Context.addonCertPinDataStore: DataStore<Preferences> by preferencesDataStore(
++    name = "addon_cert_pins",
++    corruptionHandler = androidx.datastore.core.handlers.ReplaceFileCorruptionHandler { emptyPreferences() }
++)
++
++/**
++ * The device's trusted addon certificates. At most [MAX_PINS] entries: a further trust evicts the
++ * least recently trusted pin (LRU, by [AddonCertPin.trustedAtMs]) so the store cannot grow with
++ * every host the user ever touched.
++ *
++ * The TLS checks read [pinsBlocking] on OkHttp's connection threads, and only after the platform
++ * check failed, so a host with a valid public certificate never waits on disk.
++ */
++@Singleton
++class AddonCertPinStore @Inject constructor(
++    @ApplicationContext context: Context
++) {
++    private val dataStore = context.addonCertPinDataStore
++
++    private val key = stringPreferencesKey("pins_json")
++    private val serializer = ListSerializer(AddonCertPin.serializer())
++    private val json = Json { ignoreUnknownKeys = true }
++    private val mutex = Mutex()
++
++    /** Null until the first successful read; a failed read is never kept, so the next call reads again. */
++    @Volatile
++    private var snapshot: AddonCertPins? = null
++
++    /** Observable pins, for the Addons screen's pinned-server flags. */
++    internal val pinsFlow: Flow<AddonCertPins> = dataStore.data.map { prefs -> AddonCertPins(decode(prefs[key])) }
++
++    /**
++     * The pins, read from disk on first use (blocking). Throws when the read fails; the callers
++     * treat that as "not pinned", so a disk failure fails closed and the next connection retries.
++     */
++    internal fun pinsBlocking(): AddonCertPins = snapshot ?: runBlocking { current() }
++
++    internal suspend fun current(): AddonCertPins = snapshot ?: mutex.withLock { snapshot ?: load() }
++
++    /**
++     * Stores [pin] by [withTrusted]'s rule, capped at [MAX_PINS] entries (LRU). The snapshot is
++     * current when this returns. True when a pin was removed (a renewal or an eviction), so
++     * callers can drop connections it vouched for.
++     */
++    internal suspend fun put(pin: AddonCertPin): Boolean = update { pins -> capByLru(pins.withTrusted(pin)) }
++
++    /** Drops every pin [drop] matches; true when one was removed. */
++    internal suspend fun removeWhere(drop: (AddonCertPin) -> Boolean): Boolean = update { pins -> pins.filterNot(drop) }
++
++    /** Forgets every trusted certificate (sign-out / debugging). */
++    internal suspend fun clear(): Boolean = update { emptyList() }
++
++    /** True when [transform] removed (or replaced) a stored pin. */
++    private suspend fun update(transform: (List<AddonCertPin>) -> List<AddonCertPin>): Boolean =
++        mutex.withLock {
++            var removed = false
++            val updated = dataStore.edit { prefs ->
++                val before = decode(prefs[key])
++                val next = transform(before)
++                removed = before.any { it !in next }
++                if (next.isEmpty()) prefs.remove(key) else prefs[key] = json.encodeToString(serializer, next)
++            }
++            snapshot = AddonCertPins(decode(updated[key]))
++            removed
++        }
++
++    private suspend fun load(): AddonCertPins =
++        AddonCertPins(decode(dataStore.data.first()[key])).also { snapshot = it }
++
++    /** A value that does not decode reads as no pins (fails closed: those hosts ask again). */
++    private fun decode(raw: String?): List<AddonCertPin> {
++        if (raw.isNullOrEmpty()) return emptyList()
++        return try {
++            json.decodeFromString(serializer, raw)
++        } catch (e: IllegalArgumentException) { // SerializationException included
++            Log.w(TAG, "Pins did not decode (${e.javaClass.simpleName}); reading as none")
++            emptyList()
++        }
++    }
++
++    /** Keeps at most [MAX_PINS] pins, evicting the least recently trusted ones first. */
++    private fun capByLru(pins: List<AddonCertPin>): List<AddonCertPin> =
++        if (pins.size <= MAX_PINS) pins
++        else pins.sortedByDescending { it.trustedAtMs }.take(MAX_PINS)
++
++    companion object {
++        /** The pin store's hard ceiling (LRU eviction past it). */
++        const val MAX_PINS = 50
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertPins.kt b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertPins.kt
+new file mode 100644
+index 000000000..0dae72191
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertPins.kt
+@@ -0,0 +1,93 @@
++package com.nuvio.tv.core.network.tls
++
++import kotlinx.serialization.Serializable
++import okhttp3.HttpUrl
++import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
++import java.security.MessageDigest
++import java.security.cert.X509Certificate
++import java.util.Locale
++
++/**
++ * Ported from Nuvio-KE (`core/network/tls/AddonCertPins.kt`).
++ *
++ * One leaf certificate the user trusted for one addon server, stored and shown per `host:port`.
++ * [sha256] is the leaf's DER SHA-256 in upper-case hex; [trustedAtMs] is shown in the
++ * certificate-changed dialog and doubles as the pin store's LRU clock.
++ */
++@Serializable
++data class AddonCertPin(
++    val host: String,
++    val port: Int,
++    val sha256: String,
++    val trustedAtMs: Long
++)
++
++/** An immutable view of every pin, the form the TLS checks read. */
++class AddonCertPins(val pins: List<AddonCertPin>) {
++    private val fingerprints: List<String> = pins.map { it.sha256 }
++
++    /**
++     * Host-blind: only lets a pinned leaf's handshake through. [AddonTrustManager] runs before the
++     * hostname is known, so the host-blind form is the only one it can use; [isPinnedForHost] then
++     * binds the pin to the right host in the hostname verifier.
++     */
++    fun containsFingerprint(sha256: String): Boolean =
++        fingerprints.any { fingerprintsEqual(it, sha256) }
++
++    /**
++     * The hostname verifier is never given the port, so a pin for this host on any port counts.
++     * Comparison is constant-time ([MessageDigest.isEqual]).
++     */
++    fun isPinnedForHost(host: String, sha256: String): Boolean {
++        val key = pinHost(host)
++        return pins.any { it.host == key && fingerprintsEqual(it.sha256, sha256) }
++    }
++
++    companion object {
++        val EMPTY = AddonCertPins(emptyList())
++    }
++}
++
++/** Constant-time fingerprint comparison: never a plain string `==` on secret-dependent input. */
++internal fun fingerprintsEqual(a: String, b: String): Boolean =
++    MessageDigest.isEqual(
++        a.toByteArray(Charsets.UTF_8),
++        b.toByteArray(Charsets.UTF_8)
++    )
++
++/**
++ * The one rule for storing a trusted [pin]: a port with no pin only gains one (another service on
++ * this host keeps its own); a port whose pin differs is a renewal, so its pin is replaced and other
++ * ports of this host holding the same old fingerprint go too. Trusting the fingerprint a port
++ * already holds refreshes its timestamp (the LRU clock and the shown "trusted on" date).
++ */
++internal fun List<AddonCertPin>.withTrusted(pin: AddonCertPin): List<AddonCertPin> {
++    val keyed = pin.copy(host = pinHost(pin.host))
++    val old = firstOrNull { it.host == keyed.host && it.port == keyed.port }
++    if (old == null) return this + keyed
++    if (old.sha256 == keyed.sha256) return map { if (it == old) keyed else it }
++    return filterNot { it.host == keyed.host && (it.port == keyed.port || it.sha256 == old.sha256) } + keyed
++}
++
++/**
++ * The server an addon URL's calls go to (`stremio://` read as `https://`), or null when it does not
++ * parse. Its `host` and `port` are the pin key and, as `host:port`, [com.nuvio.tv.core.network.AddonHostGuard]'s key.
++ */
++internal fun addonServerOf(url: String): HttpUrl? {
++    val trimmed = url.trim()
++    val rewritten = if (trimmed.startsWith("stremio://")) "https://" + trimmed.removePrefix("stremio://") else trimmed
++    return rewritten.takeIf { it.startsWith("http://") || it.startsWith("https://") }?.toHttpUrlOrNull()
++}
++
++/** How a server is named to the user: `host`, or `host:port` when the port is not 443. */
++internal fun addonServerLabel(host: String, port: Int): String = if (port == 443) host else "$host:$port"
++
++/** [addonServerLabel] of an addon URL (host only: never its path or query, which carry keys); null when it does not parse. */
++internal fun addonServerLabel(url: String): String? = addonServerOf(url)?.let { addonServerLabel(it.host, it.port) }
++
++/** The host form pins are keyed by: OkHttp's `HttpUrl.host` (already lower-case punycode), lower-cased again defensively. */
++internal fun pinHost(host: String): String = host.lowercase(Locale.ROOT)
++
++/** Upper-case hex SHA-256 of [cert]'s DER encoding: the pinned value. */
++internal fun leafSha256(cert: X509Certificate): String =
++    MessageDigest.getInstance("SHA-256").digest(cert.encoded).joinToString("") { "%02X".format(it) }
+diff --git a/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertProbe.kt b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertProbe.kt
+new file mode 100644
+index 000000000..a6e7ada36
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertProbe.kt
+@@ -0,0 +1,193 @@
++package com.nuvio.tv.core.network.tls
++
++import com.nuvio.tv.core.network.AddonHostGuard
++import com.nuvio.tv.core.network.IPv4FirstDns
++import com.nuvio.tv.core.network.addonGuardKey
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.CoroutineDispatcher
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.suspendCancellableCoroutine
++import kotlinx.coroutines.withContext
++import okhttp3.Call
++import okhttp3.Callback
++import okhttp3.Dns
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.Response
++import java.io.IOException
++import java.security.cert.CertificateException
++import java.security.cert.X509Certificate
++import java.util.concurrent.CopyOnWriteArrayList
++import java.util.concurrent.TimeUnit
++import javax.inject.Inject
++import javax.inject.Singleton
++import javax.net.ssl.SSLContext
++import javax.net.ssl.TrustManager
++import javax.net.ssl.X509TrustManager
++import kotlin.coroutines.resume
++
++/** What a certificate probe of an addon server found. */
++sealed interface AddonCertProbeResult {
++
++    /** No certificate came back: unreachable, or not an https address. Nothing to trust; the flag stays. */
++    data object NoCertificate : AddonCertProbeResult
++
++    /** The certificate passes the checks now (platform, or a pin for this host). The flag is cleared. */
++    data object VerifiesNow : AddonCertProbeResult
++
++    /** The server's addresses presented different certificates: no single fingerprint to trust. */
++    data object Inconsistent : AddonCertProbeResult
++
++    /**
++     * The certificate fails the checks. [previous] is the pin stored for exactly this `host:port`:
++     * non-null means the certificate changed. [shownName] is the leaf's first DNS or IP
++     * subject-alternative name, shown for a wrong name.
++     */
++    data class Untrusted internal constructor(
++        val host: String,
++        val port: Int,
++        val leaf: X509Certificate,
++        val sha256: String,
++        val reason: Reason,
++        val shownName: String?,
++        internal val previous: AddonCertPin?
++    ) : AddonCertProbeResult {
++        val previousSha256: String? get() = previous?.sha256
++        val previousTrustedAtMs: Long? get() = previous?.trustedAtMs
++    }
++
++    /** An untrusted chain is SELF_SIGNED (leaf issuer = subject), from an UNKNOWN_ISSUER, EXPIRED or WRONG_NAME. */
++    enum class Reason { SELF_SIGNED, UNKNOWN_ISSUER, EXPIRED, WRONG_NAME }
++}
++
++/**
++ * Ported from Nuvio-KE (`core/network/tls/AddonCertProbe.kt`): reads an addon server's certificate
++ * without sending it anything. This is how the presented certificate's fingerprint is captured on a
++ * certificate failure — a failed handshake on the real client exposes no peer certificates, so the
++ * consent dialog probes the server on demand. Runs only on Review certificate or after a failed
++ * install. Each probe builds a fresh client (DNS and timeouts as the addon client; no cache, no
++ * interceptors, its own pool and its own [SSLContext], so the host guard cannot answer for it and
++ * no TLS session is resumed) whose trust manager records the chain and always throws: the handshake
++ * never completes, so no request byte is written.
++ */
++@Singleton
++class AddonCertProbe internal constructor(
++    private val policy: AddonTrustPolicy,
++    private val pins: suspend () -> AddonCertPins,
++    private val guard: AddonHostGuard,
++    private val dns: Dns,
++    private val io: CoroutineDispatcher,
++    private val nowMs: () -> Long
++) {
++    @Inject
++    internal constructor(addonTls: AddonTlsTrust, store: AddonCertPinStore, guard: AddonHostGuard) : this(
++        policy = addonTls.policy,
++        pins = store::current,
++        guard = guard,
++        dns = IPv4FirstDns(),
++        io = Dispatchers.IO,
++        nowMs = System::currentTimeMillis
++    )
++
++    suspend fun probe(addonUrl: String): AddonCertProbeResult = withContext(io) {
++        val server = addonServerOf(addonUrl)
++        if (server == null || !server.isHttps) return@withContext AddonCertProbeResult.NoCertificate
++        val recorder = ChainRecorder()
++        // Scheme, host and port only: the addon's path and query carry its keys.
++        val origin = server.newBuilder().encodedPath("/").query(null).fragment(null).build()
++        capture(origin, recorder)
++        val chains = recorder.chains
++        val chain = chains.firstOrNull() ?: return@withContext AddonCertProbeResult.NoCertificate
++        if (chains.mapTo(HashSet()) { leafSha256(it.first()) }.size > 1) {
++            return@withContext AddonCertProbeResult.Inconsistent
++        }
++        val host = server.host
++        val port = server.port
++        // A pin-store failure reads as "not pinned", as on the real call.
++        if (runCatching { policy.isTrusted(host, chain) }.getOrDefault(false)) {
++            guard.clearCertificateFailure(addonGuardKey(host, port))
++            return@withContext AddonCertProbeResult.VerifiesNow
++        }
++        val leaf = chain.first()
++        val previous = try {
++            pins().pins.firstOrNull { it.host == pinHost(host) && it.port == port }
++        } catch (e: CancellationException) {
++            throw e
++        } catch (e: Exception) {
++            null // the store failed: shown as a first trust; Trust still applies the renewal rule
++        }
++        AddonCertProbeResult.Untrusted(
++            host = host,
++            port = port,
++            leaf = leaf,
++            sha256 = leafSha256(leaf),
++            reason = when {
++                // The chain is trusted, so the name is what failed.
++                policy.platformAccepts(chain) -> AddonCertProbeResult.Reason.WRONG_NAME
++                leaf.notAfter.time < nowMs() -> AddonCertProbeResult.Reason.EXPIRED
++                isSelfSigned(leaf) -> AddonCertProbeResult.Reason.SELF_SIGNED
++                else -> AddonCertProbeResult.Reason.UNKNOWN_ISSUER
++            },
++            shownName = firstSubjectAltName(leaf),
++            previous = previous
++        )
++    }
++
++    private suspend fun capture(origin: okhttp3.HttpUrl, recorder: ChainRecorder) {
++        val context = SSLContext.getInstance("TLS").apply { init(null, arrayOf<TrustManager>(recorder), null) }
++        val client = OkHttpClient.Builder()
++            .dns(dns)
++            .sslSocketFactory(context.socketFactory, recorder)
++            .hostnameVerifier { _, _ -> false } // never reached: the trust manager always throws
++            .connectTimeout(30, TimeUnit.SECONDS)
++            .readTimeout(60, TimeUnit.SECONDS)
++            .callTimeout(30, TimeUnit.SECONDS)
++            .build()
++        val call = client.newCall(Request.Builder().url(origin).build())
++        try {
++            suspendCancellableCoroutine { continuation ->
++                continuation.invokeOnCancellation { call.cancel() }
++                call.enqueue(object : Callback {
++                    override fun onFailure(call: Call, e: IOException) = continuation.resume(Unit)
++                    override fun onResponse(call: Call, response: Response) {
++                        response.close() // unreachable while the recorder throws; never read
++                        continuation.resume(Unit)
++                    }
++                })
++            }
++        } finally {
++            client.dispatcher.executorService.shutdown()
++            client.connectionPool.evictAll()
++        }
++    }
++
++    /** Records every server chain offered, first kept first; accepts nothing. */
++    private class ChainRecorder : X509TrustManager {
++        val chains = CopyOnWriteArrayList<List<X509Certificate>>()
++
++        override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {
++            if (!chain.isNullOrEmpty()) chains += chain.toList()
++            throw CertificateException("Certificate probe: capture only")
++        }
++
++        override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) =
++            throw CertificateException("Certificate probe: capture only")
++
++        override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
++    }
++}
++
++/**
++ * The leaf names itself as its issuer and its signature checks with its own key (the panel says
++ * "self-signed" only then; a home CA whose name equals the leaf's subject stays "unknown issuer").
++ */
++internal fun isSelfSigned(leaf: X509Certificate): Boolean =
++    leaf.issuerX500Principal == leaf.subjectX500Principal &&
++        runCatching { leaf.verify(leaf.publicKey) }.isSuccess
++
++/** First DNS (2) or IP (7) subject-alternative name, or null. */
++private fun firstSubjectAltName(leaf: X509Certificate): String? = runCatching {
++    leaf.subjectAlternativeNames
++        ?.firstOrNull { (it.getOrNull(0) as? Int) == 2 || (it.getOrNull(0) as? Int) == 7 }
++        ?.getOrNull(1) as? String
++}.getOrNull()
+diff --git a/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertTrustAction.kt b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertTrustAction.kt
+new file mode 100644
+index 000000000..2afbfd436
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertTrustAction.kt
+@@ -0,0 +1,53 @@
++package com.nuvio.tv.core.network.tls
++
++import com.nuvio.tv.core.network.AddonHostGuard
++import com.nuvio.tv.core.network.addonGuardKey
++import com.nuvio.tv.data.local.AddonPreferences
++import com.nuvio.tv.domain.repository.AddonRepository
++import kotlinx.coroutines.NonCancellable
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.withContext
++import javax.inject.Inject
++import javax.inject.Singleton
++
++/**
++ * Ported from Nuvio-KE (`core/network/tls/AddonCertTrustAction.kt`): the user pressed Trust on a
++ * probed certificate. Stores exactly the probed fingerprint for its `host:port` (a different
++ * certificate on the real call stays refused), resets that server's breaker and certificate flag,
++ * then re-fetches the manifest of every installed addon on it, so the Addons rows clear as soon as
++ * the server answers.
++ */
++@Singleton
++class AddonCertTrustAction internal constructor(
++    private val keeper: AddonCertPinKeeper,
++    private val guard: AddonHostGuard,
++    private val installedAddonUrls: suspend () -> List<String>,
++    private val fetchAddon: suspend (String) -> Unit,
++    private val nowMs: () -> Long
++) {
++    @Inject
++    internal constructor(
++        keeper: AddonCertPinKeeper,
++        guard: AddonHostGuard,
++        preferences: AddonPreferences,
++        addonRepository: AddonRepository
++    ) : this(
++        keeper = keeper,
++        guard = guard,
++        installedAddonUrls = { preferences.installedAddonUrls.first() },
++        fetchAddon = { url -> addonRepository.fetchAddon(url) },
++        nowMs = System::currentTimeMillis
++    )
++
++    suspend fun trust(probed: AddonCertProbeResult.Untrusted) {
++        // The user pressed Trust: storing it and resetting the server finish even if the screen goes away.
++        withContext(NonCancellable) {
++            keeper.trust(AddonCertPin(probed.host, probed.port, probed.sha256, nowMs()))
++            guard.onTrusted(addonGuardKey(probed.host, probed.port))
++        }
++        val host = pinHost(probed.host)
++        installedAddonUrls()
++            .filter { url -> addonServerOf(url)?.let { pinHost(it.host) == host && it.port == probed.port } == true }
++            .forEach { url -> fetchAddon(url) }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/network/tls/AddonTlsTrust.kt b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonTlsTrust.kt
+new file mode 100644
+index 000000000..2bd6727d9
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonTlsTrust.kt
+@@ -0,0 +1,136 @@
++package com.nuvio.tv.core.network.tls
++
++import okhttp3.internal.tls.OkHostnameVerifier
++import java.security.KeyStore
++import java.security.cert.CertificateException
++import java.security.cert.X509Certificate
++import javax.inject.Inject
++import javax.inject.Singleton
++import javax.net.ssl.HostnameVerifier
++import javax.net.ssl.SSLContext
++import javax.net.ssl.SSLSession
++import javax.net.ssl.SSLSocketFactory
++import javax.net.ssl.TrustManager
++import javax.net.ssl.TrustManagerFactory
++import javax.net.ssl.X509TrustManager
++
++/**
++ * The authType [AddonTrustPolicy] hands the platform manager when it re-checks a session's chain.
++ * On Conscrypt (Android 11+): GENERIC, RSA and ECDHE_RSA gave the same verdict on every chain.
++ */
++private const val SESSION_AUTH_TYPE = "GENERIC"
++
++/**
++ * Ported from Nuvio-KE (`core/network/tls/AddonTlsTrust.kt`): validated TLS for the addon client
++ * (`@Named("addonPermissive")`), with per-host trust on first use. A certificate passes when the
++ * platform accepts its chain and it names the host, or when its leaf is pinned for that host (any
++ * port). Replaces the old trust-all manager and always-true hostname verifier that this tree's
++ * addon client shipped with.
++ *
++ * NEVER auto-trusts: the only way a non-platform-valid certificate is accepted is a pin the user
++ * stored by pressing Trust on a consent dialog, and validation is never disabled globally (the
++ * first-party client and every other client keep the platform defaults).
++ */
++@Singleton
++class AddonTlsTrust internal constructor(platform: X509TrustManager, pins: () -> AddonCertPins) {
++
++    @Inject
++    constructor(store: AddonCertPinStore) : this(platformTrustManager(), store::pinsBlocking)
++
++    internal val policy = AddonTrustPolicy(platform, pins)
++    val trustManager: X509TrustManager = AddonTrustManager(platform, pins)
++    val hostnameVerifier: HostnameVerifier = AddonHostnameVerifier(policy)
++
++    /** The addon client's socket factory; its trust manager is [trustManager]. */
++    val sslSocketFactory: SSLSocketFactory = SSLContext.getInstance("TLS")
++        .apply { init(null, arrayOf<TrustManager>(trustManager), null) }
++        .socketFactory
++}
++
++/** The platform's default trust manager (system roots, plus any user-installed CAs). */
++internal fun platformTrustManager(): X509TrustManager {
++    val factory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
++    factory.init(null as KeyStore?)
++    return factory.trustManagers.filterIsInstance<X509TrustManager>().single()
++}
++
++/**
++ * The one decision, shared by the hostname verifier and the certificate probe so the two cannot
++ * disagree. Platform chain and name first (a valid host never reads the pin store), else the leaf
++ * pinned for this host on any port. A pinned leaf counts past its expiry: the user saw its dates.
++ */
++internal class AddonTrustPolicy(
++    private val platform: X509TrustManager,
++    private val pins: () -> AddonCertPins
++) {
++    fun isTrusted(host: String, chain: List<X509Certificate>): Boolean {
++        val leaf = chain.firstOrNull() ?: return false
++        if (platformAccepts(chain) && OkHostnameVerifier.verify(host, leaf)) return true
++        return pins().isPinnedForHost(host, leafSha256(leaf))
++    }
++
++    /** A platform failure of any kind (not only CertificateException) reads as "not accepted". */
++    fun platformAccepts(chain: List<X509Certificate>): Boolean = try {
++        platform.checkServerTrusted(chain.toTypedArray(), SESSION_AUTH_TYPE)
++        true
++    } catch (e: CertificateException) {
++        false
++    } catch (e: RuntimeException) {
++        false
++    }
++}
++
++/**
++ * Host-blind (it runs before the hostname is known): decides only whether the handshake may finish —
++ * the platform accepts the chain, or the leaf is pinned for some host ([AddonHostnameVerifier] then
++ * binds the pin to the right one). Only [CertificateException] leaves it; a pin-store failure of any
++ * kind (an Error from a first DataStore use included) counts as "not pinned", so nothing else can
++ * kill OkHttp's connection thread.
++ */
++internal class AddonTrustManager(
++    private val platform: X509TrustManager,
++    private val pins: () -> AddonCertPins
++) : X509TrustManager {
++
++    override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) =
++        platform.checkClientTrusted(chain, authType)
++
++    override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {
++        try {
++            platform.checkServerTrusted(chain, authType)
++        } catch (e: CertificateException) {
++            if (!isPinnedLeaf(chain)) throw e
++        } catch (e: RuntimeException) {
++            if (!isPinnedLeaf(chain)) throw CertificateException(e)
++        }
++    }
++
++    // OkHttp builds its certificate chain cleaner from these; the platform's issuers keep it working
++    // for valid chains. A pinned self-signed leaf's cleaned chain is empty: our code never reads
++    // Handshake.peerCertificates, and OkHttp's cache just stores the empty list.
++    override fun getAcceptedIssuers(): Array<X509Certificate> = platform.acceptedIssuers
++
++    private fun isPinnedLeaf(chain: Array<out X509Certificate>?): Boolean {
++        val leaf = chain?.firstOrNull() ?: return false
++        return try {
++            pins().containsFingerprint(leafSha256(leaf))
++        } catch (t: Throwable) {
++            false
++        }
++    }
++}
++
++/**
++ * Runs on every connection, resumed ones included (a resumed session skips the trust manager), so
++ * it is the complete check. Anything thrown inside it (Errors included) returns false rather than
++ * escaping onto OkHttp's dispatcher thread.
++ */
++internal class AddonHostnameVerifier(private val policy: AddonTrustPolicy) : HostnameVerifier {
++    override fun verify(host: String, session: SSLSession): Boolean = try {
++        val certificates = session.peerCertificates
++        val chain = certificates.filterIsInstance<X509Certificate>()
++        chain.size == certificates.size && policy.isTrusted(host, chain)
++    } catch (t: Throwable) {
++        false
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonCertificatePanel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonCertificatePanel.kt
+new file mode 100644
+index 000000000..d32559e2d
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonCertificatePanel.kt
+@@ -0,0 +1,276 @@
++package com.nuvio.tv.ui.screens.addon
++
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.ui.Alignment
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.withFrameNanos
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.semantics.Role
++import androidx.compose.ui.semantics.role
++import androidx.compose.ui.semantics.semantics
++import androidx.compose.ui.text.font.FontFamily
++import androidx.compose.ui.unit.dp
++import androidx.tv.material3.Button
++import androidx.tv.material3.MaterialTheme
++import androidx.tv.material3.Text
++import com.nuvio.tv.R
++import com.nuvio.tv.core.network.tls.AddonCertProbeResult
++import com.nuvio.tv.core.network.tls.addonServerLabel
++import com.nuvio.tv.ui.components.NuvioDialog
++import com.nuvio.tv.ui.theme.NuvioTheme
++import java.text.SimpleDateFormat
++import java.util.Date
++import java.util.Locale
++
++/**
++ * Ported from Nuvio-KE (`ui/screens/addon/AddonCertificatePanel.kt`), reshaped onto this tree's
++ * [NuvioDialog] idiom (KE's Marquee panel components do not exist here).
++ *
++ * First trust: "Trust this addon server?" — the reason sentence, what Trust does, the full
++ * SHA-256 with its expiry, Trust this server + Cancel. Changed: this `host:port` had another
++ * pin — both fingerprints side by side, Trust the new certificate + Keep paused. Pinned: the
++ * server verifies, the device holds a pin — the fingerprint and Forget this server + Close.
++ * The safe button (Cancel / Keep paused / Close) takes focus; Back = the safe button.
++ */
++@Composable
++internal fun AddonCertificateDialog(
++    state: AddonCertificatePanelState,
++    onTrust: () -> Unit,
++    onForget: () -> Unit,
++    onDismiss: () -> Unit
++) {
++    val probed = state.probed
++    val pinned = state.pinned
++    when {
++        probed != null -> CertificateConsentDialog(
++            state = state,
++            probed = probed,
++            onTrust = onTrust,
++            onDismiss = onDismiss
++        )
++        pinned != null -> CertificatePinnedDialog(
++            pinned = pinned,
++            onForget = onForget,
++            onDismiss = onDismiss
++        )
++    }
++}
++
++@Composable
++private fun CertificateConsentDialog(
++    state: AddonCertificatePanelState,
++    probed: AddonCertProbeResult.Untrusted,
++    onTrust: () -> Unit,
++    onDismiss: () -> Unit
++) {
++    val label = addonServerLabel(probed.host, probed.port)
++    val safeFocus = rememberSafeFocus()
++    NuvioDialog(
++        onDismiss = onDismiss,
++        title = stringResource(
++            if (state.changed) R.string.addon_cert_changed_title else R.string.addon_cert_trust_title
++        ),
++        width = 560.dp
++    ) {
++        Text(
++            text = certificateBody(state, probed, label),
++            style = MaterialTheme.typography.bodyMedium,
++            color = NuvioTheme.colors.TextSecondary
++        )
++        if (state.changed) {
++            Row(
++                modifier = Modifier.fillMaxWidth(),
++                horizontalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.lg)
++            ) {
++                FingerprintColumn(
++                    caption = stringResource(
++                        R.string.addon_cert_trusted_on,
++                        certificateDate(probed.previousTrustedAtMs ?: 0L)
++                    ),
++                    lines = fingerprintLines(probed.previousSha256.orEmpty(), groupsPerLine = 4),
++                    modifier = Modifier.weight(1f)
++                )
++                FingerprintColumn(
++                    caption = stringResource(
++                        R.string.addon_cert_now_valid_until,
++                        certificateDate(probed.leaf.notAfter.time)
++                    ),
++                    lines = fingerprintLines(probed.sha256, groupsPerLine = 4),
++                    modifier = Modifier.weight(1f)
++                )
++            }
++        } else {
++            FingerprintColumn(
++                caption = stringResource(
++                    R.string.addon_cert_fingerprint_label,
++                    certificateDate(probed.leaf.notAfter.time)
++                ),
++                lines = fingerprintLines(probed.sha256, groupsPerLine = 8)
++            )
++        }
++        CertificateDialogActions(
++            primaryLabel = stringResource(
++                if (state.changed) R.string.addon_cert_trust_new else R.string.addon_cert_trust
++            ),
++            safeLabel = stringResource(
++                if (state.changed && state.addonName != null) R.string.addon_cert_keep_paused
++                else R.string.action_cancel
++            ),
++            onPrimary = onTrust,
++            onSafe = onDismiss,
++            safeFocus = safeFocus
++        )
++    }
++}
++
++@Composable
++private fun CertificatePinnedDialog(
++    pinned: AddonCertPinSummary,
++    onForget: () -> Unit,
++    onDismiss: () -> Unit
++) {
++    val label = addonServerLabel(pinned.host, pinned.port)
++    val safeFocus = rememberSafeFocus()
++    NuvioDialog(
++        onDismiss = onDismiss,
++        title = stringResource(R.string.addon_cert_pinned_title, label),
++        width = 560.dp
++    ) {
++        Text(
++            text = stringResource(R.string.addon_cert_pinned_note),
++            style = MaterialTheme.typography.bodyMedium,
++            color = NuvioTheme.colors.TextSecondary
++        )
++        FingerprintColumn(
++            caption = stringResource(
++                R.string.addon_cert_trusted_on,
++                certificateDate(pinned.trustedAtMs)
++            ),
++            lines = fingerprintLines(pinned.sha256, groupsPerLine = 8)
++        )
++        CertificateDialogActions(
++            primaryLabel = stringResource(R.string.addon_cert_forget),
++            safeLabel = stringResource(R.string.action_close),
++            onPrimary = onForget,
++            onSafe = onDismiss,
++            safeFocus = safeFocus
++        )
++    }
++}
++
++@Composable
++private fun CertificateDialogActions(
++    primaryLabel: String,
++    safeLabel: String,
++    onPrimary: () -> Unit,
++    onSafe: () -> Unit,
++    safeFocus: FocusRequester
++) {
++    Row(
++        modifier = Modifier.fillMaxWidth(),
++        horizontalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.md, Alignment.End)
++    ) {
++        Button(
++            onClick = onPrimary,
++            modifier = Modifier.semantics { role = Role.Button }
++        ) {
++            Text(text = primaryLabel)
++        }
++        Button(
++            onClick = onSafe,
++            modifier = Modifier
++                .focusRequester(safeFocus)
++                .semantics { role = Role.Button }
++        ) {
++            Text(text = safeLabel)
++        }
++    }
++}
++
++@Composable
++private fun FingerprintColumn(
++    caption: String,
++    lines: String,
++    modifier: Modifier = Modifier
++) {
++    Column(
++        modifier = modifier
++            .fillMaxWidth()
++            .background(
++                NuvioTheme.colors.BackgroundCard,
++                RoundedCornerShape(NuvioTheme.radii.md)
++            )
++            .padding(horizontal = NuvioTheme.spacing.md, vertical = NuvioTheme.spacing.sm)
++    ) {
++        Text(
++            text = caption.uppercase(),
++            style = MaterialTheme.typography.labelSmall,
++            color = NuvioTheme.colors.TextTertiary
++        )
++        Text(
++            text = lines,
++            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
++            color = NuvioTheme.colors.TextPrimary
++        )
++    }
++}
++
++/** The body: the reason (or the change) and, after a blank line, what Trust does (or what a change means). */
++@Composable
++private fun certificateBody(
++    state: AddonCertificatePanelState,
++    probed: AddonCertProbeResult.Untrusted,
++    label: String
++): String {
++    if (state.changed) {
++        val trustedOn = certificateDate(probed.previousTrustedAtMs ?: 0L)
++        val change = if (state.addonName != null) {
++            stringResource(R.string.addon_cert_changed_body, label, trustedOn, state.addonName)
++        } else {
++            stringResource(R.string.addon_cert_changed_body_install, label, trustedOn)
++        }
++        return change + "\n\n" + stringResource(R.string.addon_cert_changed_note)
++    }
++    val reason = when (probed.reason) {
++        AddonCertProbeResult.Reason.SELF_SIGNED -> stringResource(R.string.addon_cert_reason_self_signed, label)
++        AddonCertProbeResult.Reason.UNKNOWN_ISSUER -> stringResource(R.string.addon_cert_reason_unknown_issuer, label)
++        AddonCertProbeResult.Reason.WRONG_NAME ->
++            stringResource(R.string.addon_cert_reason_wrong_name, label, probed.shownName ?: label)
++        AddonCertProbeResult.Reason.EXPIRED ->
++            stringResource(R.string.addon_cert_reason_expired, label, certificateDate(probed.leaf.notAfter.time))
++    }
++    return reason + "\n\n" + stringResource(R.string.addon_cert_trust_note, label)
++}
++
++/** "14 Mar 2027" in the device locale. */
++private fun certificateDate(epochMs: Long): String =
++    SimpleDateFormat("d MMM yyyy", Locale.getDefault()).format(Date(epochMs))
++
++/** The SHA-256 as 4-character groups, [groupsPerLine] groups per line (8 per line = 32 chars for a first-trust panel). */
++private fun fingerprintLines(sha256: String, groupsPerLine: Int): String =
++    sha256.uppercase(Locale.ROOT)
++        .chunked(4)
++        .chunked(groupsPerLine)
++        .joinToString("\n") { line -> line.joinToString(" ") }
++
++/** The safe button takes focus once the dialog is composed (same two-frame dance as the delete dialog). */
++@Composable
++private fun rememberSafeFocus(): FocusRequester {
++    val requester = remember { FocusRequester() }
++    LaunchedEffect(requester) {
++        repeat(2) { withFrameNanos { } }
++        runCatching { requester.requestFocus() }
++    }
++    return requester
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerScreen.kt
+index df07d97e0..2c71eccf5 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerScreen.kt
+@@ -108,6 +108,8 @@ import androidx.tv.material3.SwitchDefaults
+ import androidx.tv.material3.Text
+ import com.nuvio.tv.domain.model.Addon
+ import com.nuvio.tv.domain.model.ExperienceMode
++import com.nuvio.tv.core.network.addonGuardKeyOf
++import com.nuvio.tv.core.network.tls.addonServerLabel
+ import com.nuvio.tv.ui.components.LoadingIndicator
+ import com.nuvio.tv.ui.components.NuvioDialog
+ import com.nuvio.tv.ui.util.contentTextDirection
+@@ -569,6 +571,11 @@ fun AddonManagerScreen(
+                     key = { _, addon -> addon.baseUrl }
+                 ) { index, addon ->
+                     val bringIntoViewRequester = remember { BringIntoViewRequester() }
++                    // Nuvio-KE TLS port: the row shows the Certificate action while its server's
++                    // last failure was its certificate or while the device holds a pin for it.
++                    val certificateKey = addonGuardKeyOf(addon.baseUrl)
++                    val certificatePaused = certificateKey?.let { it in uiState.certificateFailureKeys } == true
++                    val certificatePinned = certificateKey?.let { it in uiState.pinnedServerKeys } == true
+                     AddonCard(
+                         modifier = Modifier.bringIntoViewRequester(bringIntoViewRequester),
+                         addon = addon,
+@@ -592,6 +599,9 @@ fun AddonManagerScreen(
+                         onEnabledChange = { enabled -> viewModel.setAddonEnabled(addon.baseUrl, enabled) },
+                         isReadOnly = viewModel.isReadOnly,
+                         showReorder = !isEssential,
++                        certificatePaused = certificatePaused,
++                        showCertificateAction = (certificatePaused || certificatePinned) && !viewModel.isReadOnly,
++                        onReviewCertificate = { viewModel.reviewCertificate(addon) },
+                         toggleFocusRequester = if (index == 0) firstAddonToggleFocusRequester else null
+                     )
+                 }
+@@ -650,6 +660,19 @@ fun AddonManagerScreen(
+             }
+         }
+ 
++        // Nuvio-KE TLS port: the certificate consent panel (first trust / changed / pinned).
++        uiState.certificatePanel?.let { panel ->
++            AddonCertificateDialog(
++                state = panel,
++                onTrust = { viewModel.onCertificateDecision(true) },
++                onForget = {
++                    panel.pinned?.let { viewModel.forgetPinnedCertificate(it) }
++                    viewModel.onCertificateDecision(false)
++                },
++                onDismiss = { viewModel.onCertificateDecision(false) }
++            )
++        }
++
+         AddonMessageOverlay(
+             message = uiState.transientMessage,
+             isError = uiState.transientMessageIsError
+@@ -1380,6 +1403,9 @@ private fun AddonCard(
+     onEnabledChange: (Boolean) -> Unit,
+     isReadOnly: Boolean = false,
+     showReorder: Boolean = true,
++    certificatePaused: Boolean = false,
++    showCertificateAction: Boolean = false,
++    onReviewCertificate: () -> Unit = {},
+     toggleFocusRequester: FocusRequester? = null
+ ) {
+     if (isReadOnly) {
+@@ -1427,6 +1453,9 @@ private fun AddonCard(
+                 onRemove = onRemove,
+                 onEnabledChange = onEnabledChange,
+                 showReorder = showReorder,
++                certificatePaused = certificatePaused,
++                showCertificateAction = showCertificateAction,
++                onReviewCertificate = onReviewCertificate,
+                 toggleFocusRequester = effectiveToggleFocusRequester
+             )
+         }
+@@ -1445,6 +1474,9 @@ private fun AddonCardContent(
+     onRemove: () -> Unit = {},
+     onEnabledChange: (Boolean) -> Unit = {},
+     showReorder: Boolean = true,
++    certificatePaused: Boolean = false,
++    showCertificateAction: Boolean = false,
++    onReviewCertificate: () -> Unit = {},
+     toggleFocusRequester: FocusRequester? = null
+ ) {
+     Column(modifier = Modifier.padding(20.dp)) {
+@@ -1477,6 +1509,14 @@ private fun AddonCardContent(
+                             color = NuvioTheme.colors.TextSecondary
+                         )
+                     }
++                    if (certificatePaused) {
++                        // Nuvio-KE TLS port: the row's server is paused on its certificate.
++                        Text(
++                            text = stringResource(R.string.addon_cert_paused).uppercase(),
++                            style = MaterialTheme.typography.labelSmall,
++                            color = NuvioTheme.colors.Error
++                        )
++                    }
+                 }
+             }
+             if (!isReadOnly) {
+@@ -1553,6 +1593,22 @@ private fun AddonCardContent(
+                             Icon(imageVector = Icons.Default.ArrowDownward, contentDescription = stringResource(R.string.cd_move_down))
+                         }
+                     }
++                    if (showCertificateAction) {
++                        // Nuvio-KE TLS port: opens the certificate probe + consent panel.
++                        Button(
++                            onClick = onReviewCertificate,
++                            modifier = Modifier.semantics { role = Role.Button },
++                            colors = ButtonDefaults.colors(
++                                containerColor = NuvioTheme.colors.BackgroundCard,
++                                contentColor = NuvioTheme.colors.TextSecondary,
++                                focusedContainerColor = NuvioTheme.colors.FocusBackground,
++                                focusedContentColor = NuvioTheme.colors.Secondary
++                            ),
++                            shape = ButtonDefaults.shape(RoundedCornerShape(NuvioTheme.radii.md))
++                        ) {
++                            Text(text = stringResource(R.string.addon_cert_action))
++                        }
++                    }
+                     Button(
+                         onClick = onRemove,
+                         modifier = Modifier.semantics { role = Role.Button },
+@@ -1581,6 +1637,20 @@ private fun AddonCardContent(
+             )
+         }
+ 
++        if (certificatePaused) {
++            // Nuvio-KE TLS port: the why-line replaces nothing here — it explains the paused
++            // state under the description, with the server label (host, or host:port).
++            Spacer(modifier = Modifier.height(NuvioTheme.spacing.sm))
++            Text(
++                text = stringResource(
++                    R.string.addon_cert_row_line,
++                    addonServerLabel(addon.baseUrl).orEmpty()
++                ),
++                style = MaterialTheme.typography.bodySmall,
++                color = NuvioTheme.colors.TextSecondary
++            )
++        }
++
+         Spacer(modifier = Modifier.height(NuvioTheme.spacing.sm))
+         Text(
+             text = addon.baseUrl,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerUiState.kt b/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerUiState.kt
+index e0c5853b1..c662210d0 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerUiState.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerUiState.kt
+@@ -1,6 +1,7 @@
+ package com.nuvio.tv.ui.screens.addon
+ 
+ import android.graphics.Bitmap
++import com.nuvio.tv.core.network.tls.AddonCertProbeResult
+ import com.nuvio.tv.domain.model.Addon
+ 
+ data class AddonManagerUiState(
+@@ -16,7 +17,36 @@ data class AddonManagerUiState(
+     val qrCodeBitmap: Bitmap? = null,
+     val serverUrl: String? = null,
+     // Pending change from phone
+-    val pendingChange: PendingChangeInfo? = null
++    val pendingChange: PendingChangeInfo? = null,
++    // Nuvio-KE TLS port: `host:port` keys whose last addon call failed on its certificate
++    // (the row shows the Certificate action and the paused why-line), and keys the device
++    // holds a trusted pin for (the Certificate action also offers Forget).
++    val certificateFailureKeys: Set<String> = emptySet(),
++    val pinnedServerKeys: Set<String> = emptySet(),
++    /** The open certificate panel (consent / changed / pinned), or null. */
++    val certificatePanel: AddonCertificatePanelState? = null
++)
++
++/**
++ * A certificate panel waiting for the user. [probed]: the probe's verdict (an untrusted
++ * certificate for first-trust or changed consent; null with [pinned] when the server verifies
++ * and the panel only offers Forget). [addonName]: the installed addon under review (changes the
++ * changed-panel's wording), null on Install.
++ */
++data class AddonCertificatePanelState(
++    val probed: AddonCertProbeResult.Untrusted? = null,
++    val pinned: AddonCertPinSummary? = null,
++    val addonName: String? = null
++) {
++    val changed: Boolean get() = probed?.previousSha256 != null
++}
++
++/** The pin the device holds for one `host:port` (shown in the panel's pinned state). */
++data class AddonCertPinSummary(
++    val host: String,
++    val port: Int,
++    val sha256: String,
++    val trustedAtMs: Long
+ )
+ 
+ data class PendingChangeInfo(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerViewModel.kt
+index 3fda3b3b0..3d94395f7 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerViewModel.kt
+@@ -10,6 +10,15 @@ import com.nuvio.tv.core.sync.StartupSyncService
+ import com.nuvio.tv.core.sync.homeCatalogKey
+ import com.nuvio.tv.core.sync.homeLegacyDisabledCatalogKey
+ import com.nuvio.tv.core.network.NetworkResult
++import com.nuvio.tv.core.network.AddonHostGuard
++import com.nuvio.tv.core.network.addonGuardKey
++import com.nuvio.tv.core.network.tls.AddonCertPinKeeper
++import com.nuvio.tv.core.network.tls.AddonCertProbe
++import com.nuvio.tv.core.network.tls.AddonCertProbeResult
++import com.nuvio.tv.core.network.tls.AddonCertTrustAction
++import com.nuvio.tv.core.network.tls.addonServerLabel
++import com.nuvio.tv.core.network.tls.addonServerOf
++import com.nuvio.tv.core.network.tls.pinHost
+ import com.nuvio.tv.core.qr.QrCodeGenerator
+ import com.nuvio.tv.core.server.AddonConfigServer
+ import com.nuvio.tv.core.server.AddonInfo
+@@ -48,7 +57,9 @@ import com.nuvio.tv.domain.model.enabledAddons
+ import com.nuvio.tv.domain.repository.AddonRepository
+ import dagger.hilt.android.lifecycle.HiltViewModel
+ import dagger.hilt.android.qualifiers.ApplicationContext
++import kotlinx.coroutines.CompletableDeferred
+ import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
+ import kotlinx.coroutines.delay
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.StateFlow
+@@ -73,6 +84,10 @@ class AddonManagerViewModel @Inject constructor(
+     private val profileManager: ProfileManager,
+     private val tmdbCollectionSourceResolver: TmdbCollectionSourceResolver,
+     private val traktPublicListSourceResolver: TraktPublicListSourceResolver,
++    private val hostGuard: AddonHostGuard,
++    private val certProbe: AddonCertProbe,
++    private val certTrustAction: AddonCertTrustAction,
++    private val certPinKeeper: AddonCertPinKeeper,
+     @ApplicationContext private val context: Context
+ ) : ViewModel() {
+ 
+@@ -99,13 +114,35 @@ class AddonManagerViewModel @Inject constructor(
+     private var followAddonsOrderEnabled: Boolean = false
+     private var currentCollections: List<Collection> = emptyList()
+ 
++    /** A certificate review (probe + consent panel) in progress; install and review share it. */
++    private var certificateJob: Job? = null
++
++    /** The open certificate panel's answer: true = Trust. */
++    private var certificateDecision: CompletableDeferred<Boolean>? = null
++
+     init {
+         observeInstalledAddons()
+         observeCatalogPreferences()
+         observeCollections()
++        observeCertificateFlags()
+         loadLogoBytes()
+     }
+ 
++    /** Nuvio-KE TLS port: the Addons rows read the certificate-failure flags and the device's pins. */
++    private fun observeCertificateFlags() {
++        viewModelScope.launch {
++            hostGuard.certificateFailures.collect { keys ->
++                _uiState.update { it.copy(certificateFailureKeys = keys) }
++            }
++        }
++        viewModelScope.launch {
++            certPinKeeper.pinsFlow().collect { pins ->
++                val keys = pins.pins.mapTo(HashSet()) { addonGuardKey(it.host, it.port) }
++                _uiState.update { it.copy(pinnedServerKeys = keys) }
++            }
++        }
++    }
++
+     fun requestAddonSyncNow() {
+         startupSyncService.requestAddonSyncNow()
+     }
+@@ -152,13 +189,26 @@ class AddonManagerViewModel @Inject constructor(
+             return
+         }
+ 
+-        viewModelScope.launch {
++        if (certificateJob?.isActive == true) return
++        certificateJob = viewModelScope.launch {
+             _uiState.update { it.copy(isInstalling = true, error = null, transientMessage = null) }
+ 
+-            when (val result = addonRepository.fetchAddon(normalizedUrl)) {
++            var result = addonRepository.fetchAddon(normalizedUrl)
++            // Nuvio-KE TLS port: the install failed on the addon server's certificate. Probe it,
++            // ask on the consent panel, and retry once when the user trusted it.
++            if (result is NetworkResult.Error && result.certificate) {
++                val trusted = resolveCertificate(normalizedUrl, addonName = null)
++                if (!trusted) {
++                    _uiState.update { it.copy(isInstalling = false) }
++                    return@launch
++                }
++                result = addonRepository.fetchAddon(normalizedUrl)
++            }
++
++            when (val outcome = result) {
+                 is NetworkResult.Success -> {
+                     addonRepository.addAddon(normalizedUrl)
+-                    val addonName = result.data.displayName.ifBlank { result.data.baseUrl }
++                    val addonName = outcome.data.displayName.ifBlank { outcome.data.baseUrl }
+                     _uiState.update {
+                         it.copy(
+                             isInstalling = false,
+@@ -169,7 +219,7 @@ class AddonManagerViewModel @Inject constructor(
+                     }
+                 }
+                 is NetworkResult.Error -> {
+-                    val message = result.message
++                    val message = outcome.message
+                     _uiState.update {
+                         it.copy(
+                             isInstalling = false,
+@@ -186,6 +236,107 @@ class AddonManagerViewModel @Inject constructor(
+         }
+     }
+ 
++    /**
++     * Nuvio-KE TLS port: the row's Certificate action (shown while the server's last failure was
++     * its certificate, or while the device holds a pin for it). Probes the server; an untrusted
++     * certificate opens the consent panel, a pinned-and-verified server opens the panel with the
++     * Forget option.
++     */
++    fun reviewCertificate(addon: Addon) {
++        if (certificateJob?.isActive == true) return
++        certificateJob = viewModelScope.launch {
++            val probed = certProbe.probe(addon.baseUrl)
++            when (probed) {
++                is AddonCertProbeResult.Untrusted ->
++                    askTrust(AddonCertificatePanelState(probed = probed, addonName = addon.displayName))
++                AddonCertProbeResult.VerifiesNow -> {
++                    val server = addonServerOf(addon.baseUrl)
++                    val pin = server?.let { pinFor(it.host, it.port) }
++                    if (pin != null) {
++                        askTrust(AddonCertificatePanelState(pinned = pin, addonName = addon.displayName))
++                    } else {
++                        // Nothing pinned: the certificate verifies against the platform now.
++                        showCertificateLine(
++                            R.string.addon_cert_verifies_now,
++                            addonServerLabel(addon.baseUrl).orEmpty(),
++                            isError = false
++                        )
++                    }
++                }
++                AddonCertProbeResult.NoCertificate ->
++                    showCertificateLine(R.string.addon_cert_unreachable, addonServerLabel(addon.baseUrl).orEmpty(), isError = true)
++                AddonCertProbeResult.Inconsistent ->
++                    showCertificateLine(R.string.addon_cert_inconsistent, addonServerLabel(addon.baseUrl).orEmpty(), isError = true)
++            }
++        }
++    }
++
++    /** The certificate panel's answer: Trust ([trust] true), or Cancel / Keep pinned / Back. */
++    fun onCertificateDecision(trust: Boolean) {
++        certificateDecision?.complete(trust)
++    }
++
++    /** The pinned panel's Forget: drops the pin for [summary]'s host:port and its connections. */
++    fun forgetPinnedCertificate(summary: AddonCertPinSummary) {
++        if (certificateJob?.isActive == true) return
++        certificateJob = viewModelScope.launch {
++            val removed = certPinKeeper.forget(summary.host, summary.port)
++            val label = addonServerLabel(summary.host, summary.port)
++            if (removed) {
++                showCertificateLine(R.string.addon_cert_forgotten, label, isError = false)
++            }
++        }
++    }
++
++    /** The pin stored for exactly this `host:port`, or null (store failure reads as none). */
++    private suspend fun pinFor(host: String, port: Int): AddonCertPinSummary? = try {
++        certPinKeeper.currentPins().pins
++            .firstOrNull { it.host == pinHost(host) && it.port == port }
++            ?.let { AddonCertPinSummary(it.host, it.port, it.sha256, it.trustedAtMs) }
++    } catch (e: kotlinx.coroutines.CancellationException) {
++        throw e
++    } catch (e: Exception) {
++        null
++    }
++
++    /**
++     * Probes [url]'s server and opens the consent panel when its certificate is untrusted; true
++     * when the user trusted it (pin stored, the server's breaker reset, its installed addons
++     * re-fetched). Any other outcome shows its line and returns false.
++     */
++    private suspend fun resolveCertificate(url: String, addonName: String?): Boolean {
++        val label = addonServerLabel(url).orEmpty()
++        return when (val probed = certProbe.probe(url)) {
++            is AddonCertProbeResult.Untrusted -> {
++                val trusted = askTrust(AddonCertificatePanelState(probed = probed, addonName = addonName))
++                if (trusted) certTrustAction.trust(probed)
++                trusted
++            }
++            AddonCertProbeResult.VerifiesNow -> showCertificateLine(R.string.addon_cert_verifies_now, label, isError = false)
++            AddonCertProbeResult.NoCertificate -> showCertificateLine(R.string.addon_cert_unreachable, label, isError = true)
++            AddonCertProbeResult.Inconsistent -> showCertificateLine(R.string.addon_cert_inconsistent, label, isError = true)
++        }
++    }
++
++    private fun showCertificateLine(line: Int, label: String, isError: Boolean): Boolean {
++        val message = context.getString(line, label)
++        _uiState.update { it.copy(transientMessage = message, transientMessageIsError = isError) }
++        return false
++    }
++
++    /** Opens [panel] and waits for the user; the panel closes however the wait ends. */
++    private suspend fun askTrust(panel: AddonCertificatePanelState): Boolean {
++        val decision = CompletableDeferred<Boolean>()
++        certificateDecision = decision
++        _uiState.update { it.copy(certificatePanel = panel) }
++        return try {
++            decision.await()
++        } finally {
++            certificateDecision = null
++            _uiState.update { it.copy(certificatePanel = null) }
++        }
++    }
++
+     private fun normalizeAddonUrl(input: String): String? {
+         var trimmed = input.trim()
+         if (trimmed.startsWith("stremio://")) {
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index f26eb57e5..15f4ab9cf 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1787,6 +1787,38 @@
+     <string name="addon_delete_confirm_message">Are you sure you want to delete it?</string>
+     <string name="addon_delete_no">No</string>
+     <string name="addon_delete_yes">Yes</string>
++    <!-- Nuvio-KE TLS port: addon server certificates (TOFU pinning with consent). %1$s = host, with :port when not 443. -->
++    <string name="addon_cert_action">Certificate</string>
++    <string name="addon_cert_paused">Paused</string>
++    <string name="addon_cert_row_line">Nuvio can\'t verify %1$s, so nothing is sent to this addon. Review its certificate to use it again.</string>
++    <string name="addon_cert_trust_title">Trust this addon server?</string>
++    <string name="addon_cert_reason_self_signed">Its certificate is self-signed, so Nuvio can\'t check that this really is %1$s. If it isn\'t, whoever sits in between can read what Nuvio sends this addon, including the keys in its address.</string>
++    <string name="addon_cert_reason_unknown_issuer">Its certificate comes from an issuer Nuvio doesn\'t know, so Nuvio can\'t check that this really is %1$s. If it isn\'t, whoever sits in between can read what Nuvio sends this addon, including the keys in its address.</string>
++    <!-- %2$s = the name the certificate was issued for. -->
++    <string name="addon_cert_reason_wrong_name">Its certificate was issued for a different name (%2$s), so Nuvio can\'t check that this really is %1$s. If it isn\'t, whoever sits in between can read what Nuvio sends this addon, including the keys in its address.</string>
++    <!-- %2$s = the date it expired. -->
++    <string name="addon_cert_reason_expired">Its certificate expired on %2$s, so Nuvio can\'t check that this really is %1$s. If it isn\'t, whoever sits in between can read what Nuvio sends this addon, including the keys in its address.</string>
++    <string name="addon_cert_trust_note">Trust it only if this is your own server. Nuvio then accepts this one certificate for %1$s and asks again if it ever changes.</string>
++    <string name="addon_cert_fingerprint_label">Certificate SHA-256 · valid until %1$s</string>
++    <string name="addon_cert_trust">Trust this server</string>
++    <string name="addon_cert_changed_title">This server\'s certificate changed</string>
++    <!-- %2$s = the date it was trusted, %3$s = the addon\'s name. -->
++    <string name="addon_cert_changed_body">%1$s now shows a different certificate from the one you trusted on %2$s. %3$s stays paused until you decide.</string>
++    <!-- On install, where nothing is paused yet. -->
++    <string name="addon_cert_changed_body_install">%1$s now shows a different certificate from the one you trusted on %2$s.</string>
++    <string name="addon_cert_changed_note">That is expected if you renewed or reinstalled the certificate yourself. If you didn\'t, keep it paused: someone may be sitting in between.</string>
++    <string name="addon_cert_trusted_on">Trusted %1$s</string>
++    <string name="addon_cert_now_valid_until">Now · valid until %1$s</string>
++    <string name="addon_cert_trust_new">Trust the new certificate</string>
++    <string name="addon_cert_keep_paused">Keep paused</string>
++    <string name="addon_cert_pinned_title">Trusted certificate for %1$s</string>
++    <string name="addon_cert_pinned_note">Nuvio accepts this certificate for this server because you trusted it. Forget it and Nuvio asks again the next time a certificate here fails validation.</string>
++    <string name="addon_cert_forget">Forget this server</string>
++    <string name="addon_cert_forgotten">Forgotten the trusted certificate for %1$s</string>
++    <string name="addon_cert_verifies_now">%1$s checks out now. If the addon still fails, it sends Nuvio on to a server that can\'t be verified.</string>
++    <string name="addon_cert_unreachable">Couldn\'t reach %1$s over https, so there\'s no certificate to check. Make sure the server is on, then try again.</string>
++    <string name="addon_cert_inconsistent">%1$s shows different certificates on different addresses, so Nuvio can\'t trust one of them. Fix the server\'s certificate, then try again.</string>
++    <string name="addon_cert_network_error">Can\'t verify this addon server\'s certificate</string>
+     <string name="addons_badge_disabled">Disabled</string>
+     <string name="addon_manage_from_phone_title">Manage from phone</string>
+     <string name="addon_manage_from_phone_subtitle">Scan a QR code to manage addons, catalogs, and collections from your phone</string>
