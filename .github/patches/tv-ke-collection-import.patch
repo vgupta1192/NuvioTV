@@ -1,0 +1,737 @@
+diff --git a/app/src/main/java/com/nuvio/tv/data/local/CollectionsDataStore.kt b/app/src/main/java/com/nuvio/tv/data/local/CollectionsDataStore.kt
+index 30bfe04fc..5010ad07f 100644
+--- a/app/src/main/java/com/nuvio/tv/data/local/CollectionsDataStore.kt
++++ b/app/src/main/java/com/nuvio/tv/data/local/CollectionsDataStore.kt
+@@ -31,11 +31,22 @@ import java.util.UUID
+ import javax.inject.Inject
+ import javax.inject.Singleton
+ 
++enum class CollectionImportItemStatus { OK, WARNING, SKIPPED }
++
++/** One review row for a top-level entry of an imported collections JSON (KE Stage 8). */
++data class CollectionImportItemResult(
++    val index: Int,
++    val title: String?,
++    val status: CollectionImportItemStatus,
++    val reasons: List<String> = emptyList()
++)
++
+ data class ValidationResult(
+     val valid: Boolean,
+     val error: String? = null,
+     val collectionCount: Int = 0,
+-    val folderCount: Int = 0
++    val folderCount: Int = 0,
++    val items: List<CollectionImportItemResult> = emptyList()
+ )
+ 
+ @Singleton
+@@ -80,6 +91,26 @@ class CollectionsDataStore @Inject constructor(
+         }
+     }
+ 
++    /**
++     * Read-modify-write merge inside one edit{} (KE L4-85): each collection whose id is stored
++     * replaces it in place, the rest are appended in order. Merging against the stored list
++     * (not a UI snapshot) keeps a concurrent delete or sync pull from being overwritten.
++     */
++    suspend fun upsertCollections(collections: List<Collection>) {
++        store().edit { prefs ->
++            val current = parseCollections(prefs[collectionsKey]).toMutableList()
++            for (collection in collections) {
++                val index = current.indexOfFirst { it.id == collection.id }
++                if (index >= 0) current[index] = collection else current.add(collection)
++            }
++            if (current.isEmpty()) {
++                prefs.remove(collectionsKey)
++            } else {
++                prefs[collectionsKey] = gson.toJson(current.map { it.toSerializable() })
++            }
++        }
++    }
++
+     suspend fun updateCollection(collection: Collection) {
+         store().edit { prefs ->
+             val current = parseCollections(prefs[collectionsKey]).toMutableList()
+@@ -123,62 +154,143 @@ class CollectionsDataStore @Inject constructor(
+         return prefs[collectionsKey]
+     }
+ 
+-    fun validateCollectionsJson(json: String): ValidationResult {
+-        if (json.isBlank()) return ValidationResult(false, appContext.getString(com.nuvio.tv.R.string.collections_import_error_empty_input))
+-        return try {
++    /**
++     * Structural validation of an imported collections JSON, one review row per top-level
++     * entry (KE Stage 8 port). An entry that cannot be imported at all (unparseable id,
++     * missing title, no folders array) comes back [CollectionImportItemStatus.SKIPPED] with
++     * the reason; a broken folder or source is dropped at import ([importFromJson]'s
++     * mapNotNull), so those downgrade the entry to WARNING instead of failing the whole file;
++     * addon sources whose addonId is not installed come back as a missing-addons warning when
++     * [installedAddonIds] is provided (empty set disables that check). Only level errors —
++     * blank input, not an array, empty array, unparseable JSON, or nothing importable — are
++     * fatal. Importable entries (OK + WARNING) are what [importFromJson] will store.
++     */
++    fun validateCollectionsJson(json: String, installedAddonIds: Set<String> = emptySet()): ValidationResult {
++        if (json.isBlank()) return ValidationResult(false, string(R.string.collections_import_error_empty_input))
++        // gson.fromJson returns null for a JSON "null" literal; anything unparseable throws.
++        val parsed: List<*>? = try {
+             val type = object : TypeToken<List<Map<String, Any?>>>() {}.type
+-            val parsed = gson.fromJson<List<Map<String, Any?>>>(json, type)
+-                ?: return ValidationResult(false, appContext.getString(com.nuvio.tv.R.string.collections_import_error_expected_array))
+-            if (parsed.isEmpty()) return ValidationResult(false, appContext.getString(com.nuvio.tv.R.string.collections_import_error_empty_array))
+-
+-            var folderCount = 0
+-            val validShapes = setOf("POSTER", "LANDSCAPE", "SQUARE", "poster", "wide", "square")
+-
+-            for ((i, item) in parsed.withIndex()) {
+-                val id = item["id"] as? String
+-                if (id.isNullOrBlank()) return ValidationResult(false, appContext.getString(com.nuvio.tv.R.string.collections_import_error_missing_id, i + 1))
+-                val title = item["title"] as? String
+-                    ?: return ValidationResult(false, appContext.getString(com.nuvio.tv.R.string.collections_import_error_missing_title, id))
+-                val folders = item["folders"] as? List<*>
+-                    ?: return ValidationResult(false, appContext.getString(com.nuvio.tv.R.string.collections_import_error_folders_array, title))
+-
+-                for ((j, f) in folders.withIndex()) {
+-                    val folder = f as? Map<*, *>
+-                        ?: return ValidationResult(false, appContext.getString(com.nuvio.tv.R.string.collections_import_error_folder_invalid, title, j + 1))
+-                    val folderId = folder["id"] as? String
+-                    if (folderId.isNullOrBlank()) return ValidationResult(false, appContext.getString(com.nuvio.tv.R.string.collections_import_error_folder_missing_id, title, j + 1))
+-                    val folderTitle = folder["title"] as? String
+-                        ?: return ValidationResult(false, appContext.getString(com.nuvio.tv.R.string.collections_import_error_folder_missing_title, title, folderId))
+-                    val sources = (folder["sources"] as? List<*>) ?: (folder["catalogSources"] as? List<*>)
+-                        ?: return ValidationResult(false, appContext.getString(com.nuvio.tv.R.string.collections_import_error_sources_array, title, folderTitle))
+-                    val shape = folder["tileShape"] as? String
+-                    if (shape != null && shape !in validShapes) {
+-                        return ValidationResult(false, appContext.getString(com.nuvio.tv.R.string.collections_import_error_invalid_tile_shape, title, folderTitle, shape))
++            gson.fromJson(json, type)
++        } catch (e: Exception) {
++            return ValidationResult(false, string(R.string.collections_import_error_json_parse, e.message.orEmpty()))
++        }
++        if (parsed == null) return ValidationResult(false, string(R.string.collections_import_error_expected_array))
++        if (parsed.isEmpty()) return ValidationResult(false, string(R.string.collections_import_error_empty_array))
++
++        val validShapes = setOf("POSTER", "LANDSCAPE", "SQUARE", "poster", "wide", "square")
++        val items = mutableListOf<CollectionImportItemResult>()
++        var folderCount = 0
++
++        for ((i, element) in parsed.withIndex()) {
++            val position = i + 1
++            val item = element as? Map<*, *>
++            if (item == null) {
++                items += CollectionImportItemResult(
++                    position, null, CollectionImportItemStatus.SKIPPED,
++                    listOf(string(R.string.collections_import_error_json_parse, "item $position is not an object"))
++                )
++                continue
++            }
++            val id = item["id"] as? String
++            if (id.isNullOrBlank()) {
++                items += CollectionImportItemResult(
++                    position, null, CollectionImportItemStatus.SKIPPED,
++                    listOf(string(R.string.collections_import_error_missing_id, position))
++                )
++                continue
++            }
++            val title = item["title"] as? String
++            if (title == null) {
++                items += CollectionImportItemResult(
++                    position, null, CollectionImportItemStatus.SKIPPED,
++                    listOf(string(R.string.collections_import_error_missing_title, id))
++                )
++                continue
++            }
++            val folders = item["folders"] as? List<*>
++            if (folders == null) {
++                items += CollectionImportItemResult(
++                    position, title, CollectionImportItemStatus.SKIPPED,
++                    listOf(string(R.string.collections_import_error_folders_array, title))
++                )
++                continue
++            }
++
++            val reasons = mutableListOf<String>()
++            val missingAddons = LinkedHashSet<String>()
++            for ((j, f) in folders.withIndex()) {
++                val folder = f as? Map<*, *>
++                if (folder == null) {
++                    reasons += string(R.string.collections_import_error_folder_invalid, title, j + 1)
++                    continue
++                }
++                val folderId = folder["id"] as? String
++                if (folderId.isNullOrBlank()) {
++                    reasons += string(R.string.collections_import_error_folder_missing_id, title, j + 1)
++                    continue
++                }
++                val folderTitle = folder["title"] as? String
++                if (folderTitle == null) {
++                    reasons += string(R.string.collections_import_error_folder_missing_title, title, folderId)
++                    continue
++                }
++                val sources = (folder["sources"] as? List<*>) ?: (folder["catalogSources"] as? List<*>)
++                if (sources == null) {
++                    reasons += string(R.string.collections_import_error_sources_array, title, folderTitle)
++                    continue
++                }
++                val shape = folder["tileShape"] as? String
++                if (shape != null && shape !in validShapes) {
++                    reasons += string(R.string.collections_import_error_invalid_tile_shape, title, folderTitle, shape)
++                }
++                for ((k, s) in sources.withIndex()) {
++                    val source = s as? Map<*, *>
++                    if (source == null) {
++                        reasons += string(R.string.collections_import_error_source_invalid, title, folderTitle, k + 1)
++                        continue
+                     }
+-                    for ((k, s) in sources.withIndex()) {
+-                        val source = s as? Map<*, *>
+-                            ?: return ValidationResult(false, appContext.getString(com.nuvio.tv.R.string.collections_import_error_source_invalid, title, folderTitle, k + 1))
+-                        val provider = (source["provider"] as? String)?.lowercase()
+-                        val isAddonSource = provider == null || provider == "addon"
+-                        val isTmdbSource = provider == "tmdb"
+-                        val isTraktSource = provider == "trakt"
+-                        if (isAddonSource && (source["addonId"] !is String || source["type"] !is String || source["catalogId"] !is String)) {
+-                            return ValidationResult(false, appContext.getString(com.nuvio.tv.R.string.collections_import_error_source_required_fields, title, folderTitle, k + 1))
+-                        }
+-                        if (isTmdbSource && source["tmdbSourceType"] !is String) {
+-                            return ValidationResult(false, appContext.getString(com.nuvio.tv.R.string.collections_import_error_missing_tmdb_type, title, folderTitle, k + 1))
+-                        }
+-                        if (isTraktSource && (source["traktListId"] as? Number)?.toLong() == null) {
+-                            return ValidationResult(false, appContext.getString(com.nuvio.tv.R.string.collections_import_error_missing_trakt_list_id, title, folderTitle, k + 1))
++                    val provider = (source["provider"] as? String)?.lowercase()
++                    when {
++                        provider == "tmdb" && (source["tmdbSourceType"] as? String).isNullOrBlank() ->
++                            reasons += string(R.string.collections_import_error_missing_tmdb_type, title, folderTitle, k + 1)
++                        provider == "trakt" && ((source["traktListId"] as? Number)?.toLong() ?: 0L) <= 0L ->
++                            reasons += string(R.string.collections_import_error_missing_trakt_list_id, title, folderTitle, k + 1)
++                        // No provider field means addon (SerializableSource's default), and any
++                        // unknown provider value parses as addon at import too.
++                        provider != "tmdb" && provider != "trakt" -> {
++                            val addonId = source["addonId"] as? String
++                            val type = source["type"] as? String
++                            val catalogId = source["catalogId"] as? String
++                            if (addonId.isNullOrBlank() || type.isNullOrBlank() || catalogId.isNullOrBlank()) {
++                                reasons += string(R.string.collections_import_error_source_required_fields, title, folderTitle, k + 1)
++                            } else if (installedAddonIds.isNotEmpty() && addonId !in installedAddonIds) {
++                                missingAddons += addonId
++                            }
+                         }
+                     }
+-                    folderCount++
+                 }
++                folderCount++
+             }
+-            ValidationResult(true, collectionCount = parsed.size, folderCount = folderCount)
+-        } catch (e: Exception) {
+-            ValidationResult(false, appContext.getString(com.nuvio.tv.R.string.collections_import_error_json_parse, e.message.orEmpty()))
++            if (missingAddons.isNotEmpty()) {
++                reasons += string(R.string.collections_import_missing_addons, missingAddons.joinToString(", "))
++            }
++            items += CollectionImportItemResult(
++                position, title,
++                if (reasons.isEmpty()) CollectionImportItemStatus.OK else CollectionImportItemStatus.WARNING,
++                reasons
++            )
++        }
++
++        val importable = items.filterNot { it.status == CollectionImportItemStatus.SKIPPED }
++        if (importable.isEmpty()) {
++            return ValidationResult(false, string(R.string.collections_import_invalid_or_empty), items = items)
+         }
++        return ValidationResult(
++            valid = true,
++            collectionCount = importable.size,
++            folderCount = folderCount,
++            items = items
++        )
+     }
+ 
+     private fun parseCollections(json: String?): List<Collection> {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/collection/CollectionManagementScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/collection/CollectionManagementScreen.kt
+index 82e2981f6..f1c1fae8e 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/collection/CollectionManagementScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/collection/CollectionManagementScreen.kt
+@@ -68,6 +68,8 @@ import androidx.tv.material3.MaterialTheme
+ import androidx.tv.material3.Surface
+ import androidx.tv.material3.SurfaceDefaults
+ import androidx.tv.material3.Text
++import com.nuvio.tv.data.local.CollectionImportItemResult
++import com.nuvio.tv.data.local.CollectionImportItemStatus
+ import com.nuvio.tv.data.local.ValidationResult
+ import com.nuvio.tv.domain.model.Collection
+ import com.nuvio.tv.ui.components.LoadingIndicator
+@@ -76,6 +78,7 @@ import com.nuvio.tv.ui.util.contentTextDirection
+ import com.nuvio.tv.R
+ import androidx.compose.ui.res.stringResource
+ import androidx.compose.ui.text.style.TextDirection
++import androidx.compose.ui.text.style.TextOverflow
+ import androidx.compose.ui.text.TextStyle
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.launch
+@@ -551,7 +554,8 @@ private fun ImportContent(
+                 }
+             }
+ 
+-            // Validation result preview
++            // Validation result preview: counts, one review row per JSON entry
++            // (ok / warning+reason / skipped), then the confirm-import action.
+             if (validationResult != null && validationResult.valid) {
+                 item {
+                     Spacer(modifier = Modifier.height(NuvioTheme.spacing.lg))
+@@ -565,6 +569,8 @@ private fun ImportContent(
+                         modifier = Modifier.fillMaxWidth()
+                     ) {
+                         Column(modifier = Modifier.padding(NuvioTheme.spacing.lg)) {
++                            val warningCount = validationResult.items.count { it.status == CollectionImportItemStatus.WARNING }
++                            val skippedCount = validationResult.items.count { it.status == CollectionImportItemStatus.SKIPPED }
+                             Text(
+                                 text = stringResource(R.string.collections_valid_json),
+                                 style = MaterialTheme.typography.titleMedium,
+@@ -576,6 +582,31 @@ private fun ImportContent(
+                                 style = MaterialTheme.typography.bodyMedium,
+                                 color = NuvioTheme.colors.TextSecondary
+                             )
++                            if (warningCount > 0 || skippedCount > 0) {
++                                Spacer(modifier = Modifier.height(NuvioTheme.spacing.xs))
++                                Text(
++                                    text = stringResource(R.string.collections_import_review_counts, warningCount, skippedCount),
++                                    style = MaterialTheme.typography.bodySmall,
++                                    color = NuvioTheme.colors.Warning
++                                )
++                            }
++                            if (validationResult.items.isNotEmpty()) {
++                                Spacer(modifier = Modifier.height(NuvioTheme.spacing.md))
++                                validationResult.items.forEachIndexed { rowIndex, item ->
++                                    if (rowIndex > 0) {
++                                        Spacer(modifier = Modifier.height(NuvioTheme.spacing.xs))
++                                    }
++                                    ImportReviewRow(item)
++                                }
++                            }
++                            if (warningCount > 0 || skippedCount > 0) {
++                                Spacer(modifier = Modifier.height(NuvioTheme.spacing.xs))
++                                Text(
++                                    text = stringResource(R.string.collections_import_items_note),
++                                    style = MaterialTheme.typography.bodySmall,
++                                    color = NuvioTheme.colors.TextTertiary
++                                )
++                            }
+                             Spacer(modifier = Modifier.height(NuvioTheme.spacing.md))
+                             NuvioButton(onClick = onConfirmImport) {
+                                 Text(stringResource(R.string.collections_confirm_import))
+@@ -599,6 +630,53 @@ private fun ImportContent(
+     }
+ }
+ 
++/** One review row (KE Stage 8): "Item N · title", its status chip, then the reasons. */
++@Composable
++private fun ImportReviewRow(item: CollectionImportItemResult) {
++    val statusLabel = when (item.status) {
++        CollectionImportItemStatus.OK -> stringResource(R.string.collections_import_status_ok)
++        CollectionImportItemStatus.WARNING -> stringResource(R.string.collections_import_status_warning)
++        CollectionImportItemStatus.SKIPPED -> stringResource(R.string.collections_import_status_skipped)
++    }
++    val statusColor = when (item.status) {
++        CollectionImportItemStatus.OK -> NuvioTheme.colors.Success
++        CollectionImportItemStatus.WARNING -> NuvioTheme.colors.Warning
++        CollectionImportItemStatus.SKIPPED -> NuvioTheme.colors.Error
++    }
++    Column(modifier = Modifier.fillMaxWidth()) {
++        Row(verticalAlignment = Alignment.CenterVertically) {
++            Text(
++                text = item.title?.let { title ->
++                    stringResource(R.string.collections_import_item_label, item.index) + " · " + title
++                } ?: stringResource(R.string.collections_import_item_label, item.index),
++                style = MaterialTheme.typography.bodyMedium.copy(textDirection = TextDirection.Content),
++                color = NuvioTheme.colors.TextPrimary,
++                maxLines = 1,
++                overflow = TextOverflow.Ellipsis,
++                modifier = Modifier.weight(1f)
++            )
++            Spacer(modifier = Modifier.width(NuvioTheme.spacing.sm))
++            Text(
++                text = statusLabel,
++                style = MaterialTheme.typography.bodySmall,
++                color = statusColor
++            )
++        }
++        if (item.reasons.isNotEmpty()) {
++            Text(
++                text = item.reasons.joinToString(separator = "\n"),
++                style = MaterialTheme.typography.bodySmall.copy(textDirection = TextDirection.Content),
++                color = if (item.status == CollectionImportItemStatus.SKIPPED) {
++                    NuvioTheme.colors.Error
++                } else {
++                    NuvioTheme.colors.TextTertiary
++                },
++                modifier = Modifier.padding(top = NuvioTheme.spacing.xxs)
++            )
++        }
++    }
++}
++
+ @OptIn(ExperimentalTvMaterial3Api::class)
+ @Composable
+ private fun CollectionListItem(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/collection/CollectionManagementViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/collection/CollectionManagementViewModel.kt
+index 9649cda18..c09794c96 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/collection/CollectionManagementViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/collection/CollectionManagementViewModel.kt
+@@ -8,16 +8,25 @@ import com.nuvio.tv.core.sync.CollectionSyncService
+ import com.nuvio.tv.data.local.CollectionsDataStore
+ import com.nuvio.tv.data.local.ValidationResult
+ import com.nuvio.tv.domain.model.Collection
++import com.nuvio.tv.domain.model.enabledAddons
++import com.nuvio.tv.domain.repository.AddonRepository
+ import dagger.hilt.android.lifecycle.HiltViewModel
+ import dagger.hilt.android.qualifiers.ApplicationContext
++import kotlinx.coroutines.CancellationException
+ import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.flow.asStateFlow
+ import kotlinx.coroutines.flow.collectLatest
++import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.flow.update
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withContext
++import okhttp3.OkHttpClient
++import okhttp3.ResponseBody
++import java.io.IOException
++import java.util.concurrent.TimeUnit
+ import javax.inject.Inject
+ 
+ enum class ImportMode { PASTE, FILE, URL }
+@@ -41,6 +50,8 @@ data class CollectionManagementUiState(
+ class CollectionManagementViewModel @Inject constructor(
+     private val collectionsDataStore: CollectionsDataStore,
+     private val collectionSyncService: CollectionSyncService,
++    private val addonRepository: AddonRepository,
++    private val okHttpClient: OkHttpClient,
+     @ApplicationContext private val context: Context
+ ) : ViewModel() {
+ 
+@@ -98,6 +109,7 @@ class CollectionManagementViewModel @Inject constructor(
+     }
+ 
+     fun showImportDialog() {
++        importJob?.cancel()
+         _uiState.update {
+             it.copy(
+                 showImportDialog = true, importText = "", importError = null,
+@@ -108,6 +120,7 @@ class CollectionManagementViewModel @Inject constructor(
+     }
+ 
+     fun hideImportDialog() {
++        importJob?.cancel()
+         _uiState.update {
+             it.copy(
+                 showImportDialog = false, importText = "", importError = null,
+@@ -118,7 +131,9 @@ class CollectionManagementViewModel @Inject constructor(
+     }
+ 
+     fun updateImportText(text: String) {
+-        _uiState.update { it.copy(importText = text, importError = null) }
++        // Editing after a validation must not leave a stale validatedJson behind: confirm
++        // would otherwise import the previously validated text, not what is on screen.
++        _uiState.update { it.copy(importText = text, importError = null, validationResult = null, validatedJson = null) }
+     }
+ 
+     fun importCollections() {
+@@ -133,25 +148,20 @@ class CollectionManagementViewModel @Inject constructor(
+             return
+         }
+         viewModelScope.launch {
+-            val current = _uiState.value.collections.toMutableList()
+-            val existingIds = current.map { it.id }.toSet()
+-            for (collection in imported) {
+-                if (collection.id in existingIds) {
+-                    val index = current.indexOfFirst { it.id == collection.id }
+-                    if (index >= 0) current[index] = collection
+-                } else {
+-                    current.add(collection)
+-                }
+-            }
+-            collectionsDataStore.setCollections(current)
++            // Merged against the stored list, not the UI snapshot (KE L4-85).
++            collectionsDataStore.upsertCollections(imported)
+             collectionSyncService.triggerPush()
+             _uiState.update { it.copy(showImportDialog = false, importText = "", importError = null) }
+         }
+     }
+ 
+     fun setImportMode(mode: ImportMode) {
++        importJob?.cancel()
+         _uiState.update {
+-            it.copy(importMode = mode, importError = null, validationResult = null, validatedJson = null)
++            it.copy(
++                importMode = mode, importError = null, validationResult = null, validatedJson = null,
++                isLoadingImport = false
++            )
+         }
+     }
+ 
+@@ -161,8 +171,13 @@ class CollectionManagementViewModel @Inject constructor(
+         }
+     }
+ 
+-    fun validateJson(json: String) {
+-        val result = collectionsDataStore.validateCollectionsJson(json)
++    /** Missing-addon detection runs against the enabled addons actually installed (KE Stage 8). */
++    private suspend fun installedAddonIds(): Set<String> = runCatching {
++        addonRepository.getInstalledAddons().first().enabledAddons().map { it.id }.toSet()
++    }.getOrDefault(emptySet())
++
++    private suspend fun validateJson(json: String) {
++        val result = collectionsDataStore.validateCollectionsJson(json, installedAddonIds())
+         _uiState.update {
+             if (result.valid) {
+                 it.copy(validationResult = result, validatedJson = json, importError = null)
+@@ -173,32 +188,42 @@ class CollectionManagementViewModel @Inject constructor(
+     }
+ 
+     fun validateCurrentText() {
+-        validateJson(_uiState.value.importText.trim())
++        viewModelScope.launch { validateJson(_uiState.value.importText.trim()) }
+     }
+ 
+     fun handleFileContent(content: String) {
+-        _uiState.update { it.copy(importText = content) }
+-        validateJson(content)
++        viewModelScope.launch {
++            _uiState.update { it.copy(importText = content) }
++            validateJson(content)
++        }
+     }
+ 
++    // The one file or URL load in flight (KE W2.1): a second press while it runs is ignored; a
++    // mode switch or closing the panel cancels it, so a late result never lands in the other
++    // mode or a reopened panel.
++    private var importJob: Job? = null
++
+     fun fetchUrl() {
++        if (importJob?.isActive == true) return
+         val url = _uiState.value.importUrl.trim()
+         if (url.isBlank()) {
+             _uiState.update { it.copy(importError = context.getString(R.string.web_import_enter_url)) }
+             return
+         }
+         _uiState.update { it.copy(isLoadingImport = true, importError = null) }
+-        viewModelScope.launch {
++        importJob = viewModelScope.launch {
+             try {
+-                val client = okhttp3.OkHttpClient.Builder()
+-                    .dns(com.nuvio.tv.core.network.IPv4FirstDns())
+-                    .socketFactory(com.nuvio.tv.core.network.NoDelaySocketFactory)
+-                    .build()
+                 val request = okhttp3.Request.Builder().url(url).build()
+-                // Read the body on IO too: execute() only returns the headers.
++                // Shared NetworkModule client (IPv4-first DNS, 30s/60s timeouts, UA header)
++                // with a whole-call cap on top: a user-supplied URL with no bounds otherwise
++                // reproduces the indefinite-spinner class.
++                val client = okHttpClient.newBuilder().callTimeout(30, TimeUnit.SECONDS).build()
++                // Body (null on a non-2xx) and code. State is written only after withContext
++                // returns, which throws if the load was cancelled meanwhile.
+                 val (code, body) = withContext(Dispatchers.IO) {
+                     client.newCall(request).execute().use { response ->
+-                        response.code to if (response.isSuccessful) response.body?.string().orEmpty() else null
++                        response.code to
++                            (if (response.isSuccessful) response.body?.cappedString(MAX_IMPORT_BYTES) else null)
+                     }
+                 }
+                 if (body == null) {
+@@ -215,6 +240,8 @@ class CollectionManagementViewModel @Inject constructor(
+                 }
+                 _uiState.update { it.copy(importText = body, isLoadingImport = false) }
+                 validateJson(body)
++            } catch (e: CancellationException) {
++                throw e
+             } catch (e: Exception) {
+                 _uiState.update {
+                     it.copy(
+@@ -241,17 +268,9 @@ class CollectionManagementViewModel @Inject constructor(
+             return
+         }
+         viewModelScope.launch {
+-            val current = _uiState.value.collections.toMutableList()
+-            val existingIds = current.map { it.id }.toSet()
+-            for (collection in imported) {
+-                if (collection.id in existingIds) {
+-                    val index = current.indexOfFirst { it.id == collection.id }
+-                    if (index >= 0) current[index] = collection
+-                } else {
+-                    current.add(collection)
+-                }
+-            }
+-            collectionsDataStore.setCollections(current)
++            // Merged against the stored list, not the UI snapshot (KE L4-85): an existing
++            // collection with the same id is replaced in place, the rest are appended new.
++            collectionsDataStore.upsertCollections(imported)
+             collectionSyncService.triggerPush()
+             _uiState.update {
+                 it.copy(
+@@ -264,7 +283,8 @@ class CollectionManagementViewModel @Inject constructor(
+     }
+ 
+     fun loadFromFile(context: android.content.Context) {
+-        viewModelScope.launch {
++        if (importJob?.isActive == true) return
++        importJob = viewModelScope.launch {
+             _uiState.update { it.copy(isLoadingImport = true, importError = null) }
+             try {
+                 val content = withContext(Dispatchers.IO) {
+@@ -285,6 +305,8 @@ class CollectionManagementViewModel @Inject constructor(
+                 }
+                 _uiState.update { it.copy(importText = content, isLoadingImport = false) }
+                 validateJson(content)
++            } catch (e: CancellationException) {
++                throw e
+             } catch (e: Exception) {
+                 _uiState.update {
+                     it.copy(
+@@ -326,4 +348,25 @@ class CollectionManagementViewModel @Inject constructor(
+         val file = java.io.File(downloadsDir, "nuvio-collections.json")
+         return if (file.exists()) file.readText() else null
+     }
++
++    private companion object {
++        /**
++         * URL-import body cap (KE KT-JSON-03): a real collections export is tens of KB, so
++         * 5 MB is ~100x headroom while a hostile or mistyped URL (a video, a huge page) can
++         * no longer heap-buffer an unbounded body before validation.
++         */
++        const val MAX_IMPORT_BYTES = 5_000_000L
++    }
++}
++
++/**
++ * [ResponseBody.string] with a byte cap (KE): buffers at most [maxBytes] + 1 bytes and throws
++ * [IOException] past the cap; otherwise decodes exactly as [ResponseBody.string] does
++ * (BOM / Content-Type charset, UTF-8 default) from the same, already-buffered source.
++ */
++private fun ResponseBody.cappedString(maxBytes: Long): String {
++    if (source().request(maxBytes + 1)) {
++        throw IOException("Response exceeds ${maxBytes / 1_000_000}MB import limit")
++    }
++    return string()
+ }
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index d0e9faf93..ed62ea65b 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -2696,6 +2696,13 @@
+     <string name="collections_valid_summary">%1$d collection(s), %2$d folder(s)</string>
+     <string name="collections_confirm_import">Confirm Import</string>
+     <string name="collections_folder_count">%1$d folder(s)</string>
++    <string name="collections_import_item_label">Item %1$d</string>
++    <string name="collections_import_status_ok">Ready</string>
++    <string name="collections_import_status_warning">Warning</string>
++    <string name="collections_import_status_skipped">Skipped</string>
++    <string name="collections_import_review_counts">%1$d item(s) with warnings, %2$d skipped</string>
++    <string name="collections_import_items_note">Skipped items are not imported. Items with warnings import without the broken parts.</string>
++    <string name="collections_import_missing_addons">Addons not installed: %1$s</string>
+ 
+     <!-- Collection Editor -->
+     <string name="collections_editor_row_title">Row Title</string>
+diff --git a/app/src/test/java/com/nuvio/tv/data/local/CollectionsDataStoreSourceMigrationTest.kt b/app/src/test/java/com/nuvio/tv/data/local/CollectionsDataStoreSourceMigrationTest.kt
+index e330cf2bc..c7b01b563 100644
+--- a/app/src/test/java/com/nuvio/tv/data/local/CollectionsDataStoreSourceMigrationTest.kt
++++ b/app/src/test/java/com/nuvio/tv/data/local/CollectionsDataStoreSourceMigrationTest.kt
+@@ -11,7 +11,6 @@ import com.nuvio.tv.domain.model.TraktCollectionSource
+ import io.mockk.mockk
+ import io.mockk.verify
+ import org.junit.Assert.assertEquals
+-import org.junit.Assert.assertFalse
+ import org.junit.Assert.assertTrue
+ import org.junit.Test
+ 
+@@ -135,7 +134,7 @@ class CollectionsDataStoreSourceMigrationTest {
+     }
+ 
+     @Test
+-    fun `validation rejects trakt sources without list id`() {
++    fun `validation flags trakt sources without list id as importable warnings`() {
+         val json = """
+             [
+               {
+@@ -160,7 +159,10 @@ class CollectionsDataStoreSourceMigrationTest {
+ 
+         val result = store.validateCollectionsJson(json)
+ 
+-        assertFalse(result.valid)
++        // KE Stage 8 port: a broken source no longer rejects the whole file — the entry stays
++        // importable and is reported as a WARNING review row carrying the reason.
++        assertTrue(result.valid)
++        assertEquals(CollectionImportItemStatus.WARNING, result.items.single().status)
+         verify {
+             context.getString(
+                 com.nuvio.tv.R.string.collections_import_error_missing_trakt_list_id,
+@@ -171,6 +173,68 @@ class CollectionsDataStoreSourceMigrationTest {
+         }
+     }
+ 
++    @Test
++    fun `validation skips entries without id and imports the rest`() {
++        val json = """
++            [
++              { "title": "No id" },
++              {
++                "id": "collection",
++                "title": "Good",
++                "folders": [
++                  { "id": "folder", "title": "Movies", "sources": [] }
++                ]
++              }
++            ]
++        """.trimIndent()
++
++        val result = store.validateCollectionsJson(json)
++
++        assertTrue(result.valid)
++        assertEquals(CollectionImportItemStatus.SKIPPED, result.items[0].status)
++        assertEquals(CollectionImportItemStatus.OK, result.items[1].status)
++        assertEquals(1, result.collectionCount)
++        assertEquals(1, result.folderCount)
++    }
++
++    @Test
++    fun `validation warns when an addon source references an uninstalled addon`() {
++        val json = """
++            [
++              {
++                "id": "collection",
++                "title": "Missing",
++                "folders": [
++                  {
++                    "id": "folder",
++                    "title": "Movies",
++                    "sources": [
++                      {
++                        "provider": "addon",
++                        "addonId": "gone-addon",
++                        "type": "movie",
++                        "catalogId": "popular"
++                      }
++                    ]
++                  }
++                ]
++              }
++            ]
++        """.trimIndent()
++
++        val result = store.validateCollectionsJson(json, installedAddonIds = setOf("other-addon"))
++
++        assertTrue(result.valid)
++        val item = result.items.single()
++        assertEquals(CollectionImportItemStatus.WARNING, item.status)
++        verify {
++            context.getString(
++                com.nuvio.tv.R.string.collections_import_missing_addons,
++                "gone-addon"
++            )
++        }
++    }
++
+     @Test
+     fun `import and export preserve folder hero video url`() {
+         val collection = com.nuvio.tv.domain.model.Collection(

@@ -1,0 +1,801 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryHistory.kt b/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryHistory.kt
+new file mode 100644
+index 000000000..2c3e905d7
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryHistory.kt
+@@ -0,0 +1,190 @@
++package com.nuvio.tv.ui.screens.library
++
++import androidx.compose.runtime.Immutable
++import com.nuvio.tv.domain.model.LibraryEntry
++import com.nuvio.tv.domain.model.WatchedItem
++import com.nuvio.tv.domain.model.WatchProgress
++import java.time.Instant
++import java.time.LocalDate
++import java.time.YearMonth
++import java.time.ZoneId
++import java.time.ZonedDateTime
++
++// Library's History tab (Nuvio-KE port of the KE `u7-library-marquee` stage 7 concept, adapted to
++// this tree's grid library): one entry per title from the watch progress and the watched marks,
++// newest first, grouped Today / This week / by month for the grid section headers. The data comes
++// from the existing watch-progress store — it already retains finished entries (the recent bucket
++// plus the archive bucket, nothing deleted), so no separate history store is needed here; this
++// layer only dedupes per title and caps the rendered list. Pure, so the rules stay unit-testable.
++
++/**
++ * A rendered History list is bounded to this many titles (newest first). Mirrors the intent of
++ * the progress store's recent-bucket cap (`WATCH_PROGRESS_RECENT_LIMIT = 200`): a History tab is
++ * a "recently watched" view, not an unbounded dump.
++ */
++internal const val LIBRARY_HISTORY_MAX_ENTRIES = 200
++
++/**
++ * The "Not watched yet" section shown after the history groups is a shelf, not the full grid:
++ * this bounds it to a screenful-ish set of in-library titles.
++ */
++internal const val LIBRARY_HISTORY_NOT_WATCHED_MAX = 24
++
++/**
++ * One watched title: the newest of its watch progress entries and its watched marks.
++ * [card] carries everything the Library grid needs to render and navigate it.
++ */
++@Immutable
++data class LibraryHistoryEntry(
++    val id: String,
++    val type: String,
++    val name: String,
++    val poster: String?,
++    val backdrop: String?,
++    val logo: String?,
++    /** The latest episode watched (series); null for movies and title-level marks. */
++    val season: Int?,
++    val episode: Int?,
++    /** Last watched, epoch ms. */
++    val watchedAt: Long,
++    /** Played part (0..1) while the latest play is unfinished (under the completion threshold); null once finished or marked watched. */
++    val progressFraction: Float?,
++    val addonBaseUrl: String?
++) {
++    /**
++     * The grid card for this entry, built once per entry ([LibraryEntry.listedAt] carries the
++     * last-watched time). A cached property, so the grid and the ViewModel share one instance.
++     */
++    val card: LibraryEntry by lazy {
++        LibraryEntry(
++            id = id,
++            type = type,
++            name = name,
++            poster = poster,
++            background = backdrop,
++            logo = logo,
++            description = null,
++            releaseInfo = null,
++            imdbRating = null,
++            genres = emptyList(),
++            addonBaseUrl = addonBaseUrl,
++            listedAt = watchedAt
++        )
++    }
++}
++
++enum class LibraryHistoryGroupKind { TODAY, THIS_WEEK, MONTH }
++
++/** One History section: [entries] are newest first; [month] is set for [LibraryHistoryGroupKind.MONTH]. */
++@Immutable
++data class LibraryHistorySection(
++    val key: String,
++    val kind: LibraryHistoryGroupKind,
++    val month: YearMonth?,
++    val entries: List<LibraryHistoryEntry>
++)
++
++// The maxOf orders picking a title's latest mark and latest progress entry: time, then season,
++// then episode (a batch mark shares one time, so the higher episode wins, as the progress store
++// picks its latest entry per content the same way).
++private val LibraryProgressOrder: Comparator<WatchProgress> =
++    compareBy<WatchProgress> { it.lastWatched }.thenBy { it.season ?: -1 }.thenBy { it.episode ?: -1 }
++
++private val LibraryWatchedOrder: Comparator<WatchedItem> =
++    compareBy<WatchedItem> { it.watchedAt }.thenBy { it.season ?: -1 }.thenBy { it.episode ?: -1 }
++
++/**
++ * The History list: per title the newer of its latest progress entry and its latest watched mark
++ * (equal times: the progress entry, which carries the artwork and the stream's addon), newest
++ * first, capped at [cap]. A title known only from the watched set (a manual mark or a tracking
++ * sync) still lists with the mark's title and poster.
++ */
++internal fun buildLibraryHistory(
++    progress: List<WatchProgress>,
++    watched: List<WatchedItem>,
++    cap: Int = LIBRARY_HISTORY_MAX_ENTRIES
++): List<LibraryHistoryEntry> {
++    val latestProgress = HashMap<String, WatchProgress>(progress.size)
++    progress.forEach { p ->
++        if (p.contentId.isNotBlank()) {
++            latestProgress.merge(p.contentId, p) { a, b -> maxOf(a, b, LibraryProgressOrder) }
++        }
++    }
++    val latestWatched = HashMap<String, WatchedItem>()
++    watched.forEach { w ->
++        if (w.contentId.isNotBlank()) {
++            latestWatched.merge(w.contentId, w) { a, b -> maxOf(a, b, LibraryWatchedOrder) }
++        }
++    }
++    val ids = LinkedHashSet<String>(latestProgress.keys).apply { addAll(latestWatched.keys) }
++    return ids.map { id ->
++        val p = latestProgress[id]
++        val w = latestWatched[id]
++        // The progress entry when it is the newer of the two.
++        val latestPlay = p?.takeIf { w == null || it.lastWatched >= w.watchedAt }
++        LibraryHistoryEntry(
++            id = id,
++            type = (latestPlay?.contentType ?: w?.contentType).orEmpty().ifBlank { "movie" },
++            name = (latestPlay?.name ?: w?.title).orEmpty().ifBlank { id },
++            poster = latestPlay?.poster ?: w?.poster,
++            backdrop = latestPlay?.backdrop,
++            logo = latestPlay?.logo,
++            season = latestPlay?.season,
++            episode = latestPlay?.episode,
++            watchedAt = maxOf(p?.lastWatched ?: 0L, w?.watchedAt ?: 0L),
++            progressFraction = latestPlay?.takeUnless { it.isCompleted() }?.progressPercentage,
++            addonBaseUrl = latestPlay?.addonBaseUrl
++        )
++    }
++        .sortedWith(compareByDescending<LibraryHistoryEntry> { it.watchedAt }.thenBy { it.id })
++        .take(cap.coerceAtLeast(0))
++}
++
++/**
++ * [history] (newest first) as grid sections: Today (since local midnight; a time ahead of [now]
++ * counts as today), This week (the six days before), then one section per month. Empty sections
++ * are left out.
++ */
++internal fun libraryHistorySections(
++    history: List<LibraryHistoryEntry>,
++    zone: ZoneId,
++    now: ZonedDateTime
++): List<LibraryHistorySection> {
++    val today = now.toLocalDate()
++    val todayStartMs = today.atStartOfDay(zone).toInstant().toEpochMilli()
++    val weekStartMs = today.minusDays(6).atStartOfDay(zone).toInstant().toEpochMilli()
++    val todayEntries = mutableListOf<LibraryHistoryEntry>()
++    val weekEntries = mutableListOf<LibraryHistoryEntry>()
++    val byMonth = linkedMapOf<YearMonth, MutableList<LibraryHistoryEntry>>()
++    history.forEach { entry ->
++        when {
++            entry.watchedAt >= todayStartMs -> todayEntries += entry
++            entry.watchedAt >= weekStartMs -> weekEntries += entry
++            else -> byMonth.getOrPut(YearMonth.from(Instant.ofEpochMilli(entry.watchedAt).atZone(zone))) { mutableListOf() } += entry
++        }
++    }
++    return buildList {
++        add(LibraryHistorySection("history:today", LibraryHistoryGroupKind.TODAY, null, todayEntries))
++        add(LibraryHistorySection("history:week", LibraryHistoryGroupKind.THIS_WEEK, null, weekEntries))
++        byMonth.forEach { (month, entries) ->
++            add(LibraryHistorySection("history:$month", LibraryHistoryGroupKind.MONTH, month, entries))
++        }
++    }.filter { it.entries.isNotEmpty() }
++}
++
++/**
++ * When a title was last watched, as the History card caption says it: today's time ("20:15"),
++ * this week's weekday + time ("Tue 20:15"), then the date (with the year when not this year).
++ * Locale-default patterns; no string resources so the caption stays a pure function.
++ */
++internal fun libraryHistoryWhenLine(watchedAt: Long, today: LocalDate, zone: ZoneId): String {
++    val zoned = Instant.ofEpochMilli(watchedAt).atZone(zone)
++    val date = zoned.toLocalDate()
++    val pattern = when {
++        date == today -> "HH:mm"
++        date.isAfter(today.minusDays(7)) -> "EEE HH:mm"
++        date.year == today.year -> "MMM d"
++        else -> "MMM d, yyyy"
++    }
++    return java.time.format.DateTimeFormatter.ofPattern(pattern, java.util.Locale.getDefault()).format(zoned)
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryScreen.kt
+index ed95612d2..0eaac8feb 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryScreen.kt
+@@ -95,12 +95,15 @@ import com.nuvio.tv.core.cloud.CloudLibraryFile
+ import com.nuvio.tv.core.cloud.CloudLibraryItem
+ import com.nuvio.tv.core.cloud.CloudLibraryItemType
+ import com.nuvio.tv.core.cloud.CloudLibraryPlaybackInfo
++import com.nuvio.tv.domain.model.LibraryEntry
+ import com.nuvio.tv.domain.model.LibraryListTab
+ import com.nuvio.tv.domain.model.LibrarySourceMode
++import com.nuvio.tv.domain.model.MetaPreview
+ import com.nuvio.tv.domain.model.PosterShape
+ import com.nuvio.tv.data.local.PlayerPreference
+ import com.nuvio.tv.ui.components.EmptyScreenState
+ import com.nuvio.tv.ui.components.GridContentCard
++import com.nuvio.tv.ui.components.PosterCardStyle
+ import com.nuvio.tv.ui.screens.detail.requestFocusAfterFrames
+ import com.nuvio.tv.ui.screens.home.HeroBackdropState
+ import com.nuvio.tv.ui.screens.stream.PlayerChoiceDialog
+@@ -118,6 +121,13 @@ import androidx.compose.ui.res.stringResource
+ import androidx.compose.ui.text.style.TextDirection
+ import androidx.compose.ui.text.TextStyle
+ import com.nuvio.tv.R
++import java.time.Instant
++import java.time.LocalDate
++import java.time.ZoneId
++import java.time.ZonedDateTime
++import java.time.format.DateTimeFormatter
++import java.util.Locale
++import kotlin.math.roundToInt
+ 
+ private const val KEY_REPEAT_THROTTLE_MS = 80L
+ 
+@@ -130,9 +140,25 @@ private enum class LibraryViewMode {
+ @Composable
+ private fun localizedTypeLabel(key: String): String = when (key.lowercase()) {
+     LibraryTypeTab.ALL_KEY -> stringResource(R.string.library_type_all)
++    LibraryTypeTab.HISTORY_KEY -> stringResource(R.string.library_history_tab)
+     else -> localizedContentType(key)
+ }
+ 
++/**
++ * A type-tab option's picker label (Nuvio-KE port): the tab's own label for All, the History tab
++ * name for the history view, otherwise the localized type with the tab's count suffix kept.
++ */
++@Composable
++private fun libraryTypeTabLabel(tab: LibraryTypeTab): String = when {
++    tab.key == LibraryTypeTab.ALL_KEY -> tab.label
++    tab.key == LibraryTypeTab.HISTORY_KEY -> stringResource(R.string.library_history_tab)
++    else -> {
++        val countPart = tab.label.substringAfterLast("(", "").removeSuffix(")")
++        val localizedName = localizedTypeLabel(tab.key)
++        if (countPart.isNotBlank()) "$localizedName ($countPart)" else localizedName
++    }
++}
++
+ @OptIn(ExperimentalTvMaterial3Api::class, ExperimentalComposeUiApi::class)
+ @Composable
+ fun LibraryScreen(
+@@ -182,14 +208,40 @@ fun LibraryScreen(
+         mutableStateOf(serversViewModel.focusedShelfKey?.let { key -> serversViewModel.focusedIndexes[key]?.let { key to it } })
+     }
+     var lastFocusedPosterKey by rememberSaveable { mutableStateOf<String?>(null) }
++    // Nuvio-KE port: the History tab replaces the library grid with the watch history grouped
++    // Today / This week / by month, followed by a bounded "Not watched yet" shelf of in-library
++    // titles that have no history entry yet.
++    val isHistoryTab = uiState.selectedTypeTab?.key == LibraryTypeTab.HISTORY_KEY
++    val historyZone = ZoneId.systemDefault()
++    val historySections = remember(isHistoryTab, uiState.history, historyZone) {
++        if (isHistoryTab) {
++            libraryHistorySections(uiState.history, historyZone, ZonedDateTime.now(historyZone))
++        } else {
++            emptyList()
++        }
++    }
++    val notWatchedShelf = remember(isHistoryTab, uiState.allItems, uiState.history) {
++        if (isHistoryTab && uiState.history.isNotEmpty()) {
++            val watchedIds = uiState.history.map { it.id }.toSet()
++            uiState.allItems
++                .filter { it.id.isNotBlank() && it.id !in watchedIds }
++                .distinctBy { it.type to it.id }
++                .take(LIBRARY_HISTORY_NOT_WATCHED_MAX)
++        } else {
++            emptyList()
++        }
++    }
++    val shelfItemKeys = remember(notWatchedShelf) {
++        notWatchedShelf.map { "${it.type}:${it.id}" }
++    }
+     val visibleItemKeys = remember(uiState.visibleItems) {
+         uiState.visibleItems.map { "${it.type}:${it.id}" }
+     }
+     val visibleItemIndexByKey = remember(visibleItemKeys) {
+         visibleItemKeys.withIndex().associate { (index, key) -> key to index }
+     }
+-    val posterFocusRequesters = remember(visibleItemKeys) {
+-        visibleItemKeys.associateWith { FocusRequester() }
++    val posterFocusRequesters = remember(visibleItemKeys, shelfItemKeys) {
++        (visibleItemKeys + shelfItemKeys).distinct().associateWith { FocusRequester() }
+     }
+     val layoutDirection = LocalLayoutDirection.current
+     val firstVisiblePosterKey = visibleItemKeys.firstOrNull()
+@@ -437,6 +489,7 @@ fun LibraryScreen(
+             item(span = { GridItemSpan(maxLineSpan) }) {
+                 LibrarySelectorsRow(
+                     sourceMode = uiState.sourceMode,
++                    historySelected = isHistoryTab,
+                     listTabs = uiState.listTabs,
+                     typeTabs = uiState.availableTypeTabs,
+                     sortOptions = uiState.availableSortOptions,
+@@ -495,56 +548,142 @@ fun LibraryScreen(
+ 
+             if (uiState.visibleItems.isEmpty()) {
+                 item(span = { GridItemSpan(maxLineSpan) }) {
+-                    val selectedTypeLabel = uiState.selectedTypeTab?.let { localizedTypeLabel(it.key) }?.lowercase() ?: stringResource(R.string.library_type_items)
+-                    val title = when {
+-                        uiState.sourceMode == LibrarySourceMode.TRAKT && !uiState.isTrackingAuthenticated -> stringResource(R.string.library_empty_trakt_not_auth_title)
+-                        uiState.sourceMode == LibrarySourceMode.SIMKL && !uiState.isTrackingAuthenticated -> stringResource(R.string.library_empty_simkl_not_auth_title)
+-                        uiState.sourceMode == LibrarySourceMode.TRAKT || uiState.sourceMode == LibrarySourceMode.MDBLIST || uiState.sourceMode == LibrarySourceMode.WETRAKR || uiState.sourceMode == LibrarySourceMode.PUBLICMETADB -> stringResource(R.string.library_empty_trakt_title, selectedTypeLabel)
+-                        uiState.sourceMode == LibrarySourceMode.SIMKL -> stringResource(R.string.library_empty_simkl_title, selectedTypeLabel)
+-                        else -> stringResource(R.string.library_empty_local_title, selectedTypeLabel)
++                    if (isHistoryTab) {
++                        EmptyScreenState(
++                            title = stringResource(R.string.library_history_empty_title),
++                            subtitle = stringResource(R.string.library_history_empty_body),
++                            icon = Icons.Default.BookmarkBorder
++                        )
++                    } else {
++                        val selectedTypeLabel = uiState.selectedTypeTab?.let { localizedTypeLabel(it.key) }?.lowercase() ?: stringResource(R.string.library_type_items)
++                        val title = when {
++                            uiState.sourceMode == LibrarySourceMode.TRAKT && !uiState.isTrackingAuthenticated -> stringResource(R.string.library_empty_trakt_not_auth_title)
++                            uiState.sourceMode == LibrarySourceMode.SIMKL && !uiState.isTrackingAuthenticated -> stringResource(R.string.library_empty_simkl_not_auth_title)
++                            uiState.sourceMode == LibrarySourceMode.TRAKT || uiState.sourceMode == LibrarySourceMode.MDBLIST || uiState.sourceMode == LibrarySourceMode.WETRAKR || uiState.sourceMode == LibrarySourceMode.PUBLICMETADB -> stringResource(R.string.library_empty_trakt_title, selectedTypeLabel)
++                            uiState.sourceMode == LibrarySourceMode.SIMKL -> stringResource(R.string.library_empty_simkl_title, selectedTypeLabel)
++                            else -> stringResource(R.string.library_empty_local_title, selectedTypeLabel)
++                        }
++                        val subtitle = when {
++                            uiState.sourceMode == LibrarySourceMode.TRAKT && !uiState.isTrackingAuthenticated -> stringResource(R.string.library_empty_trakt_not_auth_subtitle)
++                            uiState.sourceMode == LibrarySourceMode.SIMKL && !uiState.isTrackingAuthenticated -> stringResource(R.string.library_empty_simkl_not_auth_subtitle)
++                            uiState.sourceMode == LibrarySourceMode.TRAKT || uiState.sourceMode == LibrarySourceMode.MDBLIST || uiState.sourceMode == LibrarySourceMode.WETRAKR || uiState.sourceMode == LibrarySourceMode.PUBLICMETADB -> stringResource(R.string.library_empty_trakt_subtitle)
++                            uiState.sourceMode == LibrarySourceMode.SIMKL -> stringResource(R.string.library_empty_simkl_subtitle)
++                            else -> stringResource(R.string.library_empty_local_subtitle)
++                        }
++                        EmptyScreenState(
++                            title = title,
++                            subtitle = subtitle,
++                            icon = Icons.Default.BookmarkBorder
++                        )
++                    }
++                }
++            }
++
++            if (isHistoryTab && historySections.isNotEmpty()) {
++                // Nuvio-KE port: the History tab — one section per Today / This week / month,
++                // the same grid cards the library tabs render, each captioned with how and when
++                // it was watched and navigating to the title's detail page.
++                historySections.forEach { section ->
++                    item(key = "history_section:${section.key}", span = { GridItemSpan(maxLineSpan) }) {
++                        Text(
++                            text = libraryHistorySectionTitle(section),
++                            style = MaterialTheme.typography.titleMedium,
++                            color = NuvioTheme.colors.TextSecondary,
++                            modifier = Modifier.padding(top = NuvioTheme.spacing.xs)
++                        )
+                     }
+-                    val subtitle = when {
+-                        uiState.sourceMode == LibrarySourceMode.TRAKT && !uiState.isTrackingAuthenticated -> stringResource(R.string.library_empty_trakt_not_auth_subtitle)
+-                        uiState.sourceMode == LibrarySourceMode.SIMKL && !uiState.isTrackingAuthenticated -> stringResource(R.string.library_empty_simkl_not_auth_subtitle)
+-                        uiState.sourceMode == LibrarySourceMode.TRAKT || uiState.sourceMode == LibrarySourceMode.MDBLIST || uiState.sourceMode == LibrarySourceMode.WETRAKR || uiState.sourceMode == LibrarySourceMode.PUBLICMETADB -> stringResource(R.string.library_empty_trakt_subtitle)
+-                        uiState.sourceMode == LibrarySourceMode.SIMKL -> stringResource(R.string.library_empty_simkl_subtitle)
+-                        else -> stringResource(R.string.library_empty_local_subtitle)
++                    items(section.entries, key = { "${it.card.type}:${it.card.id}" }) { watched ->
++                        val item = watched.card
++                        val focusKey = "${item.type}:${item.id}"
++                        val isSeries = item.type.equals("series", ignoreCase = true) || item.type.equals("tv", ignoreCase = true)
++                        LibraryEntryGridCard(
++                            item = item,
++                            posterCardStyle = posterCardStyle,
++                            isWatched = if (isSeries) item.id in watchedSeriesIds else item.id in watchedMovieIds,
++                            focusKey = focusKey,
++                            focusRequester = posterFocusRequesters[focusKey],
++                            caption = libraryHistoryCardCaption(watched, historyZone),
++                            onFocused = { key, entry ->
++                                lastFocusedPosterKey = key
++                                viewModel.prefetchMetaOnFocus(entry.id, entry.type)
++                            },
++                            onClick = { key, entry ->
++                                lastFocusedPosterKey = key
++                                val backdrop = viewModel.getCachedBackdrop(entry.id, entry.type)
++                                HeroBackdropState.update(backdrop)
++                                onNavigateToDetail(entry.id, entry.type, entry.addonBaseUrl)
++                            },
++                            onLongPress = { key, preview, addonBaseUrl ->
++                                lastFocusedPosterKey = key
++                                viewModel.posterOptions.show(preview, addonBaseUrl)
++                            }
++                        )
+                     }
+-                    EmptyScreenState(
+-                        title = title,
+-                        subtitle = subtitle,
+-                        icon = Icons.Default.BookmarkBorder
++                }
++            } else if (!isHistoryTab) {
++                items(uiState.visibleItems, key = { "${it.type}:${it.id}" }) { item ->
++                    val focusKey = "${item.type}:${item.id}"
++                    val isSeries = item.type.equals("series", ignoreCase = true) || item.type.equals("tv", ignoreCase = true)
++                    LibraryEntryGridCard(
++                        item = item,
++                        posterCardStyle = posterCardStyle,
++                        isWatched = if (isSeries) item.id in watchedSeriesIds else item.id in watchedMovieIds,
++                        focusKey = focusKey,
++                        focusRequester = posterFocusRequesters[focusKey],
++                        caption = null,
++                        onFocused = { key, entry ->
++                            lastFocusedPosterKey = key
++                            viewModel.prefetchMetaOnFocus(entry.id, entry.type)
++                        },
++                        onClick = { key, entry ->
++                            lastFocusedPosterKey = key
++                            val backdrop = viewModel.getCachedBackdrop(entry.id, entry.type)
++                            HeroBackdropState.update(backdrop)
++                            onNavigateToDetail(entry.id, entry.type, entry.addonBaseUrl)
++                        },
++                        onLongPress = { key, preview, addonBaseUrl ->
++                            lastFocusedPosterKey = key
++                            viewModel.posterOptions.show(preview, addonBaseUrl)
++                        }
+                     )
+                 }
+             }
+ 
+-            items(uiState.visibleItems, key = { "${it.type}:${it.id}" }) { item ->
+-                val focusKey = "${item.type}:${item.id}"
+-                val isSeries = item.type.equals("series", ignoreCase = true) || item.type.equals("tv", ignoreCase = true)
+-                val previewForLongPress = remember(item) {
+-                    item.toMetaPreview().copy(posterShape = PosterShape.POSTER)
++            if (isHistoryTab && notWatchedShelf.isNotEmpty()) {
++                item(key = "history_section:not_watched", span = { GridItemSpan(maxLineSpan) }) {
++                    Text(
++                        text = stringResource(R.string.library_history_not_watched),
++                        style = MaterialTheme.typography.titleMedium,
++                        color = NuvioTheme.colors.TextSecondary,
++                        modifier = Modifier.padding(top = NuvioTheme.spacing.xs)
++                    )
++                }
++                items(notWatchedShelf, key = { "${it.type}:${it.id}" }) { item ->
++                    val focusKey = "${item.type}:${item.id}"
++                    val isSeries = item.type.equals("series", ignoreCase = true) || item.type.equals("tv", ignoreCase = true)
++                    LibraryEntryGridCard(
++                        item = item,
++                        posterCardStyle = posterCardStyle,
++                        isWatched = if (isSeries) item.id in watchedSeriesIds else item.id in watchedMovieIds,
++                        focusKey = focusKey,
++                        focusRequester = posterFocusRequesters[focusKey],
++                        caption = null,
++                        onFocused = { key, entry ->
++                            lastFocusedPosterKey = key
++                            viewModel.prefetchMetaOnFocus(entry.id, entry.type)
++                        },
++                        onClick = { key, entry ->
++                            lastFocusedPosterKey = key
++                            val backdrop = viewModel.getCachedBackdrop(entry.id, entry.type)
++                            HeroBackdropState.update(backdrop)
++                            onNavigateToDetail(entry.id, entry.type, entry.addonBaseUrl)
++                        },
++                        onLongPress = { key, preview, addonBaseUrl ->
++                            lastFocusedPosterKey = key
++                            viewModel.posterOptions.show(preview, addonBaseUrl)
++                        }
++                    )
+                 }
+-                GridContentCard(
+-                    item = previewForLongPress,
+-                    posterCardStyle = posterCardStyle,
+-                    isWatched = if (isSeries) item.id in watchedSeriesIds else item.id in watchedMovieIds,
+-                    focusRequester = posterFocusRequesters[focusKey],
+-                    showLabel = true,
+-                    onFocused = {
+-                        lastFocusedPosterKey = focusKey
+-                        viewModel.prefetchMetaOnFocus(item.id, item.type)
+-                    },
+-                    onClick = {
+-                        lastFocusedPosterKey = focusKey
+-                        val backdrop = viewModel.getCachedBackdrop(item.id, item.type)
+-                        HeroBackdropState.update(backdrop)
+-                        onNavigateToDetail(item.id, item.type, item.addonBaseUrl)
+-                    },
+-                    onLongPress = {
+-                        lastFocusedPosterKey = focusKey
+-                        viewModel.posterOptions.show(previewForLongPress, item.addonBaseUrl)
+-                    }
+-                )
+             }
+         } else if (viewMode == LibraryViewMode.Servers) {
+             libraryServerContent(
+@@ -761,6 +900,74 @@ fun LibraryScreen(
+     )
+ }
+ 
++/**
++ * The one grid card used by every Saved-mode list (library items, History entries, the Not watched
++ * yet shelf): the shared [GridContentCard] row idiom with this tree's navigation wiring.
++ * [caption], when set (History cards), fills the card's secondary label under the title.
++ */
++@Composable
++private fun LibraryEntryGridCard(
++    item: LibraryEntry,
++    posterCardStyle: PosterCardStyle,
++    isWatched: Boolean,
++    focusKey: String,
++    focusRequester: FocusRequester?,
++    caption: String?,
++    onFocused: (String, LibraryEntry) -> Unit,
++    onClick: (String, LibraryEntry) -> Unit,
++    onLongPress: (String, MetaPreview, String?) -> Unit
++) {
++    val previewForLongPress = remember(item, caption) {
++        item.toMetaPreview().copy(posterShape = PosterShape.POSTER, releaseInfo = caption ?: item.releaseInfo)
++    }
++    GridContentCard(
++        item = previewForLongPress,
++        posterCardStyle = posterCardStyle,
++        isWatched = isWatched,
++        focusRequester = focusRequester,
++        showLabel = true,
++        showReleaseInfo = caption != null,
++        onFocused = { onFocused(focusKey, item) },
++        onClick = { onClick(focusKey, item) },
++        onLongPress = { onLongPress(focusKey, previewForLongPress, item.addonBaseUrl) }
++    )
++}
++
++/** A History section's header: Today, This week, or the month (with the year when not this year). */
++@Composable
++private fun libraryHistorySectionTitle(section: LibraryHistorySection): String =
++    when (section.kind) {
++        LibraryHistoryGroupKind.TODAY -> stringResource(R.string.library_history_today)
++        LibraryHistoryGroupKind.THIS_WEEK -> stringResource(R.string.library_history_this_week)
++        LibraryHistoryGroupKind.MONTH -> section.month?.let { month ->
++            val pattern = if (month.year == LocalDate.now().year) "MMMM" else "MMMM yyyy"
++            DateTimeFormatter.ofPattern(pattern, Locale.getDefault()).format(month.atDay(1))
++        }.orEmpty()
++    }
++
++/**
++ * A History card's caption: "S1 E2 · 35% · Tue 20:15" for an unfinished episode, "S1 E2 · Tue
++ * 20:15" for a finished one, "Watched Tue 20:15" for a movie or a title-level mark.
++ */
++@Composable
++private fun libraryHistoryCardCaption(entry: LibraryHistoryEntry, zone: ZoneId): String? {
++    val context = LocalContext.current
++    val today = LocalDate.now(zone)
++    val parts = mutableListOf<String>()
++    if (entry.season != null && entry.episode != null) {
++        parts += context.getString(R.string.season_episode_format, entry.season, entry.episode)
++    }
++    entry.progressFraction?.let { fraction ->
++        parts += stringResource(R.string.library_history_percent, (fraction * 100).roundToInt())
++    }
++    val whenLine = libraryHistoryWhenLine(entry.watchedAt, today, zone)
++    return if (parts.isEmpty()) {
++        stringResource(R.string.library_history_watched_when, whenLine)
++    } else {
++        (parts + whenLine).joinToString(" · ")
++    }
++}
++
+ @OptIn(ExperimentalTvMaterial3Api::class)
+ @Composable
+ private fun LibraryViewModeRow(
+@@ -1190,6 +1397,8 @@ private fun CloudFilePickerDialog(
+ @Composable
+ private fun LibrarySelectorsRow(
+     sourceMode: LibrarySourceMode,
++    // Nuvio-KE port: the History tab ignores the library filters; only the type picker stays.
++    historySelected: Boolean,
+     listTabs: List<LibraryListTab>,
+     typeTabs: List<LibraryTypeTab>,
+     sortOptions: List<LibrarySortOption>,
+@@ -1230,67 +1439,79 @@ private fun LibrarySelectorsRow(
+             modifier = Modifier.fillMaxWidth(),
+             horizontalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.md)
+         ) {
+-            if (sourceMode != LibrarySourceMode.LOCAL) {
++            if (historySelected) {
++                // Watch history is a view, not a library filter: keep only the tab picker.
+                 LibraryDropdownPicker(
+                     modifier = Modifier
+                         .weight(1f)
+                         .focusRequester(primaryFocusRequester),
+                     upFocusRequester = upFocusRequester,
+-                    title = stringResource(R.string.library_filter_list),
+-                    value = selectedListLabel,
+-                    selectedValue = selectedListKey,
+-                    expanded = expandedPicker == "list",
+-                    options = listTabs.map { LibraryOption(it.localizedTitle(), it.key) },
+-                    onExpandedChange = { onExpandedChange("list", it) },
+-                    onSelect = { onSelectList(it.value) }
+-                )
+-            }
+-
+-            LibraryDropdownPicker(
+-                modifier = if (sourceMode != LibrarySourceMode.LOCAL) {
+-                    Modifier.weight(1f)
+-                } else {
+-                    Modifier
+-                        .weight(1f)
+-                        .focusRequester(primaryFocusRequester)
+-                },
+-                upFocusRequester = upFocusRequester,
+-                title = stringResource(R.string.library_filter_type),
+-                value = selectedTypeLabel,
+-                selectedValue = selectedTypeTab?.key,
+-                expanded = expandedPicker == "type",
+-                options = typeTabs.map {
+-                    val label = if (it.key == LibraryTypeTab.ALL_KEY) it.label else {
+-                        val countPart = it.label.substringAfterLast("(", "").removeSuffix(")")
+-                        val localizedName = localizedTypeLabel(it.key)
+-                        if (countPart.isNotBlank()) "$localizedName ($countPart)" else localizedName
++                    title = stringResource(R.string.library_filter_type),
++                    value = selectedTypeLabel,
++                    selectedValue = selectedTypeTab?.key,
++                    expanded = expandedPicker == "type",
++                    options = typeTabs.map { LibraryOption(libraryTypeTabLabel(it), it.key) },
++                    onExpandedChange = { onExpandedChange("type", it) },
++                    onSelect = { option ->
++                        typeTabs.firstOrNull { it.key == option.value }?.let(onSelectType)
+                     }
+-                    LibraryOption(label, it.key)
+-                },
+-                onExpandedChange = { onExpandedChange("type", it) },
+-                onSelect = { option ->
+-                    typeTabs.firstOrNull { it.key == option.value }?.let(onSelectType)
++                )
++            } else {
++                if (sourceMode != LibrarySourceMode.LOCAL) {
++                    LibraryDropdownPicker(
++                        modifier = Modifier
++                            .weight(1f)
++                            .focusRequester(primaryFocusRequester),
++                        upFocusRequester = upFocusRequester,
++                        title = stringResource(R.string.library_filter_list),
++                        value = selectedListLabel,
++                        selectedValue = selectedListKey,
++                        expanded = expandedPicker == "list",
++                        options = listTabs.map { LibraryOption(it.localizedTitle(), it.key) },
++                        onExpandedChange = { onExpandedChange("list", it) },
++                        onSelect = { onSelectList(it.value) }
++                    )
+                 }
+-            )
+ 
+-            if (sortOptions.isNotEmpty()) {
+                 LibraryDropdownPicker(
+-                    modifier = Modifier.weight(1f),
++                    modifier = if (sourceMode != LibrarySourceMode.LOCAL) {
++                        Modifier.weight(1f)
++                    } else {
++                        Modifier
++                            .weight(1f)
++                            .focusRequester(primaryFocusRequester)
++                    },
+                     upFocusRequester = upFocusRequester,
+-                    title = stringResource(R.string.library_filter_sort),
+-                    value = selectedSortLabel,
+-                    selectedValue = selectedSortOption.key,
+-                    expanded = expandedPicker == "sort",
+-                    options = sortOptions.map { LibraryOption(stringResource(it.labelResId), it.key) },
+-                    onExpandedChange = { onExpandedChange("sort", it) },
++                    title = stringResource(R.string.library_filter_type),
++                    value = selectedTypeLabel,
++                    selectedValue = selectedTypeTab?.key,
++                    expanded = expandedPicker == "type",
++                    options = typeTabs.map { LibraryOption(libraryTypeTabLabel(it), it.key) },
++                    onExpandedChange = { onExpandedChange("type", it) },
+                     onSelect = { option ->
+-                        sortOptions.firstOrNull { it.key == option.value }?.let(onSelectSort)
++                        typeTabs.firstOrNull { it.key == option.value }?.let(onSelectType)
+                     }
+                 )
++
++                if (sortOptions.isNotEmpty()) {
++                    LibraryDropdownPicker(
++                        modifier = Modifier.weight(1f),
++                        upFocusRequester = upFocusRequester,
++                        title = stringResource(R.string.library_filter_sort),
++                        value = selectedSortLabel,
++                        selectedValue = selectedSortOption.key,
++                        expanded = expandedPicker == "sort",
++                        options = sortOptions.map { LibraryOption(stringResource(it.labelResId), it.key) },
++                        onExpandedChange = { onExpandedChange("sort", it) },
++                        onSelect = { option ->
++                            sortOptions.firstOrNull { it.key == option.value }?.let(onSelectSort)
++                        }
++                    )
++                }
+             }
+         }
+ 
+-        Row(
++        if (!historySelected) Row(
+             modifier = Modifier.fillMaxWidth(),
+             horizontalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.md)
+         ) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryViewModel.kt
+index 4c2f38543..81db2e3cb 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/library/LibraryViewModel.kt
+@@ -63,7 +63,10 @@ data class LibraryTypeTab(
+ ) {
+     companion object {
+         const val ALL_KEY = "__all__"
++        /** Nuvio-KE port: the History tab. It is a view over watch history, not a library type filter. */
++        const val HISTORY_KEY = "__history__"
+         val All = LibraryTypeTab(key = ALL_KEY, label = "")
++        val History = LibraryTypeTab(key = HISTORY_KEY, label = "")
+     }
+ }
+ 
+@@ -140,6 +143,8 @@ data class LibraryUiState(
+     val selectedWatchedFilter: LibraryWatchedFilter = LibraryWatchedFilter.ALL,
+     val watchedMovieIds: Set<String> = emptySet(),
+     val watchedSeriesIds: Set<String> = emptySet(),
++    /** Nuvio-KE port: watch history for the History tab, newest first, deduped per title and capped. */
++    val history: List<LibraryHistoryEntry> = emptyList(),
+     val isNuvioAccount: Boolean = false,
+     val isTrackingAuthenticated: Boolean = false,
+     val posterCardWidthDp: Int = 126,
+@@ -221,6 +226,26 @@ class LibraryViewModel @Inject constructor(
+                     }
+                 }
+         }
++        // Nuvio-KE port: the History tab reads the existing watch-progress store, which already
++        // keeps finished entries (recent bucket + archive bucket) — no separate history store.
++        // Progress saves and completion marks flow in through the same repository the player
++        // writes to, so the list stays current; dedupe per title and cap happen in buildLibraryHistory.
++        viewModelScope.launch {
++            combine(
++                watchProgressRepository.allProgress,
++                watchProgressRepository.watchedItems
++            ) { progress, watched -> buildLibraryHistory(progress, watched) }
++                .distinctUntilChanged()
++                .collect { entries ->
++                    _uiState.update { current ->
++                        if (current.history == entries) {
++                            current
++                        } else {
++                            current.copy(history = entries).withVisibleItems()
++                        }
++                    }
++                }
++        }
+     }
+ 
+     private val metaPrefetchedIds: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+@@ -928,6 +953,15 @@ class LibraryViewModel @Inject constructor(
+     }
+ 
+     private fun LibraryUiState.withVisibleItemsOnce(): LibraryUiState {
++        // History tab: watch history replaces the library list; the other filters don't apply to it.
++        // The tab list still rebuilds so the picker stays populated while the view is open.
++        if (selectedTypeTab?.key == LibraryTypeTab.HISTORY_KEY) {
++            return copy(
++                visibleItems = history.map { it.card },
++                availableTypeTabs = buildTypeTabsWithCounts(allItems, allItems)
++            )
++        }
++
+         val listFiltered = if (sourceMode.providerId != null) {
+             val listKey = selectedListKey ?: ""
+             allItems.filter { entry -> entry.listKeys.contains(listKey) }
+@@ -1159,7 +1193,10 @@ class LibraryViewModel @Inject constructor(
+         })
+         return listOf(allTab) + sortedKeys.map { key ->
+             LibraryTypeTab(key = key, label = "${byKey[key]} (${countByType[key] ?: 0})")
+-        }
++        } + listOf(
++            // Nuvio-KE port: History sits last, without a count (KE's tab row does the same).
++            LibraryTypeTab.History.copy(label = context.getString(R.string.library_history_tab))
++        )
+     }
+ }
+ 
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index d0e9faf93..d56eb5ce1 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -2209,6 +2209,15 @@
+     <string name="library_list_edit_dialog_title">Edit List</string>
+     <string name="library_sync_btn">Sync</string>
+     <string name="library_syncing_btn">Syncing\u2026</string>
++    <!-- Nuvio-KE port: Library History tab (a view over the watch-progress store, no settings). -->
++    <string name="library_history_tab">History</string>
++    <string name="library_history_today">Today</string>
++    <string name="library_history_this_week">This week</string>
++    <string name="library_history_watched_when">Watched %1$s</string>
++    <string name="library_history_percent">%1$d%%</string>
++    <string name="library_history_empty_title">Nothing watched yet</string>
++    <string name="library_history_empty_body">Titles you play show up here, newest first.</string>
++    <string name="library_history_not_watched">Not watched yet</string>
+     <string name="cloud_library_connect_action">Connect account</string>
+     <string name="cloud_library_connect_message">Connect an account in Connected Services settings to browse playable files from your cloud library.</string>
+     <string name="cloud_library_connect_title">No cloud account connected</string>
