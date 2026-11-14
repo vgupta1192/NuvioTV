@@ -1,0 +1,444 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/RuntimeMismatchPolicy.kt b/app/src/main/java/com/nuvio/tv/core/player/RuntimeMismatchPolicy.kt
+new file mode 100644
+index 000000000..ce60d188e
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/player/RuntimeMismatchPolicy.kt
+@@ -0,0 +1,52 @@
++package com.nuvio.tv.core.player
++
++import kotlin.math.abs
++
++/**
++ * Spec 35: warn when the file playing runs noticeably longer or shorter than the title's
++ * metadata runtime, the tell that an addon served a different title under the same name
++ * (2026-10-18: the 1997 Franklin cartoon, 23 min, got a 64 min file from the 2024 drama).
++ *
++ * A warning, not a reject: [PlaceholderStreamPolicy] keeps its hard limits and is checked
++ * first, so a rejected stream never also warns. Pure, like that policy.
++ *
++ * Callers pass the runtime from the player's own metadata, never the route's runtime: the
++ * Continue Watching route carries the previous playback's duration, which a wrong file would
++ * have written itself.
++ */
++object RuntimeMismatchPolicy {
++
++    /** Off by more than this fraction of the runtime, either side, warns (Arshad 2026-10-18). */
++    const val TOLERANCE_RATIO = 0.10
++
++    /** Metadata runtimes are whole minutes, so short titles get at least this much slack. */
++    const val MIN_TOLERANCE_MS = 60_000L
++
++    /** Below this runtime (clips, extras) the metadata is too coarse to judge. */
++    const val MIN_JUDGED_RUNTIME_MS = 5L * 60_000L
++
++    /**
++     * The warning rewinds to 0:00, so it only fires near the start: when the metadata runtime
++     * arrives later than this into playback, the stream is not judged.
++     */
++    const val MAX_WARN_POSITION_MS = 60_000L
++
++    data class Mismatch(val durationMs: Long, val expectedRuntimeMs: Long) {
++        val longer: Boolean get() = durationMs > expectedRuntimeMs
++    }
++
++    /**
++     * @param durationMs decoded duration of the file, or null before it is known.
++     * @param expectedRuntimeMs metadata runtime of the title, or null when unknown.
++     * @param resumed true when playback started from a saved position (Continue Watching or
++     *   a Resume press): the viewer already saw this file, so no warning.
++     * @return the mismatch to warn about, or null.
++     */
++    fun evaluate(durationMs: Long?, expectedRuntimeMs: Long?, resumed: Boolean): Mismatch? {
++        if (resumed) return null
++        val expected = expectedRuntimeMs?.takeIf { it >= MIN_JUDGED_RUNTIME_MS } ?: return null
++        val duration = durationMs?.takeIf { it > 0L } ?: return null
++        val toleranceMs = maxOf((expected * TOLERANCE_RATIO).toLong(), MIN_TOLERANCE_MS)
++        return if (abs(duration - expected) > toleranceMs) Mismatch(duration, expected) else null
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
+index 962ed7ab1..75fc5f976 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
+@@ -516,6 +516,10 @@ class PlayerRuntimeController(
+     // Ignore EOF until MPV has reported a non-EOF state for this stream.
+     internal var mpvEofSeenClear = false
+     internal var shouldEnforceAutoplayOnFirstReady = true
++    // Nuvio-KE port: the runtime mismatch check has judged this stream (it runs once per stream).
++    internal var runtimeMismatchChecked = false
++    // Nuvio-KE port: this stream started from a saved position > 0 (a resume), so it never warns.
++    internal var playbackResumedFromSavedPosition = false
+ 
+     internal var rebufferCount: Int = 0
+     internal var rebufferTotalMs: Long = 0L
+@@ -534,6 +538,8 @@ class PlayerRuntimeController(
+         cloudPlaybackSessionStore.load(cloudSessionToken)
+     internal var metaGenres: List<String> = emptyList()
+     internal var metaCountry: String? = null
++    /** Nuvio-KE port: the meta's runtime text ("92 min", "1h 32min"); feeds the mismatch check. */
++    internal var metaRuntime: String? = null
+     internal var metaFetchJob: Job? = null
+     internal var nextEpisodeVideo: Video? = null
+     internal var nextEpisodePreloadJob: Job? = null
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+index d522efd8a..79b5a06e3 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+@@ -1429,7 +1429,11 @@ internal fun PlayerRuntimeController.initializePlayer(
+                             "isPlaying=$isPlaying playbackState=$playbackState playWhenReady=$playWhenReady " +
+                                 "userPaused=$userPausedManually"
+                         )
+-                        _uiState.update { it.copy(isPlaying = isPlaying) }
++                        // Nuvio-KE port: any play (media key, MediaSession) clears a runtime
++                        // mismatch warning; the viewer chose to play.
++                        _uiState.update {
++                            it.copy(isPlaying = isPlaying, runtimeMismatch = if (isPlaying) null else it.runtimeMismatch)
++                        }
+                         if (isPlaying) {
+                             userPausedManually = false
+                             cancelPauseOverlay()
+@@ -2153,6 +2157,10 @@ internal fun PlayerRuntimeController.resetLoadingOverlayForNewStream() {
+     mpvEofSeenClear = false
+     hasMarkedCurrentEpisodeCompleted = false
+     shouldEnforceAutoplayOnFirstReady = true
++    // Nuvio-KE port: the runtime check and its resume flag are per stream too.
++    runtimeMismatchChecked = false
++    playbackResumedFromSavedPosition = false
++    _uiState.update { it.copy(runtimeMismatch = null) }
+     userPausedManually = false
+     timeoutRecoveryAttempts = 0
+     hasRetriedCurrentStreamAfterUnexpectedNpe = false
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerMetadata.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerMetadata.kt
+index 329acdc65..8861d2bf7 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerMetadata.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerMetadata.kt
+@@ -61,6 +61,8 @@ internal fun PlayerRuntimeController.applyMetaDetails(meta: Meta) {
+     metaVideos = meta.videos
+     metaGenres = meta.genres
+     metaCountry = meta.country
++    // Nuvio-KE port: the meta's runtime text feeds the runtime mismatch check.
++    metaRuntime = meta.runtime
+     // Fill in content language from meta if not provided via navigation args.
+     if (contentLanguage == null) {
+         contentLanguage = meta.resolveContentLanguage()
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerMpv.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerMpv.kt
+index 30cc66a9b..4a67a305c 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerMpv.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerMpv.kt
+@@ -563,6 +563,8 @@ internal fun PlayerRuntimeController.applyPendingMpvSeekIfNeeded(
+     val canSeekNow = durationMs > 0L || currentPositionMs > 0L || hasRenderedFirstFrame
+     if (!canSeekNow) return
+ 
++    // Nuvio-KE port: this stream resumes from a saved position, so it never warns.
++    playbackResumedFromSavedPosition = true
+     view.seekToMs(target)
+     view.setSubtitleDelayMs(mpvSubtitleDelayMs(state.subtitleDelayMs))
+     view.setAudioDelayMs(state.audioDelayMs)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerObservers.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerObservers.kt
+index 8227e1c04..21a64665d 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerObservers.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerObservers.kt
+@@ -751,6 +751,8 @@ internal fun PlayerRuntimeController.tryApplyPendingResumeProgress(player: Playe
+     }
+ 
+     if (target > 0L) {
++        // Nuvio-KE port: this stream resumes from a saved position, so it never warns.
++        playbackResumedFromSavedPosition = true
+         player.seekTo(target)
+     }
+     _uiState.update { it.copy(pendingSeekPosition = null) }
+@@ -767,6 +769,8 @@ internal fun PlayerRuntimeController.resolvePendingInitialResumePosition(): Long
+     if (target <= 0L && saved.progressPercent == null) {
+         clearPendingInitialResumePosition()
+     }
++    // Nuvio-KE port: this stream starts from a saved position, so it never warns.
++    if (target > 0L) playbackResumedFromSavedPosition = true
+     return target.coerceAtLeast(0L)
+ }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
+index fee87140d..cbb62420b 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
+@@ -543,6 +543,8 @@ internal fun PlayerRuntimeController.startProgressUpdates() {
+                 updateActiveSkipInterval(pos)
+                 ensureLocalSkipDetection(pos)
+                 if (!_playbackTimeline.value.isLive) {
++                    // Nuvio-KE port: judge the file's length against the meta runtime (once per stream).
++                    checkRuntimeMismatch(player, getEffectiveDuration(pos))
+                     evaluatePostPlayOverlayVisibility(
+                         positionMs = pos,
+                         durationMs = playerDuration.coerceAtLeast(0L)
+@@ -1904,6 +1906,9 @@ fun PlayerRuntimeController.onEvent(event: PlayerEvent) {
+         PlayerEvent.OnDismissSourcesPanel -> {
+             dismissSourcesPanel()
+         }
++        is PlayerEvent.OnRuntimeMismatchChoice -> {
++            onRuntimeMismatchChoice(event.playAnyway)
++        }
+         PlayerEvent.OnShowPartyPanel -> {
+             showPartyPanel()
+         }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerRuntimeMismatch.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerRuntimeMismatch.kt
+new file mode 100644
+index 000000000..26f6ab192
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerRuntimeMismatch.kt
+@@ -0,0 +1,86 @@
++package com.nuvio.tv.ui.screens.player
++
++import android.util.Log
++import androidx.media3.common.Player
++import com.nuvio.tv.core.player.RuntimeMismatchPolicy
++import com.nuvio.tv.core.util.parseRuntimeMinutes
++import com.nuvio.tv.domain.model.Video
++import kotlinx.coroutines.flow.update
++
++/**
++ * Nuvio-KE port: judge the playing file's length against the title's metadata runtime once per
++ * stream, on the controller's progress tick (ExoPlayer branch; MPV has no equivalent tick and is
++ * not checked). A mismatch pauses on the first frame, rewinds to 0:00 and raises
++ * [PlayerUiState.runtimeMismatch]; the player screen shows the warning with "Pick another stream"
++ * / "Play anyway".
++ *
++ * Waits (without spending the one check) until the meta fetch supplies a runtime, but only for
++ * [RuntimeMismatchPolicy.MAX_WARN_POSITION_MS] of playback. The runtime comes from the player's
++ * own meta ([runtimeMismatchExpectedMinutes]), never from a Continue Watching route: the route
++ * carries the previous playback's duration, which a wrong file would have written itself.
++ */
++internal fun PlayerRuntimeController.checkRuntimeMismatch(player: Player, durationMs: Long) {
++    if (runtimeMismatchChecked || durationMs <= 0L) return
++    val positionMs = player.currentPosition.coerceAtLeast(0L)
++    val runtimeMinutes = runtimeMismatchExpectedMinutes(
++        videos = metaVideos,
++        videoId = currentVideoId,
++        season = currentSeason,
++        episode = currentEpisode,
++        metaRuntime = metaRuntime
++    )
++    if (runtimeMinutes == null && positionMs <= RuntimeMismatchPolicy.MAX_WARN_POSITION_MS) return
++    runtimeMismatchChecked = true
++    val mismatch = if (positionMs > RuntimeMismatchPolicy.MAX_WARN_POSITION_MS) {
++        null
++    } else {
++        RuntimeMismatchPolicy.evaluate(
++            durationMs = durationMs,
++            expectedRuntimeMs = runtimeMinutes?.let { it * 60_000L },
++            resumed = playbackResumedFromSavedPosition
++        )
++    }
++    Log.i(
++        PlayerRuntimeController.TAG,
++        "RUNTIME_MISMATCH warn=${mismatch != null} durationMs=$durationMs " +
++            "runtimeMin=${runtimeMinutes ?: -1} positionMs=$positionMs " +
++            "resumed=$playbackResumedFromSavedPosition"
++    )
++    if (mismatch == null) return
++    _uiState.update { it.copy(runtimeMismatch = mismatch) }
++    player.pause()
++    player.seekTo(0L)
++}
++
++/** The warning's buttons: Play anyway plays this stream; Pick another stream opens Sources.
++ *  Any other play (a media key, the MediaSession) clears the warning in onIsPlayingChanged. */
++internal fun PlayerRuntimeController.onRuntimeMismatchChoice(playAnyway: Boolean) {
++    _uiState.update { it.copy(runtimeMismatch = null) }
++    if (playAnyway) {
++        _exoPlayer?.play()
++    } else {
++        showSourcesPanel()
++    }
++}
++
++/**
++ * The runtime the mismatch check judges against, in minutes: the playing episode's own
++ * [Video.runtime], else (a movie, or an episode without its own) the meta's runtime text.
++ * Null when unknown.
++ */
++internal fun runtimeMismatchExpectedMinutes(
++    videos: List<Video>,
++    videoId: String?,
++    season: Int?,
++    episode: Int?,
++    metaRuntime: String?
++): Int? {
++    val video = videoId?.let { id -> videos.firstOrNull { it.id == id } }
++        ?: if (season != null && episode != null) {
++            videos.firstOrNull { it.season == season && it.episode == episode }
++        } else {
++            null
++        }
++    video?.runtime?.takeIf { it > 0 }?.let { return it }
++    return parseRuntimeMinutes(metaRuntime)?.takeIf { it > 0 }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+index f031938e3..6d1f89bd0 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+@@ -1565,6 +1565,18 @@ fun PlayerScreen(
+             )
+         }
+ 
++        // Nuvio-KE port: runtime mismatch warning over the paused first frame (wrong file served
++        // by an addon). Back picks another stream.
++        uiState.runtimeMismatch?.let { mismatch ->
++            RuntimeMismatchDialog(
++                mismatch = mismatch,
++                season = uiState.currentSeason,
++                episode = uiState.currentEpisode,
++                onPlayAnyway = { viewModel.onEvent(PlayerEvent.OnRuntimeMismatchChoice(playAnyway = true)) },
++                onPickAnother = { viewModel.onEvent(PlayerEvent.OnRuntimeMismatchChoice(playAnyway = false)) }
++            )
++        }
++
+         val skipButtonBottomPadding by animateDpAsState(
+             targetValue = if (uiState.showControls) 122.dp else 30.dp,
+             animationSpec = tween(durationMillis = NuvioMotion.tokens.durations.fast),
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt
+index 7c0afaa12..f03dc2e92 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt
+@@ -3,6 +3,7 @@ package com.nuvio.tv.ui.screens.player
+ import androidx.media3.common.C
+ import androidx.media3.common.TrackGroup
+ import androidx.media3.ui.AspectRatioFrameLayout
++import com.nuvio.tv.core.player.RuntimeMismatchPolicy
+ import com.nuvio.tv.core.streams.CompiledStreamBadgeFilter
+ import com.nuvio.tv.core.streams.StreamBadgePlacement
+ import com.nuvio.tv.data.local.FrameRateMatchingMode
+@@ -188,6 +189,9 @@ data class PlayerUiState(
+     val playbackIssueReportId: String? = null,
+     val playbackIssueReportError: String? = null,
+     val pendingSeekPosition: Long? = null, // For resuming from saved progress
++    // Nuvio-KE port: the playing file is >10% off the title's metadata runtime (wrong file
++    // served by an addon); the player paused at 0:00 and the warning overlay is up.
++    val runtimeMismatch: RuntimeMismatchPolicy.Mismatch? = null,
+     // Parental guide overlay
+     val parentalWarnings: List<ParentalWarning> = emptyList(),
+     val showParentalGuide: Boolean = false,
+@@ -364,6 +368,8 @@ sealed class PlayerEvent {
+     data class OnEpisodeStreamSelected(val stream: Stream) : PlayerEvent()
+     data object OnShowSourcesPanel : PlayerEvent()
+     data object OnDismissSourcesPanel : PlayerEvent()
++    /** Nuvio-KE port: the user chose from the runtime mismatch warning. */
++    data class OnRuntimeMismatchChoice(val playAnyway: Boolean) : PlayerEvent()
+     data object OnShowPartyPanel : PlayerEvent()
+     data object OnDismissPartyPanel : PlayerEvent()
+     data object OnReloadSourceStreams : PlayerEvent()
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/RuntimeMismatchDialog.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/RuntimeMismatchDialog.kt
+new file mode 100644
+index 000000000..eb819d2b1
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/RuntimeMismatchDialog.kt
+@@ -0,0 +1,93 @@
++package com.nuvio.tv.ui.screens.player
++
++import androidx.compose.foundation.layout.Box
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.res.stringResource
++import com.nuvio.tv.R
++import com.nuvio.tv.core.player.RuntimeMismatchPolicy
++import com.nuvio.tv.ui.components.NuvioDialog
++import com.nuvio.tv.ui.screens.detail.requestFocusAfterFrames
++import com.nuvio.tv.ui.screens.settings.SettingsDialogActionButton
++import com.nuvio.tv.ui.screens.settings.SettingsDialogActionRow
++
++/**
++ * Nuvio-KE port: runtime mismatch warning, shown over the paused first frame when the file
++ * playing runs >10% longer or shorter than the title's metadata runtime (the tell that an addon
++ * served a different title under the same name). "Pick another stream" is primary and focused;
++ * Back picks another stream too.
++ */
++@Composable
++internal fun RuntimeMismatchDialog(
++    mismatch: RuntimeMismatchPolicy.Mismatch,
++    season: Int?,
++    episode: Int?,
++    onPlayAnyway: () -> Unit,
++    onPickAnother: () -> Unit
++) {
++    val pickFocus = remember { FocusRequester() }
++    LaunchedEffect(mismatch) { pickFocus.requestFocusAfterFrames() }
++
++    val episodeCode = if (season != null && episode != null) {
++        stringResource(R.string.season_episode_format, season, episode)
++    } else {
++        null
++    }
++    val title = stringResource(
++        if (episodeCode != null) {
++            R.string.runtime_mismatch_title_episode
++        } else {
++            R.string.runtime_mismatch_title_movie
++        }
++    )
++    val message = if (episodeCode != null) {
++        stringResource(
++            R.string.runtime_mismatch_body_episode,
++            mismatchLengthText(mismatch.durationMs),
++            episodeCode,
++            mismatchLengthText(mismatch.expectedRuntimeMs)
++        )
++    } else {
++        stringResource(
++            R.string.runtime_mismatch_body_movie,
++            mismatchLengthText(mismatch.durationMs),
++            mismatchLengthText(mismatch.expectedRuntimeMs)
++        )
++    }
++
++    NuvioDialog(
++        onDismiss = onPickAnother,
++        title = title,
++        subtitle = message
++    ) {
++        SettingsDialogActionRow {
++            Box(modifier = Modifier.focusRequester(pickFocus)) {
++                SettingsDialogActionButton(
++                    text = stringResource(R.string.runtime_mismatch_pick_another),
++                    onClick = onPickAnother,
++                    primary = true
++                )
++            }
++            SettingsDialogActionButton(
++                text = stringResource(R.string.runtime_mismatch_play_anyway),
++                onClick = onPlayAnyway
++            )
++        }
++    }
++}
++
++/** Whole minutes, rounded, at least 1; the same "1h 32m" shape the detail hero uses. */
++private fun mismatchLengthText(durationMs: Long): String {
++    val minutes = ((durationMs + 30_000L) / 60_000L).toInt().coerceAtLeast(1)
++    val hours = minutes / 60
++    val rest = minutes % 60
++    return when {
++        hours > 0 && rest > 0 -> "${hours}h ${rest}m"
++        hours > 0 -> "${hours}h"
++        else -> "${rest}m"
++    }
++}
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 23e12c041..d0e9faf93 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1907,6 +1907,13 @@
+     <string name="player_live_watched">LIVE  %1$s</string>
+     <!-- Season/episode code shown in player UI (e.g. S01E02). %1$d = season, %2$d = episode. -->
+     <string name="season_episode_format">S%1$d E%2$d</string>
++    <!-- Runtime mismatch warning (wrong file served by an addon). %1$s = file length, %2$s = episode code, %3$s = expected length. -->
++    <string name="runtime_mismatch_title_episode">This may be a different show</string>
++    <string name="runtime_mismatch_title_movie">This may be a different film</string>
++    <string name="runtime_mismatch_body_episode">This file runs %1$s, but %2$s should be about %3$s. It may be a different show.</string>
++    <string name="runtime_mismatch_body_movie">This file runs %1$s, but this film should be about %2$s. It may be a different film.</string>
++    <string name="runtime_mismatch_pick_another">Pick another stream</string>
++    <string name="runtime_mismatch_play_anyway">Play anyway</string>
+     <string name="player_subtitle_delay">Subtitles Delay</string>
+     <string name="player_error_title">Playback Error</string>
+     <string name="player_go_back">Go Back</string>
