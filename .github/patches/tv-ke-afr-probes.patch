@@ -1,0 +1,129 @@
+diff --git a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
+index 93c2ed34d..456774cca 100644
+--- a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
++++ b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
+@@ -94,6 +94,11 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+ 
+     override fun onCreate() {
+         super.onCreate()
++        // Nuvio-KE port: hydrate the AFR fps cache from disk (background load) so cold
++        // rewatches take the preflight hit path — the switch happens before prepare and the
++        // sink opens once, instead of paying the mid-prepare display switch. The persistence
++        // layer inside FrameRateUtils is inert until this runs; the load never blocks onCreate.
++        com.nuvio.tv.core.player.FrameRateUtils.initFrameRateCachePersistence(this)
+         SentryInitializer.start(this, sentrySettingsDataStore)
+         com.nuvio.tv.core.diagnostics.ForkCrashReporter.install(this) // Nuvio fork: local crash reports, shown in Debug logs to phone
+         com.nuvio.tv.core.diagnostics.ForkStability.install(this) // Nuvio fork: breadcrumbs and main thread freeze watchdog
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/AfrNoisyPolicy.kt b/app/src/main/java/com/nuvio/tv/core/player/AfrNoisyPolicy.kt
+new file mode 100644
+index 000000000..035aad1c9
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/player/AfrNoisyPolicy.kt
+@@ -0,0 +1,25 @@
++package com.nuvio.tv.core.player
++
++/**
++ * Spec 50 I6 (Spec 12 F-1): an AFR display-mode switch re-plugs HDMI, and Android then broadcasts
++ * ACTION_AUDIO_BECOMING_NOISY, which Media3 (setHandleAudioBecomingNoisy) turns into a pause: the film stopped
++ * at 0:01 after "Track AFR: settle complete". A noisy pause within [GRACE_MS] of a mode switch this app made is
++ * that re-plug, not a headphone/BT disconnect, so playback resumes. Outside the window the pause stands.
++ */
++internal object AfrNoisyPolicy {
++    // HDMI hot-plug re-handshake plus the audio stack's re-route takes a few seconds; 10 s covers
++    // the observed spurious pause without masking a genuine headphone/BT unplug the viewer meant.
++    const val GRACE_MS = 10_000L
++
++    fun shouldResume(
++        noisyPause: Boolean,
++        playWhenReady: Boolean,
++        userPausedManually: Boolean,
++        lastModeSwitchElapsedMs: Long,
++        nowElapsedMs: Long
++    ): Boolean = noisyPause &&
++        !playWhenReady &&
++        !userPausedManually &&
++        lastModeSwitchElapsedMs > 0L &&
++        nowElapsedMs - lastModeSwitchElapsedMs in 0L..GRACE_MS
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
+index 75fc5f976..233c270a5 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
+@@ -663,6 +663,13 @@ class PlayerRuntimeController(
+     internal val mpvErrorHandlingInProgress = AtomicBoolean(false)
+     internal var delayMpvResumeSeekUntilVideoTrack: Boolean = false
+     internal var mpvDelayStartAfterAfrSwitch: Boolean = false
++    // Spec 50 I6: elapsedRealtime of the last real display-mode switch this app made (when applied).
++    // An AFR switch re-plugs HDMI; Android then broadcasts ACTION_AUDIO_BECOMING_NOISY, which the
++    // player (setHandleAudioBecomingNoisy) turns into a pause. AfrNoisyPolicy treats a noisy pause
++    // inside its window after this stamp as that re-plug, not a headphone/BT disconnect, and
++    // playback resumes. 0L means no switch has been made this session; the stamp is never cleared
++    // per stream because the window self-expires.
++    @Volatile internal var lastAfrModeSwitchElapsedMs: Long = 0L
+     internal var pauseOverlayJob: Job? = null
+     internal val pauseOverlayDelayMs = 5000L
+     internal val seekProgressSyncDebounceMs = 700L
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAfrPreflight.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAfrPreflight.kt
+index deed7dccc..77d4bce0c 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAfrPreflight.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAfrPreflight.kt
+@@ -117,6 +117,9 @@ internal suspend fun PlayerRuntimeController.runAfrPreflightIfEnabled(
+                 val switchedDisplayMode = initialDisplayModeId != null &&
+                     initialDisplayModeId != result.appliedMode.modeId
+                 mpvDelayStartAfterAfrSwitch = switchedDisplayMode
++                // Spec 50 I6: open AfrNoisyPolicy's grace window only on a real mode change —
++                // the switch re-plugs HDMI, and the noisy pause that follows is not a user pause.
++                if (switchedDisplayMode) lastAfrModeSwitchElapsedMs = SystemClock.elapsedRealtime()
+ 
+                 _uiState.update {
+                     it.copy(
+@@ -251,6 +254,9 @@ internal suspend fun PlayerRuntimeController.runAfrPreflightIfEnabled(
+             val switchedDisplayMode = initialDisplayModeId != null &&
+                 initialDisplayModeId != result.appliedMode.modeId
+             mpvDelayStartAfterAfrSwitch = switchedDisplayMode
++            // Spec 50 I6: open AfrNoisyPolicy's grace window only on a real mode change —
++            // the switch re-plugs HDMI, and the noisy pause that follows is not a user pause.
++            if (switchedDisplayMode) lastAfrModeSwitchElapsedMs = SystemClock.elapsedRealtime()
+ 
+             _uiState.update {
+                 it.copy(
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+index 79b5a06e3..e99cfc069 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+@@ -62,6 +62,7 @@ import androidx.media3.ui.AspectRatioFrameLayout
+ import androidx.media3.ui.PlayerView
+ import com.nuvio.tv.R
+ import com.nuvio.tv.core.intro.PlaybackIntroState
++import com.nuvio.tv.core.player.AfrNoisyPolicy
+ import com.nuvio.tv.core.player.DolbyVisionCodecFallback
+ import com.nuvio.tv.core.player.DolbyVisionBaseLayerPolicy
+ import com.nuvio.tv.core.player.BitrateAwareLoadControl
+@@ -1756,6 +1757,27 @@ internal fun PlayerRuntimeController.initializePlayer(
+                         reason: Int
+                     ) {
+                         playbackAnalyticsDiagnostics.onPlayWhenReadyChanged(eventTime, playWhenReady, reason)
++                        // Spec 50 I6: an AFR display-mode switch re-plugs HDMI and Android then
++                        // broadcasts ACTION_AUDIO_BECOMING_NOISY, which Media3
++                        // (setHandleAudioBecomingNoisy above) turns into a pause. AfrNoisyPolicy
++                        // recognises that spurious pause — it fires only when the pause was not
++                        // user-initiated (userPausedManually is untouched by Media3's noisy pause)
++                        // and only inside the grace window after a switch this app made.
++                        if (AfrNoisyPolicy.shouldResume(
++                                noisyPause = reason == Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_BECOMING_NOISY,
++                                playWhenReady = playWhenReady,
++                                userPausedManually = userPausedManually,
++                                lastModeSwitchElapsedMs = lastAfrModeSwitchElapsedMs,
++                                nowElapsedMs = SystemClock.elapsedRealtime()
++                            )
++                        ) {
++                            Log.i(
++                                PlayerRuntimeController.TAG,
++                                "AFR_NOISY_IGNORED: HDMI re-plug after a mode switch; resuming"
++                            )
++                            // Inline on the player looper: Media3's ListenerSet queues the nested events.
++                            _exoPlayer?.play()
++                        }
+                     }
+ 
+                     override fun onIsPlayingChanged(eventTime: AnalyticsListener.EventTime, isPlaying: Boolean) {

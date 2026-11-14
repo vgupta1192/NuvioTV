@@ -1,0 +1,378 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/di/NetworkModule.kt b/app/src/main/java/com/nuvio/tv/core/di/NetworkModule.kt
+index 8c473aa98..54557fb26 100644
+--- a/app/src/main/java/com/nuvio/tv/core/di/NetworkModule.kt
++++ b/app/src/main/java/com/nuvio/tv/core/di/NetworkModule.kt
+@@ -43,6 +43,8 @@ import okhttp3.logging.HttpLoggingInterceptor
+ import retrofit2.Retrofit
+ import retrofit2.converter.moshi.MoshiConverterFactory
+ import com.nuvio.tv.core.network.IPv4FirstDns
++import com.nuvio.tv.core.network.AddonHostGuard
++import com.nuvio.tv.core.network.AddonHostGuardInterceptor
+ import com.nuvio.tv.core.diagnostics.SentryNetworkBreadcrumbInterceptor
+ import java.io.File
+ import java.security.SecureRandom
+@@ -141,18 +143,37 @@ object NetworkModule {
+             .build()
+     }
+ 
++    /**
++     * Shared per-host state for the addon transport gate ([AddonHostGuard]). One process-wide
++     * instance so the interceptor on the addon client below sees every addon request's outcome.
++     */
++    @Provides
++    @Singleton
++    fun provideAddonHostGuard(): AddonHostGuard = AddonHostGuard()
++
+     /**
+      * Permissive client for addon-provided URLs, including self-hosted servers with self-signed
+      * certificates. Uses a separate cache from first-party traffic.
+      *
+      * Do not use for first-party endpoints.
++     *
++     * This is the only client that addon URLs ride (AddonApi, and with it
++     * CatalogRepositoryImpl / MetaRepositoryImpl / StreamRepositoryImpl / AddonRepositoryImpl,
++     * plus SubtitleFileCache for addon-served subtitle files), so it is also where the
++     * addon host guard lives: built with `newBuilder()`, the guard below stays off the
++     * base client and thus off first-party (tmdb/trakt/github/...), `directDebrid`
++     * (debrid resolve 429/5xx is handled as "Busy" by TorboxDirectDebridResolver) and
++     * player traffic (ExoPlayer HttpDataSource, covered by ParallelRangeRateGate and the
++     * long-Retry-After next-source switch in PlayerMediaSourceFactory). See
++     * [AddonHostGuard]'s KDoc for how the three layers divide the work.
+      */
+     @Provides
+     @Singleton
+     @Named("addonPermissive")
+     fun provideAddonPermissiveOkHttpClient(
+         @ApplicationContext context: Context,
+-        okHttpClient: OkHttpClient
++        okHttpClient: OkHttpClient,
++        addonHostGuard: AddonHostGuard
+     ): OkHttpClient {
+         val trustAllManager = object : X509TrustManager {
+             override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
+@@ -166,6 +187,13 @@ object NetworkModule {
+             .cache(Cache(File(context.cacheDir, "addon_http_cache"), 50L * 1024 * 1024))
+             .sslSocketFactory(sslContext.socketFactory, trustAllManager)
+             .hostnameVerifier { _, _ -> true }
++            // Addon host guard (Nuvio-KE port): pause all traffic to an addon host that
++            // answers 429/503-with-Retry-After, and trip a failure-count breaker on
++            // repeated 5xx / network errors. Blocked requests fail fast with an
++            // IOException instead of retrying into the ban. Application interceptor:
++            // blocked calls never reach the network. Only addon hosts ride this client,
++            // so no extra host predicate is needed.
++            .addInterceptor(AddonHostGuardInterceptor(addonHostGuard))
+             .build()
+     }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/core/network/AddonHostGuard.kt b/app/src/main/java/com/nuvio/tv/core/network/AddonHostGuard.kt
+new file mode 100644
+index 000000000..60a7f1c94
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/network/AddonHostGuard.kt
+@@ -0,0 +1,306 @@
++package com.nuvio.tv.core.network
++
++import android.os.SystemClock
++import android.util.Log
++import okhttp3.Interceptor
++import okhttp3.Response
++import java.io.IOException
++import java.time.ZonedDateTime
++import java.time.format.DateTimeFormatter
++import java.util.Locale
++import java.util.concurrent.ConcurrentHashMap
++import javax.inject.Singleton
++
++/**
++ * Ported from Nuvio-KE (`core/network/AddonHostGuard.kt`), reduced to what this tree needs.
++ *
++ * Per-host protection against hammering a misbehaving addon server: when a host answers
++ * 429 (or 503 with a Retry-After header), ALL further requests to that host are paused for
++ * the indicated period and fail fast with a clear [IOException] instead of retrying into
++ * the ban. Repeated failures (5xx answers, network errors) open a failure-count circuit
++ * breaker that half-opens after a cool-down and lets one probe request decide.
++ *
++ * How the three rate-limit layers in this tree relate (do not merge them):
++ *
++ *  1. THIS guard — the OkHttp transport gate for ADDON hosts. Every addon manifest/catalog/
++ *     meta/stream-list/subtitle JSON request goes through the `@Named("addonPermissive")`
++ *     client (AddonApi -> CatalogRepositoryImpl / MetaRepositoryImpl / StreamRepositoryImpl /
++ *     AddonRepositoryImpl), so one interceptor covers all of them. It never rewrites or
++ *     retries a request; it only pauses/breakers and fails fast.
++ *  2. Debrid 429/5xx "Busy" (tv-nov13-reduced-ports) — TorboxDirectDebridResolver maps
++ *     429/5xx from the *debrid* APIs to DirectDebridResolveResult.Busy, which surfaces as
++ *     Stale so it does not poison the resolve cache. That traffic rides the separate
++ *     `directDebrid` client and is deliberately NOT covered here: debrid services are
++ *     first-party accounts with their own quotas, not user-installed addon servers.
++ *  3. Player next-source switch (tv-nt-stable-ports) — playback of the resolved media URL
++ *     happens in ExoPlayer's HttpDataSource, mostly bypassing OkHttp entirely:
++ *     ParallelRangeRateGate/ParallelRangeRetryAfter back off per-chunk in
++ *     ParallelRangeDataSource, and PlayerMediaSourceFactory.longRefusalMs switches to the
++ *     next source on a long-Retry-After 429. A transport-layer guard cannot see that
++ *     traffic, and those layers already own it.
++ *
++ * So: this class is the first line (discovery + stream lists), layer 2 protects resolve
++ * calls, layer 3 protects playback. They share no state on purpose. (A fourth limiter,
++ * BackendRateLimitPlugin, paces the app's OWN backend API over Ktor — unrelated to addons.)
++ */
++@Singleton
++class AddonHostGuard(
++    private val nowMs: () -> Long = SystemClock::elapsedRealtime,
++    private val wallNowMs: () -> Long = System::currentTimeMillis,
++) {
++
++    enum class Admission { ALLOW, PROBE, SKIP_RATE_LIMITED, SKIP_BREAKER_OPEN }
++
++    private class HostState {
++        var pauseUntilMs = 0L
++        val failureAtMs = ArrayDeque<Long>()
++
++        /** 0 = closed. When in the past, the breaker is half-open and one probe decides. */
++        var openUntilMs = 0L
++        var probeInFlight = false
++    }
++
++    private val hosts = ConcurrentHashMap<String, HostState>()
++
++    private fun stateFor(host: String): HostState = hosts.computeIfAbsent(host) { HostState() }
++
++    /** May this request to [host] go out? [PROBE] grants a single half-open request. */
++    fun admit(host: String): Admission {
++        val state = stateFor(host)
++        synchronized(state) {
++            val now = nowMs()
++            return when {
++                now < state.pauseUntilMs -> Admission.SKIP_RATE_LIMITED
++                state.openUntilMs == 0L -> Admission.ALLOW
++                now < state.openUntilMs || state.probeInFlight -> Admission.SKIP_BREAKER_OPEN
++                else -> {
++                    state.probeInFlight = true
++                    Admission.PROBE
++                }
++            }
++        }
++    }
++
++    /** The host answered with [code] over the network (a cache hit never calls this). */
++    fun onAnswer(host: String, code: Int, retryAfter: String?, probe: Boolean) {
++        val state = stateFor(host)
++        synchronized(state) {
++            if (probe) state.probeInFlight = false
++            val now = nowMs()
++            if (shouldPauseAddonHost(code, retryAfter)) {
++                val pauseMs = addonHostPauseMs(
++                    retryAfterHeader = retryAfter,
++                    nowEpochMs = wallNowMs(),
++                    fallbackDelayMs = PAUSE_FALLBACK_MS,
++                    maxDelayMs = MAX_PAUSE_MS
++                )
++                state.pauseUntilMs = maxOf(state.pauseUntilMs, now + pauseMs)
++                Log.w(TAG, "ADDON_HOST paused host=$host code=$code pauseMs=$pauseMs")
++                // The host answered: alive, so the answer counts as a breaker success.
++                onSuccess(state)
++            } else if (code in 500..599) {
++                onFailure(state, now, probe)
++            } else {
++                onSuccess(state)
++            }
++        }
++    }
++
++    /** The call failed on the network (or ran out its call timeout). */
++    fun onNetworkFailure(host: String, probe: Boolean) {
++        val state = stateFor(host)
++        synchronized(state) {
++            if (probe) state.probeInFlight = false
++            onFailure(state, nowMs(), probe)
++        }
++    }
++
++    /** No outcome (the caller cancelled it, or the cache answered): only frees a probe slot. */
++    fun onNoOutcome(host: String, probe: Boolean) {
++        if (!probe) return
++        val state = hosts[host] ?: return
++        synchronized(state) { state.probeInFlight = false }
++    }
++
++    /**
++     * Milliseconds left on [host]'s pause or breaker cool-down, for error messages.
++     * Approximate by the time a caller formats it; the wait itself is authoritative.
++     */
++    fun blockedRemainingMs(host: String): Long {
++        val state = hosts[host] ?: return 0L
++        synchronized(state) {
++            val now = nowMs()
++            return maxOf(state.pauseUntilMs - now, state.openUntilMs - now).coerceAtLeast(0L)
++        }
++    }
++
++    private fun onSuccess(state: HostState) {
++        state.failureAtMs.clear()
++        if (state.openUntilMs != 0L) {
++            state.openUntilMs = 0L
++            Log.i(TAG, "ADDON_HOST breaker closed")
++        }
++    }
++
++    private fun onFailure(state: HostState, now: Long, probe: Boolean) {
++        if (probe) {
++            // A call admitted before the breaker opened may have closed it meanwhile:
++            // that answer wins over the stale probe.
++            if (state.openUntilMs == 0L) return
++            state.openUntilMs = now + OPEN_COOLDOWN_MS
++            Log.w(TAG, "ADDON_HOST probe failed, breaker re-opened")
++            return
++        }
++        state.failureAtMs.addLast(now)
++        while (state.failureAtMs.isNotEmpty() && now - state.failureAtMs.first() > FAILURE_WINDOW_MS) {
++            state.failureAtMs.removeFirst()
++        }
++        if (state.openUntilMs == 0L && state.failureAtMs.size >= FAILURES_TO_OPEN) {
++            state.openUntilMs = now + OPEN_COOLDOWN_MS
++            state.failureAtMs.clear()
++            Log.w(TAG, "ADDON_HOST breaker opened cooldownMs=$OPEN_COOLDOWN_MS")
++        }
++    }
++
++    companion object {
++        private const val TAG = "AddonHostGuard"
++
++        /** Failures inside [FAILURE_WINDOW_MS] that open the breaker. */
++        const val FAILURES_TO_OPEN = 3
++        const val FAILURE_WINDOW_MS = 60_000L
++
++        /** The breaker stays open this long, then half-opens for one probe. */
++        const val OPEN_COOLDOWN_MS = 30_000L
++
++        /** A 429 without Retry-After still is a rate limit: apply this modest pause. */
++        const val PAUSE_FALLBACK_MS = 10_000L
++
++        /**
++         * A hostile or wedged Retry-After must not park a host until process restart.
++         * Same intent as KE's hard ceiling on the backend cooldown.
++         */
++        const val MAX_PAUSE_MS = 10L * 60L * 1000L
++    }
++}
++
++/**
++ * The guard's per-server key: `host:port`. Self-hosted addons often share one LAN address
++ * across different ports, so the bare host is not specific enough.
++ */
++internal fun addonGuardKey(host: String, port: Int): String = "$host:$port"
++
++/** Does [code] + its Retry-After header warrant pausing the whole host? */
++internal fun shouldPauseAddonHost(code: Int, retryAfterHeader: String?): Boolean =
++    code == 429 || (code == 503 && !retryAfterHeader.isNullOrBlank())
++
++/**
++ * Delay to honour from a Retry-After header: a seconds integer or an HTTP-date, capped at
++ * [maxDelayMs]. Kept local (not a reuse of this package's [retryAfterDelayMillis], which
++ * backs the app's own trusted backend via Ktor and deliberately has no ceiling) because a
++ * hostile addon Retry-After must not park a host until process restart. Same parsing
++ * contract as the player's ParallelRangeRetryAfter (seconds first, then RFC-1123 date);
++ * [fallbackDelayMs] applies to a 429 sent without a usable header.
++ */
++internal fun addonHostPauseMs(
++    retryAfterHeader: String?,
++    nowEpochMs: Long,
++    fallbackDelayMs: Long,
++    maxDelayMs: Long,
++): Long {
++    val value = retryAfterHeader?.trim().orEmpty()
++    val secondsDelay = value.toLongOrNull()
++        ?.coerceAtLeast(0L)
++        ?.times(1_000L)
++        ?.coerceAtMost(maxDelayMs)
++    val dateDelay = if (secondsDelay == null && value.isNotEmpty()) {
++        runCatching {
++            val target = ZonedDateTime.parse(
++                value,
++                DateTimeFormatter.RFC_1123_DATE_TIME.withLocale(Locale.US)
++            )
++            (target.toInstant().toEpochMilli() - nowEpochMs).coerceAtLeast(0L)
++        }.getOrNull()?.coerceAtMost(maxDelayMs)
++    } else {
++        null
++    }
++    return secondsDelay ?: dateDelay ?: fallbackDelayMs.coerceAtLeast(0L)
++}
++
++/**
++ * The first application interceptor on the addon (`@Named("addonPermissive")`) client.
++ * Ported from Nuvio-KE; see [AddonHostGuard] for the layering contract.
++ *
++ * A blocked request never reaches the network: it fails fast with an [IOException] whose
++ * message names the host and the remaining wait, so repositories surface it as a normal
++ * NetworkResult.Error instead of hammering the ban or hanging. This deviates from KE,
++ * which re-issued only-if-cached and synthesized a 429/503 response — this tree's
++ * repositories already map thrown exceptions to errors cleanly, and the brief calls for
++ * a fail-fast exception. Everything else passes through untouched: the guard is a no-op
++ * for any answer other than 429 / 503-with-Retry-After (host pause), 5xx (breaker
++ * failures) and network errors (breaker failures).
++ */
++class AddonHostGuardInterceptor(
++    private val guard: AddonHostGuard,
++) : Interceptor {
++
++    override fun intercept(chain: Interceptor.Chain): Response {
++        val request = chain.request()
++        val host = addonGuardKey(request.url.host, request.url.port)
++        val admission = guard.admit(host)
++        when (admission) {
++            AddonHostGuard.Admission.ALLOW, AddonHostGuard.Admission.PROBE -> Unit
++            AddonHostGuard.Admission.SKIP_RATE_LIMITED -> throw pausedException(host)
++            AddonHostGuard.Admission.SKIP_BREAKER_OPEN -> throw breakerOpenException(host)
++        }
++        val probe = admission == AddonHostGuard.Admission.PROBE
++        val startedAtNs = System.nanoTime()
++        val response = try {
++            chain.proceed(request)
++        } catch (t: Throwable) {
++            if (t is IOException &&
++                (!chain.call().isCanceled() || ranOutCallTimeout(chain, startedAtNs))
++            ) {
++                guard.onNetworkFailure(host, probe)
++            } else {
++                guard.onNoOutcome(host, probe)
++            }
++            throw t
++        }
++        if (response.networkResponse == null) {
++            // Served from cache: says nothing about the host right now.
++            guard.onNoOutcome(host, probe)
++        } else {
++            guard.onAnswer(host, response.code, response.header("Retry-After"), probe)
++        }
++        return response
++    }
++
++    private fun pausedException(host: String): IOException {
++        val secs = remainingSec(host)
++        val whenPart = if (secs > 0L) "retry allowed in ~${secs}s" else "retry allowed shortly"
++        return IOException("Addon host $host paused (rate limited): $whenPart")
++    }
++
++    private fun breakerOpenException(host: String): IOException {
++        val secs = remainingSec(host)
++        val whenPart = if (secs > 0L) "half-opens in ~${secs}s" else "half-opens shortly"
++        return IOException("Addon host $host breaker open (repeated failures): $whenPart")
++    }
++
++    private fun remainingSec(host: String): Long =
++        guard.blockedRemainingMs(host) / 1000L
++
++    /**
++     * OkHttp's callTimeout cancels the call when it fires, so a cancelled call that lasted
++     * the whole timeout timed out (count it); one cancelled sooner was dropped by its
++     * caller (navigation, repositories' own timers) and says nothing about the host.
++     */
++    private fun ranOutCallTimeout(chain: Interceptor.Chain, startedAtNs: Long): Boolean {
++        val timeoutNs = chain.call().timeout().timeoutNanos()
++        return timeoutNs > 0L && System.nanoTime() - startedAtNs >= timeoutNs - CALL_TIMEOUT_SLACK_NS
++    }
++
++    companion object {
++        private const val CALL_TIMEOUT_SLACK_NS = 1_000_000_000L
++    }
++}

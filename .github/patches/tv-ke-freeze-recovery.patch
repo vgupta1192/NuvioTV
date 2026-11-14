@@ -1,0 +1,422 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerFreezeRecoveryPolicy.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerFreezeRecoveryPolicy.kt
+new file mode 100644
+index 000000000..3a7dd7ee6
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerFreezeRecoveryPolicy.kt
+@@ -0,0 +1,65 @@
++package com.nuvio.tv.ui.screens.player
++
++/**
++ * Nuvio-KE port: what to do about a frozen picture — the position stuck while ExoPlayer is READY
++ * and playing ([PlayerPlaybackAnalyticsDiagnostics.currentPositionStallMs]). Rung 1 seeks back
++ * before the playhead; rung 2, when the seek did not cure it, is the dead-source failover
++ * (reusing the tree's link ladder, [PlayerRuntimeController.tryStreamFailover]). This tree's
++ * [PlayerStallWatchdogPolicy] handles the other stall shape — buffered edge stuck during
++ * STATE_BUFFERING — so the two compose: buffering stalls go to the watchdog, READY-but-frozen
++ * goes here. Pure, so JVM tests mirror production 1:1.
++ */
++internal object PlayerFreezeRecoveryPolicy {
++
++    /**
++     * How long the position must be stuck while READY+playing before the ladder acts. The
++     * analytics detector flags a stall at 5 s; we wait past that so brief decoder or demuxer
++     * hiccups that clear on their own never trigger a seek.
++     */
++    const val ACT_AFTER_MS = 10_000L
++
++    /**
++     * Rung 1's rollback. KE shipped 500 ms — just past its detector's 250 ms tolerance so the
++     * seek restarts the stall count; the port spec asks for ~2 s, which also cannot be skipped
++     * by Media3 landing the seek where the playhead already holds, and re-reads more source on
++     * a stuck demuxer.
++     */
++    const val SEEK_BACK_MS = 2_000L
++
++    /** A new freeze this soon after our seek means the seek did not cure it. */
++    const val SEEK_CURE_WINDOW_MS = 60_000L
++
++    /**
++     * Rung-1 attempts per playback. Past this, a fresh freeze escalates straight to rung 2:
++     * freezes that outlive three seeks point at the source, not at the decoder.
++     */
++    const val MAX_RECOVERY_SEEKS = 3
++
++    data class Input(
++        val stalledForMs: Long,
++        val nowMs: Long,
++        /** elapsedRealtime of this stream's last recovery seek; null when none. */
++        val lastSeekAtMs: Long?,
++        /** Rung-1 seeks already spent this playback. */
++        val seekCount: Int,
++        /** Rung 2 already ran (or found no source) for this stream. */
++        val failoverDone: Boolean,
++        val errorShown: Boolean,
++    )
++
++    enum class Decision { NONE, SEEK, FAILOVER }
++
++    fun evaluate(input: Input): Decision {
++        if (input.failoverDone || input.errorShown || input.stalledForMs < ACT_AFTER_MS) return Decision.NONE
++        val sinceSeekMs = input.lastSeekAtMs?.let { input.nowMs - it }
++        return when {
++            sinceSeekMs == null || sinceSeekMs > SEEK_CURE_WINDOW_MS ->
++                // No recent seek: try rung 1 while seeks remain, else hand over to rung 2.
++                if (input.seekCount < MAX_RECOVERY_SEEKS) Decision.SEEK else Decision.FAILOVER
++            // Give the seek its own full window: a freeze that carried on through it is only
++            // judged ACT_AFTER_MS after the seek, not on the next tick.
++            sinceSeekMs >= ACT_AFTER_MS -> Decision.FAILOVER
++            else -> Decision.NONE
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackAnalyticsDiagnostics.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackAnalyticsDiagnostics.kt
+index b22a21721..45d1eaf2f 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackAnalyticsDiagnostics.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerPlaybackAnalyticsDiagnostics.kt
+@@ -56,6 +56,15 @@ internal class PlayerPlaybackAnalyticsDiagnostics {
+     private var positionStallCount: Int = 0
+     private var longestPositionStallMs: Long = 0L
+ 
++    /**
++     * Wall-clock length of the ongoing position stall (position stuck while READY and playing
++     * after the first frame); 0 whenever the picture is advancing or nobody is watching the
++     * position (pause, buffering). Read by the freeze-recovery ladder (Nuvio-KE port), which
++     * shares this detector instead of keeping a second one.
++     */
++    internal var currentPositionStallMs: Long = 0L
++        private set
++
+     private var droppedFrames: Int = 0
+     private var maxDroppedFramesInEvent: Int = 0
+     private var videoDecoderName: String? = null
+@@ -138,6 +147,7 @@ internal class PlayerPlaybackAnalyticsDiagnostics {
+         positionStallActive = false
+         positionStallCount = 0
+         longestPositionStallMs = 0L
++        currentPositionStallMs = 0L
+         droppedFrames = 0
+         maxDroppedFramesInEvent = 0
+         videoDecoderName = null
+@@ -220,6 +230,7 @@ internal class PlayerPlaybackAnalyticsDiagnostics {
+             lastPositionForStallMs = position
+             positionLastAdvancedAtMs = now
+             positionStallActive = false
++            currentPositionStallMs = 0L
+             return
+         }
+ 
+@@ -237,10 +248,12 @@ internal class PlayerPlaybackAnalyticsDiagnostics {
+             lastPositionForStallMs = position
+             positionLastAdvancedAtMs = now
+             positionStallActive = false
++            currentPositionStallMs = 0L
+             return
+         }
+ 
+         val stalledForMs = (now - positionLastAdvancedAtMs).coerceAtLeast(0L)
++        currentPositionStallMs = stalledForMs
+         if (stalledForMs >= POSITION_STALL_THRESHOLD_MS) {
+             longestPositionStallMs = maxOf(longestPositionStallMs, stalledForMs)
+             if (!positionStallActive) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
+index 75fc5f976..440e4d3c5 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
+@@ -479,6 +479,12 @@ class PlayerRuntimeController(
+     internal var sourceStreamsFetchCompleted: Boolean = false
+     /** Stream URLs that already failed in this playback, so stream failover never loops. */
+     internal val failoverFailedUrls = HashSet<String>()
++    // Freeze-recovery ladder (Nuvio-KE port): per player build, reset in the ExoPlayer init
++    // block. The elapsedRealtime of the last rung-1 recovery seek (null = none), how many rung-1
++    // seeks this playback has spent, and whether rung 2 (dead-source failover) already ran.
++    internal var freezeRecoverySeekAtMs: Long? = null
++    internal var freezeRecoverySeekCount: Int = 0
++    internal var freezeFailoverDone: Boolean = false
+     internal var hostActivityRef: WeakReference<Activity>? = null
+     internal var initialPlaybackStarted: Boolean = false
+     internal var lastPlaybackDiagnosticsForReport: LastPlaybackDiagnostics =
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerFreezeRecovery.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerFreezeRecovery.kt
+new file mode 100644
+index 000000000..0a27e6ec7
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerFreezeRecovery.kt
+@@ -0,0 +1,85 @@
++package com.nuvio.tv.ui.screens.player
++
++import android.net.Uri
++import android.os.SystemClock
++import android.util.Log
++import androidx.media3.common.Player
++import com.nuvio.tv.R
++import kotlinx.coroutines.flow.update
++
++/**
++ * Nuvio-KE port: acts on a frozen picture from the progress tick, right after the analytics
++ * detector has taken this tick's snapshot. Rung 1 seeks [PlayerFreezeRecoveryPolicy.SEEK_BACK_MS]
++ * before the playhead; rung 2 is the dead-source failover, reusing the tree's link ladder
++ * [tryStreamFailover] (recovery overlay, sources-list load on demand, next playable link, its own
++ * toast). Composes with the existing watchdogs: the buffering stall watchdog covers
++ * STATE_BUFFERING and the first-frame watchdog covers pre-first-frame — this only sees READY and
++ * playing with a stuck position, which neither of them touches.
++ *
++ * ExoPlayer only: the caller lives in the progress loop's ExoPlayer branch, so MPV never reaches
++ * this (mpv exposes no equivalent stall snapshot here).
++ *
++ * @return true when a failover is under way: the caller ends its tick, the next stream restarts it.
++ */
++internal fun PlayerRuntimeController.maybeRecoverFrozenPicture(player: Player, positionMs: Long): Boolean {
++    val nowMs = SystemClock.elapsedRealtime()
++    val stalledForMs = playbackAnalyticsDiagnostics.currentPositionStallMs
++    val decision = PlayerFreezeRecoveryPolicy.evaluate(
++        PlayerFreezeRecoveryPolicy.Input(
++            stalledForMs = stalledForMs,
++            nowMs = nowMs,
++            lastSeekAtMs = freezeRecoverySeekAtMs,
++            seekCount = freezeRecoverySeekCount,
++            failoverDone = freezeFailoverDone,
++            errorShown = _uiState.value.error != null
++        )
++    )
++    return when (decision) {
++        PlayerFreezeRecoveryPolicy.Decision.NONE -> false
++        PlayerFreezeRecoveryPolicy.Decision.SEEK -> {
++            freezeRecoverySeekAtMs = nowMs
++            freezeRecoverySeekCount += 1
++            // Subtle by design: no toast, only this log line. The seek-back is past the
++            // detector's tolerance, so a cured seek also restarts its stall count.
++            val target = (positionMs - PlayerFreezeRecoveryPolicy.SEEK_BACK_MS).coerceAtLeast(0L)
++            Log.w(
++                PlayerRuntimeController.TAG,
++                "FREEZE_RECOVERY rung=seek seek=$freezeRecoverySeekCount/" +
++                    "${PlayerFreezeRecoveryPolicy.MAX_RECOVERY_SEEKS} stalledMs=$stalledForMs " +
++                    "pos=${positionMs}ms seekTo=${target}ms host=${currentStreamUrl.safeFreezeLogHost()}"
++            )
++            player.seekTo(target)
++            false
++        }
++        PlayerFreezeRecoveryPolicy.Decision.FAILOVER -> {
++            freezeFailoverDone = true
++            Log.w(
++                PlayerRuntimeController.TAG,
++                "FREEZE_RECOVERY rung=failover stalledMs=$stalledForMs " +
++                    "sinceSeekMs=${freezeRecoverySeekAtMs?.let { nowMs - it }} " +
++                    "host=${currentStreamUrl.safeFreezeLogHost()}"
++            )
++            if (tryStreamFailover()) {
++                true
++            } else {
++                // No source left to hand over to (or the link-ladder budget is spent): surface
++                // the generic error over the frozen picture, as the failover's own empty-list
++                // path does. Fatal for this playback — no auto-advance under the error.
++                cancelNextEpisodeAutoPlayOnFatalError()
++                _uiState.update {
++                    it.copy(
++                        error = context.getString(R.string.player_error_playback_fallback),
++                        isBuffering = false,
++                        showLoadingOverlay = false,
++                        showPauseOverlay = false
++                    )
++                }
++                false
++            }
++        }
++    }
++}
++
++private fun String.safeFreezeLogHost(): String {
++    return runCatching { Uri.parse(this).host ?: "unknown" }.getOrDefault("unknown")
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+index 79b5a06e3..69e955a10 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+@@ -336,6 +336,10 @@ internal fun PlayerRuntimeController.initializePlayer(
+             rebufferCount = 0
+             rebufferTotalMs = 0L
+             rebufferStartedAtMs = 0L
++            // Nuvio-KE port: fresh freeze-recovery rungs for each ExoPlayer build.
++            freezeRecoverySeekAtMs = null
++            freezeRecoverySeekCount = 0
++            freezeFailoverDone = false
+ 
+             // Resolve effective DV7 mode — AUTO consults the display-capability policy.
+             // The persisted enum stays as-is; only the runtime behavior is derived per playback.
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
+index cbb62420b..130ad6472 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
+@@ -510,6 +510,14 @@ internal fun PlayerRuntimeController.startProgressUpdates() {
+                     rebufferCount = rebufferCount,
+                     rebufferTotalMs = rebufferTotalMs
+                 )
++                // Nuvio-KE port: frozen-picture recovery ladder (seek back, then dead-source
++                // failover). Acts right after this tick's stall snapshot; ExoPlayer branch only,
++                // so MPV never reaches it.
++                if (maybeRecoverFrozenPicture(player, pos)) {
++                    // A failover is switching streams; the rest of the tick would act on the
++                    // player it releases. The next stream restarts this job.
++                    return@launch
++                }
+                 // Update torrent rebuffer progress from ExoPlayer's buffer state
+                 if (isTorrentStream && _uiState.value.isBuffering && hasRenderedFirstFrame) {
+                     val bufferedAheadMs = (player.bufferedPosition - pos).coerceAtLeast(0)
+diff --git a/app/src/test/java/com/nuvio/tv/ui/screens/player/PlayerFreezeRecoveryPolicyTest.kt b/app/src/test/java/com/nuvio/tv/ui/screens/player/PlayerFreezeRecoveryPolicyTest.kt
+new file mode 100644
+index 000000000..5aaa3400e
+--- /dev/null
++++ b/app/src/test/java/com/nuvio/tv/ui/screens/player/PlayerFreezeRecoveryPolicyTest.kt
+@@ -0,0 +1,154 @@
++package com.nuvio.tv.ui.screens.player
++
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++class PlayerFreezeRecoveryPolicyTest {
++
++    private fun input(
++        stalledForMs: Long = PlayerFreezeRecoveryPolicy.ACT_AFTER_MS,
++        nowMs: Long = 100_000L,
++        lastSeekAtMs: Long? = null,
++        seekCount: Int = 0,
++        failoverDone: Boolean = false,
++        errorShown: Boolean = false,
++    ) = PlayerFreezeRecoveryPolicy.Input(
++        stalledForMs = stalledForMs,
++        nowMs = nowMs,
++        lastSeekAtMs = lastSeekAtMs,
++        seekCount = seekCount,
++        failoverDone = failoverDone,
++        errorShown = errorShown,
++    )
++
++    @Test
++    fun `nothing happens below the act threshold`() {
++        assertEquals(
++            PlayerFreezeRecoveryPolicy.Decision.NONE,
++            PlayerFreezeRecoveryPolicy.evaluate(
++                input(stalledForMs = PlayerFreezeRecoveryPolicy.ACT_AFTER_MS - 1)
++            )
++        )
++    }
++
++    @Test
++    fun `the first freeze seeks`() {
++        assertEquals(
++            PlayerFreezeRecoveryPolicy.Decision.SEEK,
++            PlayerFreezeRecoveryPolicy.evaluate(input())
++        )
++    }
++
++    @Test
++    fun `an error box or a spent failover silences the ladder`() {
++        assertEquals(
++            PlayerFreezeRecoveryPolicy.Decision.NONE,
++            PlayerFreezeRecoveryPolicy.evaluate(input(errorShown = true))
++        )
++        assertEquals(
++            PlayerFreezeRecoveryPolicy.Decision.NONE,
++            PlayerFreezeRecoveryPolicy.evaluate(input(failoverDone = true))
++        )
++    }
++
++    @Test
++    fun `a freeze that carried on through its own window escalates to failover`() {
++        val seekAt = 100_000L
++        assertEquals(
++            PlayerFreezeRecoveryPolicy.Decision.NONE,
++            PlayerFreezeRecoveryPolicy.evaluate(
++                input(lastSeekAtMs = seekAt, seekCount = 1, nowMs = seekAt + 1_000L)
++            )
++        )
++        assertEquals(
++            PlayerFreezeRecoveryPolicy.Decision.FAILOVER,
++            PlayerFreezeRecoveryPolicy.evaluate(
++                input(lastSeekAtMs = seekAt, seekCount = 1, nowMs = seekAt + PlayerFreezeRecoveryPolicy.ACT_AFTER_MS)
++            )
++        )
++    }
++
++    @Test
++    fun `a freeze outside the cure window spends another seek`() {
++        val seekAt = 100_000L
++        assertEquals(
++            PlayerFreezeRecoveryPolicy.Decision.SEEK,
++            PlayerFreezeRecoveryPolicy.evaluate(
++                input(
++                    lastSeekAtMs = seekAt,
++                    seekCount = 1,
++                    nowMs = seekAt + PlayerFreezeRecoveryPolicy.SEEK_CURE_WINDOW_MS + 1L
++                )
++            )
++        )
++    }
++
++    @Test
++    fun `past the seek cap a fresh freeze goes straight to failover`() {
++        assertEquals(
++            PlayerFreezeRecoveryPolicy.Decision.FAILOVER,
++            PlayerFreezeRecoveryPolicy.evaluate(
++                input(
++                    seekCount = PlayerFreezeRecoveryPolicy.MAX_RECOVERY_SEEKS,
++                    lastSeekAtMs = 100_000L,
++                    nowMs = 100_000L + PlayerFreezeRecoveryPolicy.SEEK_CURE_WINDOW_MS + 1L
++                )
++            )
++        )
++        assertEquals(
++            PlayerFreezeRecoveryPolicy.Decision.FAILOVER,
++            PlayerFreezeRecoveryPolicy.evaluate(
++                input(seekCount = PlayerFreezeRecoveryPolicy.MAX_RECOVERY_SEEKS)
++            )
++        )
++    }
++
++    // Mirrors the controller: one playback, freezes recurring further apart than the cure
++    // window, until the ladder exhausts rung 1 and declares the source dead exactly once.
++    @Test
++    fun `the ladder climbs seek by seek and fails over once`() {
++        var nowMs = 0L
++        var lastSeekAtMs: Long? = null
++        var seekCount = 0
++        var failoverDone = false
++        val decisions = mutableListOf<PlayerFreezeRecoveryPolicy.Decision>()
++
++        // Four freezes, 90 s apart: three seeks, then the failover.
++        repeat(4) {
++            nowMs += 90_000L
++            while (true) {
++                val decision = PlayerFreezeRecoveryPolicy.evaluate(
++                    PlayerFreezeRecoveryPolicy.Input(
++                        stalledForMs = PlayerFreezeRecoveryPolicy.ACT_AFTER_MS,
++                        nowMs = nowMs,
++                        lastSeekAtMs = lastSeekAtMs,
++                        seekCount = seekCount,
++                        failoverDone = failoverDone,
++                        errorShown = false
++                    )
++                )
++                if (decision == PlayerFreezeRecoveryPolicy.Decision.NONE) break
++                decisions.add(decision)
++                when (decision) {
++                    PlayerFreezeRecoveryPolicy.Decision.SEEK -> {
++                        lastSeekAtMs = nowMs
++                        seekCount += 1
++                    }
++                    PlayerFreezeRecoveryPolicy.Decision.FAILOVER -> failoverDone = true
++                    PlayerFreezeRecoveryPolicy.Decision.NONE -> Unit
++                }
++                if (decision == PlayerFreezeRecoveryPolicy.Decision.FAILOVER) break
++            }
++        }
++
++        assertEquals(
++            listOf(
++                PlayerFreezeRecoveryPolicy.Decision.SEEK,
++                PlayerFreezeRecoveryPolicy.Decision.SEEK,
++                PlayerFreezeRecoveryPolicy.Decision.SEEK,
++                PlayerFreezeRecoveryPolicy.Decision.FAILOVER
++            ),
++            decisions
++        )
++    }
++}
