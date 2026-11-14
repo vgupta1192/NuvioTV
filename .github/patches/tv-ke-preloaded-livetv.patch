@@ -1,0 +1,948 @@
+diff --git a/app/src/main/assets/livetv/broadcasters.m3u b/app/src/main/assets/livetv/broadcasters.m3u
+new file mode 100644
+index 000000000..9f773d5f7
+--- /dev/null
++++ b/app/src/main/assets/livetv/broadcasters.m3u
+@@ -0,0 +1,17 @@
++#EXTM3U
++#EXTINF:-1 tvg-id="DW.de@English" tvg-chno="1" group-title="News",DW English
++https://dwamdstream102.akamaized.net/hls/live/2015525/dwstream102/master.m3u8
++#EXTINF:-1 tvg-id="DW.de@English" tvg-chno="1" group-title="News",DW English
++https://amg01644-amg01644c1-amgplt0343.playout.now3.amagi.tv/ts-eu-w1-n2/playlist/amg01644-amg01644c1-amgplt0343/playlist.m3u8
++#EXTINF:-1 tvg-id="France24.fr@English" tvg-chno="2" group-title="News",France 24 English
++https://live.france24.com/hls/live/2037218-b/F24_EN_HI_HLS/master_5000.m3u8
++#EXTINF:-1 tvg-id="NHKWorldJapan.jp@HD" tvg-chno="3" group-title="News",NHK World-Japan
++https://masterpl.hls.nhkworld.jp/hls/w/live/smarttv.m3u8
++#EXTINF:-1 tvg-id="AlJazeera.qa@English" tvg-chno="4" group-title="News",Al Jazeera English
++https://live-hls-apps-aje-fa.getaj.net/AJE/index.m3u8
++#EXTINF:-1 tvg-id="DDNews.in@HD" tvg-chno="5" group-title="News",DD News
++https://d3qs3d2rkhfqrt.cloudfront.net/out/v1/0811cd8c37ca4c409d5385a6cd2fa18b/index.m3u8
++#EXTINF:-1 tvg-id="DDSports.in@SD" tvg-chno="6" group-title="Sports",DD Sports
++https://d3qs3d2rkhfqrt.cloudfront.net/out/v1/b17adfe543354fdd8d189b110617cddd/index.m3u8
++#EXTINF:-1 tvg-id="DDBangla.in@SD" tvg-chno="7" group-title="General",DD Bangla
++https://d3qs3d2rkhfqrt.cloudfront.net/out/v1/7ff57cc9046b4c188b51a0d506f36e7f/index.m3u8
+diff --git a/app/src/main/java/com/nuvio/tv/data/iptv/IptvModels.kt b/app/src/main/java/com/nuvio/tv/data/iptv/IptvModels.kt
+index 9b0c78657..ef2e2195a 100644
+--- a/app/src/main/java/com/nuvio/tv/data/iptv/IptvModels.kt
++++ b/app/src/main/java/com/nuvio/tv/data/iptv/IptvModels.kt
+@@ -5,9 +5,10 @@ import org.json.JSONObject
+ 
+ /**
+  * Fork feature: custom IPTV sources for Live TV next to the addon channels. A source is an M3U
+- * playlist URL, an Xtream Codes login or a Stalker (MAG) portal.
++ * playlist URL, an Xtream Codes login, a Stalker (MAG) portal, or the free public catalog
++ * (iptv-org) with a per-country selection.
+  */
+-enum class IptvKind { M3U, XTREAM, STALKER }
++enum class IptvKind { M3U, XTREAM, STALKER, FREE }
+ 
+ data class IptvSource(
+     val id: String,
+@@ -21,6 +22,8 @@ data class IptvSource(
+     val mac: String = "",
+     /** Optional XMLTV guide URL (Xtream and M3U playlists often carry their own). */
+     val epgUrl: String = "",
++    /** Free-catalog sources only (iptv-org): selected country names; empty selection = no channels. */
++    val countries: List<String> = emptyList(),
+     val isEnabled: Boolean = true,
+ ) {
+     val isConfigured: Boolean
+@@ -28,6 +31,7 @@ data class IptvSource(
+             IptvKind.M3U -> url.isNotBlank()
+             IptvKind.XTREAM -> url.isNotBlank() && username.isNotBlank() && password.isNotBlank()
+             IptvKind.STALKER -> url.isNotBlank() && mac.isNotBlank()
++            IptvKind.FREE -> url.isNotBlank()
+         }
+ 
+     val kindLabel: String
+@@ -35,14 +39,20 @@ data class IptvSource(
+             IptvKind.M3U -> "M3U playlist"
+             IptvKind.XTREAM -> "Xtream Codes"
+             IptvKind.STALKER -> "Stalker portal"
++            IptvKind.FREE -> "Free channels"
+         }
+ 
+     fun toJson(): JSONObject = JSONObject()
+         .put("id", id).put("kind", kind.name).put("name", name).put("url", url)
+         .put("username", username).put("password", password).put("mac", mac)
+-        .put("epgUrl", epgUrl).put("isEnabled", isEnabled)
++        .put("epgUrl", epgUrl).put("countries", JSONArray(countries)).put("isEnabled", isEnabled)
+ 
+     companion object {
++        /** Fixed identity of the free iptv-org catalog source; created and edited from the sources UI. */
++        const val FREE_SOURCE_ID = "free"
++        const val FREE_SOURCE_NAME = "Free channels"
++        const val FREE_SOURCE_URL = "https://iptv-org.github.io/iptv/index.country.m3u"
++
+         fun fromJson(o: JSONObject): IptvSource? {
+             val kind = runCatching { IptvKind.valueOf(o.optString("kind")) }.getOrNull() ?: return null
+             val id = o.optString("id").takeIf { it.isNotBlank() } ?: return null
+@@ -55,6 +65,9 @@ data class IptvSource(
+                 password = o.optString("password"),
+                 mac = o.optString("mac"),
+                 epgUrl = o.optString("epgUrl"),
++                countries = o.optJSONArray("countries")?.let { arr ->
++                    (0 until arr.length()).mapNotNull { index -> arr.optString(index).takeIf { it.isNotBlank() } }
++                } ?: emptyList(),
+                 isEnabled = o.optBoolean("isEnabled", true),
+             )
+         }
+@@ -71,3 +84,9 @@ data class IptvSource(
+         }
+     }
+ }
++
++/** One country in the free channels catalog (iptv-org master playlist): its name and channel count. */
++data class IptvFreeCountry(
++    val name: String,
++    val channelCount: Int,
++)
+diff --git a/app/src/main/java/com/nuvio/tv/data/iptv/IptvRepository.kt b/app/src/main/java/com/nuvio/tv/data/iptv/IptvRepository.kt
+index 19a9454b0..cdf46bae7 100644
+--- a/app/src/main/java/com/nuvio/tv/data/iptv/IptvRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/data/iptv/IptvRepository.kt
+@@ -21,13 +21,18 @@ import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.flow.asStateFlow
+ import kotlinx.coroutines.flow.update
+ import kotlinx.coroutines.launch
++import kotlinx.coroutines.sync.Mutex
+ import kotlinx.coroutines.sync.Semaphore
++import kotlinx.coroutines.sync.withLock
+ import kotlinx.coroutines.sync.withPermit
+ import kotlinx.coroutines.withContext
+ import okhttp3.OkHttpClient
+ import okhttp3.Request
+ import org.json.JSONArray
+ import org.json.JSONObject
++import java.io.ByteArrayOutputStream
++import java.io.File
++import java.io.IOException
+ import java.net.URLEncoder
+ import java.util.concurrent.ConcurrentHashMap
+ import java.util.concurrent.TimeUnit
+@@ -49,6 +54,21 @@ class IptvRepository @Inject constructor(
+         private const val TAG = "IptvRepository"
+         private const val PREFS = "nuvio_iptv"
+         private const val KEY_SOURCES = "sources"
++
++        // KE port (Part A): bundled broadcaster preset. Seeded on first run and loaded through the
++        // asset:// branch of loadM3u — the playlist ships in assets, no HTTP.
++        private const val PRESET_ID = "preset"
++        private const val PRESET_ASSET = "livetv/broadcasters.m3u"
++        private const val PRESET_URL = "asset:///$PRESET_ASSET"
++        private const val PRESET_NAME = "Broadcasters"
++
++        // KE port (Part B): the free public catalog (iptv-org master playlist). One big M3U whose
++        // group-title is the country name; countries are derived from the playlist itself.
++        private const val FREE_CATALOG_URL = IptvSource.FREE_SOURCE_URL
++        private const val FREE_CATALOG_CACHE_FILE = "free_channels.m3u"
++        private const val FREE_CATALOG_TTL_MS = 24 * 60 * 60 * 1000L
++        private const val FREE_CATALOG_MAX_BYTES = 16L * 1024 * 1024
++
+         private const val STALKER_UA =
+             "Mozilla/5.0 (QtEmbedded; U; Linux; MAG254; en) AppleWebKit/533.3 MAG200 stbapp ver: 4 rev: 2721 Mobile Safari/533.3"
+         private val STREAM_HEADERS = mapOf("User-Agent" to "Mozilla/5.0", "Accept" to "*/*")
+@@ -79,17 +99,57 @@ class IptvRepository @Inject constructor(
+     private val _isLoading = MutableStateFlow(false)
+     val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
+ 
++    /** Free channels catalog (Part B): countries of the master playlist with their channel counts. */
++    private val _freeCountries = MutableStateFlow<List<IptvFreeCountry>>(emptyList())
++    val freeCountries: StateFlow<List<IptvFreeCountry>> = _freeCountries.asStateFlow()
++
++    private val _isFreeCatalogLoading = MutableStateFlow(false)
++    val isFreeCatalogLoading: StateFlow<Boolean> = _isFreeCatalogLoading.asStateFlow()
++
+     private val cache = ConcurrentHashMap<String, IptvLoadResult>()
+     private val stalkerTokens = ConcurrentHashMap<String, String>()
++    @Volatile private var freeCatalogGroups: Map<String, List<FreeCatalogEntry>>? = null
++    private val freeCatalogMutex = Mutex()
++    private var freeCatalogJob: Job? = null
+     private var loadJob: Job? = null
+     private var started = false
+ 
+     fun initialize() {
+         if (started) return
+         started = true
++        seedBroadcastersIfNeeded()
+         load(forceReload = false)
+     }
+ 
++    /**
++     * KE port (Part A): seed the bundled Broadcasters preset on first run. Seeds ONLY while the
++     * IPTV prefs hold no saved sources entry at all (first run / never configured) — any later
++     * change, including removing or disabling the preset, writes the entry, so it never re-seeds
++     * after the user got rid of it.
++     */
++    private fun seedBroadcastersIfNeeded() {
++        if (prefs.getString(KEY_SOURCES, null) != null) return
++        persist(
++            listOf(
++                IptvSource(
++                    id = PRESET_ID,
++                    kind = IptvKind.M3U,
++                    name = PRESET_NAME,
++                    url = PRESET_URL,
++                )
++            )
++        )
++    }
++
++    /** Background-loads the free catalog so the country picker has countries and counts. */
++    fun ensureFreeCatalogLoaded() {
++        if (freeCatalogGroups != null) return
++        if (freeCatalogJob?.isActive == true) return
++        freeCatalogJob = scope.launch {
++            ensureFreeCatalogParsed(forceReload = false)
++        }
++    }
++
+     fun refresh() = load(forceReload = true)
+ 
+     fun addSource(source: IptvSource) {
+@@ -135,7 +195,7 @@ class IptvRepository @Inject constructor(
+                             val cached = cache[source.id]
+                             if (cached != null && !forceReload) return@withPermit Triple(source, cached, null as String?)
+                             try {
+-                                val loaded = loadSource(source)
++                                val loaded = loadSource(source, forceReload)
+                                 cache[source.id] = loaded
+                                 Triple(source, loaded, null as String?)
+                             } catch (e: CancellationException) {
+@@ -200,13 +260,15 @@ class IptvRepository @Inject constructor(
+ 
+     // ---- loading ----
+ 
+-    private suspend fun loadSource(source: IptvSource): IptvLoadResult = withContext(Dispatchers.IO) {
+-        when (source.kind) {
+-            IptvKind.M3U -> loadM3u(source)
+-            IptvKind.XTREAM -> loadXtream(source)
+-            IptvKind.STALKER -> loadStalker(source)
++    private suspend fun loadSource(source: IptvSource, forceReload: Boolean): IptvLoadResult =
++        withContext(Dispatchers.IO) {
++            when (source.kind) {
++                IptvKind.M3U -> loadM3u(source)
++                IptvKind.XTREAM -> loadXtream(source)
++                IptvKind.STALKER -> loadStalker(source)
++                IptvKind.FREE -> loadFreeCatalog(source, forceReload)
++            }
+         }
+-    }
+ 
+     private fun channel(
+         source: IptvSource,
+@@ -241,8 +303,17 @@ class IptvRepository @Inject constructor(
+ 
+     // ---- M3U ----
+ 
+-    private fun loadM3u(source: IptvSource): IptvLoadResult =
+-        parseM3u(httpGet(source.url.trim(), emptyMap()), source)
++    private fun loadM3u(source: IptvSource): IptvLoadResult {
++        val url = source.url.trim()
++        if (url.startsWith("asset://")) {
++            // KE port (Part A): the Broadcasters preset playlist ships as a bundled asset;
++            // read it from assets and parse with the regular M3U path, no HTTP.
++            val assetPath = url.removePrefix("asset://").trimStart('/')
++            val text = context.assets.open(assetPath).bufferedReader().use { it.readText() }
++            return parseM3u(text, source)
++        }
++        return parseM3u(httpGet(url, emptyMap()), source)
++    }
+ 
+     internal fun parseM3u(text: String, source: IptvSource): IptvLoadResult {
+         val epgUrls = mutableListOf<String>()
+@@ -307,6 +378,157 @@ class IptvRepository @Inject constructor(
+         return IptvLoadResult(channels.distinctBy { it.id }, listOfNotNull(extra) + epgUrls)
+     }
+ 
++    // ---- Free channels catalog (KE port Part B) ----
++
++    /**
++     * One lightweight entry of the iptv-org master playlist. The full catalog (~20k entries) is
++     * held in memory as these small objects, grouped by country; only the selected countries'
++     * channels are built into [TvChannelItem]s.
++     */
++    private class FreeCatalogEntry(
++        val name: String,
++        val url: String,
++        val logo: String?,
++        val tvgId: String?,
++        val country: String,
++    )
++
++    /**
++     * Emits the free-catalog source's channels: the entries of the master playlist grouped by
++     * country (its group-title IS the country name), filtered to the source's country selection.
++     * An empty selection yields zero channels (not an error). Keys are the stream URLs, the same
++     * scheme as the M3U path, so channel ids stay stable across refreshes. A failed load yields
++     * nothing this run and is logged — it never throws into the source's error state (a refresh
++     * that fails falls back to the last cached playlist when there is one).
++     */
++    private suspend fun loadFreeCatalog(source: IptvSource, forceReload: Boolean): IptvLoadResult {
++        val groups = ensureFreeCatalogParsed(forceReload) ?: return IptvLoadResult(emptyList(), emptyList())
++        val selected = source.countries.toHashSet()
++        if (selected.isEmpty()) return IptvLoadResult(emptyList(), emptyList())
++        val channels = groups.entries.asSequence()
++            .filter { it.key in selected }
++            .flatMap { it.value.asSequence() }
++            .map { entry ->
++                channel(
++                    source = source,
++                    key = entry.url,
++                    name = entry.name,
++                    logo = entry.logo,
++                    group = entry.country,
++                    directUrl = entry.url,
++                    headers = STREAM_HEADERS,
++                    epgId = entry.tvgId,
++                )
++            }
++            .distinctBy { it.id }
++            .toList()
++        return IptvLoadResult(channels, emptyList())
++    }
++
++    /**
++     * The parsed country grouping, fetched/cached/parsed once per app run; only a refresh
++     * (forceReload) re-fetches and re-parses. Returns null when the catalog could not be loaded.
++     */
++    private suspend fun ensureFreeCatalogParsed(forceReload: Boolean): Map<String, List<FreeCatalogEntry>>? {
++        if (!forceReload) freeCatalogGroups?.let { return it }
++        return freeCatalogMutex.withLock {
++            if (!forceReload) freeCatalogGroups?.let { return it }
++            _isFreeCatalogLoading.value = true
++            try {
++                val text = readFreeCatalogText(forceReload)
++                val groups = parseFreeCatalog(text)
++                freeCatalogGroups = groups
++                _freeCountries.value = groups.map { (country, entries) ->
++                    IptvFreeCountry(name = country, channelCount = entries.size)
++                }.sortedBy { it.name.lowercase() }
++                Log.i(TAG, "Free channels catalog: ${groups.size} countries, ${groups.values.sumOf { it.size }} channels")
++                groups
++            } catch (e: CancellationException) {
++                throw e
++            } catch (e: Throwable) {
++                Log.w(TAG, "Free channels catalog failed: ${e.message}")
++                null
++            } finally {
++                _isFreeCatalogLoading.value = false
++            }
++        }
++    }
++
++    /** Raw playlist text: cacheDir copy first (24h TTL), else a capped fetch; refresh forces a refetch. */
++    private fun readFreeCatalogText(forceReload: Boolean): String {
++        val file = File(context.cacheDir, FREE_CATALOG_CACHE_FILE)
++        if (!forceReload) {
++            val fresh = file.isFile && System.currentTimeMillis() - file.lastModified() < FREE_CATALOG_TTL_MS
++            if (fresh) {
++                try {
++                    val cached = file.readText()
++                    if (cached.isNotBlank()) return cached
++                } catch (e: IOException) {
++                    Log.w(TAG, "Free channels catalog cache unreadable: ${e.message}")
++                }
++            }
++        }
++        val text = try {
++            httpGetCapped(FREE_CATALOG_URL, emptyMap(), FREE_CATALOG_MAX_BYTES)
++        } catch (e: CancellationException) {
++            throw e
++        } catch (e: Throwable) {
++            // A failed refetch falls back to the stale cache when there is one, so a refresh
++            // never wipes the selection; without any cache the source simply yields nothing.
++            Log.w(TAG, "Free channels catalog fetch failed: ${e.message}")
++            val fallback = try {
++                file.takeIf { it.isFile }?.readText()?.takeIf { it.isNotBlank() }
++            } catch (e: IOException) {
++                null
++            }
++            fallback ?: throw IllegalStateException("No free channels playlist available", e)
++        }
++        try {
++            file.writeText(text)
++        } catch (e: IOException) {
++            Log.w(TAG, "Free channels catalog cache write failed: ${e.message}")
++        }
++        return text
++    }
++
++    /**
++     * Groups the master playlist by country (group-title). Entries without a country group are
++     * skipped; playlist order is kept, so emitted channels are deterministic. Duplicate channel
++     * names are fine — the M3U channel factory keys on the stream URL, not the name.
++     */
++    private fun parseFreeCatalog(text: String): Map<String, List<FreeCatalogEntry>> {
++        val groups = LinkedHashMap<String, MutableList<FreeCatalogEntry>>()
++        var attrs: Map<String, String> = emptyMap()
++        var name: String? = null
++        for (raw in text.lineSequence()) {
++            val line = raw.trim()
++            if (line.isEmpty()) continue
++            when {
++                line.startsWith("#EXTINF", ignoreCase = true) -> {
++                    attrs = ATTR_REGEX.findAll(line).associate { it.groupValues[1].lowercase() to it.groupValues[2] }
++                    val tail = line.substringAfterLast('"', line)
++                    name = tail.substringAfter(',', "").trim().ifBlank { attrs["tvg-name"] }
++                }
++                line.startsWith("#") -> Unit
++                else -> {
++                    val channelName = name
++                    val country = attrs["group-title"]?.trim()
++                    if (!channelName.isNullOrBlank() && !country.isNullOrBlank()) {
++                        groups.getOrPut(country) { mutableListOf() } += FreeCatalogEntry(
++                            name = channelName,
++                            url = line,
++                            logo = attrs["tvg-logo"]?.takeIf { it.isNotBlank() },
++                            tvgId = attrs["tvg-id"]?.takeIf { it.isNotBlank() },
++                            country = country,
++                        )
++                    }
++                    attrs = emptyMap(); name = null
++                }
++            }
++        }
++        return groups
++    }
++
+     // ---- Xtream Codes ----
+ 
+     private fun enc(value: String) = URLEncoder.encode(value, "UTF-8").replace("+", "%20")
+@@ -444,6 +666,30 @@ class IptvRepository @Inject constructor(
+         }
+     }
+ 
++    /** Like [httpGet] but refuses bodies over [maxBytes] — the free catalog playlist is several MiB. */
++    private fun httpGetCapped(url: String, headers: Map<String, String>, maxBytes: Long): String {
++        val request = Request.Builder().url(url).apply { headers.forEach { (k, v) -> header(k, v) } }.build()
++        http.newCall(request).execute().use { response ->
++            if (!response.isSuccessful) error("HTTP ${response.code} from ${request.url.host}")
++            val body = response.body ?: return ""
++            val declared = body.contentLength()
++            if (declared > maxBytes) error("Free channels playlist is $declared bytes, over the ${maxBytes / (1024 * 1024)} MB cap")
++            val output = ByteArrayOutputStream(if (declared > 0) minOf(declared.toLong(), maxBytes).toInt() else 256 * 1024)
++            val buffer = ByteArray(64 * 1024)
++            var total = 0L
++            body.byteStream().use { input ->
++                while (true) {
++                    val read = input.read(buffer)
++                    if (read == -1) break
++                    total += read
++                    if (total > maxBytes) error("Free channels playlist exceeds the ${maxBytes / (1024 * 1024)} MB fetch cap")
++                    output.write(buffer, 0, read)
++                }
++            }
++            return output.toString("UTF-8")
++        }
++    }
++
+     private fun String.playableUrl() = trim().removePrefix("ffmpeg ").removePrefix("auto ").substringBefore(' ').trim()
+     private fun JSONObject.js(): JSONObject = optJSONObject("js") ?: this
+     private fun JSONObject.str(key: String): String? =
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
+index 6a9fb1b94..ba9b59305 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
+@@ -175,6 +175,15 @@ class TvChannelsRepository @Inject constructor(
+                 _uiState.update { it.copy(iptvSources = sources, iptvErrors = errors, isIptvLoading = loading) }
+             }
+         }
++
++        // 6b. Fork (KE port): free channels catalog (iptv-org) countries for the country picker
++        scope.launch {
++            combine(iptvRepository.freeCountries, iptvRepository.isFreeCatalogLoading) { countries, loading ->
++                countries to loading
++            }.collectLatest { (countries, loading) ->
++                _uiState.update { it.copy(freeCountries = countries, isFreeCatalogLoading = loading) }
++            }
++        }
+         scope.launch {
+             iptvRepository.guides.collectLatest { tvEpgRepository.setIptvGuides(it) }
+         }
+@@ -978,6 +987,8 @@ class TvChannelsRepository @Inject constructor(
+ 
+     fun toggleIptvSource(sourceId: String) = iptvRepository.toggleSource(sourceId)
+ 
++    fun ensureFreeCatalogLoaded() = iptvRepository.ensureFreeCatalogLoaded()
++
+     fun setAddonsDialogVisible(visible: Boolean) {
+         _uiState.update { it.copy(isAddonsDialogVisible = visible) }
+     }
+diff --git a/app/src/main/java/com/nuvio/tv/domain/model/TvChannelsModels.kt b/app/src/main/java/com/nuvio/tv/domain/model/TvChannelsModels.kt
+index 887382b83..ddd03261a 100644
+--- a/app/src/main/java/com/nuvio/tv/domain/model/TvChannelsModels.kt
++++ b/app/src/main/java/com/nuvio/tv/domain/model/TvChannelsModels.kt
+@@ -85,6 +85,9 @@ data class TvChannelsUiState(
+     val iptvSources: List<com.nuvio.tv.data.iptv.IptvSource> = emptyList(),
+     val iptvErrors: Map<String, String> = emptyMap(),
+     val isIptvLoading: Boolean = false,
++    /** Free channels catalog (KE port): countries of the iptv-org master playlist with counts. */
++    val freeCountries: List<com.nuvio.tv.data.iptv.IptvFreeCountry> = emptyList(),
++    val isFreeCatalogLoading: Boolean = false,
+     val isIptvDialogVisible: Boolean = false,
+ ) {
+     val activeStream: Stream?
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
+index 3ae8be985..9572f75df 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
+@@ -1418,7 +1418,10 @@ fun TvChannelsScreen(
+         iptvErrors = state.iptvErrors,
+         onToggleIptv = viewModel::toggleIptvSource,
+         onRemoveIptv = viewModel::removeIptvSource,
+-        onAddIptv = viewModel::addIptvSource
++        onAddIptv = viewModel::addIptvSource,
++        freeCountries = state.freeCountries,
++        freeCatalogLoading = state.isFreeCatalogLoading,
++        onRequestFreeCatalog = viewModel::ensureFreeCatalogLoaded
+     )
+ 
+     fixGuideChannel?.let { fixCh ->
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsViewModel.kt
+index c4615f880..11cbbf3a4 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsViewModel.kt
+@@ -210,6 +210,10 @@ class TvChannelsViewModel @Inject constructor(
+         repository.toggleIptvSource(sourceId)
+     }
+ 
++    fun ensureFreeCatalogLoaded() {
++        repository.ensureFreeCatalogLoaded()
++    }
++
+     fun setScheduleDialogVisible(visible: Boolean) {
+         repository.setScheduleDialogVisible(visible)
+     }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvAddonsSelectionDialog.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvAddonsSelectionDialog.kt
+index 7b4945960..b1fe40fba 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvAddonsSelectionDialog.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvAddonsSelectionDialog.kt
+@@ -69,7 +69,10 @@ fun TvAddonsSelectionDialog(
+     iptvErrors: Map<String, String> = emptyMap(),
+     onToggleIptv: (String) -> Unit = {},
+     onRemoveIptv: (String) -> Unit = {},
+-    onAddIptv: (com.nuvio.tv.data.iptv.IptvSource) -> Unit = {}
++    onAddIptv: (com.nuvio.tv.data.iptv.IptvSource) -> Unit = {},
++    freeCountries: List<com.nuvio.tv.data.iptv.IptvFreeCountry> = emptyList(),
++    freeCatalogLoading: Boolean = false,
++    onRequestFreeCatalog: () -> Unit = {}
+ ) {
+     if (!visible) return
+ 
+@@ -264,7 +267,10 @@ fun TvAddonsSelectionDialog(
+                 errors = iptvErrors,
+                 onToggle = onToggleIptv,
+                 onRemove = onRemoveIptv,
+-                onAdd = onAddIptv
++                onAdd = onAddIptv,
++                freeCountries = freeCountries,
++                freeCatalogLoading = freeCatalogLoading,
++                onRequestFreeCatalog = onRequestFreeCatalog
+             )
+ 
+             Spacer(modifier = Modifier.height(10.dp))
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvIptvSourcesSection.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvIptvSourcesSection.kt
+index d3b52fe4f..af2e66b76 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvIptvSourcesSection.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/components/TvIptvSourcesSection.kt
+@@ -10,11 +10,14 @@ import androidx.compose.foundation.layout.Spacer
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.heightIn
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.layout.size
+ import androidx.compose.foundation.lazy.LazyColumn
+ import androidx.compose.foundation.lazy.items
++import androidx.compose.foundation.rememberScrollState
+ import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.foundation.verticalScroll
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.rounded.Check
+ import androidx.compose.material.icons.rounded.Close
+@@ -28,6 +31,7 @@ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.draw.clip
+ import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.res.stringResource
+ import androidx.compose.ui.text.font.FontWeight
+ import androidx.compose.ui.text.style.TextOverflow
+ import androidx.compose.ui.unit.dp
+@@ -40,13 +44,19 @@ import androidx.tv.material3.ExperimentalTvMaterial3Api
+ import androidx.tv.material3.MaterialTheme
+ import androidx.tv.material3.Surface
+ import androidx.tv.material3.Text
++import com.nuvio.tv.R
++import com.nuvio.tv.data.iptv.IptvFreeCountry
+ import com.nuvio.tv.data.iptv.IptvKind
+ import com.nuvio.tv.data.iptv.IptvSource
+ import com.nuvio.tv.ui.components.NuvioDialog
+ import com.nuvio.tv.ui.screens.collection.NuvioTextField
+ import com.nuvio.tv.ui.theme.NuvioTheme
+ 
+-/** Fork feature: IPTV sources (M3U / Xtream / Stalker) section of the Live TV sources dialog. */
++/**
++ * Fork feature: IPTV sources (M3U / Xtream / Stalker / free catalog) section of the Live TV
++ * sources dialog. The free-catalog source (iptv-org, KE port) is created and edited through the
++ * dedicated "free channels" action and its country picker, never through the manual add dialog.
++ */
+ @OptIn(ExperimentalTvMaterial3Api::class)
+ @Composable
+ fun TvIptvSourcesSection(
+@@ -55,8 +65,13 @@ fun TvIptvSourcesSection(
+     onToggle: (String) -> Unit,
+     onRemove: (String) -> Unit,
+     onAdd: (IptvSource) -> Unit,
++    freeCountries: List<IptvFreeCountry> = emptyList(),
++    freeCatalogLoading: Boolean = false,
++    onRequestFreeCatalog: () -> Unit = {},
+ ) {
+     var showAdd by remember { mutableStateOf(false) }
++    var showFreePicker by remember { mutableStateOf(false) }
++    val freeSource = sources.firstOrNull { it.kind == IptvKind.FREE }
+ 
+     Text(
+         text = "IPTV sources",
+@@ -122,7 +137,7 @@ fun TvIptvSourcesSection(
+                                 )
+                                 val error = errors[source.id]
+                                 Text(
+-                                    text = error ?: source.kindLabel,
++                                    text = error ?: freeSourceSummary(source, freeCountries),
+                                     style = MaterialTheme.typography.bodySmall,
+                                     color = if (error != null) Color(0xFFFF8A80) else Color.White.copy(alpha = 0.45f),
+                                     fontSize = 11.sp,
+@@ -186,6 +201,31 @@ fun TvIptvSourcesSection(
+         Text(text = "+ Add IPTV source", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+     }
+ 
++    // KE port (Part B): create the free-catalog source, or re-open the picker with the current
++    // selection to edit the existing one. Saving goes through the same onAdd, which replaces by id.
++    Spacer(modifier = Modifier.height(6.dp))
++    Button(
++        onClick = {
++            onRequestFreeCatalog()
++            showFreePicker = true
++        },
++        shape = ButtonDefaults.shape(shape = RoundedCornerShape(8.dp)),
++        colors = ButtonDefaults.colors(
++            containerColor = Color.White.copy(alpha = 0.10f),
++            focusedContainerColor = Color.White,
++            focusedContentColor = Color.Black,
++        ),
++        modifier = Modifier.fillMaxWidth(),
++    ) {
++        Text(
++            text = stringResource(
++                if (freeSource == null) R.string.iptv_free_add_action else R.string.iptv_free_edit_action
++            ),
++            fontSize = 12.sp,
++            fontWeight = FontWeight.SemiBold,
++        )
++    }
++
+     if (showAdd) {
+         TvIptvAddDialog(
+             onDismiss = { showAdd = false },
+@@ -195,6 +235,35 @@ fun TvIptvSourcesSection(
+             },
+         )
+     }
++
++    if (showFreePicker) {
++        TvIptvFreeCountriesDialog(
++            existing = freeSource,
++            countries = freeCountries,
++            loading = freeCatalogLoading,
++            onDismiss = { showFreePicker = false },
++            onSave = {
++                onAdd(it)
++                showFreePicker = false
++            },
++        )
++    }
++}
++
++/** Subtitle of a source row: "Free channels · N countries · M channels" for free-catalog sources. */
++@Composable
++private fun freeSourceSummary(source: IptvSource, countries: List<IptvFreeCountry>): String {
++    if (source.kind != IptvKind.FREE) return source.kindLabel
++    val counts = remember(countries) { countries.associate { it.name to it.channelCount } }
++    return if (counts.isEmpty()) {
++        stringResource(R.string.iptv_free_source_summary_short, source.countries.size)
++    } else {
++        stringResource(
++            R.string.iptv_free_source_summary,
++            source.countries.size,
++            source.countries.sumOf { counts[it] ?: 0 },
++        )
++    }
+ }
+ 
+ @OptIn(ExperimentalTvMaterial3Api::class)
+@@ -216,6 +285,7 @@ internal fun TvIptvAddDialog(onDismiss: () -> Unit, onAdd: (IptvSource) -> Unit)
+                 IptvKind.M3U -> "M3U playlist"
+                 IptvKind.XTREAM -> "Xtream"
+                 IptvKind.STALKER -> "Stalker"
++                IptvKind.FREE -> IptvSource.FREE_SOURCE_NAME
+             }
+         },
+         url = url.trim(),
+@@ -233,7 +303,8 @@ internal fun TvIptvAddDialog(onDismiss: () -> Unit, onAdd: (IptvSource) -> Unit)
+         contentSpacing = 8.dp,
+     ) {
+         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+-            IptvKind.entries.forEach { option ->
++            // The free-catalog source has its own "free channels" action; never added manually.
++            IptvKind.entries.filter { it != IptvKind.FREE }.forEach { option ->
+                 Button(
+                     onClick = { kind = option },
+                     shape = ButtonDefaults.shape(shape = RoundedCornerShape(8.dp)),
+@@ -250,6 +321,7 @@ internal fun TvIptvAddDialog(onDismiss: () -> Unit, onAdd: (IptvSource) -> Unit)
+                             IptvKind.M3U -> "M3U"
+                             IptvKind.XTREAM -> "Xtream"
+                             IptvKind.STALKER -> "Stalker"
++                            IptvKind.FREE -> "Free" // unreachable: filtered out above
+                         },
+                         fontSize = 12.sp,
+                         fontWeight = FontWeight.SemiBold,
+@@ -266,6 +338,7 @@ internal fun TvIptvAddDialog(onDismiss: () -> Unit, onAdd: (IptvSource) -> Unit)
+                 IptvKind.M3U -> "Playlist URL (.m3u / .m3u8)"
+                 IptvKind.XTREAM -> "Server URL, e.g. http://host:8080"
+                 IptvKind.STALKER -> "Portal URL, e.g. http://host/c/"
++                IptvKind.FREE -> IptvSource.FREE_SOURCE_URL // unreachable: not a manual kind
+             },
+         )
+         if (kind != IptvKind.M3U) {
+@@ -311,3 +384,210 @@ internal fun TvIptvAddDialog(onDismiss: () -> Unit, onAdd: (IptvSource) -> Unit)
+         }
+     }
+ }
++
++/**
++ * KE port (Part B): country picker for the free channels catalog (iptv-org). Multi-select list of
++ * countries (name + channel count) in the addons-selection dialog idiom; the selection is saved on
++ * the free-catalog source. Editing an existing source opens it with the current selection; an
++ * empty selection is valid (the source then emits zero channels).
++ */
++@OptIn(ExperimentalTvMaterial3Api::class)
++@Composable
++internal fun TvIptvFreeCountriesDialog(
++    existing: IptvSource?,
++    countries: List<IptvFreeCountry>,
++    loading: Boolean,
++    onDismiss: () -> Unit,
++    onSave: (IptvSource) -> Unit,
++) {
++    var selection by remember(existing?.id) { mutableStateOf(existing?.countries?.toSet() ?: emptySet()) }
++    val base = existing ?: IptvSource(
++        id = IptvSource.FREE_SOURCE_ID,
++        kind = IptvKind.FREE,
++        name = IptvSource.FREE_SOURCE_NAME,
++        url = IptvSource.FREE_SOURCE_URL,
++    )
++
++    NuvioDialog(
++        onDismiss = onDismiss,
++        title = stringResource(R.string.iptv_free_picker_title),
++        subtitle = stringResource(R.string.iptv_free_picker_subtitle),
++        width = 540.dp,
++        contentPadding = 16.dp,
++        contentSpacing = 10.dp,
++    ) {
++        Column(
++            modifier = Modifier
++                .fillMaxWidth()
++                .heightIn(max = 400.dp)
++                .verticalScroll(rememberScrollState())
++        ) {
++            Row(
++                modifier = Modifier.fillMaxWidth(),
++                horizontalArrangement = Arrangement.spacedBy(8.dp)
++            ) {
++                Button(
++                    onClick = { selection = countries.map { it.name }.toSet() },
++                    shape = ButtonDefaults.shape(shape = RoundedCornerShape(8.dp)),
++                    colors = ButtonDefaults.colors(
++                        containerColor = Color.White.copy(alpha = 0.10f),
++                        focusedContainerColor = Color.White,
++                        focusedContentColor = Color.Black,
++                    ),
++                    modifier = Modifier.weight(1f)
++                ) {
++                    Text(
++                        text = stringResource(R.string.tv_channels_select_all),
++                        fontSize = 12.sp,
++                        fontWeight = FontWeight.SemiBold
++                    )
++                }
++                Button(
++                    onClick = { selection = emptySet() },
++                    shape = ButtonDefaults.shape(shape = RoundedCornerShape(8.dp)),
++                    colors = ButtonDefaults.colors(
++                        containerColor = Color.White.copy(alpha = 0.10f),
++                        focusedContainerColor = Color.White,
++                        focusedContentColor = Color.Black,
++                    ),
++                    modifier = Modifier.weight(1f)
++                ) {
++                    Text(
++                        text = stringResource(R.string.tv_channels_clear_all),
++                        fontSize = 12.sp,
++                        fontWeight = FontWeight.SemiBold
++                    )
++                }
++            }
++
++            Spacer(modifier = Modifier.height(8.dp))
++
++            when {
++                loading && countries.isEmpty() -> Box(
++                    modifier = Modifier
++                        .fillMaxWidth()
++                        .height(100.dp),
++                    contentAlignment = Alignment.Center
++                ) {
++                    Text(
++                        text = stringResource(R.string.iptv_free_picker_loading),
++                        style = MaterialTheme.typography.bodyMedium,
++                        color = Color.White.copy(alpha = 0.5f)
++                    )
++                }
++                countries.isEmpty() -> Box(
++                    modifier = Modifier
++                        .fillMaxWidth()
++                        .height(100.dp),
++                    contentAlignment = Alignment.Center
++                ) {
++                    Text(
++                        text = stringResource(R.string.iptv_free_picker_empty),
++                        style = MaterialTheme.typography.bodyMedium,
++                        color = Color.White.copy(alpha = 0.5f)
++                    )
++                }
++                else -> LazyColumn(
++                    modifier = Modifier
++                        .fillMaxWidth()
++                        .height(280.dp),
++                    verticalArrangement = Arrangement.spacedBy(8.dp)
++                ) {
++                    items(countries, key = { it.name }) { country ->
++                        val shape = RoundedCornerShape(8.dp)
++                        val isSelected = country.name in selection
++                        Surface(
++                            onClick = {
++                                selection = if (isSelected) selection - country.name else selection + country.name
++                            },
++                            shape = ClickableSurfaceDefaults.shape(shape),
++                            scale = ClickableSurfaceDefaults.scale(focusedScale = 1.02f),
++                            colors = ClickableSurfaceDefaults.colors(
++                                containerColor = if (isSelected) {
++                                    NuvioTheme.colors.Secondary.copy(alpha = 0.16f)
++                                } else {
++                                    Color.White.copy(alpha = 0.05f)
++                                },
++                                focusedContainerColor = NuvioTheme.colors.Secondary.copy(alpha = 0.35f)
++                            ),
++                            border = ClickableSurfaceDefaults.border(
++                                focusedBorder = Border(
++                                    border = BorderStroke(2.dp, NuvioTheme.colors.Secondary),
++                                    shape = shape
++                                ),
++                                border = Border(
++                                    border = BorderStroke(1.dp, Color.White.copy(alpha = 0.08f)),
++                                    shape = shape
++                                )
++                            )
++                        ) {
++                            Row(
++                                modifier = Modifier
++                                    .fillMaxWidth()
++                                    .padding(horizontal = 12.dp, vertical = 10.dp),
++                                verticalAlignment = Alignment.CenterVertically,
++                                horizontalArrangement = Arrangement.spacedBy(10.dp)
++                            ) {
++                                Column(modifier = Modifier.weight(1f)) {
++                                    Text(
++                                        text = country.name,
++                                        style = MaterialTheme.typography.labelLarge,
++                                        fontWeight = FontWeight.SemiBold,
++                                        color = Color.White,
++                                        maxLines = 1,
++                                        overflow = TextOverflow.Ellipsis
++                                    )
++                                    Text(
++                                        text = stringResource(R.string.iptv_free_channel_count, country.channelCount),
++                                        style = MaterialTheme.typography.bodySmall,
++                                        color = Color.White.copy(alpha = 0.45f),
++                                        fontSize = 11.sp
++                                    )
++                                }
++                                Box(
++                                    modifier = Modifier
++                                        .size(22.dp)
++                                        .clip(RoundedCornerShape(4.dp))
++                                        .border(
++                                            1.dp,
++                                            if (isSelected) NuvioTheme.colors.Secondary else Color.White.copy(alpha = 0.3f),
++                                            RoundedCornerShape(4.dp)
++                                        ),
++                                    contentAlignment = Alignment.Center
++                                ) {
++                                    if (isSelected) {
++                                        Icon(
++                                            imageVector = Icons.Rounded.Check,
++                                            contentDescription = null,
++                                            tint = NuvioTheme.colors.Secondary,
++                                            modifier = Modifier.size(14.dp)
++                                        )
++                                    }
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++
++            Spacer(modifier = Modifier.height(10.dp))
++
++            Button(
++                onClick = { onSave(base.copy(countries = selection.toList())) },
++                shape = ButtonDefaults.shape(shape = RoundedCornerShape(8.dp)),
++                colors = ButtonDefaults.colors(
++                    containerColor = NuvioTheme.colors.Secondary,
++                    focusedContainerColor = Color.White,
++                    focusedContentColor = Color.Black,
++                ),
++                modifier = Modifier.fillMaxWidth()
++            ) {
++                Text(
++                    text = stringResource(R.string.iptv_free_save),
++                    fontSize = 12.sp,
++                    fontWeight = FontWeight.Bold
++                )
++            }
++        }
++    }
++}
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index c05d1d43d..37da654af 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -3729,4 +3729,15 @@
+     <string name="sports_hub_all">All events</string>
+     <string name="sports_hub_badge_live">LIVE NOW</string>
+     <string name="sports_hub_hint">OK: watch live or set a reminder · Hold OK: watch now · ◄ ► through a row</string>
++    <!-- Fork (KE port): free Live TV channels catalog (iptv-org) -->
++    <string name="iptv_free_add_action">+ Add free channels</string>
++    <string name="iptv_free_edit_action">Edit free channels</string>
++    <string name="iptv_free_picker_title">Free channels</string>
++    <string name="iptv_free_picker_subtitle">Pick the countries whose free channels to include. You can change this any time.</string>
++    <string name="iptv_free_picker_loading">Loading the free channel catalog…</string>
++    <string name="iptv_free_picker_empty">No countries found in the free channel catalog</string>
++    <string name="iptv_free_save">Save</string>
++    <string name="iptv_free_channel_count">%1$d channels</string>
++    <string name="iptv_free_source_summary">Free channels · %1$d countries · %2$d channels</string>
++    <string name="iptv_free_source_summary_short">Free channels · %1$d countries</string>
+ </resources>
