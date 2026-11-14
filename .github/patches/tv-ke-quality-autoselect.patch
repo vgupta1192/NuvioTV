@@ -1,0 +1,1586 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/StreamAutoPlaySelector.kt b/app/src/main/java/com/nuvio/tv/core/player/StreamAutoPlaySelector.kt
+index f86a0a1b4..e5dfe2cfb 100644
+--- a/app/src/main/java/com/nuvio/tv/core/player/StreamAutoPlaySelector.kt
++++ b/app/src/main/java/com/nuvio/tv/core/player/StreamAutoPlaySelector.kt
+@@ -1,9 +1,15 @@
+ package com.nuvio.tv.core.player
+ 
++import android.util.Log
+ import com.nuvio.tv.core.build.AppFeaturePolicy
++import com.nuvio.tv.core.stream.ContentIdentity
++import com.nuvio.tv.core.stream.ContentIdentityGuard
++import com.nuvio.tv.core.stream.ReleaseFactsParser
++import com.nuvio.tv.core.stream.isOverResolutionCap
+ import com.nuvio.tv.data.local.StreamAutoPlayMode
+ import com.nuvio.tv.data.local.StreamAutoPlaySource
+ import com.nuvio.tv.domain.model.AddonStreams
++import com.nuvio.tv.domain.model.ReleaseResolution
+ import com.nuvio.tv.domain.model.Stream
+ import com.nuvio.tv.domain.model.StreamDebridCacheState
+ 
+@@ -55,8 +61,68 @@ object StreamAutoPlaySelector {
+             (AppFeaturePolicy.inAppTrailerPlaybackEnabled && stream.youTubeIdToResolve() != null)
+     }
+ 
++    /**
++     * Nuvio-KE port (KE Spec 65 P3): the per-stream pre-selection checks every auto-play
++     * candidate must pass, whatever the mode. Two checks:
++     *
++     *  - the device resolution cap (KE Spec 58 F3, ResolutionLimit): KE defaults the cap to the
++     *    TV's largest display mode and hides over-cap streams; this fork has no user setting for
++     *    it, so the same default is passed in by the callers ([tvMaxResolution]). An unknown
++     *    resolution always passes (KE D2).
++     *  - the content identity guard (ContentIdentityGuard): the release name (file or torrent
++     *    name, never formatter text) must not name another season or episode than the one asked
++     *    for, and for a film the year straight after the requested title must be within one of
++     *    it. A missing or unparseable name passes (KE D2); a manual pick never reaches this.
++     *
++     * KE applies the same pair at every auto-play site (AutoPlaySelection.candidates) with no
++     * "every candidate rejected" escape (KE D7): all rejected = the picker.
++     */
++    private fun passesPreSelectionChecks(
++        stream: Stream,
++        identity: ContentIdentity?,
++        resolutionCap: ReleaseResolution?
++    ): Boolean {
++        if (resolutionCap != null &&
++            isOverResolutionCap(ReleaseFactsParser.resolutionOf(stream), resolutionCap)
++        ) {
++            return false
++        }
++        if (identity != null) {
++            val rejection = ContentIdentityGuard.evaluate(
++                releaseName = ContentIdentityGuard.releaseNameOf(stream),
++                identity = identity
++            )
++            if (rejection != null) {
++                // Every rejection is logged so the guard's false-positive rate is measurable
++                // (KE Spec 65 P3); a screen that re-selects as streams arrive logs it again.
++                Log.i(
++                    AUTO_PLAY_IDENTITY_TAG,
++                    "reject=$rejection addon=${stream.addonName} name=${ContentIdentityGuard.releaseNameOf(stream)}"
++                )
++                return false
++            }
++        }
++        return true
++    }
+ 
+-
++    private const val AUTO_PLAY_IDENTITY_TAG = "AutoPlayIdentity"
++
++    /**
++     * Selects the stream to auto-play, or null for the picker.
++     *
++     * Nuvio-KE port (quality-ranked auto-select with pre-play stream checks): [identity] and
++     * [resolutionCap] carry the pre-selection checks every auto candidate must pass (see
++     * [passesPreSelectionChecks]); a candidate that fails one is skipped and the next one is
++     * tried, and when every candidate fails the caller shows the picker. With "Prefer best
++     * picture" on, the survivors are ordered with KE's full quality ladder
++     * ([StreamQualityRank.rank]: suspect guard, then resolution -> quality label -> release
++     * group -> visual/audio formats -> channels -> encode -> size -> container), which also
++     * drops the shipped default exclusions (CAM/TS/TC/SCR, 3D layouts, AI, AV1, TRaSH LQ
++     * groups) and falls back to the unfiltered pool when that would empty it (KE's
++     * `.ifEmpty { streams }`), and demotes fake-quality / implausible-size suspects below the
++     * rest — for a film ([filmSizeFloors]) under the higher film size floors. This replaces the
++     * fork's previous single-regex picture-quality score; the toggle itself is unchanged.
++     */
+     fun selectAutoPlayStream(
+         streams: List<Stream>,
+         mode: StreamAutoPlayMode,
+@@ -67,7 +133,10 @@ object StreamAutoPlaySelector {
+         selectedPlugins: Set<String>,
+         preferredBingeGroup: String? = null,
+         preferBingeGroupInSelection: Boolean = false,
+-        bingeGroupOnly: Boolean = false
++        bingeGroupOnly: Boolean = false,
++        identity: ContentIdentity? = null,
++        filmSizeFloors: Boolean = identity?.film == true,
++        resolutionCap: ReleaseResolution? = null
+     ): Stream? {
+         if (streams.isEmpty()) return null
+ 
+@@ -93,25 +162,29 @@ object StreamAutoPlaySelector {
+             }
+         }
+         if (scopedCandidates.isEmpty()) return null
+-        // Nuvio fork: "Prefer best picture" ranks by resolution and codec first; the sort is stable, so ties keep addon order.
++
++        // Nuvio-KE port: the gated, playable pool every mode picks from (KE's
++        // AutoPlaySelection.candidates + isPlayable). The quality rank inside the
++        // "prefer best picture" branch below is stable, so ties keep addon order.
++        val playableCandidates = scopedCandidates
++            .filter { passesPreSelectionChecks(it, identity, resolutionCap) }
++            .filter { isPlayable(it) }
+         val candidateStreams = if (com.nuvio.tv.ui.screens.player.PlayerEffects.preferBestQuality) {
+-            scopedCandidates.sortedByDescending {
+-                com.nuvio.tv.ui.screens.player.streamPictureQualityScore(
+-                    listOfNotNull(it.name, it.title, it.description, it.quality).joinToString(" "),
+-                )
+-            }
++            StreamQualityRank.rank(playableCandidates, filmSizeFloors)
+         } else {
+-            scopedCandidates
++            playableCandidates
+         }
+ 
+         // Binge group matching takes priority over mode and source filters — even in MANUAL mode,
+         // a persisted binge group should auto-play without showing the picker.
+         // Search ALL streams, not just candidateStreams, since binge group reuse should
+-        // not be limited by autoplay source/addon selection filters.
++        // not be limited by autoplay source/addon selection filters. The pre-selection
++        // checks still apply (KE gates its binge match too: Spec 65 P5/P3).
+         val targetBingeGroup = preferredBingeGroup?.trim().orEmpty()
+         if (preferBingeGroupInSelection && targetBingeGroup.isNotEmpty()) {
+             val bingeGroupMatch = streams.firstOrNull { stream ->
+                 !stream.isExternal() &&
++                    passesPreSelectionChecks(stream, identity, resolutionCap) &&
+                     stream.behaviorHints?.bingeGroup == targetBingeGroup &&
+                     isPlayable(stream)
+             }
+@@ -128,10 +201,10 @@ object StreamAutoPlaySelector {
+ 
+         return when (mode) {
+             StreamAutoPlayMode.MANUAL -> null
+-            StreamAutoPlayMode.FIRST_STREAM -> candidateStreams.firstOrNull { isPlayable(it) }
++            StreamAutoPlayMode.FIRST_STREAM -> candidateStreams.firstOrNull()
+             StreamAutoPlayMode.REGEX_MATCH -> {
+                 val pattern = regexPattern.trim()
+- 
++
+                 // Try to compile the user regex
+                 val userRegex = runCatching { Regex(pattern, RegexOption.IGNORE_CASE) }.getOrNull()
+                 if (userRegex == null) return null
+@@ -149,10 +222,8 @@ object StreamAutoPlaySelector {
+                     Regex("\\b(${exclusionWords.joinToString("|")})\\b", RegexOption.IGNORE_CASE)
+                 } else null
+ 
+-                // 1. Build list of ALL regex‑matching streams
++                // 1. Build list of ALL regex‑matching streams (already gated and playable)
+                 val matchingStreams = candidateStreams.filter { stream ->
+-                    if (!isPlayable(stream)) return@filter false
+-
+                     val searchableText = buildString {
+                         append(stream.addonName).append(' ')
+                         append(stream.name.orEmpty()).append(' ')
+@@ -174,7 +245,7 @@ object StreamAutoPlaySelector {
+                 }
+ 
+                 if (matchingStreams.isEmpty()) return null
+-                matchingStreams.firstOrNull { isPlayable(it) }
++                matchingStreams.firstOrNull()
+             }
+ 
+         }
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/StreamQualityRank.kt b/app/src/main/java/com/nuvio/tv/core/player/StreamQualityRank.kt
+new file mode 100644
+index 000000000..d18257ca1
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/player/StreamQualityRank.kt
+@@ -0,0 +1,71 @@
++package com.nuvio.tv.core.player
++
++import com.nuvio.tv.core.stream.ReleaseFactsParser
++import com.nuvio.tv.domain.model.Stream
++
++/**
++ * Deterministic quality ranking for auto-select (task 3.7; TRaSH-aligned
++ * rebuild).
++ *
++ * Candidates are ranked with the shared release-fact extraction
++ * (ReleaseFactsParser) against the shipped default ladders
++ * (ReleaseRankPreferences.DEFAULT); there is no user-editable override.
++ *
++ * Order (Q18: resolution wins outright, no cross-tier trading), after one guard key: a suspect
++ * stream (ReleaseFacts.suspect: fake quality or a size implausible for its resolution, Spec 65 P4;
++ * with [rank]'s filmSizeFloors, also a size under the film floor) ranks below every other, then
++ * resolution -> quality (REMUX > BluRay > WEB-DL > ...) -> preferred release
++ * group ladder (TRaSH HQ tiers by default) -> visual tags -> audio tags
++ * (TrueHD first by default) -> channels -> encode -> size (desc) -> container
++ * (mkv over mp4/unknown). Ties keep incoming order (stable sort).
++ *
++ * Streams matching any EXCLUDED preference (release groups, encodes, visual
++ * tags, qualities, ...) are dropped from the pool first. If that empties the
++ * pool, ranking falls back to the unfiltered candidates so auto-select still
++ * plays something rather than silently doing nothing. There are no
++ * required/floor filters: resolution-rank ordering means low tiers only win
++ * when nothing better exists.
++ */
++object StreamQualityRank {
++
++    private val CONTAINER_MKV = Regex("\\.mkv\\b|\\bmkv\\b", RegexOption.IGNORE_CASE)
++
++    /**
++     * Stable, deterministic best-first ordering of the given streams. [filmSizeFloors]: the caller
++     * knows the content is a film, so the higher film size floors apply (Spec 65 D4).
++     */
++    fun rank(streams: List<Stream>, filmSizeFloors: Boolean = false): List<Stream> {
++        if (streams.size <= 1) return streams
++        val factsByStream = streams.associateWith { ReleaseFactsParser.factsFor(it) }
++        val suspect = streams.associateWith { stream ->
++            val facts = factsByStream.getValue(stream)
++            facts.suspect || (filmSizeFloors && ReleaseFactsParser.belowFilmSizeFloor(facts))
++        }
++        val pool = streams.filter {
++            ReleaseFactsParser.passesExclusionFilters(factsByStream.getValue(it))
++        }.ifEmpty { streams }
++        return pool.sortedWith(
++            compareBy<Stream> { suspect.getValue(it) }
++                .thenBy { factsByStream.getValue(it).resolutionRank }
++                .thenBy { factsByStream.getValue(it).qualityRank }
++                .thenBy { factsByStream.getValue(it).groupRank }
++                .thenBy { factsByStream.getValue(it).visualRank }
++                .thenBy { factsByStream.getValue(it).audioRank }
++                .thenBy { factsByStream.getValue(it).channelRank }
++                .thenBy { factsByStream.getValue(it).encodeRank }
++                .thenByDescending { factsByStream.getValue(it).size ?: -1L }
++                .thenByDescending { containerScore(it) }
++        )
++    }
++
++    internal fun containerScore(stream: Stream): Int {
++        val text = listOfNotNull(
++            stream.behaviorHints?.filename,
++            stream.getStreamUrl(),
++            stream.name,
++            stream.title,
++            stream.description
++        ).joinToString(" ")
++        return if (CONTAINER_MKV.containsMatchIn(text)) 1 else 0
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/stream/ContentIdentityGuard.kt b/app/src/main/java/com/nuvio/tv/core/stream/ContentIdentityGuard.kt
+new file mode 100644
+index 000000000..98564aa3c
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/stream/ContentIdentityGuard.kt
+@@ -0,0 +1,167 @@
++package com.nuvio.tv.core.stream
++
++import com.nuvio.tv.domain.model.Stream
++import java.text.Normalizer
++import kotlin.math.abs
++
++/**
++ * What auto-play was asked to play (Spec 65 P3). A null field is unknown and never rejects.
++ * [film] is the caller's content type (a movie), never inferred from missing fields: it enables
++ * the year check here and the film size floors in [com.nuvio.tv.core.player.StreamQualityRank].
++ */
++data class ContentIdentity(
++    val title: String?,
++    val year: Int?,
++    val season: Int?,
++    val episode: Int?,
++    val film: Boolean
++) {
++    companion object {
++        private val YEAR = Regex("(19|20)\\d{2}")
++
++        /** Anime-database video ids, which number episodes per database entry (Spec 84 A9). */
++        private val PER_ENTRY_EPISODE_PREFIXES = listOf("kitsu:", "mal:", "anilist:", "anidb:")
++
++        /** The content type every auto-play site reads film from ("movie", Stremio's type). */
++        fun isFilmType(type: String?): Boolean = type.equals("movie", ignoreCase = true)
++
++        /**
++         * The identity of a play request, built the same way at every auto-play site (Spec 65 S3).
++         * [year] is the free-text year ("2021", "2019-2023"): its first year counts. A Kitsu,
++         * MyAnimeList, AniList or AniDB id numbers episodes per database entry, not as releases
++         * name them, so its season and episode are left unknown (Spec 65 D7, Spec 84 A9).
++         */
++        fun of(
++            type: String?,
++            title: String?,
++            year: String?,
++            season: Int?,
++            episode: Int?,
++            videoId: String?
++        ): ContentIdentity {
++            val perEntry = videoId != null &&
++                PER_ENTRY_EPISODE_PREFIXES.any { videoId.startsWith(it, ignoreCase = true) }
++            return ContentIdentity(
++                title = title?.takeIf { it.isNotBlank() },
++                year = year?.let { YEAR.find(it)?.value?.toInt() },
++                season = season.takeUnless { perEntry },
++                episode = episode.takeUnless { perEntry },
++                film = isFilmType(type)
++            )
++        }
++    }
++}
++
++/**
++ * Rejects auto-play candidates only on a hard mismatch in their release name (Spec 65 P3, D6;
++ * after Zokaper/NuvioZDesktop `ContentIdentityGuard.kt` `4e774b58a`, GPL-3.0). A missing or
++ * unparseable name passes (Spec 65 D2), and manual picks never reach it.
++ *
++ * - Episode: the name's SxxEyy (ranges E01E02E03, E01-E03, E01-03 and S01E01-S03E13 packs count)
++ *   names another season or episode.
++ * - Film year ([ContentIdentity.film] only): the year straight after the requested title is more
++ *   than one off ("Dune.1984" for Dune 2021). Anything else passes: a year after more words may
++ *   be a re-release's ("Blade.Runner.The.Final.Cut.2007"), and episodes may carry the show's year.
++ *
++ * Not checked (D6): another title sharing the requested one's start (Daredevil vs
++ * Daredevil.Born.Again); text cannot tell a spin-off from a season subtitle, so Spec 35's
++ * after-start runtime check covers it.
++ */
++object ContentIdentityGuard {
++
++    enum class Rejection { WRONG_SEASON, WRONG_EPISODE, WRONG_YEAR }
++
++    /** A release is often tagged with its publication year, one off from the title's. */
++    const val YEAR_TOLERANCE = 1
++
++    /**
++     * Groups: 1 season, 2 first episode, 3+4 a cross-season pack's end (S01E01-S03E13), 5 further
++     * episodes (the last number ends the range; "+", "." and spaced dashes chain). A range end must
++     * not run into letters other than a chained "e" or a "v2" revision, so "-720p", "-4k" and
++     * "-10bit" are not range ends.
++     */
++    private val SEASON_EPISODE = Regex(
++        "(?<![a-z0-9])s(\\d{1,4})[ ._-]?e(\\d{1,3})" +
++            "(?:-s(\\d{1,4})e(\\d{1,3})(?![0-9a-uw-z])|((?:(?:[ ._+-]*e|-)\\d{1,3}(?![0-9a-df-uw-z]))*))(?![0-9])"
++    )
++    private val DIGITS = Regex("\\d+")
++    private val YEAR_TOKEN = Regex("(19|20)\\d{2}")
++    private val NON_ALNUM = Regex("[^a-z0-9]+")
++    private val APOSTROPHES = Regex("['\u2019`]")
++    private val COMBINING_MARKS = Regex("\\p{Mn}+")
++
++    /**
++     * The release name the guard reads: the file or torrent name, never formatter text (an
++     * addon's display title/description is not a release name).
++     */
++    fun releaseNameOf(stream: Stream): String? {
++        val resolve = stream.clientResolve
++        val raw = resolve?.stream?.raw
++        return listOf(
++            stream.behaviorHints?.filename,
++            resolve?.filename,
++            raw?.filename,
++            resolve?.torrentName,
++            raw?.torrentName
++        ).firstOrNull { !it.isNullOrBlank() }
++    }
++
++    /**
++     * Each rejected candidate of [streams] with its reason; candidates absent from the map pass.
++     * No "every candidate rejected" escape (Spec 65 D7): whether a list is complete is not
++     * knowable at the select (a prefetch entry cut by its cap ends the flow early), and on a
++     * partial list the escape plays the first addon's wrong episode. All rejected = the picker.
++     */
++    fun rejections(streams: List<Stream>, identity: ContentIdentity): Map<Stream, Rejection> {
++        val titleTokens = identity.title?.let { tokens(normalize(it)) }.orEmpty()
++        val rejected = LinkedHashMap<Stream, Rejection>()
++        for (stream in streams) {
++            evaluate(releaseNameOf(stream), identity, titleTokens)?.let { rejected[stream] = it }
++        }
++        return rejected
++    }
++
++    internal fun evaluate(
++        releaseName: String?,
++        identity: ContentIdentity,
++        titleTokens: List<String> = identity.title?.let { tokens(normalize(it)) }.orEmpty()
++    ): Rejection? {
++        val name = releaseName?.takeIf { it.isNotBlank() }?.let(::normalize) ?: return null
++        val season = identity.season
++        val episode = identity.episode
++        if (season != null && episode != null) return episodeRejection(name, season, episode)
++        if (!identity.film) return null
++        val requestedYear = identity.year ?: return null
++        val nameTokens = tokens(name)
++        if (titleTokens.isEmpty() || nameTokens.size <= titleTokens.size ||
++            nameTokens.subList(0, titleTokens.size) != titleTokens
++        ) return null
++        val next = nameTokens[titleTokens.size]
++        if (!YEAR_TOKEN.matches(next)) return null
++        return if (abs(next.toInt() - requestedYear) > YEAR_TOLERANCE) Rejection.WRONG_YEAR else null
++    }
++
++    private fun episodeRejection(name: String, season: Int, episode: Int): Rejection? {
++        val match = SEASON_EPISODE.find(name) ?: return null
++        val first = match.groupValues[1].toInt()
++        val lastSeason = match.groupValues[3].toIntOrNull()
++        if (lastSeason != null && lastSeason != first) {
++            // A cross-season pack: the episode lies inside it when its season does.
++            return if (season in first..lastSeason) null else Rejection.WRONG_SEASON
++        }
++        if (first != season) return Rejection.WRONG_SEASON
++        val firstEpisode = match.groupValues[2].toInt()
++        val lastEpisode = (match.groupValues[4].toIntOrNull()
++            ?: DIGITS.findAll(match.groupValues[5]).lastOrNull()?.value?.toInt())
++            ?.takeIf { it >= firstEpisode } ?: firstEpisode
++        return if (episode in firstEpisode..lastEpisode) null else Rejection.WRONG_EPISODE
++    }
++
++    /** Lowercase, accents folded ("Pokémon" = "pokemon"), apostrophes dropped ("Marvel's" = "marvels"). */
++    private fun normalize(text: String): String =
++        COMBINING_MARKS.replace(Normalizer.normalize(text, Normalizer.Form.NFD), "")
++            .replace(APOSTROPHES, "")
++            .lowercase()
++
++    private fun tokens(normalized: String): List<String> = normalized.split(NON_ALNUM).filter { it.isNotEmpty() }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/stream/ReleaseEditions.kt b/app/src/main/java/com/nuvio/tv/core/stream/ReleaseEditions.kt
+new file mode 100644
+index 000000000..e78d7be84
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/stream/ReleaseEditions.kt
+@@ -0,0 +1,50 @@
++package com.nuvio.tv.core.stream
++
++import com.nuvio.tv.domain.model.ReleaseVisualTag
++import com.nuvio.tv.domain.model.StreamClientResolveParsed
++
++/**
++ * Edition display tokens for a stream's facts (P6), one vocabulary for every source.
++ * AIOStreams sends parse-torrent-title's labels ("Extended Edition", "Director's Cut",
++ * "Criterion Collection", "Remastered", ...), which [tokensOf] uppercases without the
++ * Edition/Collection suffix, so they land on the same tokens as the resolver flags and text.
++ * IMAX is the IMAX visual tag, never an edition.
++ */
++internal object ReleaseEditions {
++    private const val EXTENDED = "EXTENDED"
++    private const val THEATRICAL = "THEATRICAL"
++    private const val REMASTERED = "REMASTERED"
++    private const val UNRATED = "UNRATED"
++
++    private val SUFFIX_REGEX = Regex("\\s+(edition|collection)$", RegexOption.IGNORE_CASE)
++
++    /** Whole-token text patterns (lowercase text) with their display tokens. */
++    private val TEXT_PATTERNS: List<Pair<Regex, String>> = listOf(
++        ReleaseFactsParser.tokenRegex("extended") to EXTENDED,
++        ReleaseFactsParser.tokenRegex("remastered") to REMASTERED,
++        ReleaseFactsParser.tokenRegex("theatrical") to THEATRICAL,
++        ReleaseFactsParser.tokenRegex("unrated") to UNRATED,
++        ReleaseFactsParser.tokenRegex("uncut") to "UNCUT",
++        ReleaseFactsParser.tokenRegex("criterion") to "CRITERION",
++        ReleaseFactsParser.tokenRegex("director'?s[ ._-]?cut") to "DIRECTOR'S CUT"
++    )
++
++    fun tokensOf(values: List<String>): List<String> =
++        values.map(::normalized).filter { it.isNotEmpty() && it != ReleaseVisualTag.IMAX.label }.distinct()
++
++    fun fromResolver(parsed: StreamClientResolveParsed): List<String> = (
++        parsed.edition?.let { tokensOf(listOf(it)) }.orEmpty() + listOfNotNull(
++            EXTENDED.takeIf { parsed.extended == true },
++            THEATRICAL.takeIf { parsed.theatrical == true },
++            REMASTERED.takeIf { parsed.remastered == true },
++            UNRATED.takeIf { parsed.unrated == true }
++        )
++    ).distinct()
++
++    fun fromText(lowercaseText: String): List<String> =
++        TEXT_PATTERNS.mapNotNull { (regex, token) -> token.takeIf { regex.containsMatchIn(lowercaseText) } }
++
++    fun isImax(value: String): Boolean = normalized(value) == ReleaseVisualTag.IMAX.label
++
++    private fun normalized(value: String): String = SUFFIX_REGEX.replace(value.trim(), "").uppercase()
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/stream/ReleaseFactsParser.kt b/app/src/main/java/com/nuvio/tv/core/stream/ReleaseFactsParser.kt
+new file mode 100644
+index 000000000..0e7d1462e
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/stream/ReleaseFactsParser.kt
+@@ -0,0 +1,569 @@
++package com.nuvio.tv.core.stream
++
++import com.nuvio.tv.core.debrid.StreamTextSizeParser
++import com.nuvio.tv.domain.model.ReleaseAudioChannel
++import com.nuvio.tv.domain.model.ReleaseAudioTag
++import com.nuvio.tv.domain.model.ReleaseEncode
++import com.nuvio.tv.domain.model.ReleaseRankPreferences
++import com.nuvio.tv.domain.model.ReleaseQuality
++import com.nuvio.tv.domain.model.ReleaseResolution
++import com.nuvio.tv.domain.model.ReleaseVisualTag
++import com.nuvio.tv.domain.model.Stream
++import com.nuvio.tv.domain.model.StreamClientResolveParsed
++import java.util.concurrent.ConcurrentHashMap
++
++/**
++ * Parses release facts (resolution, source quality, HDR/DV, audio, encode,
++ * release group, size, editions, languages) from a stream's advertised text
++ * and structured clientResolve parse. The resolver's parse (parsed) wins field
++ * by field where it maps; the text path fills the rest. Ported from
++ * Nuvio-KE's core/stream/ReleaseFactsParser.kt; KE's AIOStreams
++ * `streamData.parsedFile` layer is dropped because this fork's Stream model
++ * has no streamData field, and the size lookup reuses this fork's existing
++ * com.nuvio.tv.core.debrid.StreamTextSizeParser (same structured-first,
++ * text-fallback chain KE's does).
++ *
++ * Upstream: NuvioMedia/NuvioTV. Licensed under GPL-3.0.
++ */
++object ReleaseFactsParser {
++    /** [hasToken] patterns keyed by the (lowercase literal) token; built once per token. */
++    private val tokenRegexCache = ConcurrentHashMap<String, Regex>()
++    private val NON_ALNUM_REGEX = Regex("[^a-z0-9]")
++    private val NON_ALNUM_PLUS_REGEX = Regex("[^a-z0-9+]")
++
++    /**
++     * Resolution passes, each in ladder order; first match wins. "NNNp" heights come first:
++     * "UHD BluRay 1080p" is a 1080p encode of a UHD source (KE B10). Then the named aliases,
++     * then bare numbers (a bare "720" may be a seeder count, so it must not beat "4K"), and
++     * "hd"/"sd" last ("hd" is also the HD of "DTS-HD", so it must not beat a bare "1080").
++     */
++    private val RESOLUTION_HEIGHTS: List<Pair<String, ReleaseResolution>> = listOf(
++        "2160" to ReleaseResolution.P2160,
++        "1440" to ReleaseResolution.P1440,
++        "1080" to ReleaseResolution.P1080,
++        "720" to ReleaseResolution.P720,
++        "576" to ReleaseResolution.P576,
++        "480" to ReleaseResolution.P480,
++        "360" to ReleaseResolution.P360
++    )
++    private val RESOLUTION_HEIGHT_PATTERNS: List<Pair<Regex, ReleaseResolution>> =
++        RESOLUTION_HEIGHTS.map { (height, resolution) -> tokenRegex("${height}p") to resolution }
++    private val RESOLUTION_BARE_HEIGHT_PATTERNS: List<Pair<Regex, ReleaseResolution>> =
++        RESOLUTION_HEIGHTS.map { (height, resolution) -> tokenRegex(height) to resolution }
++    private val RESOLUTION_ALIAS_PATTERNS: List<Pair<Regex, ReleaseResolution>> = listOf(
++        tokenRegex("4k", "uhd") to ReleaseResolution.P2160,
++        tokenRegex("2k") to ReleaseResolution.P1440,
++        tokenRegex("fhd") to ReleaseResolution.P1080
++    )
++    private val RESOLUTION_WEAK_ALIAS_PATTERNS: List<Pair<Regex, ReleaseResolution>> = listOf(
++        tokenRegex("hd") to ReleaseResolution.P720,
++        tokenRegex("sd") to ReleaseResolution.P480
++    )
++    private val DV_TEXT_REGEX = Regex("(^|[^a-z0-9])(dv|dovi|dolby[ ._-]?vision)([^a-z0-9]|$)")
++
++    /** 3D layout tokens (half/full side-by-side, over-under, top-and-bottom). */
++    private const val THREE_D_LAYOUTS = "half(-?sbs|-?ou)?|h-?sbs|h-?ou|sbs|ou|tab"
++
++    /**
++     * 3D is read case-sensitively ("3D", as release names write it) or beside a 3D layout
++     * token: a lowercase "3d" alone is also a formatter's age ("· 3d" = 3 days old), and
++     * 3D is a default exclusion, so misreading it dropped those streams from auto-play (KE B9).
++     */
++    private val THREE_D_TEXT_REGEX = Regex("(^|[^A-Za-z0-9])3D([^A-Za-z0-9]|$)")
++    private val THREE_D_LAYOUT_REGEX = Regex(
++        "(^|[^a-z0-9])(3d[ ._-]*($THREE_D_LAYOUTS)|($THREE_D_LAYOUTS)[ ._-]*3d)([^a-z0-9]|$)"
++    )
++
++    /**
++     * Dolby Digital Plus spellings, and plain Dolby Digital that is none of them: the "dd" of
++     * "dd+"/"ddp", the "ac3" of "eac3"/"e-ac3" and "dolby digital plus" are not DD (KE B11).
++     */
++    private val DD_PLUS_TEXT_REGEX = Regex("dd\\+|ddp|dolby digital ?(plus|\\+)|e-?ac-?3")
++    private val DD_TEXT_REGEX = Regex("(?<![a-z0-9])dd(?![a-z+])|(?<!e)(?<!e-)ac3|dolby digital(?! ?(plus|\\+))")
++    private val HDR_TEXT_REGEX = Regex("(^|[^a-z0-9])(hdr|hdr10|hdr10plus|hdr10\\+|hlg)([^a-z0-9]|$)")
++    private const val CONTAINER_EXTENSIONS = "mkv|mp4|m4v|avi|ts|m2ts|webm|mov"
++    private val CONTAINER_EXTENSION_REGEX = Regex("\\.($CONTAINER_EXTENSIONS)$", RegexOption.IGNORE_CASE)
++    private val LEADING_GROUP_TOKEN_REGEX = Regex("^[A-Za-z0-9][A-Za-z0-9._]{0,23}")
++    private val BRACKET_GROUP_REGEX = Regex("^\\[([A-Za-z0-9][A-Za-z0-9._-]{1,23})\\]")
++    private val TERMINAL_GROUP_REGEX = Regex("-([A-Za-z0-9][A-Za-z0-9_]{1,23})$")
++    private val SEASON_EPISODE_TOKEN_REGEX = Regex("(?i)(s\\d{1,4}(e\\d{1,4})?|e\\d{1,4})")
++    private val CHANNEL_TOKEN_REGEX = Regex("^\\d\\.\\d$")
++
++    /**
++     * Fake-quality spellings (KE Spec 65 P4; VortX `StreamRanking.kt` `junkClass`, GPL-3.0):
++     * CAM, TS, TC, screener, R5, workprint and upscaled releases. Bare cam/ts/tc/scr are
++     * [ReleaseQuality] already (default exclusions, so not repeated here). Read on lowercase
++     * text with [JUNK_BLANK_REGEX]'s matches blanked: container extensions ("HD.ts" is not a
++     * telesync) and negated upscale phrases ("Not.AI.Upscaled"). An apostrophe before
++     * "s print" is a possessive ("director's print"); the dotted spelling
++     * "Director.s.Print" still reads as S-Print (indistinguishable from the tag).
++     */
++    private val JUNK_TEXT_REGEX = Regex(
++        "(?<![a-z0-9])(" +
++            "h[dq][ ._-]?cam(rip)?|cam[ ._-]?rip|(?<!['\u2019])s[ ._-]+print|" +
++            "telesynch?|hd[ ._-]?ts(rip)?|ts[ ._-]?rip|telecine|hd[ ._-]?tc|" +
++            "screener|(dvd|bd|br|web|hd)[ ._-]?scr|p(re)?dvd(rip)?|workprint|r5|" +
++            "upscaled?|up[ ._-]?rez|ai[ ._-]?(upscaled?|enhanced?)" +
++            ")(?![a-z0-9])"
++    )
++    private val JUNK_BLANK_REGEX = Regex(
++        "\\.($CONTAINER_EXTENSIONS)(?![a-z0-9])|" +
++            "(?<![a-z0-9])(not|non|no)[ ._-]+(ai[ ._-]?)?(upscaled?|up[ ._-]?rez|enhanced?)(?![a-z0-9])"
++    )
++    private const val MIB = 1024L * 1024L
++
++    /** Hyphen-suffixed tokens in release names that are never the group. */
++    private val NON_GROUP_TOKENS = setOf(
++        "dl", "rip", "hd", "uhd", "sd", "web", "bluray", "remux", "hdr", "hdr10", "sdr",
++        "dv", "dovi", "ma", "es", "x", "atmos", "truehd", "dts", "aac", "ac3", "eac3",
++        "flac", "opus", "avc", "hevc", "av1", "x264", "x265", "h264", "h265", "vc1",
++        "10bit", "8bit", "hi10p", "imax", "proper", "repack", "extended", "remastered",
++        "unrated", "multi", "dual", "sub", "subs", "dubbed", "hc", "cam", "ts", "tc", "scr",
++        "2160p", "1440p", "1080p", "720p", "576p", "480p", "360p", "4k", "2k",
++        // Same on unrelated releases, so never a group (KE Spec 65 P7 red team b19e4557): rip and
++        // source words, codecs, service tags, dub/audio, Usenet repost suffixes.
++        "webrip", "webdl", "hdrip", "bdrip", "brrip", "dvdrip", "hdtv", "xvid", "divx", "amzn", "nf",
++        "dub", "audio", "obfuscated", "postbot", "xpost", "rakuv", "asrequested", "scrambled"
++    )
++
++    /** Ladder/exclusion names containing '-' or '.' that last-hyphen splitting would mangle. */
++    private val COMPOUND_GROUP_REGEX = Regex(
++        "(?<![A-Za-z0-9])(VISIONPLUSHDR\\-X|BR\\-GuyZo|Pahe\\.in|Pahe\\.ph|D\\-Z0N3|YTS\\.LT|YTS\\.MX|YTS\\.AG|C\\.A\\.A)(?![A-Za-z0-9])",
++        RegexOption.IGNORE_CASE
++    )
++
++    /** Tags naming Dolby Vision / any HDR format; also the filters' HDR keys in KE (StreamFacets). */
++    internal val DV_FAMILY = setOf(ReleaseVisualTag.DV, ReleaseVisualTag.DV_ONLY, ReleaseVisualTag.HDR_DV)
++    internal val HDR_FAMILY = setOf(
++        ReleaseVisualTag.HDR, ReleaseVisualTag.HDR10, ReleaseVisualTag.HDR10_PLUS, ReleaseVisualTag.HLG,
++        ReleaseVisualTag.HDR_ONLY, ReleaseVisualTag.HDR_DV
++    )
++
++    /** Excluded-list checks shared with auto-select ranking across all sources. */
++    private fun ReleaseFacts.passesExclusions(preferences: ReleaseRankPreferences): Boolean {
++        if (resolution in preferences.excludedResolutions) return false
++        if (quality in preferences.excludedQualities) return false
++        if (visualTags.any { it in preferences.excludedVisualTags }) return false
++        if (audioTags.any { it in preferences.excludedAudioTags }) return false
++        if (audioChannels.any { it in preferences.excludedAudioChannels }) return false
++        if (encode in preferences.excludedEncodes) return false
++        if (preferences.excludedReleaseGroups.any { releaseGroup.equals(it, ignoreCase = true) }) return false
++        return true
++    }
++
++    fun passesExclusionFilters(
++        facts: ReleaseFacts,
++        preferences: ReleaseRankPreferences = ReleaseRankPreferences.DEFAULT
++    ): Boolean = facts.passesExclusions(preferences)
++
++    fun factsFor(
++        stream: Stream,
++        preferences: ReleaseRankPreferences = ReleaseRankPreferences.DEFAULT
++    ): ReleaseFacts = streamFacts(stream, preferences)
++
++    /**
++     * Only the resolution of [stream], as [factsFor] reads it (KE Spec 58 F3's resolution limit):
++     * the stream's search text is built only when the resolver parse names no resolution, so a
++     * list check stays far cheaper than full facts.
++     */
++    fun resolutionOf(stream: Stream): ReleaseResolution =
++        resolutionFrom(stream, stream.clientResolve?.stream?.raw?.parsed) {
++            streamSearchText(stream).lowercase()
++        }
++
++    /**
++     * The one resolution rule: the clientResolve parse and the stream's quality, else the
++     * stream's text. [searchText] runs only for that last step (a vararg argument would build
++     * it every time).
++     */
++    private inline fun resolutionFrom(
++        stream: Stream,
++        parsed: StreamClientResolveParsed?,
++        searchText: () -> String
++    ): ReleaseResolution = streamResolution(parsed?.resolution, parsed?.quality, stream.quality)
++        .takeIf { it != ReleaseResolution.UNKNOWN }
++        ?: streamResolution(searchText())
++
++    /**
++     * The resolver's parsed fields are final where they map (in KE the AIOStreams parse was, for
++     * the same reason): its visual tags and release group settle the field when present, and
++     * every other field falls back to the text path when the parse lacks it.
++     */
++    private fun streamFacts(stream: Stream, preferences: ReleaseRankPreferences): ReleaseFacts {
++        val parsed = stream.clientResolve?.stream?.raw?.parsed
++        val rawSearchText = streamSearchText(stream)
++        val searchText = rawSearchText.lowercase()
++        val resolution = resolutionFrom(stream, parsed) { searchText }
++        val quality = streamQuality(parsed?.quality, searchText)
++        val visualTags = streamVisualTags(parsed?.hdr.orEmpty(), rawSearchText)
++        val audioTags = streamAudioTags(parsed?.audio.orEmpty(), searchText)
++        val audioChannels = streamAudioChannels(parsed?.channels.orEmpty(), searchText)
++        val encode = streamEncode(parsed?.codec, searchText)
++        val releaseGroup = releaseGroupOf(stream)
++        val size = streamSize(stream)
++        return ReleaseFacts(
++            resolution = resolution,
++            quality = quality,
++            visualTags = visualTags,
++            audioTags = audioTags,
++            audioChannels = audioChannels,
++            encode = encode,
++            releaseGroup = releaseGroup,
++            size = size,
++            resolutionRank = rank(resolution, preferences.preferredResolutions),
++            qualityRank = rank(quality, preferences.preferredQualities),
++            visualRank = rankAny(visualTags, preferences.preferredVisualTags),
++            audioRank = rankAny(audioTags, preferences.preferredAudioTags),
++            channelRank = rankAny(audioChannels, preferences.preferredAudioChannels),
++            encodeRank = rank(encode, preferences.preferredEncodes),
++            groupRank = releaseGroupRank(releaseGroup, preferences.preferredReleaseGroups),
++            editions = streamEditions(parsed, searchText),
++            languages = streamLanguages(parsed, searchText),
++            suspect = isSuspect(resolution, size, searchText)
++        )
++    }
++
++    /** [ReleaseFacts.suspect]: a fake-quality spelling, or an implausible size (KE Spec 65 P4). */
++    private fun isSuspect(
++        resolution: ReleaseResolution,
++        size: Long?,
++        searchText: String
++    ): Boolean =
++        JUNK_TEXT_REGEX.containsMatchIn(JUNK_BLANK_REGEX.replace(searchText, " ")) ||
++            implausibleSize(resolution, size)
++
++    /**
++     * A known size far too small for the claimed resolution even for an episode (VortX
++     * `implausibleForResolution` episode floors). Release text cannot tell a film from an episode
++     * (KE Spec 65 S1 red team: 1x04, Ep05, date-named shows, seeder counts read as years), so the
++     * film floors apply only through [belowFilmSizeFloor], when the caller knows (D4).
++     */
++    private fun implausibleSize(resolution: ReleaseResolution, size: Long?): Boolean =
++        belowSizeFloor(resolution, size, film = false)
++
++    /** [facts]' known size is under the film floor for its resolution (KE Spec 65 D4: caller-known films only). */
++    fun belowFilmSizeFloor(facts: ReleaseFacts): Boolean = belowSizeFloor(facts.resolution, facts.size, film = true)
++
++    /**
++     * VortX floors: 2160p film 1800 / episode 700 MiB, 1080p 600 / 150. Unknown size, or a resolution
++     * other than 2160p/1080p, passes; so does a reading under 1 MiB, a misparsed bitrate ("640kb").
++     */
++    private fun belowSizeFloor(resolution: ReleaseResolution, size: Long?, film: Boolean): Boolean {
++        if (size == null || size < MIB) return false
++        val floorMib = when (resolution) {
++            ReleaseResolution.P2160 -> if (film) 1800 else 700
++            ReleaseResolution.P1080 -> if (film) 600 else 150
++            else -> return false
++        }
++        return size < floorMib * MIB
++    }
++
++    /** One home for the combined DV/HDR tag the text path derives (AIOStreams derives the same set). */
++    private fun dvHdrCombination(hasDv: Boolean, hasHdr: Boolean): ReleaseVisualTag? = when {
++        hasDv && hasHdr -> ReleaseVisualTag.HDR_DV
++        hasDv -> ReleaseVisualTag.DV_ONLY
++        hasHdr -> ReleaseVisualTag.HDR_ONLY
++        else -> null
++    }
++
++    /** Edition display tokens (KE P6), first source that has any: resolver flags, text. */
++    private fun streamEditions(
++        parsed: StreamClientResolveParsed?,
++        searchText: String
++    ): List<String> =
++        parsed?.let(ReleaseEditions::fromResolver)?.ifEmpty { null }
++            ?: ReleaseEditions.fromText(searchText)
++
++    /** Language tokens (KE P7), first source that has any: resolver, multi/dual text. */
++    private fun streamLanguages(
++        parsed: StreamClientResolveParsed?,
++        searchText: String
++    ): List<String> =
++        parsed?.languages?.let(ReleaseLanguages::tokensOf)?.ifEmpty { null }
++            ?: ReleaseLanguages.multiFromText(searchText)
++
++    private fun streamResolution(vararg values: String?): ReleaseResolution {
++        return values.firstNotNullOfOrNull { resolutionValue(it) } ?: ReleaseResolution.UNKNOWN
++    }
++
++    private fun resolutionValue(value: String?): ReleaseResolution? {
++        val normalized = value?.lowercase().orEmpty()
++        return RESOLUTION_HEIGHT_PATTERNS.firstMatch(normalized)
++            ?: RESOLUTION_ALIAS_PATTERNS.firstMatch(normalized)
++            ?: RESOLUTION_BARE_HEIGHT_PATTERNS.firstMatch(normalized)
++            ?: RESOLUTION_WEAK_ALIAS_PATTERNS.firstMatch(normalized)
++    }
++
++    private fun List<Pair<Regex, ReleaseResolution>>.firstMatch(text: String): ReleaseResolution? =
++        firstOrNull { (regex, _) -> regex.containsMatchIn(text) }?.second
++
++    private fun streamQuality(parsedQuality: String?, searchText: String): ReleaseQuality {
++        val text = listOfNotNull(parsedQuality, searchText).joinToString(" ").lowercase()
++        return when {
++            text.contains("remux") -> ReleaseQuality.BLURAY_REMUX
++            text.contains("blu-ray") || text.contains("bluray") || text.contains("bdrip") || text.contains("brrip") -> ReleaseQuality.BLURAY
++            text.contains("web-dl") || text.contains("webdl") -> ReleaseQuality.WEB_DL
++            text.contains("webrip") || text.contains("web-rip") -> ReleaseQuality.WEBRIP
++            text.contains("hdrip") -> ReleaseQuality.HDRIP
++            text.contains("hd-rip") || text.contains("hcrip") -> ReleaseQuality.HD_RIP
++            text.contains("dvdrip") -> ReleaseQuality.DVDRIP
++            text.contains("hdtv") -> ReleaseQuality.HDTV
++            text.hasToken("cam") -> ReleaseQuality.CAM
++            text.hasToken("ts") -> ReleaseQuality.TS
++            text.hasToken("tc") -> ReleaseQuality.TC
++            text.hasToken("scr") -> ReleaseQuality.SCR
++            else -> ReleaseQuality.UNKNOWN
++        }
++    }
++
++    /** Takes the original-case text: the 3D check reads case (KE B9), everything else lowercase. */
++    private fun streamVisualTags(parsedHdr: List<String>, rawSearchText: String): List<ReleaseVisualTag> {
++        val searchText = rawSearchText.lowercase()
++        val text = (parsedHdr + searchText).joinToString(" ").lowercase()
++        val tags = mutableListOf<ReleaseVisualTag>()
++        val hasDv = parsedHdr.any { it.isDolbyVisionToken() } || DV_TEXT_REGEX.containsMatchIn(searchText)
++        val hasHdr = parsedHdr.any { it.isHdrToken() } || HDR_TEXT_REGEX.containsMatchIn(searchText)
++        dvHdrCombination(hasDv, hasHdr)?.let { tags += it }
++        if (text.contains("hdr10+") || text.contains("hdr10plus")) tags += ReleaseVisualTag.HDR10_PLUS
++        if (text.contains("hdr10")) tags += ReleaseVisualTag.HDR10
++        if (hasDv) tags += ReleaseVisualTag.DV
++        if (hasHdr) tags += ReleaseVisualTag.HDR
++        if (text.hasToken("hlg")) tags += ReleaseVisualTag.HLG
++        if (text.contains("10bit") || text.contains("10 bit")) tags += ReleaseVisualTag.TEN_BIT
++        val isThreeD = parsedHdr.any { it.equals("3d", ignoreCase = true) } ||
++            THREE_D_TEXT_REGEX.containsMatchIn(rawSearchText) ||
++            THREE_D_LAYOUT_REGEX.containsMatchIn(text)
++        if (isThreeD) tags += ReleaseVisualTag.THREE_D
++        if (text.hasToken("imax")) tags += ReleaseVisualTag.IMAX
++        if (text.hasToken("ai")) tags += ReleaseVisualTag.AI
++        if (text.hasToken("sdr")) tags += ReleaseVisualTag.SDR
++        if (text.contains("h-ou")) tags += ReleaseVisualTag.H_OU
++        if (text.contains("h-sbs")) tags += ReleaseVisualTag.H_SBS
++        return tags.distinct().ifEmpty { listOf(ReleaseVisualTag.UNKNOWN) }
++    }
++
++    private fun streamAudioTags(parsedAudio: List<String>, searchText: String): List<ReleaseAudioTag> {
++        val text = (parsedAudio + searchText).joinToString(" ").lowercase()
++        val tags = mutableListOf<ReleaseAudioTag>()
++        if (text.hasToken("atmos")) tags += ReleaseAudioTag.ATMOS
++        if (DD_PLUS_TEXT_REGEX.containsMatchIn(text)) tags += ReleaseAudioTag.DD_PLUS
++        if (DD_TEXT_REGEX.containsMatchIn(text)) tags += ReleaseAudioTag.DD
++        if (text.contains("dts:x") || text.contains("dtsx")) tags += ReleaseAudioTag.DTS_X
++        if (text.contains("dts-hd ma") || text.contains("dtshd ma")) tags += ReleaseAudioTag.DTS_HD_MA
++        if (text.contains("dts-hd") || text.contains("dtshd")) tags += ReleaseAudioTag.DTS_HD
++        if (text.contains("dts-es") || text.contains("dtses")) tags += ReleaseAudioTag.DTS_ES
++        if (text.hasToken("dts")) tags += ReleaseAudioTag.DTS
++        if (text.contains("truehd") || text.contains("true hd")) tags += ReleaseAudioTag.TRUEHD
++        if (text.hasToken("opus")) tags += ReleaseAudioTag.OPUS
++        if (text.hasToken("flac")) tags += ReleaseAudioTag.FLAC
++        if (text.hasToken("aac")) tags += ReleaseAudioTag.AAC
++        return tags.distinct().ifEmpty { listOf(ReleaseAudioTag.UNKNOWN) }
++    }
++
++    private fun streamAudioChannels(parsedChannels: List<String>, searchText: String): List<ReleaseAudioChannel> {
++        val text = (parsedChannels + searchText).joinToString(" ").lowercase()
++        val channels = mutableListOf<ReleaseAudioChannel>()
++        if (text.hasToken("7.1")) channels += ReleaseAudioChannel.CH_7_1
++        if (text.hasToken("6.1")) channels += ReleaseAudioChannel.CH_6_1
++        if (text.hasToken("5.1") || text.hasToken("6ch")) channels += ReleaseAudioChannel.CH_5_1
++        if (text.hasToken("2.0")) channels += ReleaseAudioChannel.CH_2_0
++        return channels.distinct().ifEmpty { listOf(ReleaseAudioChannel.UNKNOWN) }
++    }
++
++    private fun streamEncode(parsedCodec: String?, searchText: String): ReleaseEncode {
++        val text = listOfNotNull(parsedCodec, searchText).joinToString(" ").lowercase()
++        return when {
++            text.hasToken("av1") -> ReleaseEncode.AV1
++            text.hasToken("hevc") || text.hasToken("h265") || text.hasToken("x265") -> ReleaseEncode.HEVC
++            text.hasToken("avc") || text.hasToken("h264") || text.hasToken("x264") -> ReleaseEncode.AVC
++            text.hasToken("xvid") -> ReleaseEncode.XVID
++            text.hasToken("divx") -> ReleaseEncode.DIVX
++            else -> ReleaseEncode.UNKNOWN
++        }
++    }
++
++    /**
++     * KE Spec 65 P7 (D11): the release group only from a source that names one as such: the
++     * resolver's parsed group, else a terminal `-GROUP` or leading `[GROUP]` token of a filename
++     * or torrent name ([terminalReleaseGroup]). Never the display name, title or description,
++     * and never a mid-line hyphen word: those read pack titles ("S01-S05 Complete") and episode
++     * titles ("- The Return (...)") as groups (red team `f2cd86b6`). Null when none qualifies.
++     */
++    fun parsedReleaseGroupOf(stream: Stream): String? {
++        stream.clientResolve?.stream?.raw?.parsed?.group?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
++        return releaseNamesOf(stream).firstNotNullOfOrNull(::terminalReleaseGroup)
++    }
++
++    /** The stream's release-name fields, most reliable first (filenames, then torrent names). */
++    private fun releaseNamesOf(stream: Stream): List<String> {
++        val resolve = stream.clientResolve
++        val raw = resolve?.stream?.raw
++        return listOfNotNull(
++            stream.behaviorHints?.filename,
++            resolve?.filename,
++            raw?.filename,
++            resolve?.torrentName,
++            raw?.torrentName
++        )
++    }
++
++    /**
++     * A one-line release name's terminal `-GROUP` (extension stripped), else its leading `[GROUP]`
++     * without a dot (a dotted bracket is a site tag), else null.
++     */
++    private fun terminalReleaseGroup(name: String): String? {
++        val line = name.trim().takeIf { it.isNotEmpty() && '\n' !in it } ?: return null
++        val stripped = CONTAINER_EXTENSION_REGEX.replace(line, "")
++        TERMINAL_GROUP_REGEX.find(stripped)?.groupValues?.get(1)?.takeIf(::isGroupToken)?.let { return it }
++        return BRACKET_GROUP_REGEX.find(line)?.groupValues?.get(1)?.takeIf { '.' !in it && isGroupToken(it) }
++    }
++
++    private fun isGroupToken(token: String): Boolean =
++        token.lowercase() !in NON_GROUP_TOKENS && !token.all { it.isDigit() } && !SEASON_EPISODE_TOKEN_REGEX.matches(token)
++
++    /**
++     * Parses the release group from a stream's advertised fields, tried
++     * most-reliable-first: resolver-parsed group, then filenames, torrent
++     * names, and finally display text. URLs are deliberately not candidates.
++     */
++    private fun releaseGroupOf(stream: Stream): String {
++        val parsedGroup = stream.clientResolve?.stream?.raw?.parsed?.group
++        if (!parsedGroup.isNullOrBlank()) return parsedGroup.trim()
++        val candidates = releaseNamesOf(stream) + listOfNotNull(stream.name, stream.title, stream.description)
++        for (candidate in candidates) {
++            val group = releaseGroupFromText(candidate)
++            if (group.isNotEmpty()) return group
++        }
++        return ""
++    }
++
++    /**
++     * Extracts the group as the token after the LAST hyphen of a line once
++     * the container extension is stripped, rejecting codec/source/resolution
++     * tokens. Known compound names containing '-' or '.' (e.g. D-Z0N3) are
++     * matched explicitly first, and leading [Group] prefixes are honoured.
++     * Single-character groups are only accepted when terminal on the line.
++     */
++    internal fun releaseGroupFromText(text: String): String {
++        val trimmed = text.trim()
++        if (trimmed.isEmpty()) return ""
++        COMPOUND_GROUP_REGEX.find(trimmed)?.let { return it.value }
++        BRACKET_GROUP_REGEX.find(trimmed)?.let { match ->
++            val candidate = match.groupValues[1]
++            if (candidate.lowercase() !in NON_GROUP_TOKENS) return candidate
++        }
++        for (line in trimmed.lineSequence()) {
++            val stripped = CONTAINER_EXTENSION_REGEX.replace(line.trim(), "")
++            val hyphen = stripped.lastIndexOf('-')
++            if (hyphen <= 0 || hyphen >= stripped.length - 1) continue
++            val tail = stripped.substring(hyphen + 1).trim()
++            var token = LEADING_GROUP_TOKEN_REGEX.find(tail)?.value ?: continue
++            token = CONTAINER_EXTENSION_REGEX.replace(token, "")
++            if (token.isEmpty()) continue
++            val lower = token.lowercase()
++            if (lower in NON_GROUP_TOKENS) continue
++            if (token.all { it.isDigit() }) continue
++            if (CHANNEL_TOKEN_REGEX.matches(token)) continue
++            if (token.length == 1 && tail != token) continue
++            return token
++        }
++        return ""
++    }
++
++    private fun releaseGroupRank(group: String, preferred: List<String>): Int {
++        if (group.isEmpty()) return Int.MAX_VALUE
++        val index = preferred.indexOfFirst { it.equals(group, ignoreCase = true) }
++        return if (index >= 0) index else Int.MAX_VALUE
++    }
++
++    private fun <T> rank(value: T, preferred: List<T>): Int {
++        val index = preferred.indexOf(value)
++        return if (index >= 0) index else Int.MAX_VALUE
++    }
++
++    private fun <T> rankAny(values: List<T>, preferred: List<T>): Int {
++        return values.minOfOrNull { rank(it, preferred) } ?: Int.MAX_VALUE
++    }
++
++    /** Whole-token match of lowercase patterns (not escaped, unlike [hasToken]). */
++    internal fun tokenRegex(vararg patterns: String): Regex =
++        Regex("(^|[^a-z0-9])(${patterns.joinToString("|")})([^a-z0-9]|\$)")
++
++    /**
++     * Receiver must already be lowercase (every caller lowercases its joined
++     * text once); [token] is a lowercase literal.
++     */
++    private fun String.hasToken(token: String): Boolean {
++        val regex = tokenRegexCache.getOrPut(token) {
++            Regex("(^|[^a-z0-9])${Regex.escape(token)}([^a-z0-9]|\$)")
++        }
++        return regex.containsMatchIn(this)
++    }
++
++    private fun String.isDolbyVisionToken(): Boolean {
++        val normalized = lowercase().replace(NON_ALNUM_REGEX, "")
++        return normalized == "dv" || normalized == "dovi" || normalized == "dolbyvision"
++    }
++
++    private fun String.isHdrToken(): Boolean {
++        val normalized = lowercase().replace(NON_ALNUM_PLUS_REGEX, "")
++        return normalized == "hdr" ||
++            normalized == "hdr10" ||
++            normalized == "hdr10+" ||
++            normalized == "hdr10plus" ||
++            normalized == "hlg"
++    }
++
++    private fun streamSize(stream: Stream): Long? =
++        StreamTextSizeParser.effectiveSizeBytes(stream)
++
++    /** Original case; callers lowercase it (only the 3D check reads the original). */
++    private fun streamSearchText(stream: Stream): String {
++        val resolve = stream.clientResolve
++        val raw = resolve?.stream?.raw
++        val parsed = raw?.parsed
++        return listOfNotNull(
++            stream.name,
++            stream.title,
++            stream.description,
++            stream.behaviorHints?.filename,
++            stream.quality,
++            resolve?.torrentName,
++            resolve?.filename,
++            raw?.torrentName,
++            raw?.filename,
++            parsed?.resolution,
++            parsed?.quality,
++            parsed?.codec,
++            parsed?.hdr?.joinToString(" "),
++            parsed?.audio?.joinToString(" ")
++        ).joinToString(" ")
++    }
++}
++
++/**
++ * Release facts parsed from one stream; `*Rank` fields index the preference ladders.
++ * [editions] and [languages] are display tokens ("EXTENDED"; "EN", "MULTI"), not ranked.
++ * [suspect]: fake quality (CAM/TS/TC/SCR/R5/workprint/upscaled) or a size implausible for the
++ * resolution (KE Spec 65 P4); auto-play ranks it below every other stream, nothing displays it.
++ */
++data class ReleaseFacts(
++    val resolution: ReleaseResolution,
++    val quality: ReleaseQuality,
++    val visualTags: List<ReleaseVisualTag>,
++    val audioTags: List<ReleaseAudioTag>,
++    val audioChannels: List<ReleaseAudioChannel>,
++    val encode: ReleaseEncode,
++    val releaseGroup: String,
++    val size: Long?,
++    val resolutionRank: Int,
++    val qualityRank: Int,
++    val visualRank: Int,
++    val audioRank: Int,
++    val channelRank: Int,
++    val encodeRank: Int,
++    val groupRank: Int,
++    val editions: List<String> = emptyList(),
++    val languages: List<String> = emptyList(),
++    val suspect: Boolean = false
++)
+diff --git a/app/src/main/java/com/nuvio/tv/core/stream/ReleaseLanguages.kt b/app/src/main/java/com/nuvio/tv/core/stream/ReleaseLanguages.kt
+new file mode 100644
+index 000000000..a5a64825c
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/stream/ReleaseLanguages.kt
+@@ -0,0 +1,59 @@
++package com.nuvio.tv.core.stream
++
++/**
++ * Audio-language display tokens for a stream's facts (P7): ISO 639-1 codes in upper case, or
++ * [MULTI] for multi/dual-audio releases and for more than two languages.
++ */
++internal object ReleaseLanguages {
++    const val MULTI = "MULTI"
++
++    private const val MAX_LISTED = 2
++
++    private val MULTI_VALUES = setOf("multi", "multi audio", "dual", "dual audio")
++
++    /**
++     * AIOStreams' LANGUAGES names (packages/core/src/utils/constants.ts, 2026-10-11). A table,
++     * not Locale lookup: "Latino" and "Portuguese (Brazil)" are not language names.
++     * "Dubbed", "Original" and "Unknown" carry no language and map to nothing. Resolver
++     * parses write Latino as "la" (Latin's code), mapped here like AIOStreams' "Latino".
++     */
++    private val CODE_BY_NAME = mapOf(
++        "la" to "ES",
++        "english" to "EN", "japanese" to "JA", "chinese" to "ZH", "russian" to "RU",
++        "arabic" to "AR", "portuguese" to "PT", "portuguese (brazil)" to "PT", "spanish" to "ES",
++        "latino" to "ES", "french" to "FR", "german" to "DE", "italian" to "IT", "korean" to "KO",
++        "hindi" to "HI", "bengali" to "BN", "punjabi" to "PA", "marathi" to "MR",
++        "gujarati" to "GU", "tamil" to "TA", "telugu" to "TE", "kannada" to "KN",
++        "malayalam" to "ML", "thai" to "TH", "vietnamese" to "VI", "indonesian" to "ID",
++        "turkish" to "TR", "hebrew" to "HE", "persian" to "FA", "ukrainian" to "UK",
++        "greek" to "EL", "lithuanian" to "LT", "latvian" to "LV", "estonian" to "ET",
++        "polish" to "PL", "czech" to "CS", "slovak" to "SK", "hungarian" to "HU",
++        "romanian" to "RO", "bulgarian" to "BG", "serbian" to "SR", "croatian" to "HR",
++        "slovenian" to "SL", "dutch" to "NL", "danish" to "DA", "finnish" to "FI",
++        "swedish" to "SV", "norwegian" to "NO", "malay" to "MS"
++    )
++
++    private val ISO_639_1_REGEX = Regex("[a-z]{2}")
++
++    /**
++     * "multi"/"dual" as a release token, not "multi-subs"/"-subtitles"/"-subbed" (subtitles,
++     * not audio). Lowercase input; the fallback when no structured languages exist (QU5-13).
++     */
++    private val MULTI_TEXT_REGEX =
++        Regex("(^|[^a-z0-9])(multi|dual)(?![a-z0-9])(?![ ._-]*sub(s|bed|titles?)?(?![a-z0-9]))")
++
++    /** Language names or codes (AIOStreams names, resolver codes) to display tokens. */
++    fun tokensOf(values: List<String>): List<String> {
++        val tokens = values.mapNotNull(::tokenOf).distinct()
++        return if (MULTI in tokens || tokens.size > MAX_LISTED) listOf(MULTI) else tokens
++    }
++
++    fun multiFromText(lowercaseText: String): List<String> =
++        if (MULTI_TEXT_REGEX.containsMatchIn(lowercaseText)) listOf(MULTI) else emptyList()
++
++    private fun tokenOf(value: String): String? {
++        val normalized = value.trim().lowercase()
++        if (normalized in MULTI_VALUES) return MULTI
++        return CODE_BY_NAME[normalized] ?: normalized.takeIf { ISO_639_1_REGEX.matches(it) }?.uppercase()
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/stream/ResolutionLimit.kt b/app/src/main/java/com/nuvio/tv/core/stream/ResolutionLimit.kt
+new file mode 100644
+index 000000000..5313e69b2
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/stream/ResolutionLimit.kt
+@@ -0,0 +1,96 @@
++package com.nuvio.tv.core.stream
++
++import android.content.Context
++import android.hardware.display.DisplayManager
++import android.view.Display
++import com.nuvio.tv.domain.model.ReleaseResolution
++import com.nuvio.tv.domain.model.Stream
++
++/** How the resolution limit is set (Spec 58 F3; Settings › Playback › Buffer & network › This TV). */
++enum class ResolutionLimitMode {
++    /** This TV's largest display mode (D2, the default). */
++    THIS_TV,
++    UP_TO_1080P,
++    UP_TO_720P,
++    OFF;
++
++    companion object {
++        /** A stored name, else the default (an unknown or missing value). */
++        fun fromStored(name: String?): ResolutionLimitMode = entries.firstOrNull { it.name == name } ?: THIS_TV
++    }
++}
++
++/**
++ * The resolution limit as it applies (device-wide, beside the stream list limit): [mode] as stored and
++ * [tvMax], the largest resolution the TV reports (null when it reports none).
++ */
++data class ResolutionLimit(
++    val mode: ResolutionLimitMode = ResolutionLimitMode.THIS_TV,
++    val tvMax: ReleaseResolution? = null
++) {
++    /**
++     * The highest resolution shown, or null when nothing is hidden: OFF, This TV with an unknown TV,
++     * or a cap at the top of the ladder (nothing is above 2160p, so a 4K TV hides nothing and its
++     * streams are never parsed).
++     */
++    val cap: ReleaseResolution?
++        get() = when (mode) {
++            ResolutionLimitMode.THIS_TV -> tvMax
++            ResolutionLimitMode.UP_TO_1080P -> ReleaseResolution.P1080
++            ResolutionLimitMode.UP_TO_720P -> ReleaseResolution.P720
++            ResolutionLimitMode.OFF -> null
++        }?.takeIf { it != ReleaseResolution.UNKNOWN && it != ReleaseResolution.P2160 }
++}
++
++/** What a stream is hidden for by the resolution limit: the [cap] it is over, and whether that is the TV's own. */
++data class ResolutionVerdict(val cap: ReleaseResolution, val fromTv: Boolean)
++
++/** How the copy names a resolution: "4K" for 2160p (the TV word), else the ladder's own "1080p". */
++fun resolutionLabel(resolution: ReleaseResolution): String =
++    if (resolution == ReleaseResolution.P2160) "4K" else resolution.label
++
++/** Highest first; UNKNOWN is not on it. */
++private val LADDER = ReleaseResolution.defaultOrder.filter { it != ReleaseResolution.UNKNOWN }
++
++/** True when [resolution] is known and above [cap] (an unknown resolution always shows, D2). */
++fun isOverResolutionCap(resolution: ReleaseResolution, cap: ReleaseResolution): Boolean {
++    if (resolution == ReleaseResolution.UNKNOWN) return false
++    return LADDER.indexOf(resolution) < LADDER.indexOf(cap)
++}
++
++/** The verdict for [stream] under [limit], or null when the limit hides nothing or the stream is not over it. */
++fun resolutionLimitVerdict(stream: Stream, limit: ResolutionLimit): ResolutionVerdict? {
++    val cap = limit.cap ?: return null
++    if (!isOverResolutionCap(ReleaseFactsParser.resolutionOf(stream), cap)) return null
++    return ResolutionVerdict(cap, fromTv = limit.mode == ResolutionLimitMode.THIS_TV)
++}
++
++/**
++ * The ladder rung of a display mode [width] x [height], landscape whichever way it is reported: the
++ * larger of its short side and the 16:9 height of its long side (a scope-width mode such as 3840x1600
++ * is still 4K; 2560x1080 reads 1440p by width). Below 360 lines reads as 360p.
++ */
++fun resolutionOfMode(width: Int, height: Int): ReleaseResolution {
++    val lines = maxOf(minOf(width, height), maxOf(width, height) * 9 / 16)
++    return when {
++        lines >= 2160 -> ReleaseResolution.P2160
++        lines >= 1440 -> ReleaseResolution.P1440
++        lines >= 1080 -> ReleaseResolution.P1080
++        lines >= 720 -> ReleaseResolution.P720
++        lines >= 576 -> ReleaseResolution.P576
++        lines >= 480 -> ReleaseResolution.P480
++        else -> ReleaseResolution.P360
++    }
++}
++
++/**
++ * The largest resolution the TV reports (Spec 58 D2): the largest of the default display's supported
++ * modes, null when it reports none. A box that reports only its current output mode reads that mode;
++ * the fixed choices cover it. Read where the limit inputs are built (a binder call, not per stream).
++ */
++fun tvMaxResolution(context: Context): ReleaseResolution? = runCatching {
++    val display = context.getSystemService(DisplayManager::class.java)?.getDisplay(Display.DEFAULT_DISPLAY)
++    display?.supportedModes
++        ?.map { resolutionOfMode(it.physicalWidth, it.physicalHeight) }
++        ?.minByOrNull { LADDER.indexOf(it) }
++}.getOrNull()
+diff --git a/app/src/main/java/com/nuvio/tv/core/stream/TrashReleaseGroups.kt b/app/src/main/java/com/nuvio/tv/core/stream/TrashReleaseGroups.kt
+new file mode 100644
+index 000000000..fd3926ed9
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/stream/TrashReleaseGroups.kt
+@@ -0,0 +1,76 @@
++package com.nuvio.tv.core.stream
++
++/**
++ * Release-group data derived from the TRaSH Guides custom formats for Radarr.
++ *
++ * Source: github.com/TRaSH-Guides/Guides (docs/json/radarr/cf), commit 1027cd5,
++ * 2026-07-16. TRaSH Guides is MIT licensed, Copyright (c) 2021 TRaSH; this file
++ * embeds group names extracted from those definitions with attribution.
++ *
++ * PREFERRED_LADDER orders the HQ release-group tiers best-first (Remux Tier
++ * 01..03, UHD BluRay 01..03, HD BluRay 01..03, WEB 01..03), deduplicated on
++ * first occurrence, so groups listed in several tiers keep their highest
++ * position. EXCLUDED_GROUPS flattens the LQ, Bad Dual Groups and Generated
++ * Dynamic HDR lists to literal names. "Flights" is deliberately omitted from
++ * the exclusions: upstream lists it both in WEB Tier 02 and in Generated
++ * Dynamic HDR, where the latter only matches together with fabricated HDR
++ * metadata -- a condition a flat name list cannot express -- so the preferred
++ * listing wins. Regex alternations and optionals in the upstream definitions
++ * were expanded to literals; open-ended patterns (alfaHD.*, MGE\\b.*) were
++ * truncated to their literal prefixes.
++ *
++ * Entries are matched case-insensitively against the release group parsed by
++ * ReleaseFactsParser. To refresh, re-extract from the TRaSH repository.
++ */
++object TrashReleaseGroups {
++
++    val PREFERRED_LADDER: List<String> = listOf(
++        // Remux Tier 01
++        "3L", "BiZKiT", "BLURANiUM", "BMF", "CiNEPHiLES", "FraMeSToR", "PiRAMiDHEAD", "PmP", "WiLDCAT", "ZQ",
++        // Remux Tier 02
++        "ATELiER", "NCmt", "playBD", "SiCFoI", "SURFINBIRD", "TEPES",
++        // Remux Tier 03
++        "12GaugeShotgun", "decibeL", "EPSiLON", "HiFi", "iFT", "KRaLiMaRKo", "NTb", "PTP", "SumVision", "TOA",
++        "TRiToN",
++        // UHD BluRay Tier 01
++        "CtrlHD", "MainFrame", "DON", "W4NK3R",
++        // UHD BluRay Tier 02
++        "HiDt", "HQMUX",
++        // UHD BluRay Tier 03
++        "BHDStudio", "hallowed", "HONE", "PTer", "SPHD", "WEBDV",
++        // HD BluRay Tier 01
++        "BBQ", "c0kE", "Chotab", "CRiSC", "D-Z0N3", "Dariush", "EbP", "EDPH", "Geek", "LolHD", "TayTO", "TDD", "TnP",
++        "VietHD", "ZoroSenpai",
++        // HD BluRay Tier 02
++        "EA", "HiSD", "QOQ", "SA89", "sbR",
++        // HD BluRay Tier 03
++        "LoRD", "playHD",
++        // WEB Tier 01
++        "ABBIE", "AJP69", "APEX", "PAXA", "PEXA", "XEPA", "BLUTONiUM", "BYNDR", "CMRG", "CRFW", "CRUD", "FLUX",
++        "GNOME", "KiNGS", "Kitsune", "MADSKY", "NOSiViD", "NTG", "RAWR", "SiC", "TheFarm",
++        // WEB Tier 02
++        "dB", "Flights", "MiU", "monkee", "MZABI", "PHOENiX", "playWEB", "SMURF", "TOMMY", "XEBEC", "4KBEC", "CEBEX",
++        // WEB Tier 03
++        "BLOOM", "Dooky", "GNOMiSSiON", "HHWEB", "NINJACENTRAL", "NPMS", "ROCCaT", "SiGMA", "SLiGNOME", "SwAgLaNdEr"
++    )
++
++    val EXCLUDED_GROUPS: List<String> = listOf(
++        // LQ
++        "24xHD", "41RGB", "4K4U", "AOC", "AROMA", "aXXo", "AZAZE", "BARC0DE", "BAUCKLEY", "BdC", "beAst", "BTM",
++        "C1NEM4", "C4K", "CDDHD", "CHAOS", "CHD", "CiNE", "CLEANUP", "COLLECTiVE", "CREATiVE24", "CrEwSaDe", "CTFOH",
++        "d3g", "DDR", "DNL", "DRX", "E", "EPiC", "EuReKA", "FaNGDiNG0", "Feranki1980", "FGT", "FMD", "FRDS", "FS",
++        "FZHD", "GalaxyRG", "GHD", "GPTHD", "HDHUB4U", "HDS", "HDT", "HDTime", "HDWinG", "iNTENSO", "iPlanet", "iVy",
++        "jennaortegaUHD", "jennaortega", "JFF", "KC", "KiNGDOM", "KIRA", "L0SERNIGHT", "LAMA", "Leffe", "Liber8",
++        "LiGaS", "LUCY", "MarkII", "MeGusta", "Mesc", "mHD", "mSD", "MTeam", "MT", "MySiLU", "NhaNc3", "nHD",
++        "nikt0", "NoGroup", "NoGrp", "nSD", "OFT", "Pahe.ph", "Pahe", "Pahe.in", "PATOMiEL", "PRODJi", "PSA", "PTNK",
++        "RARBG", "RBB", "RDN", "Rifftrax", "RU4HD", "SANTi", "Scene", "SHD", "ShieldBearer", "STUTTERSHIT",
++        "SUNSCREEN", "SyncUP", "TBS", "TEKNO3D", "Tigole", "TIKO", "VISIONPLUSHDR-X", "VISIONPLUSHDR1000",
++        "VISIONPLUSHDR", "WAF", "WiKi", "x0r", "YIFY", "YTS.MX", "YTS", "YTS.LT", "YTS.AG", "Zeus",
++        // Bad Dual Groups
++        "alfaHD", "BAT", "BlackBit", "BNd", "C.A.A", "C76", "Cory", "CYPHER", "EniaHD", "EXTREME", "FF", "FOXX",
++        "G4RiS", "GUEIRA", "LCD", "MGE", "MLH", "N3G4N", "ONLYMOViE", "PD", "PTHome", "RiPER", "RK", "SiGLA", "Tars",
++        "TM", "tokar86a", "TURG", "TvR", "vnlls", "WTV", "XiQUEXiQUE", "Yatogam1", "YusukeFLA", "ZigZag", "ZNM",
++        // Generated Dynamic HDR
++        "BiTOR", "DepraveD", "GuyZo", "BR-GuyZo", "SasukeducK", "tarunk9c", "VD0N", "VECTOR", "VisionXpert"
++    )
++}
+diff --git a/app/src/main/java/com/nuvio/tv/domain/model/ReleaseTags.kt b/app/src/main/java/com/nuvio/tv/domain/model/ReleaseTags.kt
+new file mode 100644
+index 000000000..5e2a6825a
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/domain/model/ReleaseTags.kt
+@@ -0,0 +1,143 @@
++package com.nuvio.tv.domain.model
++
++import com.nuvio.tv.core.stream.TrashReleaseGroups
++
++/**
++ * Release-fact ladders and exclusions used to parse and rank addon streams
++ * (source badges, auto-play QUALITY_RANK). Not user-editable: ranking always
++ * uses these shipped defaults.
++ */
++data class ReleaseRankPreferences(
++    val preferredResolutions: List<ReleaseResolution> = ReleaseResolution.defaultOrder,
++    val excludedResolutions: List<ReleaseResolution> = emptyList(),
++    val preferredQualities: List<ReleaseQuality> = ReleaseQuality.defaultOrder,
++    val excludedQualities: List<ReleaseQuality> = listOf(
++        ReleaseQuality.CAM,
++        ReleaseQuality.TS,
++        ReleaseQuality.TC,
++        ReleaseQuality.SCR
++    ),
++    val preferredVisualTags: List<ReleaseVisualTag> = ReleaseVisualTag.defaultOrder,
++    val excludedVisualTags: List<ReleaseVisualTag> = listOf(
++        ReleaseVisualTag.THREE_D,
++        ReleaseVisualTag.H_OU,
++        ReleaseVisualTag.H_SBS,
++        ReleaseVisualTag.AI
++    ),
++    val preferredAudioTags: List<ReleaseAudioTag> = ReleaseAudioTag.defaultOrder,
++    val excludedAudioTags: List<ReleaseAudioTag> = emptyList(),
++    val preferredAudioChannels: List<ReleaseAudioChannel> = ReleaseAudioChannel.defaultOrder,
++    val excludedAudioChannels: List<ReleaseAudioChannel> = emptyList(),
++    val preferredEncodes: List<ReleaseEncode> = ReleaseEncode.defaultOrder,
++    val excludedEncodes: List<ReleaseEncode> = listOf(ReleaseEncode.AV1),
++    val preferredReleaseGroups: List<String> = TrashReleaseGroups.PREFERRED_LADDER,
++    val excludedReleaseGroups: List<String> = TrashReleaseGroups.EXCLUDED_GROUPS
++) {
++    companion object {
++        /** The one ranking configuration; preferences are no longer user-editable. */
++        val DEFAULT = ReleaseRankPreferences()
++    }
++}
++
++enum class ReleaseResolution(val label: String) {
++    P2160("2160p"),
++    P1440("1440p"),
++    P1080("1080p"),
++    P720("720p"),
++    P576("576p"),
++    P480("480p"),
++    P360("360p"),
++    UNKNOWN("Unknown");
++
++    companion object {
++        val defaultOrder = listOf(P2160, P1440, P1080, P720, P576, P480, P360, UNKNOWN)
++    }
++}
++
++enum class ReleaseQuality(val label: String) {
++    BLURAY_REMUX("BluRay REMUX"),
++    BLURAY("BluRay"),
++    WEB_DL("WEB-DL"),
++    WEBRIP("WEBRip"),
++    HDRIP("HDRip"),
++    HD_RIP("HC HD-Rip"),
++    DVDRIP("DVDRip"),
++    HDTV("HDTV"),
++    CAM("CAM"),
++    TS("TS"),
++    TC("TC"),
++    SCR("SCR"),
++    UNKNOWN("Unknown");
++
++    companion object {
++        val defaultOrder = listOf(BLURAY_REMUX, BLURAY, WEB_DL, WEBRIP, HDRIP, HD_RIP, DVDRIP, HDTV, CAM, TS, TC, SCR, UNKNOWN)
++    }
++}
++
++enum class ReleaseVisualTag(val label: String) {
++    HDR_DV("HDR+DV"),
++    DV_ONLY("DV Only"),
++    HDR_ONLY("HDR Only"),
++    HDR10_PLUS("HDR10+"),
++    HDR10("HDR10"),
++    DV("DV"),
++    HDR("HDR"),
++    HLG("HLG"),
++    TEN_BIT("10bit"),
++    THREE_D("3D"),
++    IMAX("IMAX"),
++    AI("AI"),
++    SDR("SDR"),
++    H_OU("H-OU"),
++    H_SBS("H-SBS"),
++    UNKNOWN("Unknown");
++
++    companion object {
++        val defaultOrder = listOf(HDR_DV, DV_ONLY, HDR_ONLY, HDR10_PLUS, HDR10, DV, HDR, HLG, TEN_BIT, IMAX, SDR, THREE_D, AI, H_OU, H_SBS, UNKNOWN)
++    }
++}
++
++enum class ReleaseAudioTag(val label: String) {
++    ATMOS("Atmos"),
++    DD_PLUS("DD+"),
++    DD("DD"),
++    DTS_X("DTS:X"),
++    DTS_HD_MA("DTS-HD MA"),
++    DTS_HD("DTS-HD"),
++    DTS_ES("DTS-ES"),
++    DTS("DTS"),
++    TRUEHD("TrueHD"),
++    OPUS("OPUS"),
++    FLAC("FLAC"),
++    AAC("AAC"),
++    UNKNOWN("Unknown");
++
++    companion object {
++        val defaultOrder = listOf(TRUEHD, DTS_HD_MA, ATMOS, DTS_X, FLAC, DTS_HD, DTS_ES, DD_PLUS, DTS, DD, OPUS, AAC, UNKNOWN)
++    }
++}
++
++enum class ReleaseAudioChannel(val label: String) {
++    CH_2_0("2.0"),
++    CH_5_1("5.1"),
++    CH_6_1("6.1"),
++    CH_7_1("7.1"),
++    UNKNOWN("Unknown");
++
++    companion object {
++        val defaultOrder = listOf(CH_7_1, CH_6_1, CH_5_1, CH_2_0, UNKNOWN)
++    }
++}
++
++enum class ReleaseEncode(val label: String) {
++    AV1("AV1"),
++    HEVC("HEVC"),
++    AVC("AVC"),
++    XVID("XviD"),
++    DIVX("DivX"),
++    UNKNOWN("Unknown");
++
++    companion object {
++        val defaultOrder = listOf(HEVC, AVC, AV1, XVID, DIVX, UNKNOWN)
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
+index a4ab5add3..4767be392 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
+@@ -1913,6 +1913,21 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
+         try {
+             streamRepository.setLocalPluginSearchPaused(false)
+             val playerSettings = playerSettingsDataStore.playerSettings.first()
++            // Nuvio-KE port (KE Spec 65 S3/P3): the next episode's identity guards the
++            // auto-selected stream against release names for another season or episode. A film
++            // never reaches this path, so the film floors and year check stay off here; the
++            // release year is not carried per episode, and the guard only reads it for films.
++            val autoPlayIdentity = com.nuvio.tv.core.stream.ContentIdentity.of(
++                type = type,
++                title = state.contentName ?: state.title,
++                year = null,
++                season = nextVideo.season,
++                episode = nextVideo.episode,
++                videoId = nextVideo.id
++            )
++            // Nuvio-KE port (KE Spec 58 F3): the resolution limit defaults to this TV's largest
++            // display mode; the fork has no user setting for the cap, so KE's default applies.
++            val resolutionCap = com.nuvio.tv.core.stream.tvMaxResolution(context)
+             val shouldAutoSelectInManualMode =
+                 playerSettings.streamAutoPlayMode == StreamAutoPlayMode.MANUAL &&
+                     (
+@@ -1989,7 +2004,9 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
+                         null
+                     },
+                     preferBingeGroupInSelection = playerSettings.streamAutoPlayPreferBingeGroupForNextEpisode,
+-                    bingeGroupOnly = bingeGroupOnlyManualMode
++                    bingeGroupOnly = bingeGroupOnlyManualMode,
++                    identity = autoPlayIdentity,
++                    resolutionCap = resolutionCap
+                 )
+             }
+ 
+@@ -2026,7 +2043,9 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
+                     selectedPlugins = effectiveSelectedPlugins,
+                     preferredBingeGroup = currentStreamBingeGroup,
+                     preferBingeGroupInSelection = true,
+-                    bingeGroupOnly = true
++                    bingeGroupOnly = true,
++                    identity = autoPlayIdentity,
++                    resolutionCap = resolutionCap
+                 )
+             }
+ 
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
+index 6b3f7707d..a178e9e4e 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
+@@ -17,6 +17,8 @@ import com.nuvio.tv.core.torrent.TorrentService
+ import com.nuvio.tv.core.torrent.TorrentState
+ import com.nuvio.tv.core.player.StreamAutoPlayPolicy
+ import com.nuvio.tv.core.player.StreamAutoPlaySelector
++import com.nuvio.tv.core.stream.ContentIdentity
++import com.nuvio.tv.core.stream.tvMaxResolution
+ import com.nuvio.tv.core.tracking.TrackingMediaKind
+ import com.nuvio.tv.core.tracking.TrackingMediaReference
+ import com.nuvio.tv.core.tracking.TrackingScrobbleAction
+@@ -637,6 +639,24 @@ class StreamScreenViewModel @Inject constructor(
+             }
+             val directDebridSourceNames = emptyList<String>()
+             val directDebridAvailable = false
++            // Nuvio-KE port (KE Spec 65 S3): what this screen was asked to play. The identity
++            // guard rejects candidates whose release name names another season or episode (or,
++            // for a film, a title year more than one off), and a movie enables the film size
++            // floors in the quality rank. Anime ids that number episodes per database entry
++            // keep season and episode unknown (ContentIdentity.of).
++            val autoPlayIdentity = ContentIdentity.of(
++                type = contentType,
++                title = contentName ?: title,
++                year = year,
++                season = season,
++                episode = episode,
++                videoId = videoId
++            )
++            // Nuvio-KE port (KE Spec 58 F3): the resolution limit defaults to this TV's largest
++            // display mode. The fork has no user setting for the cap, so KE's default applies;
++            // null (the display reports nothing usable) hides nothing. One binder call per load,
++            // never per stream.
++            val resolutionCap = tvMaxResolution(context)
+             val persistedBingeGroup = if (playerSettings.streamAutoPlayPreferBingeGroupForNextEpisode &&
+                 playerSettings.streamAutoPlayReuseBingeGroup) {
+                 contentId?.let { bingeGroupCacheDataStore.get(it) }
+@@ -729,7 +749,10 @@ class StreamScreenViewModel @Inject constructor(
+                                 stream.infoHash?.equals(persistedInfoHash, ignoreCase = true) == true
+                         }
+                     } else null
+-                    // Fall back to binge group alone
++                    // Fall back to binge group alone. Nuvio-KE port: the exact filename/infoHash
++                    // match above continues the stream the viewer actually watched, so it is
++                    // deliberately not second-guessed by the pre-selection checks (KE D2); the
++                    // fallback pick below is an auto choice and is gated and ranked.
+                     bingeAndFilename ?: bingeAndInfoHash ?: StreamAutoPlaySelector.selectAutoPlayStream(
+                         streams = allStreams,
+                         mode = playerSettings.streamAutoPlayMode,
+@@ -740,7 +763,9 @@ class StreamScreenViewModel @Inject constructor(
+                         selectedPlugins = playerSettings.streamAutoPlaySelectedPlugins,
+                         preferredBingeGroup = persistedBingeGroup,
+                         preferBingeGroupInSelection = true,
+-                        bingeGroupOnly = true
++                        bingeGroupOnly = true,
++                        identity = autoPlayIdentity,
++                        resolutionCap = resolutionCap
+                     )
+                 } else null
+ 
+@@ -763,7 +788,11 @@ class StreamScreenViewModel @Inject constructor(
+                         selectedAddons = playerSettings.streamAutoPlaySelectedAddons,
+                         selectedPlugins = playerSettings.streamAutoPlaySelectedPlugins,
+                         preferredBingeGroup = persistedBingeGroup,
+-                        preferBingeGroupInSelection = persistedBingeGroup != null
++                        preferBingeGroupInSelection = persistedBingeGroup != null,
++                        // Nuvio-KE port: pre-selection checks (identity guard, resolution cap)
++                        // plus, under "Prefer best picture", KE's quality-ranked ordering.
++                        identity = autoPlayIdentity,
++                        resolutionCap = resolutionCap
+                     )
+                 }
+                 if (selectedAutoPlayStream != null) {
+@@ -967,7 +996,9 @@ class StreamScreenViewModel @Inject constructor(
+                                     selectedPlugins = playerSettings.streamAutoPlaySelectedPlugins,
+                                     preferredBingeGroup = persistedBingeGroup,
+                                     preferBingeGroupInSelection = true,
+-                                    bingeGroupOnly = true
++                                    bingeGroupOnly = true,
++                                    identity = autoPlayIdentity,
++                                    resolutionCap = resolutionCap
+                                 )
+                                 if (earlyMatch != null) {
+                                     resolvedAutoPlayTarget = true
