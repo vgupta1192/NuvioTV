@@ -11,7 +11,7 @@ index 26f9a4507..fe4def2e7 100644
  
  /** Low-RAM mode: fewer eager Home rows, no hero trailers, smaller image memory cache, shorter rows. */
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt
-index b1805174c..0e84da225 100644
+index b1805174c..e84962ad7 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt
 @@ -47,6 +47,7 @@ import androidx.compose.ui.graphics.graphicsLayer
@@ -62,15 +62,18 @@ index b1805174c..0e84da225 100644
              val rowTitleLineHeight = MaterialTheme.typography.titleMedium.lineHeight
              val rowTitleHeight = remember(rowTitleLineHeight, localDensity) {
                  with(localDensity) {
-@@ -1045,7 +1052,32 @@ fun ModernHomeContent(
+@@ -1045,7 +1052,46 @@ fun ModernHomeContent(
                          .getOrDefault(NuvioTheme.spacing.xl)
                  }
              }
 -            val heroBackdropHeight = remember(screenHeight, rowsViewportHeight, rowTitleHeight) { (screenHeight - rowsViewportHeight + rowTitleHeight + 14.dp).coerceAtMost(screenHeight) }
-+            // Immersive hero: the rows viewport shrinks to a peek — the first row's header plus the
-+            // top part of its cards — so every other row stays below the fold. The first built row is
-+            // Continue Watching; when it is absent, fall back to the first row's card metrics.
-+            val immersiveFirstRowCardHeight = if (carouselRows.list.firstOrNull()?.key == MODERN_CONTINUE_WATCHING_ROW_KEY) {
++            // Immersive hero: the rows viewport shows exactly the first row — its header and the
++            // complete card incl. its caption — so every other row stays below the fold. The first
++            // built row is Continue Watching (self-contained card, no caption below); when it is
++            // absent, fall back to the first row's card metrics and allow for its title/subtitle
++            // caption. The trailing slack keeps the focused card's glow from being clipped.
++            val immersiveFirstRowIsContinueWatching = carouselRows.list.firstOrNull()?.key == MODERN_CONTINUE_WATCHING_ROW_KEY
++            val immersiveFirstRowCardHeight = if (immersiveFirstRowIsContinueWatching) {
 +                continueWatchingCardHeight
 +            } else {
 +                carouselRows.list.firstOrNull()?.items?.list?.firstOrNull()?.catalogCardMetrics(
@@ -81,9 +84,20 @@ index b1805174c..0e84da225 100644
 +                    landscapeCardHeight = landscapeCatalogCardHeight
 +                )?.height ?: portraitCatalogCardHeight
 +            }
++            val immersiveFirstRowCaptionHeight = if (immersiveFirstRowIsContinueWatching || !uiState.posterLabelsEnabled) {
++                NuvioTheme.spacing.none
++            } else {
++                val captionTitleLineHeight = MaterialTheme.typography.titleMedium.lineHeight
++                val captionSubtitleLineHeight = MaterialTheme.typography.labelMedium.lineHeight
++                with(localDensity) {
++                    val captionTitle = runCatching { captionTitleLineHeight.toDp() }.getOrDefault(NuvioTheme.spacing.lg)
++                    val captionSubtitle = runCatching { captionSubtitleLineHeight.toDp() }.getOrDefault(NuvioTheme.spacing.md)
++                    NuvioTheme.spacing.sm + captionTitle + NuvioTheme.spacing.xxs + captionSubtitle
++                }
++            }
 +            val rowsViewportHeight = if (homeImmersiveHeroEnabled) {
-+                remember(screenHeight, rowTitleHeight, immersiveFirstRowCardHeight) {
-+                    (rowTitleHeight + 14.dp + immersiveFirstRowCardHeight * MODERN_IMMERSIVE_ROW_PEEK_FRACTION)
++                remember(screenHeight, rowTitleHeight, immersiveFirstRowCardHeight, immersiveFirstRowCaptionHeight) {
++                    (rowTitleHeight + 14.dp + immersiveFirstRowCardHeight + immersiveFirstRowCaptionHeight + NuvioTheme.spacing.lg)
 +                        .coerceAtMost(screenHeight)
 +                }
 +            } else {
@@ -96,7 +110,7 @@ index b1805174c..0e84da225 100644
              val verticalRowBringIntoViewSpec = remember(localDensity, defaultBringIntoViewSpec) {
                  val topInsetPx = with(localDensity) { MODERN_ROW_HEADER_FOCUS_INSET.toPx() }
                  @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
-@@ -1061,21 +1093,21 @@ fun ModernHomeContent(
+@@ -1061,21 +1107,21 @@ fun ModernHomeContent(
                  }
              }
              val contentFocusRequester = LocalContentFocusRequester.current
@@ -124,19 +138,6 @@ index b1805174c..0e84da225 100644
                      Modifier.align(Alignment.TopStart).fillMaxWidth().height(screenHeight)
                  } else {
                      Modifier.align(Alignment.TopEnd).offset(x = NuvioTheme.spacing.huge).fillMaxWidth(MODERN_HERO_MEDIA_WIDTH_FRACTION).height(heroBackdropHeight)
-diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeModels.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeModels.kt
-index 03447d156..55776c7af 100644
---- a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeModels.kt
-+++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeModels.kt
-@@ -31,6 +31,8 @@ internal const val MODERN_HERO_FOCUS_DEBOUNCE_MS = 450L
- internal val MODERN_ROW_HEADER_FOCUS_INSET = 40.dp
- internal const val MODERN_CONTINUE_WATCHING_ROW_KEY = "continue_watching"
- internal const val MODERN_UPCOMING_ROW_KEY = "upcoming_section"
-+/** Immersive hero: share of the first row's card height that peeks above the bottom edge, under the row header. */
-+internal const val MODERN_IMMERSIVE_ROW_PEEK_FRACTION = 0.55f
- internal val MODERN_LANDSCAPE_LOGO_GRADIENT = Brush.verticalGradient(
-     colorStops = arrayOf(
-         0.0f to Color.Transparent,
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt
 index 7f3596236..873c5fe57 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt
