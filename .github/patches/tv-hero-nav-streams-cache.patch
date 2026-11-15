@@ -1,0 +1,308 @@
+diff --git a/app/src/main/java/com/nuvio/tv/core/streams/StreamScreenResultsCache.kt b/app/src/main/java/com/nuvio/tv/core/streams/StreamScreenResultsCache.kt
+new file mode 100644
+index 000000000..38af9cc49
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/streams/StreamScreenResultsCache.kt
+@@ -0,0 +1,38 @@
++package com.nuvio.tv.core.streams
++
++import com.nuvio.tv.domain.model.AddonStreams
++
++/**
++ * Process-wide handoff of the Stream screen's loaded results so the player's Sources panel can
++ * show the same links (and per-source counts) instantly instead of re-querying every addon.
++ * Entries are keyed to the exact request and expire; an explicit refresh always bypasses it.
++ */
++object StreamScreenResultsCache {
++    private const val MAX_AGE_MS = 15 * 60_000L
++
++    private data class Entry(
++        val type: String,
++        val videoId: String,
++        val season: Int?,
++        val episode: Int?,
++        val groups: List<AddonStreams>,
++        val savedAtMs: Long
++    )
++
++    @Volatile private var entry: Entry? = null
++
++    fun put(type: String, videoId: String, season: Int?, episode: Int?, groups: List<AddonStreams>) {
++        entry = Entry(type, videoId, season, episode, groups, System.currentTimeMillis())
++    }
++
++    fun find(type: String, videoId: String, season: Int?, episode: Int?): List<AddonStreams>? {
++        val e = entry ?: return null
++        if (e.type != type || e.videoId != videoId || e.season != season || e.episode != episode) return null
++        if (System.currentTimeMillis() - e.savedAtMs > MAX_AGE_MS) return null
++        return e.groups
++    }
++
++    fun clear() {
++        entry = null
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt
+index 534224961..9c80f02fe 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt
+@@ -1224,20 +1224,39 @@ fun ModernHomeContent(
+                     },
+                     modifier = Modifier
+                 )
+-                // Immersive hero: "View title" pill under the description. Only for catalog titles
+-                // (collection folders and continue-watching hero items have no single title to open).
+-                val heroViewTitleCatalog = (activeCarouselItemState.value?.payload as? ModernPayload.Catalog)
+-                    ?.takeIf { !it.itemId.startsWith("__placeholder_") }
+-                if (homeImmersiveHeroEnabled && heroViewTitleCatalog != null) {
++                // Immersive hero: "View title" pill under the description. Available for every
++                // catalog title AND continue-watching items (both have a detail screen); only
++                // collection folders have no single title to open.
++                val heroViewTitleNavigate = when (val payload = activeCarouselItemState.value?.payload) {
++                    is ModernPayload.Catalog ->
++                        if (!payload.itemId.startsWith("__placeholder_")) {
++                            {
++                                onNavigateToDetail(payload.itemId, payload.itemType, payload.addonBaseUrl)
++                            }
++                        } else {
++                            null
++                        }
++                    is ModernPayload.ContinueWatching -> {
++                        { onNavigateToDetail(payload.item.contentId(), payload.item.contentType(), "") }
++                    }
++                    else -> null
++                }
++                if (homeImmersiveHeroEnabled && heroViewTitleNavigate != null) {
+                     HeroViewTitleButton(
+-                        onClick = {
+-                            onNavigateToDetail(
+-                                heroViewTitleCatalog.itemId,
+-                                heroViewTitleCatalog.itemType,
+-                                heroViewTitleCatalog.addonBaseUrl
+-                            )
+-                        },
+-                        onFocusedChanged = { heroViewTitleFocused.value = it }
++                        onClick = { heroViewTitleNavigate() },
++                        onFocusedChanged = { heroViewTitleFocused.value = it },
++                        onDownKey = {
++                            // Return to the exact row item the user came from.
++                            val rowKey = activeRowKey.value
++                            if (rowKey == null) {
++                                false
++                            } else {
++                                pendingRowFocusKey.value = rowKey
++                                pendingRowFocusIndex.value = activeItemIndex.intValue
++                                pendingRowFocusNonce.intValue++
++                                true
++                            }
++                        }
+                     )
+                 }
+             }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeHero.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeHero.kt
+index 57cb597ba..6f99ffa3a 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeHero.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeHero.kt
+@@ -36,6 +36,8 @@ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.draw.clip
+ import androidx.compose.ui.draw.drawWithCache
+ import androidx.compose.ui.focus.onFocusChanged
++import androidx.compose.ui.input.key.KeyEvent
++import androidx.compose.ui.input.key.onPreviewKeyEvent
+ import androidx.compose.ui.geometry.Offset
+ import androidx.compose.ui.geometry.Size
+ import androidx.compose.ui.graphics.Brush
+@@ -790,12 +792,15 @@ private fun HeroMetaDivider(
+ /**
+  * Immersive-hero "View title" pill. Focus and click are reported to the caller: focus pulls the
+  * bottom row into its hidden header-sliver state and click opens the focused hero title.
++ * [onDownKey] returning true consumes DPAD_DOWN so the caller can restore focus to the exact
++ * row item the user came from.
+  */
+ @Composable
+ internal fun HeroViewTitleButton(
+     onClick: () -> Unit,
+     onFocusedChanged: (Boolean) -> Unit,
+-    modifier: Modifier = Modifier
++    modifier: Modifier = Modifier,
++    onDownKey: (() -> Boolean)? = null
+ ) {
+     var isFocused by remember { mutableStateOf(false) }
+     val buttonShape = RoundedCornerShape(percent = 50)
+@@ -808,6 +813,12 @@ internal fun HeroViewTitleButton(
+                 color = if (isFocused) NuvioTheme.colors.TextPrimary else Color.Transparent,
+                 shape = buttonShape
+             )
++            .onPreviewKeyEvent { event ->
++                val native = event.nativeKeyEvent
++                native.action == android.view.KeyEvent.ACTION_DOWN &&
++                    native.keyCode == android.view.KeyEvent.KEYCODE_DPAD_DOWN &&
++                    onDownKey?.invoke() == true
++            }
+             .onFocusChanged {
+                 isFocused = it.isFocused
+                 onFocusedChanged(it.isFocused)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
+index 4767be392..96b68a0a1 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
+@@ -219,7 +219,8 @@ internal fun PlayerRuntimeController.loadSourceStreams(forceRefresh: Boolean) {
+                 sourceSelectedAddonFilter = if (forceRefresh || targetChanged) null else it.sourceSelectedAddonFilter,
+                 sourceFilteredStreams = if (forceRefresh || targetChanged) emptyList() else it.sourceFilteredStreams,
+                 sourceAvailableAddons = if (forceRefresh || targetChanged) emptyList() else it.sourceAvailableAddons,
+-                sourceChips = if (forceRefresh || targetChanged) emptyList() else it.sourceChips
++                sourceChips = if (forceRefresh || targetChanged) emptyList() else it.sourceChips,
++                sourceStreamCounts = if (forceRefresh || targetChanged) emptyMap() else it.sourceStreamCounts
+             )
+         }
+ 
+@@ -234,13 +235,27 @@ internal fun PlayerRuntimeController.loadSourceStreams(forceRefresh: Boolean) {
+             updateSourceChipsForFetchStart(type, vid, installedAddons)
+         }
+ 
+-        streamRepository.getStreamsFromAllAddons(
+-            type = type,
+-            videoId = vid,
+-            season = seasonArg,
+-            episode = episodeArg,
+-            forceRefresh = forceRefresh
+-        ).collect { result ->
++        // Reuse the Stream screen's already-loaded results when they match this exact request:
++        // emit them through the normal Success path (badges, chips, debrid prep all behave the
++        // same) so the panel opens instantly instead of re-querying every addon. Explicit
++        // refreshes always hit the real repository.
++        val handoffGroups = if (!forceRefresh) {
++            com.nuvio.tv.core.streams.StreamScreenResultsCache.find(type, vid, seasonArg, episodeArg)
++        } else {
++            null
++        }
++        val sourceResultsFlow = if (handoffGroups != null) {
++            kotlinx.coroutines.flow.flowOf<NetworkResult<List<AddonStreams>>>(NetworkResult.Success(handoffGroups))
++        } else {
++            streamRepository.getStreamsFromAllAddons(
++                type = type,
++                videoId = vid,
++                season = seasonArg,
++                episode = episodeArg,
++                forceRefresh = forceRefresh
++            )
++        }
++        sourceResultsFlow.collect { result ->
+             when (result) {
+                 is NetworkResult.Success -> {
+                     val addonStreams = StreamAutoPlaySelector.orderAddonStreams(result.data, installedAddonOrder, preferredServerNames)
+@@ -287,6 +302,7 @@ internal fun PlayerRuntimeController.loadSourceStreams(forceRefresh: Boolean) {
+                             sourceAllStreams = badgePreserved,
+                             sourceFilteredStreams = paginatedStreams,
+                             sourceAvailableAddons = mergedAvailableAddons,
++                            sourceStreamCounts = addonStreams.associate { group -> group.addonName to group.streams.size },
+                             sourceChips = mergeSourceChipStatuses(
+                                 existing = it.sourceChips,
+                                 succeededNames = addonStreams.map { group -> group.addonName }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+index 69bcf477c..1b2a021a4 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+@@ -3993,6 +3993,7 @@ private fun SeekOverlay(
+     duration: Long,
+     bufferedPosition: Long = 0L,
+     chapters: List<PlayerChapter> = emptyList(),
++    showRemaining: Boolean = false,
+     preview: @Composable () -> Unit = {} // Nuvio fork: seek previews
+ ) {
+     Column(
+@@ -4020,7 +4021,12 @@ private fun SeekOverlay(
+                 verticalAlignment = Alignment.CenterVertically
+             ) {
+                 Text(
+-                    text = "${formatTime(currentPosition)} / ${formatTime(duration)}",
++                    text = if (showRemaining) {
++                        val left = (duration - currentPosition).coerceAtLeast(0L)
++                        "-${formatTime(left)} / ${formatTime(duration)}"
++                    } else {
++                        "${formatTime(currentPosition)} / ${formatTime(duration)}"
++                    },
+                     style = MaterialTheme.typography.bodyMedium,
+                     color = Color.White.copy(alpha = 0.9f)
+                 )
+@@ -4032,12 +4038,14 @@ private fun SeekOverlay(
+ @Composable
+ private fun SeekOverlayHost(viewModel: PlayerViewModel, chapters: List<PlayerChapter>) {
+     val playbackTimeline by viewModel.playbackTimeline.collectAsState()
++    val uiState by viewModel.uiState.collectAsState()
+ 
+     SeekOverlay(
+         currentPosition = playbackTimeline.currentPosition,
+         duration = playbackTimeline.duration,
+         bufferedPosition = playbackTimeline.bufferedPosition,
+         chapters = chapters,
++        showRemaining = uiState.showRemainingDuration,
+         preview = { com.nuvio.tv.ui.screens.player.seekpreview.SeekPreviewThumbnailHost(viewModel = viewModel) } // Nuvio fork: seek previews
+     )
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt
+index df52fd79d..cd0c98c31 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt
+@@ -181,6 +181,8 @@ data class PlayerUiState(
+     val sourceFilteredStreams: List<Stream> = emptyList(),
+     val sourceAvailableAddons: List<String> = emptyList(),
+     val sourceChips: List<SourceChipItem> = emptyList(),
++    /** Per-source link counts for the filter chips — mirrors the standalone Stream screen. */
++    val sourceStreamCounts: Map<String, Int> = emptyMap(),
+     // Nuvio-KE port: stream URLs that already failed once in this playback, for the failure marks
+     // on the sources list rows. Session-scoped, bounded in the player runtime.
+     val sourceFailedStreamUrls: Set<String> = emptySet(),
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamSourcesSidePanel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamSourcesSidePanel.kt
+index 3d756380f..5878a8340 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamSourcesSidePanel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamSourcesSidePanel.kt
+@@ -313,12 +313,7 @@ internal fun StreamSourcesSidePanel(
+                             try { closeButtonFocusRequester.requestFocus() } catch (_: Exception) {}
+                         },
+                         // Same per-source counts the standalone Stream screen shows on its chips.
+-                        streamCounts = remember(uiState.sourceAllStreams) {
+-                            uiState.sourceAllStreams
+-                                .flatMap { it.sources.orEmpty() }
+-                                .groupingBy { it }
+-                                .eachCount()
+-                        },
++                        streamCounts = uiState.sourceStreamCounts,
+                         debugTag = "SourcesSidePanel"
+                     )
+                 }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
+index a178e9e4e..ec66d0678 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
+@@ -228,7 +228,29 @@ class StreamScreenViewModel @Inject constructor(
+     ) {
+         _uiState.update { state ->
+             val next = transform(state)
+-            if (next == state) state else next
++            if (next == state) {
++                state
++            } else {
++                // Hand the loaded results to the player's Sources panel so it can reuse them
++                // (same links, same per-source counts) instead of re-querying every addon.
++                // Only complete loads are handed off: a partial list would leave the panel's
++                // chips spinning on addons that will never answer inside the player.
++                val chipsComplete = next.sourceChips.isNotEmpty() &&
++                    next.sourceChips.none { it.status == SourceChipStatus.LOADING }
++                if ((next.addonStreams != state.addonStreams || next.sourceChips != state.sourceChips) &&
++                    chipsComplete &&
++                    next.addonStreams.isNotEmpty()
++                ) {
++                    com.nuvio.tv.core.streams.StreamScreenResultsCache.put(
++                        type = contentType,
++                        videoId = videoId,
++                        season = season,
++                        episode = episode,
++                        groups = next.addonStreams
++                    )
++                }
++                next
++            }
+         }
+     }
+ 
