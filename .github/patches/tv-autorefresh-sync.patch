@@ -1,0 +1,133 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
+index 3966e5711..90ef5546f 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
+@@ -331,6 +331,28 @@ internal fun PlayerRuntimeController.loadSourceStreams(forceRefresh: Boolean) {
+                         installedAddonNames = installedAddonNames,
+                     ) { debridPreparationLaunched = true }
+                     scheduleSourceBadgeApplication()
++                    // Two-way sync: when the player fetched these itself (not via the Stream
++                    // screen handoff), publish them back so the Stream screen can adopt them
++                    // on resume and both lists stay identical.
++                    if (handoffEntry == null && addonStreams.isNotEmpty()) {
++                        val prior = com.nuvio.tv.core.streams.StreamScreenResultsCache.snapshot(
++                            type = type, videoId = vid, season = seasonArg, episode = episodeArg
++                        )
++                        com.nuvio.tv.core.streams.StreamScreenResultsCache.put(
++                            type = type,
++                            videoId = vid,
++                            season = seasonArg,
++                            episode = episodeArg,
++                            groups = addonStreams,
++                            loading = false,
++                            refreshPhase = prior?.refreshPhase ?: 0,
++                            refreshRounds = prior?.refreshRounds ?: 0,
++                            refreshAdded = prior?.refreshAdded ?: 0,
++                            refreshDryRounds = prior?.refreshDryRounds ?: 0,
++                            refreshLastAtMs = prior?.refreshLastAtMs ?: 0L,
++                            refreshLastOk = prior?.refreshLastOk ?: true
++                        )
++                    }
+                 }
+ 
+                 is NetworkResult.Error -> {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
+index 482ead4b9..28089142b 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
+@@ -81,6 +81,8 @@ private const val DIRECT_AUTOPLAY_HARD_TIMEOUT_MS = 60_000L
+ private const val STREAM_FILTER_PAGE_SIZE = 100
+ private const val AUTO_REFRESH_INTERVAL_MS = 10_000L
+ private const val AUTO_REFRESH_TIMEOUT_MS = 45_000L
++/** Wall-clock cap for the whole addon sweep, so a hung scraper can't pin the auto-refresh engine on "waiting". */
++private const val STREAM_LOAD_HARD_TIMEOUT_MS = 90_000L
+ 
+ @HiltViewModel
+ class StreamScreenViewModel @Inject constructor(
+@@ -118,6 +120,8 @@ class StreamScreenViewModel @Inject constructor(
+     private var streamLoadJob: Job? = null
+     private var streamLoadScope: kotlinx.coroutines.CoroutineScope? = null
+     private var streamLoadCompleted = false
++    /** When this screen last published to StreamScreenResultsCache; adoption only takes newer entries. */
++    private var lastCachePublishAtMs = 0L
+     // Nuvio fork (stream auto refresh): ordering of the last load, reused when a refresh adds links.
+     private var orderStreamGroups: ((List<AddonStreams>) -> List<AddonStreams>)? = null
+     private var autoRefreshPaused = false
+@@ -257,6 +261,7 @@ class StreamScreenViewModel @Inject constructor(
+                         refreshLastAtMs = next.autoRefreshLastAtMs,
+                         refreshLastOk = next.autoRefreshLastOk
+                     )
++                    lastCachePublishAtMs = System.currentTimeMillis()
+                 }
+                 next
+             }
+@@ -408,6 +413,36 @@ class StreamScreenViewModel @Inject constructor(
+         }
+     }
+ 
++    /**
++     * Two-way sync: pull back what happened while playback owned the screen. The player's own
++     * refresh publishes its results to [com.nuvio.tv.core.streams.StreamScreenResultsCache]; on
++     * resume we merge anything newer than our last publish so the outside list matches the one
++     * the player finished with. Returns true when it adopted something.
++     */
++    fun adoptNewerCachedResults(): Boolean {
++        val entry = com.nuvio.tv.core.streams.StreamScreenResultsCache.snapshot(
++            type = contentType, videoId = videoId, season = season, episode = episode
++        ) ?: return false
++        if (entry.savedAtMs <= lastCachePublishAtMs) return false
++        val added = mergeRefreshedStreams(entry.groups)
++        if (added <= 0 && _uiState.value.allStreams.isNotEmpty()) {
++            // Nothing new link-wise; still carry the auto-refresh bookkeeping over.
++            updateUiStateIfChanged {
++                it.copy(
++                    autoRefreshRounds = entry.refreshRounds,
++                    autoRefreshAdded = entry.refreshAdded,
++                    autoRefreshDryRounds = entry.refreshDryRounds,
++                    autoRefreshLastAtMs = entry.refreshLastAtMs,
++                    autoRefreshLastOk = entry.refreshLastOk
++                )
++            }
++            lastCachePublishAtMs = entry.savedAtMs
++            return true
++        }
++        lastCachePublishAtMs = entry.savedAtMs
++        return true
++    }
++
+     /** Returns how many links the list grew by. */
+     private fun mergeRefreshedStreams(fresh: List<AddonStreams>): Int {
+         val current = _uiState.value
+@@ -507,9 +542,12 @@ class StreamScreenViewModel @Inject constructor(
+                 if (!externalPlaybackTracker.isTracking) {
+                     streamRepository.setLocalPluginSearchPaused(false)
+                 }
++                // Two-way sync: if the player's Sources panel refreshed/fetched results while we
++                // were behind the player, take them back before deciding anything needs reloading.
++                val adopted = adoptNewerCachedResults()
+                 // Reattach to the repository-owned session if playback stopped
+                 // this screen's collector before every source finished.
+-                if (!streamLoadCompleted && streamLoadJob == null) {
++                if (!adopted && !streamLoadCompleted && streamLoadJob == null) {
+                     loadStreams()
+                 }
+             }
+@@ -1197,7 +1235,17 @@ class StreamScreenViewModel @Inject constructor(
+             // sets streamLoadCompleted = true while addons are still
+             // being fetched — which makes OnResume think there is nothing
+             // left to do when the user returns from the player.
+-            streamLoadInner.join()
++            // Hard wall-clock cap: a hung scraper can keep the plugin channel
++            // open forever, and the auto-refresh engine waits on this flag —
++            // without the cap the label sticks on "waiting for the load"
++            // until the user presses refresh manually.
++            val joinedInner = kotlinx.coroutines.withTimeoutOrNull(STREAM_LOAD_HARD_TIMEOUT_MS) {
++                streamLoadInner.join()
++            }
++            if (joinedInner == null) {
++                streamLoadInner.cancel()
++                markRemainingSourceChipsAsError()
++            }
+             // Only mark completed if the coroutine was NOT cancelled.
+             // ensureActive() throws CancellationException if the scope
+             // was cancelled (e.g. user selected a stream and navigated
