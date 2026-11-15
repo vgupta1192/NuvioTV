@@ -1,0 +1,169 @@
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
+index 26f9a4507..fe4def2e7 100644
+--- a/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
++++ b/app/src/main/java/com/nuvio/tv/data/repository/ForkTvPreferences.kt
+@@ -51,6 +51,7 @@ object ForkTvPreferences {
+     val skipFeedbackPrompt = ForkTvBoolPref("skip_feedback_prompt", true)
+     val lowRamMode = ForkTvBoolPref("low_ram_mode", false)
+     val rateAfterWatching = ForkTvBoolPref("rate_after_watching", false)
++    val homeImmersiveHero = ForkTvBoolPref("home_immersive_hero", true)
+ }
+ 
+ /** Low-RAM mode: fewer eager Home rows, no hero trailers, smaller image memory cache, shorter rows. */
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt
+index b1805174c..0e84da225 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt
+@@ -47,6 +47,7 @@ import androidx.compose.ui.graphics.graphicsLayer
+ import androidx.compose.ui.platform.LocalView
+ import androidx.lifecycle.Lifecycle
+ import androidx.lifecycle.compose.LocalLifecycleOwner
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
+ import androidx.metrics.performance.PerformanceMetricsState
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.withContext
+@@ -76,6 +77,7 @@ import coil3.memory.MemoryCache
+ import coil3.request.ImageRequest
+ import androidx.compose.ui.platform.LocalConfiguration
+ import androidx.compose.ui.platform.LocalContext
++import com.nuvio.tv.data.repository.ForkTvPreferences
+ import com.nuvio.tv.domain.model.ContinueWatchingCardStyle
+ import com.nuvio.tv.domain.model.FocusedPosterTrailerPlaybackTarget
+ import com.nuvio.tv.domain.model.MetaPreview
+@@ -156,6 +158,11 @@ fun ModernHomeContent(
+     val alwaysShowLandscapeClearlogo = uiState.alwaysShowLandscapeClearlogo
+     val fullScreenBackdrop = uiState.modernHeroFullScreenBackdropEnabled
+     val trailerPlaybackTarget = uiState.focusedPosterBackdropTrailerPlaybackTarget
++    // Nuvio fork: immersive home hero (Features toggle, default on). The hero artwork fills the
++    // screen and only the first row peeks at the bottom edge; off reverts to the compact layout.
++    val forkHomeContext = LocalContext.current
++    ForkTvPreferences.homeImmersiveHero.ensureLoaded(forkHomeContext)
++    val homeImmersiveHeroEnabled by ForkTvPreferences.homeImmersiveHero.value.collectAsStateWithLifecycle()
+     val lowRamContext = androidx.compose.ui.platform.LocalContext.current
+     val effectiveAutoplayEnabled =
+         !com.nuvio.tv.data.repository.ForkTvLowRam.active(lowRamContext) &&
+@@ -1028,8 +1035,8 @@ fun ModernHomeContent(
+                 }
+             }
+ 
+-            val isFullScreenState = remember {
+-                derivedStateOf { liveHeroSceneState.value.fullScreenBackdrop }
++            val isFullScreenState = remember(homeImmersiveHeroEnabled) {
++                derivedStateOf { liveHeroSceneState.value.fullScreenBackdrop || homeImmersiveHeroEnabled }
+             }
+             val isFullScreenLambda = remember {
+                 { isFullScreenState.value }
+@@ -1037,7 +1044,7 @@ fun ModernHomeContent(
+ 
+             val localDensity = LocalDensity.current
+             val rowsViewportHeightFraction = if (useLandscapePosters) 0.49f else 0.52f
+-            val rowsViewportHeight = remember(screenHeight, rowsViewportHeightFraction) { screenHeight * rowsViewportHeightFraction }
++            val compactRowsViewportHeight = remember(screenHeight, rowsViewportHeightFraction) { screenHeight * rowsViewportHeightFraction }
+             val rowTitleLineHeight = MaterialTheme.typography.titleMedium.lineHeight
+             val rowTitleHeight = remember(rowTitleLineHeight, localDensity) {
+                 with(localDensity) {
+@@ -1045,7 +1052,32 @@ fun ModernHomeContent(
+                         .getOrDefault(NuvioTheme.spacing.xl)
+                 }
+             }
+-            val heroBackdropHeight = remember(screenHeight, rowsViewportHeight, rowTitleHeight) { (screenHeight - rowsViewportHeight + rowTitleHeight + 14.dp).coerceAtMost(screenHeight) }
++            // Immersive hero: the rows viewport shrinks to a peek — the first row's header plus the
++            // top part of its cards — so every other row stays below the fold. The first built row is
++            // Continue Watching; when it is absent, fall back to the first row's card metrics.
++            val immersiveFirstRowCardHeight = if (carouselRows.list.firstOrNull()?.key == MODERN_CONTINUE_WATCHING_ROW_KEY) {
++                continueWatchingCardHeight
++            } else {
++                carouselRows.list.firstOrNull()?.items?.list?.firstOrNull()?.catalogCardMetrics(
++                    useLandscapePosters = useLandscapePosters,
++                    portraitCardWidth = portraitCatalogCardWidth,
++                    portraitCardHeight = portraitCatalogCardHeight,
++                    landscapeCardWidth = landscapeCatalogCardWidth,
++                    landscapeCardHeight = landscapeCatalogCardHeight
++                )?.height ?: portraitCatalogCardHeight
++            }
++            val rowsViewportHeight = if (homeImmersiveHeroEnabled) {
++                remember(screenHeight, rowTitleHeight, immersiveFirstRowCardHeight) {
++                    (rowTitleHeight + 14.dp + immersiveFirstRowCardHeight * MODERN_IMMERSIVE_ROW_PEEK_FRACTION)
++                        .coerceAtMost(screenHeight)
++                }
++            } else {
++                compactRowsViewportHeight
++            }
++            val heroBackdropHeight = remember(screenHeight, rowsViewportHeight, rowTitleHeight, homeImmersiveHeroEnabled) {
++                if (homeImmersiveHeroEnabled) screenHeight
++                else (screenHeight - rowsViewportHeight + rowTitleHeight + 14.dp).coerceAtMost(screenHeight)
++            }
+             val verticalRowBringIntoViewSpec = remember(localDensity, defaultBringIntoViewSpec) {
+                 val topInsetPx = with(localDensity) { MODERN_ROW_HEADER_FOCUS_INSET.toPx() }
+                 @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
+@@ -1061,21 +1093,21 @@ fun ModernHomeContent(
+                 }
+             }
+             val contentFocusRequester = LocalContentFocusRequester.current
+-            val heroMediaWidthPx = remember(screenWidth, localDensity, fullScreenBackdrop) {
++            val heroMediaWidthPx = remember(screenWidth, localDensity, fullScreenBackdrop, homeImmersiveHeroEnabled) {
+                 with(localDensity) {
+-                    if (fullScreenBackdrop) screenWidth.roundToPx()
++                    if (fullScreenBackdrop || homeImmersiveHeroEnabled) screenWidth.roundToPx()
+                     else (screenWidth * MODERN_HERO_MEDIA_WIDTH_FRACTION).roundToPx()
+                 }.coerceAtLeast(1)
+             }
+-            val heroMediaHeightPx = remember(heroBackdropHeight, screenHeight, localDensity, fullScreenBackdrop) {
++            val heroMediaHeightPx = remember(heroBackdropHeight, screenHeight, localDensity, fullScreenBackdrop, homeImmersiveHeroEnabled) {
+                 with(localDensity) {
+-                    if (fullScreenBackdrop) screenHeight.roundToPx()
++                    if (fullScreenBackdrop || homeImmersiveHeroEnabled) screenHeight.roundToPx()
+                     else heroBackdropHeight.roundToPx()
+                 }.coerceAtLeast(1)
+             }
+ 
+-            val heroMediaModifier = remember(heroBackdropHeight, screenHeight, fullScreenBackdrop) {
+-                if (fullScreenBackdrop) {
++            val heroMediaModifier = remember(heroBackdropHeight, screenHeight, fullScreenBackdrop, homeImmersiveHeroEnabled) {
++                if (fullScreenBackdrop || homeImmersiveHeroEnabled) {
+                     Modifier.align(Alignment.TopStart).fillMaxWidth().height(screenHeight)
+                 } else {
+                     Modifier.align(Alignment.TopEnd).offset(x = NuvioTheme.spacing.huge).fillMaxWidth(MODERN_HERO_MEDIA_WIDTH_FRACTION).height(heroBackdropHeight)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeModels.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeModels.kt
+index 03447d156..55776c7af 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeModels.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeModels.kt
+@@ -31,6 +31,8 @@ internal const val MODERN_HERO_FOCUS_DEBOUNCE_MS = 450L
+ internal val MODERN_ROW_HEADER_FOCUS_INSET = 40.dp
+ internal const val MODERN_CONTINUE_WATCHING_ROW_KEY = "continue_watching"
+ internal const val MODERN_UPCOMING_ROW_KEY = "upcoming_section"
++/** Immersive hero: share of the first row's card height that peeks above the bottom edge, under the row header. */
++internal const val MODERN_IMMERSIVE_ROW_PEEK_FRACTION = 0.55f
+ internal val MODERN_LANDSCAPE_LOGO_GRADIENT = Brush.verticalGradient(
+     colorStops = arrayOf(
+         0.0f to Color.Transparent,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt
+index 7f3596236..873c5fe57 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt
+@@ -36,6 +36,7 @@ internal fun ForkFeaturesPane(
+                 forkHomeVideoOnlyRow()
+                 forkHomeLibraryRowsRows()
+                 forkCatalogUnderlineRow()
++                forkImmersiveHomeRow()
+             }
+         }
+         item {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
+index b9cc27365..a1120b4e7 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
+@@ -161,6 +161,13 @@ internal fun forkCatalogUnderlineRow() = forkTvToggleRow(
+     pref = ForkTvPreferences.catalogAccentUnderline
+ )
+ 
++@Composable
++internal fun forkImmersiveHomeRow() = forkTvToggleRow(
++    title = "Immersive home hero",
++    subtitle = "Hero artwork fills the screen with one row peeking at the bottom. Turn off for the compact home.",
++    pref = ForkTvPreferences.homeImmersiveHero
++)
++
+ @Composable
+ internal fun forkSkipFeedbackRow() = forkTvToggleRow(
+     title = "Skip feedback prompt",
