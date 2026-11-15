@@ -79363,7 +79363,7 @@ index bae6b3c0e..ff01069cd 100644
              onDetails = {
                  onNavigateToDetail(target.id, target.apiType, state.addonBaseUrl)
 diff --git a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
-index 0133c760c..0624197c8 100644
+index 0133c760c..992924724 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
 @@ -28,6 +28,7 @@ import androidx.lifecycle.viewmodel.compose.LocalViewModelStoreOwner
@@ -79387,16 +79387,26 @@ index 0133c760c..0624197c8 100644
                  PlaybackIntroHost()
              }
          }
-@@ -136,6 +143,8 @@ private fun PlaybackNavHost(
+@@ -136,6 +143,18 @@ private fun PlaybackNavHost(
  ) {
      val playbackAvailability = LocalPlaybackAvailability.current
      val context = LocalContext.current
-+    val scoutNav: com.nuvio.tv.ui.screens.scout.ScoutNavViewModel = androidx.hilt.navigation.compose.hiltViewModel()
-+    val scoutMixNav: com.nuvio.tv.ui.screens.scout.ScoutMixNavViewModel = androidx.hilt.navigation.compose.hiltViewModel()
++    // Scout: the nav session store owner has no default factory, so a bare hiltViewModel() at
++    // this level falls back to reflective creation and crashes. Anchor to the activity, whose
++    // default factory dispatches through Hilt.
++    val scoutActivity = androidx.activity.compose.LocalActivity.current as? androidx.activity.ComponentActivity
++    val scoutNav: com.nuvio.tv.ui.screens.scout.ScoutNavViewModel =
++        androidx.hilt.navigation.compose.hiltViewModel(
++            viewModelStoreOwner = checkNotNull(scoutActivity) { "Scout nav VM needs the activity owner" }
++        )
++    val scoutMixNav: com.nuvio.tv.ui.screens.scout.ScoutMixNavViewModel =
++        androidx.hilt.navigation.compose.hiltViewModel(
++            viewModelStoreOwner = checkNotNull(scoutActivity) { "Scout nav VM needs the activity owner" }
++        )
      fun isStreamToPlayer(from: String, to: String): Boolean {
          return from.startsWith("stream/") && to.startsWith("player/")
      }
-@@ -352,7 +361,23 @@ private fun PlaybackNavHost(
+@@ -352,7 +371,23 @@ private fun PlaybackNavHost(
                      navController.navigate(Screen.CatalogSeeAll.createRoute(catalogId, addonId, type))
                  },
                  onNavigateToFolderDetail = { collectionId, folderId ->
@@ -79421,7 +79431,7 @@ index 0133c760c..0624197c8 100644
                  },
                  onNavigateToGenres = { key ->
                      navController.navigate(Screen.Genres.createRoute(key)) { launchSingleTop = true }
-@@ -1225,8 +1250,11 @@ private fun PlaybackNavHost(
+@@ -1225,8 +1260,11 @@ private fun PlaybackNavHost(
                          }
                      }
                  },
@@ -79434,7 +79444,7 @@ index 0133c760c..0624197c8 100644
                      val initialSeason = args?.getString("season")?.toIntOrNull()
                      val initialEpisode = args?.getString("episode")?.toIntOrNull()
                      val episodeChangedInPlace = (currentSeason != null || currentEpisode != null) &&
-@@ -1326,6 +1354,12 @@ private fun PlaybackNavHost(
+@@ -1326,6 +1364,12 @@ private fun PlaybackNavHost(
                  },
                  onPlaybackEnded = { nextVideoId, nextSeason, nextEpisode, exitReason ->
                      val args = backStackEntry.arguments
@@ -79447,7 +79457,7 @@ index 0133c760c..0624197c8 100644
                      // YouTube fork: a video that ends by itself carries on with the next one, if autoplay is on.
                      val endedYouTubeId = args?.getString("contentId")
                          ?.takeIf { com.nuvio.tv.youtube.YouTubeProgress.isYouTubeId(it) }
-@@ -1702,6 +1736,114 @@ private fun PlaybackNavHost(
+@@ -1702,6 +1746,114 @@ private fun PlaybackNavHost(
              )
          }
  
@@ -79562,7 +79572,7 @@ index 0133c760c..0624197c8 100644
          composable(Screen.Settings.route) {
              SettingsScreen(
                  showBuiltInHeader = !hideBuiltInHeaders,
-@@ -1718,7 +1860,9 @@ private fun PlaybackNavHost(
+@@ -1718,7 +1870,9 @@ private fun PlaybackNavHost(
                  onNavigateToLicensesAttributions = {
                      navController.navigate(Screen.LicensesAttributions.route)
                  },
@@ -79573,7 +79583,7 @@ index 0133c760c..0624197c8 100644
              )
          }
  
-@@ -1978,3 +2122,25 @@ private fun PlaybackNavHost(
+@@ -1978,3 +2132,25 @@ private fun PlaybackNavHost(
          }
      }
  }
@@ -79637,10 +79647,10 @@ index 8513ce36c..403a723fd 100644
      data object WatchParty : Screen("watch_party?code={code}") {
 diff --git a/app/src/main/java/com/nuvio/tv/ui/scout/ScoutAskHost.kt b/app/src/main/java/com/nuvio/tv/ui/scout/ScoutAskHost.kt
 new file mode 100644
-index 000000000..f8993f4f5
+index 000000000..fbb6b5f3f
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/scout/ScoutAskHost.kt
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,70 @@
 +package com.nuvio.tv.ui.scout
 +
 +import androidx.compose.runtime.Composable
@@ -79664,7 +79674,18 @@ index 000000000..f8993f4f5
 +
 +/** Asks "How was it?" over whichever page the player returned to. */
 +@Composable
-+fun ScoutAskHost(isPlayerShowing: Boolean, viewModel: ScoutRatingViewModel = hiltViewModel()) {
++fun ScoutAskHost(
++    isPlayerShowing: Boolean,
++    // The host can compose above the nav session store owner, which has no default factory;
++    // a bare hiltViewModel() there falls back to reflective creation and crashes.
++    viewModel: ScoutRatingViewModel = hiltViewModel(
++        viewModelStoreOwner = checkNotNull(
++            androidx.activity.compose.LocalActivity.current as? androidx.activity.ComponentActivity
++        ) {
++            "Scout ask VM needs the activity owner"
++        }
++    )
++) {
 +    val pending by viewModel.pendingAsk.collectAsStateWithLifecycle()
 +    var showing by remember { mutableStateOf<ScoutAskTarget?>(null) }
 +
