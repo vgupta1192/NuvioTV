@@ -11,10 +11,25 @@ index 26f9a4507..fe4def2e7 100644
  
  /** Low-RAM mode: fewer eager Home rows, no hero trailers, smaller image memory cache, shorter rows. */
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt
-index b1805174c..e84962ad7 100644
+index b1805174c..534224961 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt
-@@ -47,6 +47,7 @@ import androidx.compose.ui.graphics.graphicsLayer
+@@ -10,11 +10,14 @@ import com.nuvio.tv.ui.theme.NuvioTheme
+ 
+ import androidx.activity.compose.BackHandler
+ import androidx.compose.animation.core.AnimationSpec
++import androidx.compose.animation.core.animateDpAsState
+ import androidx.compose.animation.core.animateFloatAsState
+ import androidx.compose.animation.core.tween
+ import androidx.compose.foundation.background
+ import androidx.compose.foundation.gestures.BringIntoViewSpec
+ import androidx.compose.foundation.gestures.LocalBringIntoViewSpec
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.fillMaxWidth
+@@ -47,6 +50,7 @@ import androidx.compose.ui.graphics.graphicsLayer
  import androidx.compose.ui.platform.LocalView
  import androidx.lifecycle.Lifecycle
  import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -22,7 +37,7 @@ index b1805174c..e84962ad7 100644
  import androidx.metrics.performance.PerformanceMetricsState
  import kotlinx.coroutines.Dispatchers
  import kotlinx.coroutines.withContext
-@@ -76,6 +77,7 @@ import coil3.memory.MemoryCache
+@@ -76,6 +80,7 @@ import coil3.memory.MemoryCache
  import coil3.request.ImageRequest
  import androidx.compose.ui.platform.LocalConfiguration
  import androidx.compose.ui.platform.LocalContext
@@ -30,7 +45,7 @@ index b1805174c..e84962ad7 100644
  import com.nuvio.tv.domain.model.ContinueWatchingCardStyle
  import com.nuvio.tv.domain.model.FocusedPosterTrailerPlaybackTarget
  import com.nuvio.tv.domain.model.MetaPreview
-@@ -156,6 +158,11 @@ fun ModernHomeContent(
+@@ -156,6 +161,11 @@ fun ModernHomeContent(
      val alwaysShowLandscapeClearlogo = uiState.alwaysShowLandscapeClearlogo
      val fullScreenBackdrop = uiState.modernHeroFullScreenBackdropEnabled
      val trailerPlaybackTarget = uiState.focusedPosterBackdropTrailerPlaybackTarget
@@ -42,7 +57,7 @@ index b1805174c..e84962ad7 100644
      val lowRamContext = androidx.compose.ui.platform.LocalContext.current
      val effectiveAutoplayEnabled =
          !com.nuvio.tv.data.repository.ForkTvLowRam.active(lowRamContext) &&
-@@ -1028,8 +1035,8 @@ fun ModernHomeContent(
+@@ -1028,8 +1038,8 @@ fun ModernHomeContent(
                  }
              }
  
@@ -53,7 +68,7 @@ index b1805174c..e84962ad7 100644
              }
              val isFullScreenLambda = remember {
                  { isFullScreenState.value }
-@@ -1037,7 +1044,7 @@ fun ModernHomeContent(
+@@ -1037,7 +1047,7 @@ fun ModernHomeContent(
  
              val localDensity = LocalDensity.current
              val rowsViewportHeightFraction = if (useLandscapePosters) 0.49f else 0.52f
@@ -62,7 +77,7 @@ index b1805174c..e84962ad7 100644
              val rowTitleLineHeight = MaterialTheme.typography.titleMedium.lineHeight
              val rowTitleHeight = remember(rowTitleLineHeight, localDensity) {
                  with(localDensity) {
-@@ -1045,7 +1052,46 @@ fun ModernHomeContent(
+@@ -1045,7 +1055,60 @@ fun ModernHomeContent(
                          .getOrDefault(NuvioTheme.spacing.xl)
                  }
              }
@@ -103,6 +118,20 @@ index b1805174c..e84962ad7 100644
 +            } else {
 +                compactRowsViewportHeight
 +            }
++            // Immersive hero: when the View-title button takes focus the rows viewport collapses
++            // to just its header sliver so the artwork owns the screen; it restores on focus loss.
++            // The hero text block stays anchored to the expanded height so it never jumps.
++            val heroViewTitleFocused = remember { mutableStateOf(false) }
++            val collapsedRowsViewportHeight = rowTitleHeight + 14.dp + NuvioTheme.spacing.sm
++            val animatedRowsViewportHeight by animateDpAsState(
++                targetValue = if (homeImmersiveHeroEnabled && heroViewTitleFocused.value) {
++                    collapsedRowsViewportHeight
++                } else {
++                    rowsViewportHeight
++                },
++                animationSpec = tween(durationMillis = 240),
++                label = "immersiveRowsViewport"
++            )
 +            val heroBackdropHeight = remember(screenHeight, rowsViewportHeight, rowTitleHeight, homeImmersiveHeroEnabled) {
 +                if (homeImmersiveHeroEnabled) screenHeight
 +                else (screenHeight - rowsViewportHeight + rowTitleHeight + 14.dp).coerceAtMost(screenHeight)
@@ -110,7 +139,7 @@ index b1805174c..e84962ad7 100644
              val verticalRowBringIntoViewSpec = remember(localDensity, defaultBringIntoViewSpec) {
                  val topInsetPx = with(localDensity) { MODERN_ROW_HEADER_FOCUS_INSET.toPx() }
                  @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
-@@ -1061,21 +1107,21 @@ fun ModernHomeContent(
+@@ -1061,21 +1124,21 @@ fun ModernHomeContent(
                  }
              }
              val contentFocusRequester = LocalContentFocusRequester.current
@@ -138,6 +167,149 @@ index b1805174c..e84962ad7 100644
                      Modifier.align(Alignment.TopStart).fillMaxWidth().height(screenHeight)
                  } else {
                      Modifier.align(Alignment.TopEnd).offset(x = NuvioTheme.spacing.huge).fillMaxWidth(MODERN_HERO_MEDIA_WIDTH_FRACTION).height(heroBackdropHeight)
+@@ -1134,29 +1197,50 @@ fun ModernHomeContent(
+                     .fillMaxWidth(MODERN_HERO_TEXT_WIDTH_FRACTION)
+             }
+ 
+-            HeroTitleBlock(
+-                previewProvider = {
+-                    val state = heroSceneStateLambda()
+-                    if (isRapidHorizontalNav.value || state.enrichmentActive) null
+-                    else state.preview
+-                },
+-                enrichmentActive = {
+-                    if (isRapidHorizontalNav.value) false
+-                    else heroSceneStateLambda().enrichmentActive
+-                },
+-                portraitMode = !useLandscapePosters,
+-                showImdbRatings = uiState.homeImdbRatingsVisibility.showRatings,
+-                mdbListShowOnHero = uiState.mdbListShowOnHero,
+-                mdbListRatingOrder = uiState.mdbListRatingOrder,
+-                trailerPlaying = {
+-                    if (isRapidHorizontalNav.value) false
+-                    else {
++            Column(
++                modifier = heroMetadataModifier,
++                verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.md)
++            ) {
++                HeroTitleBlock(
++                    previewProvider = {
+                         val state = heroSceneStateLambda()
+-                        state.fullScreenBackdrop && shouldPlayTrailerLambda() && heroTrailerRenderedLambda()
+-                    }
+-                },
+-                modifier = heroMetadataModifier
+-            )
++                        if (isRapidHorizontalNav.value || state.enrichmentActive) null
++                        else state.preview
++                    },
++                    enrichmentActive = {
++                        if (isRapidHorizontalNav.value) false
++                        else heroSceneStateLambda().enrichmentActive
++                    },
++                    portraitMode = !useLandscapePosters,
++                    showImdbRatings = uiState.homeImdbRatingsVisibility.showRatings,
++                    mdbListShowOnHero = uiState.mdbListShowOnHero,
++                    mdbListRatingOrder = uiState.mdbListRatingOrder,
++                    trailerPlaying = {
++                        if (isRapidHorizontalNav.value) false
++                        else {
++                            val state = heroSceneStateLambda()
++                            state.fullScreenBackdrop && shouldPlayTrailerLambda() && heroTrailerRenderedLambda()
++                        }
++                    },
++                    modifier = Modifier
++                )
++                // Immersive hero: "View title" pill under the description. Only for catalog titles
++                // (collection folders and continue-watching hero items have no single title to open).
++                val heroViewTitleCatalog = (activeCarouselItemState.value?.payload as? ModernPayload.Catalog)
++                    ?.takeIf { !it.itemId.startsWith("__placeholder_") }
++                if (homeImmersiveHeroEnabled && heroViewTitleCatalog != null) {
++                    HeroViewTitleButton(
++                        onClick = {
++                            onNavigateToDetail(
++                                heroViewTitleCatalog.itemId,
++                                heroViewTitleCatalog.itemType,
++                                heroViewTitleCatalog.addonBaseUrl
++                            )
++                        },
++                        onFocusedChanged = { heroViewTitleFocused.value = it }
++                    )
++                }
++            }
+ 
+             val latestOnFocusedRowKeyChanged by rememberUpdatedState(onFocusedRowKeyChanged)
+             val onActiveRowKeyChangeLambda = remember {
+@@ -1218,7 +1302,7 @@ fun ModernHomeContent(
+                 isFastScrolling = isFastScrolling,
+                 onFastScrollingChanged = onFastScrollingChangedLambda,
+                 contentFocusRequester = contentFocusRequester,
+-                rowsViewportHeight = rowsViewportHeight,
++                rowsViewportHeight = if (homeImmersiveHeroEnabled) animatedRowsViewportHeight else rowsViewportHeight,
+                 catalogBottomPadding = NuvioTheme.spacing.none,
+                 trailerContentAlpha = stableTrailerContentAlphaLambda,
+                 verticalRowBringIntoViewSpec = verticalRowBringIntoViewSpec,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeHero.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeHero.kt
+index a82d49754..57cb597ba 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeHero.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeHero.kt
+@@ -9,6 +9,7 @@ import androidx.compose.animation.core.tween
+ import androidx.compose.foundation.BorderStroke
+ import androidx.compose.foundation.background
+ import androidx.compose.foundation.border
++import androidx.compose.foundation.clickable
+ import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.Column
+@@ -34,6 +35,7 @@ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.draw.clip
+ import androidx.compose.ui.draw.drawWithCache
++import androidx.compose.ui.focus.onFocusChanged
+ import androidx.compose.ui.geometry.Offset
+ import androidx.compose.ui.geometry.Size
+ import androidx.compose.ui.graphics.Brush
+@@ -784,3 +786,40 @@ private fun HeroMetaDivider(
+             .background(NuvioTheme.colors.TextTertiary.copy(alpha = 0.78f))
+     )
+ }
++
++/**
++ * Immersive-hero "View title" pill. Focus and click are reported to the caller: focus pulls the
++ * bottom row into its hidden header-sliver state and click opens the focused hero title.
++ */
++@Composable
++internal fun HeroViewTitleButton(
++    onClick: () -> Unit,
++    onFocusedChanged: (Boolean) -> Unit,
++    modifier: Modifier = Modifier
++) {
++    var isFocused by remember { mutableStateOf(false) }
++    val buttonShape = RoundedCornerShape(percent = 50)
++    Box(
++        modifier = modifier
++            .clip(buttonShape)
++            .background(if (isFocused) NuvioTheme.colors.PrimaryVariant else NuvioTheme.colors.Primary)
++            .border(
++                width = 2.dp,
++                color = if (isFocused) NuvioTheme.colors.TextPrimary else Color.Transparent,
++                shape = buttonShape
++            )
++            .onFocusChanged {
++                isFocused = it.isFocused
++                onFocusedChanged(it.isFocused)
++            }
++            .clickable { onClick() }
++            .padding(horizontal = NuvioTheme.spacing.lg, vertical = NuvioTheme.spacing.md),
++        contentAlignment = Alignment.Center
++    ) {
++        Text(
++            text = stringResource(R.string.home_hero_view_title),
++            style = MaterialTheme.typography.titleMedium,
++            color = NuvioTheme.colors.TextPrimary
++        )
++    }
++}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt
 index 7f3596236..873c5fe57 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt
@@ -168,3 +340,15 @@ index b9cc27365..a1120b4e7 100644
  @Composable
  internal fun forkSkipFeedbackRow() = forkTvToggleRow(
      title = "Skip feedback prompt",
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index a3d9c780e..b4264552c 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -98,6 +98,7 @@
+ 
+     <string name="home_no_addons">No addons installed. Add one to get started.</string>
+     <string name="home_no_catalog_addons">No catalog addons installed. Install a catalog addon to see content.</string>
++    <string name="home_hero_view_title">View title</string>
+     <string name="auth_notice_nuvio_logged_out">You have been signed out of Nuvio. Please sign in again.</string>
+     <string name="auth_notice_trakt_logged_out">You have been signed out of Trakt. Please reconnect.</string>
+     <string name="error_generic">An error occurred</string>
