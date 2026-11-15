@@ -1,0 +1,316 @@
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
+index 130ad6472..ef6e461f2 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
+@@ -1563,6 +1563,7 @@ fun PlayerRuntimeController.onEvent(event: PlayerEvent) {
+         }
+         PlayerEvent.OnShowChaptersPanel -> showChaptersPanel()
+         PlayerEvent.OnDismissChaptersPanel -> dismissChaptersPanel()
++        PlayerEvent.OnToggleRemainingDuration -> _uiState.update { it.copy(showRemainingDuration = !it.showRemainingDuration) }
+         is PlayerEvent.OnSelectChapter -> {
+             val chapter = _uiState.value.chapters.getOrNull(event.index) ?: return
+             _uiState.update { it.copy(showChaptersPanel = false) }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+index 6d1f89bd0..69bcf477c 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
+@@ -3265,7 +3265,10 @@ private fun PlayerControlsOverlay(
+                 Row(
+                     modifier = Modifier
+                         .weight(1f, fill = false)
+-                        .horizontalScroll(androidx.compose.foundation.rememberScrollState()),
++                        .horizontalScroll(androidx.compose.foundation.rememberScrollState())
++                        // Padding inside the scroll viewport: the focus-scaled circle otherwise
++                        // clips flat at the row edges on the first/last buttons.
++                        .padding(horizontal = NuvioTheme.spacing.md),
+                     horizontalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.xs),
+                     verticalAlignment = Alignment.CenterVertically
+                 ) {
+@@ -3625,7 +3628,10 @@ private fun PlayerControlsProgressBarHost(
+ @Composable
+ private fun PlayerControlsTimeTextHost(viewModel: PlayerViewModel) {
+     val playbackTimeline by viewModel.playbackTimeline.collectAsState()
+-    var showRemaining by remember { mutableStateOf(false) }
++    // Remaining-time toggle lives in PlayerUiState: the controls leave composition when they
++    // auto-hide, so a remember here used to reset the toggle on every re-show.
++    val uiState by viewModel.uiState.collectAsState()
++    val showRemaining = uiState.showRemainingDuration
+     var focused by remember { mutableStateOf(false) }
+     val timeText = if (playbackTimeline.isLive) {
+         stringResource(R.string.player_live_watched, formatTime(playbackTimeline.watchedDurationMs))
+@@ -3647,7 +3653,9 @@ private fun PlayerControlsTimeTextHost(viewModel: PlayerViewModel) {
+             .then(
+                 if (focused) Modifier.border(2.dp, Color.White, RoundedCornerShape(6.dp)) else Modifier
+             )
+-            .clickable(enabled = !playbackTimeline.isLive) { showRemaining = !showRemaining }
++            .clickable(enabled = !playbackTimeline.isLive) {
++                viewModel.onEvent(PlayerEvent.OnToggleRemainingDuration)
++            }
+             .padding(horizontal = 8.dp, vertical = 4.dp)
+     )
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt
+index 7ce4ee8c4..df52fd79d 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerUiState.kt
+@@ -107,6 +107,8 @@ data class PlayerUiState(
+     /** The file's chapters, sorted; empty when it has fewer than two. */
+     val chapters: List<PlayerChapter> = emptyList(),
+     val showChaptersPanel: Boolean = false,
++    /** Duration-text toggle: show remaining time instead of elapsed. Lives in state so it survives controls hide/show. */
++    val showRemainingDuration: Boolean = false,
+     val audioDelayMs: Int = 0,
+     val audioAmplificationDb: Int = 0,
+     val isAudioAmplificationAvailable: Boolean = false,
+@@ -332,6 +334,7 @@ sealed class PlayerEvent {
+     data class OnSkipChapter(val forward: Boolean) : PlayerEvent()
+     data object OnShowChaptersPanel : PlayerEvent()
+     data object OnDismissChaptersPanel : PlayerEvent()
++    data object OnToggleRemainingDuration : PlayerEvent()
+     data class OnSelectChapter(val index: Int) : PlayerEvent()
+     data class OnSelectAudioTrack(val index: Int) : PlayerEvent()
+     data class OnSetAudioDelayMs(val delayMs: Int) : PlayerEvent()
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamSourceStatusRings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamSourceStatusRings.kt
+deleted file mode 100644
+index 7a3ccb328..000000000
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamSourceStatusRings.kt
++++ /dev/null
+@@ -1,174 +0,0 @@
+-package com.nuvio.tv.ui.screens.player
+-
+-import androidx.compose.animation.core.LinearEasing
+-import androidx.compose.animation.core.animateFloat
+-import androidx.compose.animation.core.infiniteRepeatable
+-import androidx.compose.animation.core.rememberInfiniteTransition
+-import androidx.compose.animation.core.tween
+-import androidx.compose.foundation.horizontalScroll
+-import androidx.compose.foundation.layout.Arrangement
+-import androidx.compose.foundation.layout.Box
+-import androidx.compose.foundation.layout.Row
+-import androidx.compose.foundation.layout.size
+-import androidx.compose.foundation.rememberScrollState
+-import androidx.compose.runtime.Composable
+-import androidx.compose.runtime.remember
+-import androidx.compose.ui.Alignment
+-import androidx.compose.ui.Modifier
+-import androidx.compose.ui.draw.drawBehind
+-import androidx.compose.ui.geometry.Offset
+-import androidx.compose.ui.geometry.Size
+-import androidx.compose.ui.graphics.StrokeCap
+-import androidx.compose.ui.graphics.drawscope.Stroke
+-import androidx.compose.ui.res.stringResource
+-import androidx.compose.ui.semantics.contentDescription
+-import androidx.compose.ui.semantics.semantics
+-import androidx.compose.ui.unit.dp
+-import com.nuvio.tv.R
+-import com.nuvio.tv.domain.model.Stream
+-import com.nuvio.tv.ui.components.SourceChipItem
+-import com.nuvio.tv.ui.components.SourceChipStatus
+-import com.nuvio.tv.ui.theme.NuvioTheme
+-
+-/** The per-addon status ring's size and the stroke it is drawn with. */
+-private val RING_SIZE = 14.dp
+-private val RING_STROKE = 3.dp
+-/** The spinner arc's sweep, and the smallest fill a one-stream addon still shows. */
+-private const val RING_SPIN_SWEEP = 90f
+-private const val RING_MIN_SHARE = 0.06f
+-
+-/**
+- * One addon's resolution outcome for the sources panel's status rings (Nuvio-KE port of the
+- * per-addon circle): [status] is the chip state the tree already tracks, [resolvedCount] is the
+- * streams the addon listed for this title.
+- */
+-internal data class AddonSourceRing(
+-    val name: String,
+-    val status: SourceChipStatus,
+-    val resolvedCount: Int
+-)
+-
+-/**
+- * A ring per addon in [orderedAddons] (the chip row's order): its chip status and the streams it
+- * contributed, counted from [allStreams] by addon name. An addon that answered with no streams
+- * stays at zero; one whose chip has not resolved yet reads as loading.
+- */
+-internal fun buildAddonSourceRings(
+-    orderedAddons: List<String>,
+-    sourceChips: List<SourceChipItem>,
+-    allStreams: List<Stream>
+-): List<AddonSourceRing> {
+-    if (orderedAddons.isEmpty()) return emptyList()
+-    val statusByName = sourceChips.associate { it.name to it.status }
+-    val countsByName = HashMap<String, Int>()
+-    allStreams.forEach { stream -> countsByName.merge(stream.addonName, 1, Int::plus) }
+-    return orderedAddons.map { name ->
+-        AddonSourceRing(
+-            name = name,
+-            status = statusByName[name] ?: SourceChipStatus.SUCCESS,
+-            resolvedCount = countsByName[name] ?: 0
+-        )
+-    }
+-}
+-
+-/**
+- * The row of small status rings, one per addon that was asked for sources (Nuvio-KE port of the
+- * per-addon circle, sized and coloured for this tree). A resolved addon fills its ring
+- * proportionally to its share of all resolved streams in the tree's success colour; an addon
+- * still answering spins; one that failed draws a full error-coloured ring, so the problem addon
+- * reads at a glance. Not focusable: it mirrors the chip row beside it.
+- */
+-@Composable
+-internal fun AddonSourceRingRow(
+-    rings: List<AddonSourceRing>,
+-    modifier: Modifier = Modifier
+-) {
+-    if (rings.isEmpty()) return
+-    val colors = NuvioTheme.colors
+-    val spacing = NuvioTheme.spacing
+-    val totalResolved = remember(rings) { rings.sumOf { it.resolvedCount } }
+-    // The spin clock runs only while some addon is still answering.
+-    val needsSpin = remember(rings) { rings.any { it.status == SourceChipStatus.LOADING } }
+-    val spin = if (needsSpin) {
+-        rememberInfiniteTransition(label = "addonSourceRings").animateFloat(
+-            initialValue = 0f,
+-            targetValue = 360f,
+-            animationSpec = infiniteRepeatable(animation = tween(durationMillis = 1100, easing = LinearEasing)),
+-            label = "addonSourceRingSpin"
+-        )
+-    } else {
+-        null
+-    }
+-    Row(
+-        modifier = modifier.horizontalScroll(rememberScrollState()),
+-        horizontalArrangement = Arrangement.spacedBy(spacing.sm),
+-        verticalAlignment = Alignment.CenterVertically
+-    ) {
+-        rings.forEach { ring ->
+-            val description = when (ring.status) {
+-                SourceChipStatus.LOADING -> stringResource(R.string.sources_ring_loading, ring.name)
+-                SourceChipStatus.ERROR -> stringResource(R.string.sources_ring_failed, ring.name)
+-                SourceChipStatus.SUCCESS ->
+-                    "${ring.name} · " + stringResource(R.string.sources_ring_streams, ring.resolvedCount)
+-            }
+-            Box(
+-                modifier = Modifier
+-                    .size(RING_SIZE)
+-                    .semantics { contentDescription = description }
+-                    .drawBehind {
+-                        val stroke = RING_STROKE.toPx()
+-                        val topLeft = Offset(stroke / 2f, stroke / 2f)
+-                        val arcSize = Size(size.width - stroke, size.height - stroke)
+-                        val trackStyle = Stroke(width = stroke)
+-                        // The faint track every ring carries, so an empty ring still reads as a ring.
+-                        drawCircle(
+-                            color = colors.TextDisabled.copy(alpha = 0.55f),
+-                            radius = (size.minDimension - stroke) / 2f,
+-                            style = trackStyle
+-                        )
+-                        when (ring.status) {
+-                            SourceChipStatus.LOADING -> spin?.let { arc ->
+-                                drawArc(
+-                                    color = colors.TextSecondary,
+-                                    startAngle = arc.value,
+-                                    sweepAngle = RING_SPIN_SWEEP,
+-                                    useCenter = false,
+-                                    topLeft = topLeft,
+-                                    size = arcSize,
+-                                    style = Stroke(width = stroke, cap = StrokeCap.Round)
+-                                )
+-                            }
+-                            SourceChipStatus.ERROR -> drawArc(
+-                                color = colors.Error,
+-                                startAngle = -90f,
+-                                sweepAngle = 360f,
+-                                useCenter = false,
+-                                topLeft = topLeft,
+-                                size = arcSize,
+-                                style = trackStyle
+-                            )
+-                            SourceChipStatus.SUCCESS -> {
+-                                // An addon that answered with no streams keeps its bare track.
+-                                val share = if (ring.resolvedCount > 0 && totalResolved > 0) {
+-                                    (ring.resolvedCount.toFloat() / totalResolved).coerceIn(RING_MIN_SHARE, 1f)
+-                                } else {
+-                                    0f
+-                                }
+-                                if (share > 0f) {
+-                                    drawArc(
+-                                        color = colors.Success,
+-                                        startAngle = -90f,
+-                                        sweepAngle = 360f * share,
+-                                        useCenter = false,
+-                                        topLeft = topLeft,
+-                                        size = arcSize,
+-                                        style = trackStyle
+-                                    )
+-                                }
+-                            }
+-                        }
+-                    }
+-            )
+-        }
+-    }
+-}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamSourcesSidePanel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamSourcesSidePanel.kt
+index 5c0e77b94..3d756380f 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamSourcesSidePanel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamSourcesSidePanel.kt
+@@ -295,33 +295,32 @@ internal fun StreamSourcesSidePanel(
+                 exit = fadeOut(animationSpec = tween(120))
+             ) {
+                 Box(modifier = Modifier.onFocusChanged { chipsHasFocus = it.hasFocus }) {
+-                    Column {
+-                        AddonFilterChips(
+-                            addons = uiState.sourceAvailableAddons,
+-                            sourceChips = uiState.sourceChips,
+-                            selectedAddon = uiState.sourceSelectedAddonFilter,
+-                            isStillFetching = uiState.isLoadingSourceStreams ||
+-                                uiState.sourceChips.any { it.status == SourceChipStatus.LOADING },
+-                            onRefresh = {
+-                                userMovedFromFirstResult = false
+-                                firstResultFocusAssigned = false
+-                                onReload()
+-                            },
+-                            onAddonSelected = { onAddonFilterSelected(it) },
+-                            externalFocusRequesters = chipFocusRequesters,
+-                            externalOrderedNames = orderedAddonNames,
+-                            onUpKey = {
+-                                try { closeButtonFocusRequester.requestFocus() } catch (_: Exception) {}
+-                            },
+-                            debugTag = "SourcesSidePanel"
+-                        )
+-                        Spacer(modifier = Modifier.height(NuvioTheme.spacing.xs))
+-                        AddonSourceRingRow(
+-                            rings = remember(orderedAddonNames, uiState.sourceChips, uiState.sourceAllStreams) {
+-                                buildAddonSourceRings(orderedAddonNames, uiState.sourceChips, uiState.sourceAllStreams)
+-                            }
+-                        )
+-                    }
++                    AddonFilterChips(
++                        addons = uiState.sourceAvailableAddons,
++                        sourceChips = uiState.sourceChips,
++                        selectedAddon = uiState.sourceSelectedAddonFilter,
++                        isStillFetching = uiState.isLoadingSourceStreams ||
++                            uiState.sourceChips.any { it.status == SourceChipStatus.LOADING },
++                        onRefresh = {
++                            userMovedFromFirstResult = false
++                            firstResultFocusAssigned = false
++                            onReload()
++                        },
++                        onAddonSelected = { onAddonFilterSelected(it) },
++                        externalFocusRequesters = chipFocusRequesters,
++                        externalOrderedNames = orderedAddonNames,
++                        onUpKey = {
++                            try { closeButtonFocusRequester.requestFocus() } catch (_: Exception) {}
++                        },
++                        // Same per-source counts the standalone Stream screen shows on its chips.
++                        streamCounts = remember(uiState.sourceAllStreams) {
++                            uiState.sourceAllStreams
++                                .flatMap { it.sources.orEmpty() }
++                                .groupingBy { it }
++                                .eachCount()
++                        },
++                        debugTag = "SourcesSidePanel"
++                    )
+                 }
+             }
+ 
