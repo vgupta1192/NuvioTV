@@ -80226,7 +80226,7 @@ index d49884e41..1f410dda2 100644
          videos: List<Video>,
          currentSeason: Int?,
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
-index 950205c95..0a4cb532b 100644
+index 950205c95..b8c1d9447 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeController.kt
 @@ -464,6 +464,7 @@ class PlayerRuntimeController(
@@ -80237,6 +80237,21 @@ index 950205c95..0a4cb532b 100644
      internal var debridResolveJob: Job? = null
      internal var stillWatchingPromptJob: Job? = null
      internal var startupLoadingReportJob: Job? = null
+@@ -477,6 +478,14 @@ class PlayerRuntimeController(
+     internal var sourceChipErrorDismissJob: Job? = null
+     internal var sourceStreamsCacheRequestKey: String? = null
+     internal var sourceStreamsFetchCompleted: Boolean = false
++    // Nuvio fork: the player's own stream auto refresh (the Stream screen's loop dies with its
++    // entry when the player opens on top of it), see PlayerRuntimeControllerStreams.
++    internal var sourceAutoRefreshJob: Job? = null
++    internal var sourceAutoRefreshRounds: Int = 0
++    internal var sourceAutoRefreshAdded: Int = 0
++    internal var sourceAutoRefreshDryRounds: Int = 0
++    internal var sourceAutoRefreshLastAtMs: Long = 0L
++    internal var sourceAutoRefreshLastOk: Boolean = true
+     /** Stream URLs that already failed in this playback, so stream failover never loops. */
+     internal val failoverFailedUrls = HashSet<String>()
+     // Nuvio-KE port: every link playback gave up on this session (a superset of the failover
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerMetadata.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerMetadata.kt
 index 8861d2bf7..b07c6eb95 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerMetadata.kt
@@ -80350,6 +80365,201 @@ index 8861d2bf7..b07c6eb95 100644
 +        it.copy(postPlayMode = null, postPlayDismissedForCurrentEpisode = true, pendingExitReason = PlayerExitReason.ScoutMixNext)
 +    }
 +}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
+index 90ef5546f..8157bb088 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
+@@ -19,6 +19,7 @@ import com.nuvio.tv.domain.model.enabledAddons
+ import com.nuvio.tv.ui.components.SourceChipItem
+ import com.nuvio.tv.ui.components.SourceChipStatus
+ import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.isActive
+ import kotlinx.coroutines.CompletableDeferred
+ import kotlinx.coroutines.cancel
+ import kotlinx.coroutines.delay
+@@ -28,6 +29,10 @@ import kotlinx.coroutines.flow.update
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withTimeoutOrNull
+ 
++// Same cadence the Stream screen's auto refresh runs on (StreamScreenViewModel).
++private const val SOURCE_AUTO_REFRESH_INTERVAL_MS = 10_000L
++private const val SOURCE_AUTO_REFRESH_TIMEOUT_MS = 45_000L
++
+ /** Hard ceiling for next-episode stream search to prevent hanging forever. */
+ private const val NEXT_EPISODE_HARD_TIMEOUT_MS = 120_000L
+ private const val CLOUD_LIBRARY_AUTO_NEXT_TIMEOUT_MS = 65_000L
+@@ -210,7 +215,10 @@ internal fun PlayerRuntimeController.loadSourceStreams(forceRefresh: Boolean) {
+     sourceStreamsJob = newScope.launch {
+         sourceStreamsCacheRequestKey = requestKey
+         sourceStreamsFetchCompleted = false
+-        if (forceRefresh || targetChanged) sourceBadgedAddonNames = emptySet()
++        if (forceRefresh || targetChanged) {
++            sourceBadgedAddonNames = emptySet()
++            resetSourceAutoRefresh()
++        }
+         _uiState.update {
+             it.copy(
+                 isLoadingSourceStreams = true,
+@@ -375,6 +383,12 @@ internal fun PlayerRuntimeController.loadSourceStreams(forceRefresh: Boolean) {
+         if (handoffEntry == null) {
+             markRemainingSourceChipsAsError()
+         }
++        // The Stream screen that would normally run the auto refresh was closed when the player
++        // opened on top of it (popUpTo inclusive), which used to freeze the panel's status line
++        // at "waiting for the load to finish" forever. Run the same loop here: re-ask the addons
++        // every few seconds, merge the new links in, and keep the status line and the handoff
++        // cache (so the Stream screen adopts them on resume) moving.
++        startSourceAutoRefresh(type, vid, seasonArg, episodeArg, installedAddonOrder, preferredServerNames, handoffEntry)
+         // Mirror the Stream screen's ongoing load: it keeps republishing to the cache as its
+         // auto-refresh rounds and badge jobs finish, so new links appear here live instead of
+         // the panel restarting its own fetch.
+@@ -444,6 +458,146 @@ internal fun PlayerRuntimeController.loadSourceStreams(forceRefresh: Boolean) {
+     }
+ }
+ 
++/** Nuvio fork: the player's own auto refresh, mirroring StreamScreenViewModel.startAutoRefresh. */
++internal fun PlayerRuntimeController.resetSourceAutoRefresh() {
++    sourceAutoRefreshJob?.cancel()
++    sourceAutoRefreshJob = null
++    sourceAutoRefreshRounds = 0
++    sourceAutoRefreshAdded = 0
++    sourceAutoRefreshDryRounds = 0
++    sourceAutoRefreshLastAtMs = 0L
++    sourceAutoRefreshLastOk = true
++}
++
++internal fun PlayerRuntimeController.startSourceAutoRefresh(
++    type: String,
++    vid: String,
++    seasonArg: Int?,
++    episodeArg: Int?,
++    installedAddonOrder: List<String>,
++    preferredServerNames: Set<String>,
++    seed: com.nuvio.tv.core.streams.StreamScreenResultsCache.Entry?
++) {
++    val loopScope = sourceStreamsScope ?: return
++    sourceAutoRefreshJob?.cancel()
++    if (seed != null) {
++        sourceAutoRefreshRounds = seed.refreshRounds
++        sourceAutoRefreshAdded = seed.refreshAdded
++        sourceAutoRefreshDryRounds = seed.refreshDryRounds
++        sourceAutoRefreshLastAtMs = seed.refreshLastAtMs
++        sourceAutoRefreshLastOk = seed.refreshLastOk
++    }
++    sourceAutoRefreshJob = loopScope.launch {
++        val requestKey = sourceStreamsCacheRequestKey
++        while (isActive && sourceStreamsCacheRequestKey == requestKey) {
++            kotlinx.coroutines.delay(SOURCE_AUTO_REFRESH_INTERVAL_MS)
++            if (sourceStreamsCacheRequestKey != requestKey || !sourceStreamsFetchCompleted) continue
++            publishSourceAutoRefreshStatus(phase = 1)
++            var roundOk = false
++            var roundAdded = 0
++            try {
++                roundOk = kotlinx.coroutines.withTimeoutOrNull(SOURCE_AUTO_REFRESH_TIMEOUT_MS) {
++                    streamRepository.getStreamsFromAllAddons(
++                        type = type,
++                        videoId = vid,
++                        season = seasonArg,
++                        episode = episodeArg,
++                        forceRefresh = true
++                    ).collect { result ->
++                        if (result is NetworkResult.Success) {
++                            val ordered = StreamAutoPlaySelector.orderAddonStreams(result.data, installedAddonOrder, preferredServerNames)
++                            roundAdded += applyRefreshedSourceGroups(ordered)
++                        }
++                    }
++                    true
++                } == true
++            } catch (cancelled: CancellationException) {
++                throw cancelled
++            } catch (_: Exception) {
++                // A failed round keeps the list as it is; the next round tries again.
++            }
++            sourceAutoRefreshRounds += 1
++            sourceAutoRefreshDryRounds = if (roundAdded > 0) 0 else sourceAutoRefreshDryRounds + 1
++            sourceAutoRefreshAdded = (sourceAutoRefreshAdded + roundAdded).coerceAtMost(_uiState.value.sourceAllStreams.size)
++            sourceAutoRefreshLastAtMs = System.currentTimeMillis()
++            sourceAutoRefreshLastOk = roundOk
++            publishSourceAutoRefreshStatus(phase = 2)
++            // Publish back so the Stream screen adopts the merged list and the rounds when the
++            // player closes (same two-way sync the player's manual refresh uses).
++            val current = _uiState.value
++            val groups = current.sourceAvailableAddons.mapNotNull { name ->
++                current.sourceAllStreams.filter { it.addonName == name }
++                    .takeIf { it.isNotEmpty() }
++                    ?.let { AddonStreams(addonName = name, addonLogo = null, streams = it) }
++            }
++            if (groups.isNotEmpty()) {
++                com.nuvio.tv.core.streams.StreamScreenResultsCache.put(
++                    type = type,
++                    videoId = vid,
++                    season = seasonArg,
++                    episode = episodeArg,
++                    groups = groups,
++                    loading = false,
++                    refreshPhase = 2,
++                    refreshRounds = sourceAutoRefreshRounds,
++                    refreshAdded = sourceAutoRefreshAdded,
++                    refreshDryRounds = sourceAutoRefreshDryRounds,
++                    refreshLastAtMs = sourceAutoRefreshLastAtMs,
++                    refreshLastOk = sourceAutoRefreshLastOk
++                )
++            }
++        }
++    }
++}
++
++private fun PlayerRuntimeController.publishSourceAutoRefreshStatus(phase: Int) {
++    _uiState.update {
++        it.copy(
++            sourceRefreshStatus = com.nuvio.tv.ui.screens.player.SourceRefreshStatusSnapshot(
++                phase = phase,
++                rounds = sourceAutoRefreshRounds,
++                added = sourceAutoRefreshAdded,
++                dryRounds = sourceAutoRefreshDryRounds,
++                lastAtMs = sourceAutoRefreshLastAtMs,
++                lastOk = sourceAutoRefreshLastOk
++            )
++        )
++    }
++}
++
++/** Merges a refreshed addon list into the panel, badge- and filter-preserving. Returns the count of new links. */
++internal fun PlayerRuntimeController.applyRefreshedSourceGroups(ordered: List<AddonStreams>): Int {
++    val existingKeys = _uiState.value.sourceAllStreams.map { it.sourceBadgeMergeKey() }.toHashSet()
++    var added = 0
++    _uiState.update { current ->
++        val freshAllStreams = ordered.flatMap { group -> group.streams }
++        added = freshAllStreams.count { it.sourceBadgeMergeKey() !in existingKeys }
++        if (added == 0 && ordered.map { it.addonName }.none { it !in current.sourceAvailableAddons }) return@update current
++        val badged = current.sourceAllStreams
++            .filter { it.badges.isNotEmpty() }
++            .associateBy { it.sourceBadgeMergeKey() }
++        val badgePreserved = freshAllStreams.map { stream ->
++            val known = badged[stream.sourceBadgeMergeKey()]
++            if (known != null && stream.badges.isEmpty()) stream.copy(badges = known.badges) else stream
++        }
++        val combined = mergeSourceStreams(current.sourceAllStreams, badgePreserved)
++        val selected = current.sourceSelectedAddonFilter
++        val filtered = if (selected == null) combined else combined.filter { it.addonName == selected }
++        sourceFilterFullList = filtered
++        val shown = filtered.take(
++            maxOf(current.sourceFilteredStreams.size, SOURCE_FILTER_PAGE_SIZE).coerceAtMost(filtered.size)
++        )
++        current.copy(
++            isLoadingSourceStreams = false,
++            sourceAllStreams = combined,
++            sourceFilteredStreams = shown,
++            sourceAvailableAddons = (current.sourceAvailableAddons + ordered.map { it.addonName }).distinct(),
++            sourceStreamCounts = ordered.associate { group -> group.addonName to group.streams.size }
++        )
++    }
++    return added
++}
++
+ /**
+  * Merge fresh stream results with previously cached streams.
+  * Newer entries for the same stream (matched by addon + url/infoHash) replace older ones.
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
 index 1b2a021a4..ab8f435ba 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
@@ -80719,6 +80929,98 @@ index 000000000..fe7d3b077
 +    }
 +}
 +
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/scout/ScoutHeroExtrasViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/scout/ScoutHeroExtrasViewModel.kt
+new file mode 100644
+index 000000000..fcffa78d8
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/scout/ScoutHeroExtrasViewModel.kt
+@@ -0,0 +1,86 @@
++package com.nuvio.tv.ui.screens.scout
++
++import androidx.lifecycle.ViewModel
++import androidx.lifecycle.viewModelScope
++import com.nuvio.tv.BuildConfig
++import com.nuvio.tv.data.local.MDBListSettingsDataStore
++import com.nuvio.tv.data.remote.api.TmdbApi
++import com.nuvio.tv.domain.model.ContentType
++import com.nuvio.tv.domain.model.MDBListRatings
++import com.nuvio.tv.domain.model.MDBListSettings
++import com.nuvio.tv.domain.model.Meta
++import com.nuvio.tv.domain.model.PosterShape
++import dagger.hilt.android.lifecycle.HiltViewModel
++import javax.inject.Inject
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.launch
++
++data class ScoutHeroExtras(
++    val ratings: MDBListRatings?,
++    val order: List<String> = MDBListSettings.DEFAULT_RATING_ORDER,
++    val imdbId: String?
++)
++
++/**
++ * Per-hero-title lookups for the Scout homepage hero: the MDBList ratings badges shown next to
++ * the meta line (same row as the details page) and the IMDb id the trackers rate under, which the
++ * shared "Your rating" dialog needs. Cached per title; empty when MDBList is off.
++ */
++@HiltViewModel
++class ScoutHeroExtrasViewModel @Inject constructor(
++    private val tmdbApi: TmdbApi,
++    private val mdbListRepository: com.nuvio.tv.data.repository.MDBListRepository,
++    private val mdbListSettings: MDBListSettingsDataStore
++) : ViewModel() {
++    private val cache = HashMap<String, ScoutHeroExtras>()
++
++    suspend fun load(tmdbId: Int, tv: Boolean): ScoutHeroExtras {
++        val key = "$tmdbId:$tv"
++        cache[key]?.let { return it }
++        val extras = ScoutHeroExtras(
++            ratings = runCatching {
++                mdbListRepository.getRatingsForMeta(
++                    meta = ratingsMeta(tmdbId, tv),
++                    fallbackItemId = "tmdb:$tmdbId",
++                    fallbackItemType = if (tv) "series" else "movie"
++                )?.ratings
++            }.getOrNull(),
++            order = runCatching { mdbListSettings.settings.first().enabledRatingOrder() }
++                .getOrDefault(MDBListSettings.DEFAULT_RATING_ORDER),
++            imdbId = runCatching {
++                if (tv) tmdbApi.getTvExternalIds(tmdbId, BuildConfig.TMDB_API_KEY).body()?.imdbId
++                else tmdbApi.getMovieExternalIds(tmdbId, BuildConfig.TMDB_API_KEY).body()?.imdbId
++            }.getOrNull()?.takeIf { it.startsWith("tt") }
++        )
++        cache[key] = extras
++        return extras
++    }
++
++    /** The IMDb id for the shared rating dialog, resolved through the same cached load. */
++    fun resolveImdbId(tmdbId: Int, tv: Boolean, onReady: (String?) -> Unit) {
++        viewModelScope.launch { onReady(load(tmdbId, tv).imdbId) }
++    }
++
++    // resolveMediaRef in MDBListRepository reads only the id prefix and the api type.
++    private fun ratingsMeta(tmdbId: Int, tv: Boolean) = Meta(
++        id = "tmdb:$tmdbId",
++        type = if (tv) ContentType.SERIES else ContentType.MOVIE,
++        name = "",
++        poster = null,
++        posterShape = PosterShape.POSTER,
++        background = null,
++        logo = null,
++        description = null,
++        releaseInfo = null,
++        imdbRating = null,
++        genres = emptyList(),
++        runtime = null,
++        director = emptyList(),
++        cast = emptyList(),
++        videos = emptyList(),
++        country = null,
++        awards = null,
++        language = null,
++        links = emptyList()
++    )
++}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/scout/ScoutMixNavViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/scout/ScoutMixNavViewModel.kt
 new file mode 100644
 index 000000000..77ca9faf7
@@ -83720,10 +84022,10 @@ index 000000000..c6361a3d4
 +
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/scout/ScoutScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/scout/ScoutScreen.kt
 new file mode 100644
-index 000000000..d83dd584b
+index 000000000..66ff61a78
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/scout/ScoutScreen.kt
-@@ -0,0 +1,992 @@
+@@ -0,0 +1,1015 @@
 +@file:OptIn(ExperimentalTvMaterial3Api::class, ExperimentalLayoutApi::class)
 +
 +package com.nuvio.tv.ui.screens.scout
@@ -83740,8 +84042,11 @@ index 000000000..d83dd584b
 +import androidx.compose.runtime.CompositionLocalProvider
 +import androidx.compose.runtime.rememberCoroutineScope
 +import androidx.compose.runtime.saveable.rememberSaveable
++import com.nuvio.tv.domain.model.MDBListRatings
++import com.nuvio.tv.domain.model.MDBListSettings
 +import com.nuvio.tv.domain.model.ScoutRating
 +import com.nuvio.tv.domain.model.ScoutTitle
++import com.nuvio.tv.ui.components.MDBListRatingsRow
 +import com.nuvio.tv.ui.components.NuvioDialog
 +import com.nuvio.tv.ui.components.NuvioScrollDefaults
 +import com.nuvio.tv.ui.components.posteroptions.PosterOptionsController
@@ -83749,6 +84054,7 @@ index 000000000..d83dd584b
 +import com.nuvio.tv.ui.scout.ScoutRatingIcon
 +import com.nuvio.tv.ui.scout.ScoutRatingViewModel
 +import com.nuvio.tv.core.scout.ask.AskFailure
++import com.nuvio.tv.ui.screens.detail.UserRatingDialog
 +import com.nuvio.tv.ui.screens.detail.requestFocusAfterFrames
 +import com.nuvio.tv.ui.screens.scout.ask.AskInputBar
 +import com.nuvio.tv.ui.screens.scout.ask.failureText
@@ -83939,7 +84245,23 @@ index 000000000..d83dd584b
 +    var showThumbs by rememberSaveable { mutableStateOf(false) }
 +    var chosenGenre by rememberSaveable { mutableStateOf<String?>(null) }
 +    var confirmFresh by rememberSaveable { mutableStateOf(false) }
-+    var rating by remember { mutableStateOf<ScoutPick?>(null) }
++    // Hero extras: the MDBList ratings badges next to the meta line and the IMDb id the shared
++    // "Your rating" dialog (the one on the details page and in the player) submits under.
++    val heroExtras: ScoutHeroExtrasViewModel = hiltViewModel()
++    var heroExtrasData by remember { mutableStateOf<ScoutHeroExtras?>(null) }
++    var rateTarget by remember { mutableStateOf<ScoutPick?>(null) }
++    var userRatingFor by remember { mutableStateOf<Triple<String, String, Boolean>?>(null) }
++    LaunchedEffect(state.hero?.pick?.key) {
++        val pick = state.hero?.pick ?: return@LaunchedEffect
++        heroExtrasData = heroExtras.load(pick.tmdbId, pick.tv)
++    }
++    LaunchedEffect(rateTarget) {
++        val pick = rateTarget ?: return@LaunchedEffect
++        rateTarget = null
++        heroExtras.resolveImdbId(pick.tmdbId, pick.tv) { imdbId ->
++            if (imdbId != null) userRatingFor = Triple(pick.name, imdbId, !pick.tv)
++        }
++    }
 +    var mixesOpen by rememberSaveable { mutableStateOf(startOnMixes) }
 +    var mixesOpened by remember { mutableStateOf(false) }
 +    if (mixesOpen) mixesOpened = true
@@ -84087,11 +84409,13 @@ index 000000000..d83dd584b
 +                            compact = compact,
 +                            ratingsOn = scoutProfile.settings.ratingsEnabled,
 +                            rating = scoutProfile.rating("tmdb:${hero.pick.tmdbId}"),
++                            mdbListRatings = heroExtrasData?.ratings,
++                            mdbListOrder = heroExtrasData?.order ?: MDBListSettings.DEFAULT_RATING_ORDER,
 +                            focus = ::focus,
 +                            controller = posterOptions.controller,
 +                            onPlay = { onPlayTitle("tmdb:${hero.pick.tmdbId}", if (hero.pick.tv) "series" else "movie", hero.pick.backdrop, state.heroLogo) },
 +                            onDetails = { onOpenTitle("tmdb:${hero.pick.tmdbId}", if (hero.pick.tv) "series" else "movie") },
-+                            onRate = { rating = hero.pick }
++                            onRate = { rateTarget = hero.pick }
 +                        )
 +                    }
 +                }
@@ -84177,20 +84501,10 @@ index 000000000..d83dd584b
 +        CHOOSING_WHO -> ScoutWhoDialog(state, profiles, pictures, activeId, viewModel, onDismiss = { choosing = null })
 +    }
 +
-+    rating?.let { pick ->
-+        val first = remember { FocusRequester() }
-+        val id = "tmdb:${pick.tmdbId}"
-+        NuvioDialog(onDismiss = { rating = null }, title = pick.name) {
-+            ScoutRateRow(
-+                current = scoutProfile.rating(id),
-+                onRate = {
-+                    ratings.setRating(ScoutTitle(id, if (pick.tv) "series" else "movie", pick.name, pick.poster), it)
-+                    rating = null
-+                },
-+                firstFocus = first
-+            )
-+        }
-+        LaunchedEffect(Unit) { first.requestFocusAfterFrames() }
++    userRatingFor?.let { (title, imdbId, isMovie) ->
++        // The same "Your rating" popup the details page and the player use, so a rating from
++        // here lands on every connected tracker, not just Scout's thumbs.
++        UserRatingDialog(name = title, imdbId = imdbId, isMovie = isMovie, onDismiss = { userRatingFor = null })
 +    }
 +
 +    val optionsState by posterOptions.controller.state.collectAsState()
@@ -84367,6 +84681,8 @@ index 000000000..d83dd584b
 +    compact: Boolean,
 +    ratingsOn: Boolean,
 +    rating: ScoutRating?,
++    mdbListRatings: MDBListRatings?,
++    mdbListOrder: List<String>,
 +    focus: (String) -> Modifier,
 +    controller: PosterOptionsController,
 +    onPlay: () -> Unit,
@@ -84416,7 +84732,16 @@ index 000000000..d83dd584b
 +                modifier = Modifier.fillMaxWidth(.5f)
 +            )
 +        }
-+        Text(scoutMetaLine(shown), style = MaterialTheme.typography.bodySmall, color = NuvioTheme.colors.TextSecondary, maxLines = 1)
++        Row(
++            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
++            horizontalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.lg)
++        ) {
++            Text(scoutMetaLine(shown), style = MaterialTheme.typography.bodySmall, color = NuvioTheme.colors.TextSecondary, maxLines = 1)
++            if (mdbListRatings != null) {
++                // The same badge row the details page shows, so the hero reads like it too.
++                MDBListRatingsRow(ratings = mdbListRatings, order = mdbListOrder)
++            }
++        }
 +    }
 +}
 +
@@ -88246,10 +88571,10 @@ index 000000000..8385b270a
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ScoutSettingsContent.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ScoutSettingsContent.kt
 new file mode 100644
-index 000000000..565c1edb6
+index 000000000..1a902731a
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ScoutSettingsContent.kt
-@@ -0,0 +1,392 @@
+@@ -0,0 +1,389 @@
 +@file:OptIn(ExperimentalTvMaterial3Api::class)
 +
 +package com.nuvio.tv.ui.screens.settings
@@ -88315,7 +88640,6 @@ index 000000000..565c1edb6
 +    viewModel: ScoutRatingViewModel = hiltViewModel(),
 +    askAccess: com.nuvio.tv.ui.screens.scout.ask.AskAccessViewModel = hiltViewModel()
 +) {
-+    val context = androidx.compose.ui.platform.LocalContext.current
 +    val askHasKey by askAccess.hasKey.collectAsStateWithLifecycle()
 +    val profile by viewModel.profile.collectAsStateWithLifecycle()
 +    val trackerSignedIn by viewModel.trackerSignedIn.collectAsStateWithLifecycle()
@@ -88472,12 +88796,10 @@ index 000000000..565c1edb6
 +                leadingIcon = Icons.Default.QuestionAnswer,
 +                subtitle = stringResource(R.string.scout_question_settings_sub),
 +                value = stringResource(if (askHasKey) R.string.scout_question_settings_on else R.string.scout_question_settings_none),
-+                onClick = {
-+                    context.startActivity(
-+                        android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("nuvio://scout-ask"))
-+                            .setPackage(context.packageName)
-+                    )
-+                }
++                // The ask setup screen owns the "add a key with your phone" QR flow; the old
++                // nuvio://scout-ask deep link has no handler here and crashed with
++                // ActivityNotFoundException.
++                onClick = { onOpenRoute(com.nuvio.tv.ui.navigation.Screen.ScoutAsk.route) }
 +            )
 +        }
 +        SettingsGroupCard(title = stringResource(R.string.scout_settings_ratings)) {
@@ -88693,7 +89015,7 @@ index 366def869..b6cabf31c 100644
                          text = title,
                          style = MaterialTheme.typography.bodyLarge,
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt
-index 1e92634fe..be3e72aba 100644
+index 1e92634fe..4d96d008c 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt
 @@ -170,6 +170,7 @@ private fun settingsSectionSpec(category: SettingsCategory): SettingsSectionSpec
@@ -88730,7 +89052,19 @@ index 1e92634fe..be3e72aba 100644
                                  isEssentialMode = isEssentialMode,
                                  allowDetailAutofocus = allowDetailAutofocus,
                                  contentFocusRequesters = contentFocusRequesters,
-@@ -866,6 +872,8 @@ private fun SettingsDetailPane(
+@@ -815,6 +821,11 @@ fun SettingsScreen(
+                 ) {
+                     SettingsDetailPane(
+                         selectedCategory = selectedCategory,
++                        // The rail layout composes this pane directly; without these the Scout
++                        // action rows ("Your taste", "Pick five you love", the ask key) click as
++                        // no-ops because they fall back to the empty defaults.
++                        onNavigateToScoutTaste = onNavigateToScoutTaste,
++                        onNavigateToScout = onNavigateToScout,
+                         isEssentialMode = isEssentialMode,
+                         allowDetailAutofocus = allowDetailAutofocus,
+                         contentFocusRequesters = contentFocusRequesters,
+@@ -866,6 +877,8 @@ private fun SettingsDetailPane(
      integrationAnimeSkipFocusRequester: FocusRequester,
      integrationTvdbFocusRequester: FocusRequester,
      onNavigateToManageProfiles: () -> Unit,
@@ -88739,7 +89073,7 @@ index 1e92634fe..be3e72aba 100644
      onOpenDetail: (String, String, String?) -> Unit,
      onNavigateToAddons: () -> Unit,
      onNavigateToPlugins: () -> Unit,
-@@ -1009,6 +1017,15 @@ private fun SettingsDetailPane(
+@@ -1009,6 +1022,15 @@ private fun SettingsDetailPane(
                  null
              }
          )
