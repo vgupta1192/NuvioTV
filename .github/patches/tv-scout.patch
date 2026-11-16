@@ -78456,15 +78456,42 @@ index 8ce933618..e9dc95a46 100644
              val row = try {
                  serverCatalog.catalog(addonBaseUrl, addonId, addonName, catalogId, catalogName, type, skip, extraArgs)
 diff --git a/app/src/main/java/com/nuvio/tv/data/repository/WatchProgressRepositoryImpl.kt b/app/src/main/java/com/nuvio/tv/data/repository/WatchProgressRepositoryImpl.kt
-index 338c4fe2c..29be9a4f9 100644
+index 338c4fe2c..e69c899b4 100644
 --- a/app/src/main/java/com/nuvio/tv/data/repository/WatchProgressRepositoryImpl.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/repository/WatchProgressRepositoryImpl.kt
-@@ -481,6 +481,9 @@ class WatchProgressRepositoryImpl @Inject constructor(
+@@ -481,6 +481,36 @@ class WatchProgressRepositoryImpl @Inject constructor(
              }
          }
  
++    // Scout taste used to see only locally completed watches, so titles tracked by the active
++    // provider or only partly watched here (Continue Watching, tracker history rows) never
++    // counted towards it. Provider history folds in where the provider projects watched items;
++    // everything still uncovered (e.g. Trakt's own history, titles you started but have not
++    // finished) comes from the progress rows, newest entry per title.
 +    override val tasteHistory: Flow<List<WatchedItem>>
-+        get() = watchedItemsPreferences.allItems.distinctUntilChanged().flowOn(Dispatchers.Default)
++        get() = combine(
++            watchedItemsPreferences.allItems.distinctUntilChanged().flowOn(Dispatchers.Default),
++            activeProgressProviderFlow().flatMapLatest { provider ->
++                provider?.watchedItems ?: flowOf(emptyList())
++            },
++            allProgress
++        ) { local, remote, progress ->
++            val covered = (local + remote).mapTo(mutableSetOf()) { it.contentId }
++            val fromProgress = progress
++                .filter { it.contentId.isNotBlank() && it.contentId !in covered }
++                .groupBy { it.contentId }
++                .map { (_, rows) ->
++                    val row = rows.maxBy { it.lastWatched }
++                    WatchedItem(
++                        contentId = row.contentId,
++                        contentType = row.contentType,
++                        title = row.name,
++                        watchedAt = row.lastWatched,
++                        poster = row.poster
++                    )
++                }
++            local + remote + fromProgress
++        }.flowOn(Dispatchers.Default)
 +
      override val continueWatching: Flow<List<WatchProgress>>
          get() = allProgress.map { list -> list.filter { it.isInProgress() } }
@@ -85698,10 +85725,10 @@ index 000000000..ea8c8c46b
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/scout/ScoutTasteViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/scout/ScoutTasteViewModel.kt
 new file mode 100644
-index 000000000..32a83f42e
+index 000000000..4a9876c75
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/scout/ScoutTasteViewModel.kt
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,155 @@
 +package com.nuvio.tv.ui.screens.scout
 +
 +import androidx.lifecycle.ViewModel
@@ -85808,8 +85835,19 @@ index 000000000..32a83f42e
 +    init {
 +        viewModelScope.launch { engine.refreshIfDue() }
 +        viewModelScope.launch {
-+            watched.value = withContext(Dispatchers.Default) { watchProgress.tasteHistory.first() }
-+            taste.load { progress.value = it }
++            // Providers load their history asynchronously; keep following the flow so titles
++            // watched on Trakt/MDBList/Simkl or only partly watched here fill the taste page in
++            // live instead of needing a revisit. Each growth re-runs the summary load — the
++            // repository caches its lookups, so repeats are cheap.
++            var loadedTitles = -1
++            watchProgress.tasteHistory.flowOn(Dispatchers.Default).collect { items ->
++                watched.value = items
++                val distinct = items.filter { it.contentId.isNotBlank() }.distinctBy { it.contentId }.size
++                if (distinct > loadedTitles) {
++                    loadedTitles = distinct
++                    taste.load { progress.value = it }
++                }
++            }
 +        }
 +    }
 +
@@ -89231,6 +89269,37 @@ index 7193d2fd0..4bb6bbc9e 100644
      private fun selectTheme(theme: AppTheme) {
          if (currentTheme() == theme) return
          viewModelScope.launch {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/theme/ThemeColors.kt b/app/src/main/java/com/nuvio/tv/ui/theme/ThemeColors.kt
+index fae3dfe69..3ab07e0f4 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/theme/ThemeColors.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/theme/ThemeColors.kt
+@@ -35,14 +35,22 @@ object ThemeColors {
+         backgroundCard = Color(0xFF241A1A)
+     )
+ 
++    // Nuvio fork: Ocean carries the blue theme toggle (the Nuvio Arc look), so every surface is
++    // navy-tinted — stock Ocean's near-neutral surfaces only shifted accents, not the app itself.
+     val Ocean = ThemeColorPalette(
+         secondary = NuvioPrimitives.blue500,
+         secondaryVariant = NuvioPrimitives.blue700,
+         focusRing = NuvioPrimitives.blue300,
+-        focusBackground = Color(0xFF1A2D3D),
+-        background = Color(0xFF0D0D0F),
+-        backgroundElevated = Color(0xFF1A1A1E),
+-        backgroundCard = Color(0xFF1A1F24)
++        focusBackground = Color(0xFF1B3050),
++        background = Color(0xFF0A1322),
++        backgroundElevated = Color(0xFF122036),
++        backgroundCard = Color(0xFF16283F),
++        surface = Color(0xFF142239),
++        surfaceVariant = Color(0xFF0F1B2C),
++        panel = Color(0xFF101D30),
++        field = Color(0xFF15243A),
++        menu = Color(0xFF122036),
++        modal = Color(0xFF101D30)
+     )
+ 
+     val Violet = ThemeColorPalette(
 diff --git a/app/src/main/java/com/nuvio/tv/ui/v2/appearance/UiPresentationEnvironment.kt b/app/src/main/java/com/nuvio/tv/ui/v2/appearance/UiPresentationEnvironment.kt
 new file mode 100644
 index 000000000..5f7d092a7
