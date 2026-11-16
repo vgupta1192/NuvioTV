@@ -78106,6 +78106,47 @@ index 000000000..9185f9ce4
 +}
 +
 +data class ScoutOutItem(val title: ScoutTitle, val action: OutAction, val done: Set<String>)
+diff --git a/app/src/main/java/com/nuvio/tv/data/local/ThemeDataStore.kt b/app/src/main/java/com/nuvio/tv/data/local/ThemeDataStore.kt
+index 997aefa85..bd1053ecf 100644
+--- a/app/src/main/java/com/nuvio/tv/data/local/ThemeDataStore.kt
++++ b/app/src/main/java/com/nuvio/tv/data/local/ThemeDataStore.kt
+@@ -33,6 +33,8 @@ class ThemeDataStore @Inject constructor(
+         factory.get(profileId, FEATURE)
+ 
+     private val themeKey = stringPreferencesKey("selected_theme")
++    // Nuvio fork: blue theme toggle — the theme to restore when the toggle goes off again.
++    private val blueThemePreviousKey = stringPreferencesKey("blue_theme_previous")
+     private val customThemeColorsKey = stringPreferencesKey("custom_theme_colors")
+     private val fontKey = stringPreferencesKey("selected_font")
+     private val amoledModeKey = booleanPreferencesKey("amoled_mode")
+@@ -130,6 +132,27 @@ class ThemeDataStore @Inject constructor(
+         }
+     }
+ 
++    /**
++     * Nuvio fork: the Features-pane blue theme switch (the Nuvio Arc look). On, it selects the
++     * Ocean palette and remembers what was active before; off, it restores that. The toggle reads
++     * its state straight off the selected theme, so picking Ocean in the theme picker shows it on.
++     */
++    suspend fun setBlueTheme(enabled: Boolean) {
++        store().edit { prefs ->
++            if (enabled) {
++                val current = prefs[themeKey]?.let { name -> AppTheme.entries.firstOrNull { it.name == name } }
++                    ?: AppTheme.WHITE
++                if (current != AppTheme.OCEAN) prefs[blueThemePreviousKey] = current.name
++                prefs[themeKey] = AppTheme.OCEAN.name
++            } else {
++                val previous = prefs[blueThemePreviousKey]?.let { name -> AppTheme.entries.firstOrNull { it.name == name } }
++                    ?.takeIf { it != AppTheme.OCEAN }
++                    ?: AppTheme.WHITE
++                prefs[themeKey] = previous.name
++            }
++        }
++    }
++
+     suspend fun setCustomTheme(colors: CustomThemeColors) {
+         store().edit { prefs ->
+             prefs[customThemeColorsKey] = colors.encode()
 diff --git a/app/src/main/java/com/nuvio/tv/data/remote/api/ScoutTmdbModels.kt b/app/src/main/java/com/nuvio/tv/data/remote/api/ScoutTmdbModels.kt
 new file mode 100644
 index 000000000..68c77d4d9
@@ -84055,10 +84096,10 @@ index 000000000..c6361a3d4
 +
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/scout/ScoutScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/scout/ScoutScreen.kt
 new file mode 100644
-index 000000000..66ff61a78
+index 000000000..09df8fab0
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/scout/ScoutScreen.kt
-@@ -0,0 +1,1015 @@
+@@ -0,0 +1,1018 @@
 +@file:OptIn(ExperimentalTvMaterial3Api::class, ExperimentalLayoutApi::class)
 +
 +package com.nuvio.tv.ui.screens.scout
@@ -84424,7 +84465,10 @@ index 000000000..66ff61a78
 +                modifier = Modifier
 +                    .weight(1f)
 +                    .fillMaxWidth()
-+                    .padding(horizontal = FOCUS_ROOM),
++                    .padding(horizontal = FOCUS_ROOM)
++                    // The taste stack (headline, stats, three charts) can be taller than the hero
++                    // area on shorter screens; scroll it instead of spilling over the rows below.
++                    .then(if (onTaste) Modifier.verticalScroll(rememberScrollState()) else Modifier),
 +                contentAlignment = BiasAlignment(-1f, if (onTaste) TASTE_BLOCK_BIAS else HERO_BLOCK_BIAS)
 +            ) {
 +                when {
@@ -85076,10 +85120,10 @@ index 000000000..66ff61a78
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/scout/ScoutTasteScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/scout/ScoutTasteScreen.kt
 new file mode 100644
-index 000000000..1759aa48f
+index 000000000..ea8c8c46b
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/scout/ScoutTasteScreen.kt
-@@ -0,0 +1,569 @@
+@@ -0,0 +1,572 @@
 +@file:OptIn(ExperimentalTvMaterial3Api::class, ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
 +
 +package com.nuvio.tv.ui.screens.scout
@@ -85216,6 +85260,9 @@ index 000000000..1759aa48f
 +@Composable
 +internal fun ScoutTasteHero(state: ScoutTasteState, focus: (String) -> Modifier, onGenre: (String) -> Unit) {
 +    val summary = state.summary
++    // The working / not-enough-data note owns the hero on its own; stacking it above the summary
++    // headline pushed the charts over the rows below on shorter screens.
++    val introOnly = state.working || state.titlesUsed < SCOUT_TASTE_MIN_TITLES || summary.isEmpty
 +    Column(Modifier.offset(y = NuvioTheme.spacing.md), verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.md)) {
 +        when {
 +            state.working -> Column(verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.xs)) {
@@ -85228,7 +85275,7 @@ index 000000000..1759aa48f
 +                Text(stringResource(R.string.scout_taste_new_sub), style = scoutReadingStyle(), color = NuvioTheme.colors.TextSecondary)
 +            }
 +        }
-+        if (summary.isEmpty) return@Column
++        if (introOnly) return@Column
 +        ScoutTasteHead(state)
 +        Row(
 +            modifier = Modifier.offset(x = -NuvioTheme.spacing.xs).padding(top = CHARTS_DROP),
@@ -88605,6 +88652,49 @@ index 000000000..8385b270a
 +    AskFailure.NOTHING_FOUND -> R.string.scout_question_error_nothing
 +    AskFailure.REJECTED -> R.string.scout_question_error_rejected
 +}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt
+index 873c5fe57..e4e691285 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkFeaturesPane.kt
+@@ -39,6 +39,11 @@ internal fun ForkFeaturesPane(
+                 forkImmersiveHomeRow()
+             }
+         }
++        item {
++            SettingsGroupCard(title = "Appearance") {
++                forkBlueThemeRow()
++            }
++        }
+         item {
+             SettingsGroupCard(title = "Details") {
+                 forkFillerGuideRow()
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
+index a1120b4e7..624147326 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ForkTvSettingsItems.kt
+@@ -161,6 +161,22 @@ internal fun forkCatalogUnderlineRow() = forkTvToggleRow(
+     pref = ForkTvPreferences.catalogAccentUnderline
+ )
+ 
++@Composable
++internal fun forkBlueThemeRow() {
++    // The blue theme is the app's own Ocean palette (the Nuvio Arc look), applied through the
++    // regular theme store so it restyles every screen and shows up in the theme picker too.
++    val themeViewModel: com.nuvio.tv.ui.screens.settings.ThemeSettingsViewModel =
++        androidx.hilt.navigation.compose.hiltViewModel()
++    val uiState by themeViewModel.uiState.collectAsStateWithLifecycle()
++    val checked = uiState.selectedTheme == com.nuvio.tv.domain.model.AppTheme.OCEAN
++    SettingsToggleRow(
++        title = "Blue theme",
++        subtitle = "The Nuvio Arc look: blue accent on dark surfaces across every screen. Turn off to go back to the theme you had.",
++        checked = checked,
++        onToggle = { themeViewModel.setBlueTheme(!checked) }
++    )
++}
++
+ @Composable
+ internal fun forkImmersiveHomeRow() = forkTvToggleRow(
+     title = "Immersive home hero",
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ScoutSettingsContent.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ScoutSettingsContent.kt
 new file mode 100644
 index 000000000..1a902731a
@@ -89125,6 +89215,22 @@ index 1e92634fe..4d96d008c 100644
          SettingsCategory.FEATURES -> ForkFeaturesPane(
              initialFocusRequester = if (allowDetailAutofocus) {
                  contentFocusRequesters[SettingsCategory.FEATURES]
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ThemeSettingsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ThemeSettingsViewModel.kt
+index 7193d2fd0..4bb6bbc9e 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ThemeSettingsViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ThemeSettingsViewModel.kt
+@@ -216,6 +216,11 @@ class ThemeSettingsViewModel @Inject constructor(
+ 
+     fun selectAppIcon(option: AppIconOption): Boolean = appIconManager.select(option)
+ 
++    /** Nuvio fork: the Features-pane blue theme switch; state flows back through themeSelection. */
++    fun setBlueTheme(enabled: Boolean) {
++        viewModelScope.launch { themeDataStore.setBlueTheme(enabled) }
++    }
++
+     private fun selectTheme(theme: AppTheme) {
+         if (currentTheme() == theme) return
+         viewModelScope.launch {
 diff --git a/app/src/main/java/com/nuvio/tv/ui/v2/appearance/UiPresentationEnvironment.kt b/app/src/main/java/com/nuvio/tv/ui/v2/appearance/UiPresentationEnvironment.kt
 new file mode 100644
 index 000000000..5f7d092a7
