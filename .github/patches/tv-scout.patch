@@ -85645,7 +85645,7 @@ index 90ef5546f..8157bb088 100644
   * Merge fresh stream results with previously cached streams.
   * Newer entries for the same stream (matched by addon + url/infoHash) replace older ones.
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
-index 1b2a021a4..7ab7e6385 100644
+index 1b2a021a4..ece5bcd1e 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
 @@ -6,6 +6,9 @@
@@ -85731,24 +85731,26 @@ index 1b2a021a4..7ab7e6385 100644
              forkRatePromptNow -> {
                  forkRatePromptShown = true
                  forkRateOpen = true
-@@ -686,6 +727,7 @@ fun PlayerScreen(
+@@ -686,6 +727,8 @@ fun PlayerScreen(
          uiState.showAudioOverlay,
          uiState.showSubtitleOverlay,
          uiState.showSpeedDialog,
 +        isV2 && uiState.showStreamInfoOverlay,
++        isV2 && uiState.showYouTubePanel,
          shouldConfirmNextEpisodeOnEnd,
          postPlayRecommendationState.isVisible,
      ) {
-@@ -697,15 +739,24 @@ fun PlayerScreen(
+@@ -697,15 +740,25 @@ fun PlayerScreen(
              !uiState.showAudioOverlay && !uiState.showSubtitleOverlay &&
              !uiState.showSubtitleStylePanel && !uiState.showSubtitleDelayOverlay &&
              !uiState.showSubtitleTimingDialog &&
 -            !uiState.showSpeedDialog
-+            !uiState.showSpeedDialog && !(isV2 && uiState.showStreamInfoOverlay)
++            !uiState.showSpeedDialog && !(isV2 && uiState.showStreamInfoOverlay) &&
++            !(isV2 && uiState.showYouTubePanel)
          ) {
 +            // Arc: the V2 deck re-focuses the control that opened a panel after it closes.
 +            val returning = if (isV2) v2Focus.pendingReturn else null
-+            if (returning == V2PlayerControl.SPEED) {
++            if (returning == V2PlayerControl.SPEED || returning == V2PlayerControl.INFO) {
 +                viewModel.onEvent(PlayerEvent.OnShowMoreDialog)
 +            }
              // Wait for AnimatedVisibility animation to complete before focusing play/pause button
@@ -85769,7 +85771,7 @@ index 1b2a021a4..7ab7e6385 100644
          } else if (!uiState.showControls) {
              // When controls are hidden, let skip intro button take focus if visible
              val skipVisible = uiState.activeSkipInterval != null && !uiState.skipIntervalDismissed
-@@ -1738,6 +1789,7 @@ fun PlayerScreen(
+@@ -1738,6 +1791,7 @@ fun PlayerScreen(
                  uiState = uiState,
                  playerBadges = playerBadges,
                  viewModel = viewModel,
@@ -85777,7 +85779,7 @@ index 1b2a021a4..7ab7e6385 100644
                  subtitleReportingActive = playerControlsVisible,
                  onSubtitleClearanceChanged = {
                      if (latestPlayerControlsVisible) subtitleControlsClearancePx = it
-@@ -3025,6 +3077,7 @@ private fun PlayerControlsOverlay(
+@@ -3025,6 +3079,7 @@ private fun PlayerControlsOverlay(
      uiState: PlayerUiState,
      playerBadges: List<StreamBadge>,
      viewModel: PlayerViewModel,
@@ -85785,7 +85787,7 @@ index 1b2a021a4..7ab7e6385 100644
      playPauseFocusRequester: FocusRequester,
      progressBarFocusRequester: FocusRequester,
      streamInfoFocusRequester: FocusRequester,
-@@ -3092,6 +3145,45 @@ private fun PlayerControlsOverlay(
+@@ -3092,6 +3147,69 @@ private fun PlayerControlsOverlay(
      val customAspectPainter = rememberRawSvgPainter(R.raw.ic_player_aspect_ratio)
      val customEpisodesPainter = rememberRawSvgPainter(R.raw.ic_player_episodes)
      var showEngineSwitchConfirm by remember { mutableStateOf(false) }
@@ -85809,6 +85811,21 @@ index 1b2a021a4..7ab7e6385 100644
 +                onDismiss = { showEngineSwitchConfirm = false }
 +            )
 +        }
++        // Nuvio fork: classic-deck parity — the quality dialog and its availability gate mirror
++        // the classic quality button (hidden for live playback and single-quality streams).
++        var showQualityDialogV2 by remember { mutableStateOf(false) }
++        val playbackTimelineV2 by viewModel.playbackTimeline.collectAsState()
++        val qualityPlayerV2 = viewModel.exoPlayer
++        val v2QualityAction: (() -> Unit)? = if (qualityPlayerV2 != null && !playbackTimelineV2.isLive &&
++            qualityPlayerV2.extractVideoQualities().size > 1
++        ) {
++            { showQualityDialogV2 = true }
++        } else {
++            null
++        }
++        if (showQualityDialogV2 && qualityPlayerV2 != null) {
++            VideoQualityDialog(exoPlayer = qualityPlayerV2, onDismiss = { showQualityDialogV2 = false })
++        }
 +        V2PlayerControls(
 +            uiState, viewModel, v2Focus, playPauseFocusRequester, progressBarFocusRequester,
 +            streamInfoFocusRequester, progressBarUpFocusRequester, { anchor ->
@@ -85820,9 +85837,18 @@ index 1b2a021a4..7ab7e6385 100644
 +                audio = onShowAudioDialog, subtitles = onShowSubtitleDialog, speed = onShowSpeedDialog,
 +                aspect = onToggleAspectRatio, engine = { showEngineSwitchConfirm = true },
 +                report = onReportPlaybackIssue, more = onToggleMoreActions,
-+                external = { onOpenInExternalPlayer?.invoke() }, info = onShowStreamInfo,
++                info = onShowStreamInfo,
 +                stats = {}, interaction = onResetHideTimer, hide = onHideControls,
-+                party = { viewModel.onEvent(PlayerEvent.OnShowPartyPanel) }
++                party = { viewModel.onEvent(PlayerEvent.OnShowPartyPanel) },
++                quality = v2QualityAction, rate = onShowRate,
++                youtubePanel = if (showYouTubeButton) onShowYouTubePanel else null,
++                youtubeSubscribe = onYouTubeSubscribe,
++                youtubeLoop = onYouTubeLoop,
++                youtubeChat = onYouTubeChat,
++                youtubeSubscribed = youtubeSubscribed,
++                youtubeLoopOn = youtubeLoopOn,
++                youtubeChatOn = youtubeChatOn,
++                seekSync = com.nuvio.tv.ui.screens.player.seekpreview.seekPreviewSyncAction(viewModel)
 +            ),
 +            reportCodeVisible, playerBadges
 +        )
@@ -85831,7 +85857,7 @@ index 1b2a021a4..7ab7e6385 100644
      val playbackTimeline by viewModel.playbackTimeline.collectAsState()
      val isLivePlayback = playbackTimeline.isLive
      val progressUpTarget = if (isLivePlayback) {
-@@ -3592,7 +3684,7 @@ private fun PlayerControlsOverlay(
+@@ -3592,7 +3710,7 @@ private fun PlayerControlsOverlay(
  }
  
  @Composable
@@ -85840,7 +85866,7 @@ index 1b2a021a4..7ab7e6385 100644
      viewModel: PlayerViewModel,
      chapters: List<PlayerChapter>,
      focusRequester: FocusRequester,
-@@ -3626,7 +3718,7 @@ private fun PlayerControlsProgressBarHost(
+@@ -3626,7 +3744,7 @@ private fun PlayerControlsProgressBarHost(
  }
  
  @Composable
@@ -85849,7 +85875,7 @@ index 1b2a021a4..7ab7e6385 100644
      val playbackTimeline by viewModel.playbackTimeline.collectAsState()
      // Remaining-time toggle lives in PlayerUiState: the controls leave composition when they
      // auto-hide, so a remember here used to reset the toggle on every re-show.
-@@ -3717,6 +3809,7 @@ private fun ControlButton(
+@@ -3717,6 +3835,7 @@ private fun ControlButton(
      avatarUrl: String? = null
  ) {
      var isFocused by remember { mutableStateOf(false) }
@@ -85857,7 +85883,7 @@ index 1b2a021a4..7ab7e6385 100644
  
      IconButton(
          onClick = onClick,
-@@ -3758,12 +3851,16 @@ private fun ControlButton(
+@@ -3758,12 +3877,16 @@ private fun ControlButton(
              .onFocusChanged {
                  isFocused = it.isFocused
                  if (it.isFocused) onFocused?.invoke()
@@ -85877,7 +85903,7 @@ index 1b2a021a4..7ab7e6385 100644
          ),
          shape = IconButtonDefaults.shape(shape = CircleShape)
      ) {
-@@ -3808,6 +3905,10 @@ private fun ProgressBar(
+@@ -3808,6 +3931,10 @@ private fun ProgressBar(
      chapters: List<PlayerChapter> = emptyList()
  ) {
      val accentBrush = NuvioTheme.palette.accentBrush()
@@ -85888,7 +85914,7 @@ index 1b2a021a4..7ab7e6385 100644
      val seekBarLabel = stringResource(R.string.cd_seek_bar)
      val progress = if (duration > 0) {
          (currentPosition.toFloat() / duration.toFloat()).coerceIn(0f, 1f)
-@@ -3938,20 +4039,29 @@ private fun ProgressBar(
+@@ -3938,20 +4065,29 @@ private fun ProgressBar(
              },
          contentAlignment = Alignment.Center
      ) {
@@ -85924,7 +85950,7 @@ index 1b2a021a4..7ab7e6385 100644
                  )
                  // Chapter marks, drawn over the fill.
                  .drawBehind {
-@@ -3969,6 +4079,18 @@ private fun ProgressBar(
+@@ -3969,6 +4105,18 @@ private fun ProgressBar(
                      }
                  }
          )
@@ -85943,7 +85969,7 @@ index 1b2a021a4..7ab7e6385 100644
      }
  }
  
-@@ -4274,13 +4396,18 @@ private fun SubtitleDelayOverlay(
+@@ -4274,13 +4422,18 @@ private fun SubtitleDelayOverlay(
  ) {
      val fraction = ((subtitleDelayMs - SUBTITLE_DELAY_MIN_MS).toFloat() /
          (SUBTITLE_DELAY_MAX_MS - SUBTITLE_DELAY_MIN_MS).toFloat()).coerceIn(0f, 1f)
@@ -85965,7 +85991,7 @@ index 1b2a021a4..7ab7e6385 100644
              .padding(horizontal = 26.dp, vertical = 20.dp)
      ) {
          Row(
-@@ -4653,20 +4780,27 @@ internal fun PlayerOverlayButton(
+@@ -4653,20 +4806,27 @@ internal fun PlayerOverlayButton(
      modifier: Modifier = Modifier,
      enabled: Boolean = true
  ) {
@@ -86000,7 +86026,7 @@ index 1b2a021a4..7ab7e6385 100644
                  border = NuvioTheme.focusRing.border(NuvioTheme.spacing.xxs),
                  shape = shape
              )
-@@ -4675,7 +4809,7 @@ internal fun PlayerOverlayButton(
+@@ -4675,7 +4835,7 @@ internal fun PlayerOverlayButton(
              horizontal = NuvioTheme.spacing.lg,
              vertical = 14.dp
          ),
@@ -86009,7 +86035,7 @@ index 1b2a021a4..7ab7e6385 100644
      ) {
          Text(
              text = text,
-@@ -4702,11 +4836,52 @@ private fun SpeedSelectionDialog(
+@@ -4702,11 +4862,52 @@ private fun SpeedSelectionDialog(
      val speedFocusRequesters = remember {
          PLAYBACK_SPEEDS.map { FocusRequester() }
      }
@@ -86062,7 +86088,7 @@ index 1b2a021a4..7ab7e6385 100644
      Dialog(onDismissRequest = onDismiss) {
          Box(
              modifier = Modifier
-@@ -4879,14 +5054,15 @@ internal fun DialogButton(
+@@ -4879,14 +5080,15 @@ internal fun DialogButton(
      Button(
          onClick = onClick,
          enabled = enabled,
@@ -99393,10 +99419,10 @@ index 000000000..b77123720
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/v2/player/V2PlayerControls.kt b/app/src/main/java/com/nuvio/tv/ui/v2/player/V2PlayerControls.kt
 new file mode 100644
-index 000000000..958768232
+index 000000000..1bcd05689
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/v2/player/V2PlayerControls.kt
-@@ -0,0 +1,262 @@
+@@ -0,0 +1,295 @@
 +package com.nuvio.tv.ui.v2.player
 +
 +import androidx.compose.animation.core.tween
@@ -99408,7 +99434,6 @@ index 000000000..958768232
 +import androidx.compose.foundation.shape.RoundedCornerShape
 +import androidx.compose.material.icons.Icons
 +import androidx.compose.material.icons.automirrored.filled.List
-+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 +import androidx.compose.material.icons.filled.*
 +import androidx.compose.runtime.*
 +import androidx.compose.ui.Alignment
@@ -99445,7 +99470,7 @@ index 000000000..958768232
 +import com.nuvio.tv.ui.v2.appearance.LocalV2Appearance
 +import com.nuvio.tv.ui.v2.components.*
 +
-+enum class V2PlayerControl { INFO, STATS, AUDIO, SUBTITLES, SOURCES, EPISODES, CHAPTERS, RESTART, MORE, SPEED, ASPECT, EXTERNAL, ENGINE, REPORT }
++enum class V2PlayerControl { INFO, STATS, AUDIO, SUBTITLES, SOURCES, EPISODES, CHAPTERS, RESTART, MORE, SPEED, ASPECT, ENGINE, REPORT, QUALITY, RATE, YOUTUBE, YOUTUBE_SUB, YOUTUBE_LOOP, YOUTUBE_CHAT, SEEK_SYNC }
 +
 +/** Owned by PlayerScreen, so requesters survive a utility panel replacing the control deck. */
 +@Stable
@@ -99461,10 +99486,21 @@ index 000000000..958768232
 +    val seekToStart: () -> Unit, val episodes: () -> Unit, val sources: () -> Unit,
 +    val audio: () -> Unit, val subtitles: () -> Unit, val speed: () -> Unit,
 +    val aspect: () -> Unit, val engine: () -> Unit, val report: () -> Unit,
-+    val more: () -> Unit, val external: () -> Unit, val info: () -> Unit,
++    val more: () -> Unit, val info: () -> Unit,
 +    val stats: () -> Unit, val interaction: () -> Unit, val hide: () -> Unit,
 +    val party: () -> Unit = {},
-+    val chapters: () -> Unit = {}
++    val chapters: () -> Unit = {},
++    // Nuvio fork: parity with the classic deck. Null hides the tile.
++    val quality: (() -> Unit)? = null,
++    val rate: (() -> Unit)? = null,
++    val youtubePanel: (() -> Unit)? = null,
++    val youtubeSubscribe: (() -> Unit)? = null,
++    val youtubeLoop: (() -> Unit)? = null,
++    val youtubeChat: (() -> Unit)? = null,
++    val youtubeSubscribed: Boolean = false,
++    val youtubeLoopOn: Boolean = false,
++    val youtubeChatOn: Boolean = false,
++    val seekSync: (() -> Unit)? = null
 +)
 +
 +private data class Utility(val id: V2PlayerControl, val icon: ImageVector, val label: String, val action: () -> Unit, val panel: Boolean = false, val enabled: Boolean = true)
@@ -99491,15 +99527,38 @@ index 000000000..958768232
 +        // Nuvio fork: Arc's playback-stats overlay is not ported, so the deck has no STATS tile.
 +        if (uiState.audioTracks.isNotEmpty()) add(Utility(V2PlayerControl.AUDIO, Icons.Default.Speaker, stringResource(R.string.cd_audio_tracks), actions.audio, true))
 +        if (uiState.subtitleTracks.isNotEmpty() || uiState.addonSubtitles.isNotEmpty()) add(Utility(V2PlayerControl.SUBTITLES, Icons.Default.Subtitles, stringResource(R.string.cd_subtitles), actions.subtitles, true))
-+        add(Utility(V2PlayerControl.SOURCES, Icons.Default.Cloud, stringResource(R.string.cd_sources), actions.sources, true))
++        // Nuvio fork: a YouTube video has no other sources to switch to — the panel button takes its place.
++        actions.youtubePanel?.let {
++            add(Utility(V2PlayerControl.YOUTUBE, Icons.Default.PlayCircle, "YouTube", it))
++            // Nuvio fork: the classic deck's YouTube extras (subscribe/loop/live chat).
++            actions.youtubeSubscribe?.let { sub ->
++                add(Utility(V2PlayerControl.YOUTUBE_SUB,
++                    if (actions.youtubeSubscribed) Icons.Default.NotificationsActive else Icons.Default.PersonAdd,
++                    if (actions.youtubeSubscribed) "Subscribed" else "Subscribe", sub))
++            }
++            actions.youtubeLoop?.let { loop ->
++                add(Utility(V2PlayerControl.YOUTUBE_LOOP,
++                    if (actions.youtubeLoopOn) Icons.Default.RepeatOne else Icons.Default.Repeat,
++                    if (actions.youtubeLoopOn) "Stop looping" else "Loop this video", loop))
++            }
++            actions.youtubeChat?.let { chat ->
++                add(Utility(V2PlayerControl.YOUTUBE_CHAT, Icons.Default.Forum,
++                    if (actions.youtubeChatOn) "Hide live chat" else "Show live chat", chat))
++            }
++        } ?: add(Utility(V2PlayerControl.SOURCES, Icons.Default.Cloud, stringResource(R.string.cd_sources), actions.sources, true))
 +        if (uiState.currentSeason != null && uiState.currentEpisode != null) add(Utility(V2PlayerControl.EPISODES, Icons.AutoMirrored.Filled.List, stringResource(R.string.player_pill_episodes), actions.episodes, true))
 +        if (uiState.chapters.isNotEmpty()) add(Utility(V2PlayerControl.CHAPTERS, Icons.Default.Bookmarks, stringResource(R.string.player_chapters), actions.chapters, true))
++        actions.quality?.let { add(Utility(V2PlayerControl.QUALITY, Icons.Default.HighQuality, stringResource(R.string.player_video_quality), it)) }
++        actions.rate?.let { add(Utility(V2PlayerControl.RATE, Icons.Default.StarBorder, "Rate title", it)) }
 +        add(Utility(V2PlayerControl.MORE, Icons.Default.MoreHoriz, stringResource(R.string.player_more_actions_title), actions.more))
 +    }
 +    val more = buildList {
 +        add(Utility(V2PlayerControl.SPEED, Icons.Default.Speed, stringResource(R.string.cd_playback_speed), actions.speed, true))
 +        add(Utility(V2PlayerControl.ASPECT, Icons.Default.AspectRatio, stringResource(R.string.cd_aspect_ratio), actions.aspect))
-+        if (!uiState.isServerStream) add(Utility(V2PlayerControl.EXTERNAL, Icons.AutoMirrored.Filled.OpenInNew, stringResource(R.string.cd_open_external_player), actions.external))
++        add(Utility(V2PlayerControl.INFO, Icons.Default.Info, stringResource(R.string.cd_stream_info), actions.info, true))
++        actions.seekSync?.let {
++            add(Utility(V2PlayerControl.SEEK_SYNC, forkSeekPreviewSyncIcon, stringResource(R.string.cd_seek_preview_sync), it))
++        }
 +        add(Utility(V2PlayerControl.ENGINE, Icons.Default.SwapHoriz, stringResource(R.string.cd_switch_player_engine), actions.engine))
 +        if (uiState.playbackIssueReportsEnabled) add(Utility(V2PlayerControl.REPORT, Icons.Default.BugReport,
 +            if (reportCodeVisible && uiState.playbackIssueReportId != null) uiState.playbackIssueReportId else stringResource(R.string.player_report_issue),
