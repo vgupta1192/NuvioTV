@@ -86534,6 +86534,437 @@ index e22855b2b..9aae9f4b7 100644
                  !isPlayable && !nextEpisode.unairedMessage.isNullOrBlank() -> nextEpisode.unairedMessage
                  mode.searching -> stringResource(R.string.next_episode_finding_source)
                  !mode.sourceName.isNullOrBlank() && mode.countdownSec != null ->
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/SubtitleSyncStatusOverlay.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/SubtitleSyncStatusOverlay.kt
+index 241eff1d6..c14cbb1a3 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/SubtitleSyncStatusOverlay.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/SubtitleSyncStatusOverlay.kt
+@@ -1,15 +1,27 @@
+ package com.nuvio.tv.ui.screens.player.audiosync
+ 
+ import androidx.compose.animation.AnimatedVisibility
++import androidx.compose.animation.core.tween
+ import androidx.compose.animation.fadeIn
+ import androidx.compose.animation.fadeOut
+ import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.BoxScope
+ import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
+ import androidx.compose.foundation.layout.widthIn
++import androidx.compose.foundation.shape.CircleShape
+ import androidx.compose.foundation.shape.RoundedCornerShape
+-import androidx.compose.material3.Text
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.Check
++import androidx.compose.material.icons.filled.Info
++import androidx.compose.material.icons.filled.Sync
++import androidx.compose.material.icons.filled.Warning
++import androidx.tv.material3.Icon
++import androidx.tv.material3.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
+@@ -18,19 +30,26 @@ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.setValue
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
+ import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.vector.ImageVector
++import androidx.compose.ui.res.stringResource
+ import androidx.compose.ui.text.font.FontWeight
+ import androidx.compose.ui.unit.Dp
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.unit.sp
+ import androidx.compose.ui.zIndex
+ import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import com.nuvio.tv.ui.theme.NuvioTheme
++import com.nuvio.tv.ui.v2.components.GlassRole
++import com.nuvio.tv.ui.v2.components.nuvioGlass
+ import kotlinx.coroutines.delay
+ import kotlin.math.abs
+ 
+ /**
+  * Small live readout of what audio subtitle sync is doing: how far ahead it has listened, what it
+  * has heard, and why it is not synced yet. Hidden a few seconds after a confirmed sync.
++ * Rendered as the V2 glass HUD card: a phase glyph, an AutoSync eyebrow and the detail lines.
+  */
+ @Composable
+ internal fun SubtitleSyncStatusOverlay(modifier: Modifier = Modifier) {
+@@ -51,41 +70,75 @@ internal fun SubtitleSyncStatusOverlay(modifier: Modifier = Modifier) {
+     }
+     AnimatedVisibility(
+         visible = current != null && !(settled && hideAfterSync),
+-        enter = fadeIn(),
+-        exit = fadeOut(),
++        enter = fadeIn(tween(220)),
++        exit = fadeOut(tween(220)),
+         modifier = modifier,
+     ) {
+         val state = current ?: return@AnimatedVisibility
+-        Column(
++        val accent = when {
++            synced -> NuvioTheme.colors.Success
++            state.phase == SubtitleSyncDiagnostics.Phase.Estimated -> Color(0xFFFFD166)
++            state.phase == SubtitleSyncDiagnostics.Phase.Unavailable && !gaveUp -> NuvioTheme.colors.Error
++            else -> Color.White
++        }
++        val glyph = when {
++            synced -> Icons.Default.Check
++            state.phase == SubtitleSyncDiagnostics.Phase.Unavailable && !gaveUp -> Icons.Default.Warning
++            state.phase == SubtitleSyncDiagnostics.Phase.Unavailable -> Icons.Default.Info
++            else -> Icons.Default.Sync
++        }
++        val headline = when (state.phase) {
++            SubtitleSyncDiagnostics.Phase.Synced ->
++                "Subtitles synced ${formatOffset(state.offsetMs)} · ${state.method ?: ""}"
++            SubtitleSyncDiagnostics.Phase.Estimated ->
++                "Syncing ${formatOffset(state.offsetMs)} (early estimate)…"
++            SubtitleSyncDiagnostics.Phase.Listening -> "Syncing subtitles to audio…"
++            SubtitleSyncDiagnostics.Phase.Unavailable ->
++                if (gaveUp) "Original subtitle timing kept" else "Subtitle sync unavailable"
++        }
++        Row(
+             modifier = Modifier
+                 .widthIn(max = 520.dp)
+-                .background(Color.Black.copy(alpha = 0.62f), RoundedCornerShape(10.dp))
+-                .padding(horizontal = 16.dp, vertical = 12.dp),
++                .nuvioGlass(GlassRole.HUD, shape = RoundedCornerShape(20.dp))
++                .padding(horizontal = 18.dp, vertical = 14.dp),
++            horizontalArrangement = Arrangement.spacedBy(12.dp),
+         ) {
+-            val (headline, color) = when (state.phase) {
+-                SubtitleSyncDiagnostics.Phase.Synced ->
+-                    "Subtitles synced ${formatOffset(state.offsetMs)} · ${state.method ?: ""}" to Color(0xFF7CE38B)
+-                SubtitleSyncDiagnostics.Phase.Estimated ->
+-                    "Syncing ${formatOffset(state.offsetMs)} (early estimate)…" to Color(0xFFFFD166)
+-                SubtitleSyncDiagnostics.Phase.Listening -> "Syncing subtitles to audio…" to Color.White
+-                SubtitleSyncDiagnostics.Phase.Unavailable ->
+-                    if (gaveUp) "Original subtitle timing kept" to Color.White
+-                    else "Subtitle sync unavailable" to Color(0xFFFF8A80)
++            SyncStatusGlyph(accent = accent, glyph = glyph)
++            Column {
++                Text(
++                    text = stringResource(com.nuvio.tv.R.string.autosync_bubble_label),
++                    color = NuvioTheme.colors.TextPrimary.copy(alpha = 0.6f),
++                    fontSize = 10.sp,
++                    lineHeight = 12.sp,
++                    fontWeight = FontWeight.Medium,
++                    letterSpacing = 0.3.sp,
++                )
++                Text(
++                    text = headline,
++                    color = accent,
++                    fontSize = 16.sp,
++                    lineHeight = 20.sp,
++                    fontWeight = FontWeight.SemiBold,
++                    modifier = Modifier.padding(top = 2.dp),
++                )
++                Column(modifier = Modifier.padding(top = 6.dp)) {
++                    state.notice?.let { Line(it, NuvioTheme.colors.Success) }
++                    state.rate?.let { Line("Frame rate: $it", Color(0xFFFFD166)) }
++                    val listening = if (state.liveOnly) {
++                        "Listening live (no look-ahead for this audio)"
++                    } else {
++                        "Listened ${state.lookAheadSec}s ahead"
++                    }
++                    Line("$listening · ${state.wordsHeard} words recognised")
++                    if (state.sampling.isNotEmpty()) Line("Across the film: ${state.sampling}")
++                    if (state.recognizer.isNotEmpty()) Line("Speech recognition: ${state.recognizer}")
++                    if (state.reference.isNotEmpty()) Line("English reference: ${state.reference}")
++                    if (state.alternatives.isNotEmpty()) Line("Other subtitles: ${state.alternatives}")
++                    state.problem?.let {
++                        Line(it, if (gaveUp) NuvioTheme.colors.TextPrimary.copy(alpha = 0.85f) else Color(0xFFFFB4A9))
++                    }
++                }
+             }
+-            Text(headline, color = color, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+-            state.notice?.let { Line(it, Color(0xFF7CE38B)) }
+-            state.rate?.let { Line("Frame rate: $it", Color(0xFFFFD166)) }
+-            val listening = if (state.liveOnly) {
+-                "Listening live (no look-ahead for this audio)"
+-            } else {
+-                "Listened ${state.lookAheadSec}s ahead"
+-            }
+-            Line("$listening · ${state.wordsHeard} words recognised")
+-            if (state.sampling.isNotEmpty()) Line("Across the film: ${state.sampling}")
+-            if (state.recognizer.isNotEmpty()) Line("Speech recognition: ${state.recognizer}")
+-            if (state.reference.isNotEmpty()) Line("English reference: ${state.reference}")
+-            if (state.alternatives.isNotEmpty()) Line("Other subtitles: ${state.alternatives}")
+-            state.problem?.let { Line(it, if (gaveUp) Color.White.copy(alpha = 0.85f) else Color(0xFFFFB4A9)) }
+         }
+     }
+ }
+@@ -106,9 +159,28 @@ internal fun BoxScope.SubtitleSyncStatusPanel(safePadding: Dp) {
+     )
+ }
+ 
++/** The phase glyph in a softly tinted circle, shared with the AutoSync notification pill. */
++@Composable
++private fun SyncStatusGlyph(accent: Color, glyph: ImageVector) {
++    Box(
++        modifier = Modifier
++            .size(28.dp)
++            .clip(CircleShape)
++            .background(accent.copy(alpha = 0.16f)),
++        contentAlignment = Alignment.Center,
++    ) {
++        Icon(
++            imageVector = glyph,
++            contentDescription = null,
++            tint = accent,
++            modifier = Modifier.size(15.dp),
++        )
++    }
++}
++
+ @Composable
+-private fun Line(text: String, color: Color = Color.White.copy(alpha = 0.85f)) {
+-    Text(text, color = color, fontSize = 15.sp, lineHeight = 20.sp)
++private fun Line(text: String, color: Color = NuvioTheme.colors.TextPrimary.copy(alpha = 0.75f)) {
++    Text(text, color = color, fontSize = 13.sp, lineHeight = 17.sp)
+ }
+ 
+ private fun formatOffset(offsetMs: Long?): String {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/bubble/AutoSyncBubbleToast.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/bubble/AutoSyncBubbleToast.kt
+index bb339a1eb..e5e40f186 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/bubble/AutoSyncBubbleToast.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/bubble/AutoSyncBubbleToast.kt
+@@ -19,6 +19,7 @@ import androidx.compose.animation.shrinkHorizontally
+ import androidx.compose.animation.slideInVertically
+ import androidx.compose.animation.slideOutVertically
+ import androidx.compose.animation.togetherWith
++import androidx.compose.foundation.background
+ import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.BoxScope
+@@ -32,6 +33,8 @@ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.layout.size
+ import androidx.compose.foundation.layout.width
+ import androidx.compose.foundation.layout.widthIn
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.DisposableEffect
+ import androidx.compose.runtime.FloatState
+@@ -48,8 +51,13 @@ import androidx.compose.runtime.rememberUpdatedState
+ import androidx.compose.runtime.setValue
+ import androidx.compose.runtime.mutableLongStateOf
+ import androidx.compose.runtime.withFrameNanos
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.Check
++import androidx.compose.material.icons.filled.Close
++import androidx.compose.material.icons.filled.Sync
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
+ import androidx.compose.ui.draw.drawWithCache
+ import androidx.compose.ui.geometry.CornerRadius
+ import androidx.compose.ui.geometry.Offset
+@@ -70,9 +78,12 @@ import androidx.compose.ui.unit.IntOffset
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.unit.sp
+ import androidx.compose.ui.zIndex
++import androidx.tv.material3.Icon
+ import androidx.tv.material3.Text
+ import com.nuvio.tv.R
+ import com.nuvio.tv.ui.theme.NuvioTheme
++import com.nuvio.tv.ui.v2.components.GlassRole
++import com.nuvio.tv.ui.v2.components.nuvioGlass
+ import kotlinx.coroutines.delay
+ import kotlinx.coroutines.launch
+ import kotlin.math.PI
+@@ -129,8 +140,18 @@ internal fun BoxScope.AutoSyncBubbleToastHost(controlsVisible: Boolean) {
+     }
+     val enabled by AutoSyncBubbleToasts.enabled.collectAsState()
+     val message by AutoSyncBubbleToasts.current.collectAsState()
++    val plain by AutoSyncBubbleToasts.plain.collectAsState()
+     val current = message
+-    if (!enabled || current == null) return
++    // The plain pill outlives its message briefly, so its exit fade can finish before it drops.
++    var pillMessage by remember { mutableStateOf<AutoSyncBubbleMessage?>(null) }
++    if (plain != null) pillMessage = plain
++    LaunchedEffect(plain) {
++        if (plain == null && pillMessage != null) {
++            delay(320)
++            pillMessage = null
++        }
++    }
++    if ((!enabled || current == null) && pillMessage == null) return
+     val safeBottom = NuvioTheme.spacing.screen.overscanVertical
+     val aboveSubtitles = (LocalConfiguration.current.screenHeightDp * LIFT_ABOVE_SUBTITLES_FRACTION).dp
+     val lift = animateDpAsState(
+@@ -149,8 +170,91 @@ internal fun BoxScope.AutoSyncBubbleToastHost(controlsVisible: Boolean) {
+             .zIndex(2.74f)
+             .offset { IntOffset(0, -lift.value.roundToPx()) },
+     ) {
+-        key(current.session) {
+-            AutoSyncBubble(message = current, colors = colors, modifier = Modifier)
++        if (enabled && current != null) {
++            key(current.session) {
++                AutoSyncBubble(message = current, colors = colors, modifier = Modifier)
++            }
++        }
++        AnimatedVisibility(
++            visible = plain != null,
++            enter = fadeIn(tween(200)) + slideInVertically(tween(240) { it / 3 }),
++            exit = fadeOut(tween(200)),
++        ) {
++            val shown = pillMessage ?: return@AnimatedVisibility
++            AutoSyncPlainPill(message = shown, colors = colors)
++        }
++    }
++}
++
++/**
++ * The plain pill: what AutoSync's messages look like when "Bubble notifications" is off but the
++ * player is showing. The bubble's glass family without the droplet — a phase glyph, the AutoSync
++ * eyebrow and the message — so the unstyled system toast stays outside the player.
++ */
++@Composable
++private fun AutoSyncPlainPill(message: AutoSyncBubbleMessage, colors: BubbleColors) {
++    val accent = message.kind.color(colors)
++    val glyph = when (message.kind) {
++        AutoSyncBubbleKind.Working -> Icons.Default.Sync
++        AutoSyncBubbleKind.Success -> Icons.Default.Check
++        AutoSyncBubbleKind.Failure -> Icons.Default.Close
++    }
++    LaunchedEffect(message.id) {
++        delay(
++            when (message.kind) {
++                AutoSyncBubbleKind.Working -> WORKING_LABEL_MS
++                AutoSyncBubbleKind.Failure -> FAILURE_HOLD_MS
++                AutoSyncBubbleKind.Success -> SUCCESS_HOLD_MS
++            }
++        )
++        AutoSyncBubbleToasts.finishPlain(message.id)
++    }
++    Row(
++        verticalAlignment = Alignment.CenterVertically,
++        horizontalArrangement = Arrangement.spacedBy(10.dp),
++        modifier = Modifier
++            .nuvioGlass(GlassRole.HUD, shape = RoundedCornerShape(50))
++            .padding(start = 10.dp, end = 18.dp, top = 8.dp, bottom = 8.dp),
++    ) {
++        Box(
++            modifier = Modifier
++                .size(26.dp)
++                .clip(CircleShape)
++                .background(accent.copy(alpha = 0.16f)),
++            contentAlignment = Alignment.Center,
++        ) {
++            Icon(
++                imageVector = glyph,
++                contentDescription = null,
++                tint = accent,
++                modifier = Modifier.size(14.dp),
++            )
++        }
++        Column(modifier = Modifier.widthIn(max = 420.dp)) {
++            Text(
++                text = stringResource(R.string.autosync_bubble_label),
++                color = NuvioTheme.colors.TextPrimary.copy(alpha = 0.6f),
++                fontSize = 10.sp,
++                lineHeight = 12.sp,
++                fontWeight = FontWeight.Medium,
++                letterSpacing = 0.3.sp,
++            )
++            Text(
++                text = message.headline,
++                color = NuvioTheme.colors.TextPrimary,
++                fontSize = 13.sp,
++                lineHeight = 16.sp,
++                fontWeight = FontWeight.SemiBold,
++            )
++            message.detail?.let {
++                Text(
++                    text = it,
++                    color = NuvioTheme.colors.TextPrimary.copy(alpha = 0.8f),
++                    fontSize = 11.sp,
++                    lineHeight = 15.sp,
++                    modifier = Modifier.padding(top = 2.dp),
++                )
++            }
+         }
+     }
+ }
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/bubble/AutoSyncBubbleToasts.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/bubble/AutoSyncBubbleToasts.kt
+index 56f9fa871..0d99fa204 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/bubble/AutoSyncBubbleToasts.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/bubble/AutoSyncBubbleToasts.kt
+@@ -28,8 +28,9 @@ internal data class AutoSyncBubbleMessage(
+ 
+ /**
+  * The optional frosted bubble that replaces AutoSync's plain toasts. On by default. Without a
+- * player on screen to draw it (or with the setting off) [post] returns false, so the caller
+- * shows its plain toast instead.
++ * player on screen to draw it, [post] returns false, so the caller shows its plain toast instead.
++ * With the setting off but a player showing, the message goes to the styled plain pill, so the
++ * unstyled system toast is only ever seen outside the player.
+  */
+ internal object AutoSyncBubbleToasts {
+     private const val PREFS_NAME = "nuvio_autosync_bubble_settings"
+@@ -44,6 +45,13 @@ internal object AutoSyncBubbleToasts {
+     private val _current = MutableStateFlow<AutoSyncBubbleMessage?>(null)
+     val current: StateFlow<AutoSyncBubbleMessage?> = _current.asStateFlow()
+ 
++    /**
++     * The styled plain pill the player host shows when the bubble is turned off: the same glass
++     * family without the droplet. Only the system toast (no player on screen) stays unstyled.
++     */
++    private val _plain = MutableStateFlow<AutoSyncBubbleMessage?>(null)
++    val plain: StateFlow<AutoSyncBubbleMessage?> = _plain.asStateFlow()
++
+     private val hosts = AtomicInteger(0)
+     private val nextId = AtomicLong(0L)
+     /** The run whose bubble is fading away; a message arriving now starts a fresh bubble. */
+@@ -71,7 +79,12 @@ internal object AutoSyncBubbleToasts {
+ 
+     /** Shows [text] (an "Auto Sync • headline • detail" toast string) in the bubble, if it can. */
+     fun post(kind: AutoSyncBubbleKind, text: String): Boolean {
+-        if (!_enabled.value || hosts.get() <= 0) return false
++        if (hosts.get() <= 0) return false
++        if (!_enabled.value) {
++            postPlain(kind, text)
++            return true
++        }
++        _plain.value = null
+         val (headline, detail) = split(kind, text)
+         val id = nextId.incrementAndGet()
+         _current.update { previous ->
+@@ -86,9 +99,21 @@ internal object AutoSyncBubbleToasts {
+         return true
+     }
+ 
++    private fun postPlain(kind: AutoSyncBubbleKind, text: String) {
++        val (headline, detail) = split(kind, text)
++        val id = nextId.incrementAndGet()
++        _plain.value = AutoSyncBubbleMessage(id, id, kind, headline, detail)
++    }
++
++    /** Called by the host once the plain pill has held long enough. */
++    fun finishPlain(id: Long) {
++        _plain.update { if (it?.id == id) null else it }
++    }
++
+     /** Takes down a bubble that is still working: its run was cancelled, so nothing is left to end it. */
+     fun dismissWorking() {
+         _current.update { if (it?.kind == AutoSyncBubbleKind.Working) null else it }
++        _plain.update { if (it?.kind == AutoSyncBubbleKind.Working) null else it }
+     }
+ 
+     /** Called by the bubble as it starts fading [session] away, so later messages do not join it. */
+@@ -109,6 +134,7 @@ internal object AutoSyncBubbleToasts {
+         if (hosts.decrementAndGet() <= 0) {
+             hosts.set(0)
+             _current.value = null
++            _plain.value = null
+         }
+     }
+ 
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginFocus.kt b/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginFocus.kt
 new file mode 100644
 index 000000000..a631656b3
