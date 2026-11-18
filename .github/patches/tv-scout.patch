@@ -431462,7 +431462,7 @@ index 310ec9294..66d7862ab 100644
  
      override fun isWatched(
 diff --git a/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
-index ba9b59305..7cb82b22e 100644
+index ba9b59305..2a8cd8586 100644
 --- a/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
 @@ -6,6 +6,7 @@ import com.nuvio.tv.core.network.safeApiCall
@@ -431481,7 +431481,7 @@ index ba9b59305..7cb82b22e 100644
  import com.nuvio.tv.domain.model.onlyLiveTvCatalogs
  import com.nuvio.tv.domain.model.resolvePlayableTvStreamUrl
  import com.nuvio.tv.domain.repository.AddonRepository
-@@ -53,6 +55,17 @@ class TvChannelsRepository @Inject constructor(
+@@ -53,6 +55,12 @@ class TvChannelsRepository @Inject constructor(
  ) {
      companion object {
          private const val TAG = "TvChannelsRepo"
@@ -431491,15 +431491,10 @@ index ba9b59305..7cb82b22e 100644
 +            "rate.?limit|too many requests|try again (later|in \\d)|wait a (few|couple)",
 +            RegexOption.IGNORE_CASE
 +        )
-+        /** Catalog ids/names that hold replays and recaps, not live channels (kept out of the
-+         *  guide — those lists can run to thousands of entries and bury the live ones). */
-+        private val REPLAY_CATALOG_WORDS = listOf(
-+            "replay", "recap", "highlight", "catchup", "catch-up", "catch up", "vod"
-+        )
      }
  
      private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-@@ -215,6 +228,212 @@ class TvChannelsRepository @Inject constructor(
+@@ -215,6 +223,215 @@ class TvChannelsRepository @Inject constructor(
      private fun List<Addon>.liveTvOnly(): List<Addon> =
          filter { it.hasLiveTvCatalogs() }.map { it.onlyLiveTvCatalogs() }
  
@@ -431515,14 +431510,6 @@ index ba9b59305..7cb82b22e 100644
 +        val id: String,
 +    )
 +
-+    /** Is this addon catalog a replay/recap list rather than live channels? (Nuvio Live
-+     *  Sports' ~45 replay lists all carry a required "skip" option as well.) */
-+    private fun isReplayCatalog(catalog: com.nuvio.tv.domain.model.CatalogDescriptor): Boolean {
-+        val text = (catalog.id + " " + catalog.name).lowercase()
-+        if (REPLAY_CATALOG_WORDS.any { text.contains(it) }) return true
-+        return catalog.extra.any { it.isRequired && it.name.equals("skip", true) }
-+    }
-+
 +    /**
 +     * The enabled, selected addons whose Live TV catalogs feed the V2 guide (install order).
 +     */
@@ -431537,15 +431524,17 @@ index ba9b59305..7cb82b22e 100644
 +
 +    /**
 +     * One addon's live-TV rows (uncapped: the guide takes everything, adding each addon's
-+     * share as it arrives). The stream URL is NOT fetched here — addons rate-limit, and
-+     * asking /stream for every channel (over a thousand entries) gets the whole addon
-+     * throttled; a channel is resolved when it is picked.
++     * share as it arrives). Every Live TV catalog counts — replay/recap lists too, like the
++     * classic screen: a replay entry is a channel whose stream resolves when it is picked.
++     * The stream URL is NOT fetched here — addons rate-limit, and asking /stream for every
++     * channel (over a thousand entries) gets the whole addon throttled; a channel is resolved
++     * when it is picked.
 +     */
 +    suspend fun fetchAddonLiveChannelRowsFor(addon: Addon): List<AddonLiveChannelRow> {
 +        val seen = mutableSetOf<String>()
 +        val rows = mutableListOf<AddonLiveChannelRow>()
 +        for (catalog in addon.catalogs) {
-+            if (isReplayCatalog(catalog)) continue
++            if (!catalog.isLiveTvCatalog()) continue
 +            val catName = catalog.name.ifBlank { catalog.id }
 +            val items = runCatching { fetchAllItemsFromCatalog(addon.baseUrl, catalog) }
 +                .onFailure { err -> Log.w(TAG, "V2 bridge: catalog ${catalog.name} of ${addon.displayName} failed: ${err.message}") }
@@ -431644,7 +431633,9 @@ index ba9b59305..7cb82b22e 100644
 +     */
 +    data class ResolvedAddonStream(
 +        val url: String,
-+        val headers: Map<String, String>
++        val headers: Map<String, String>,
++        /** The stream's name as the addon wrote it ("DaddyLive | Willow Cricket 🇮🇳"), for pickers. */
++        val label: String = ""
 +    )
 +
 +    /**
@@ -431670,9 +431661,16 @@ index ba9b59305..7cb82b22e 100644
 +        streams.mapNotNull { dto ->
 +            val domain = resolveYouTubeStream(dto.toDomain("", null))
 +            val url = domain?.let { resolvePlayableTvStreamUrl(it) } ?: return@mapNotNull null
++            // The addon's own name for this copy ("DaddyLive | Willow Cricket 🇮🇳 · HD"),
++            // so screens listing the copies can show them apart.
++            val label = listOfNotNull(
++                dto.name,
++                dto.title ?: dto.description?.lineSequence()?.firstOrNull()
++            ).map { it.trim() }.filter { it.isNotEmpty() }.joinToString(" · ").take(70)
 +            ResolvedAddonStream(
 +                url = url,
-+                headers = sanitizeAddonPlaybackHeaders(dto.behaviorHints?.proxyHeaders?.request)
++                headers = sanitizeAddonPlaybackHeaders(dto.behaviorHints?.proxyHeaders?.request),
++                label = label
 +            )
 +        }.distinctBy { it.url }
 +
@@ -441237,10 +441235,10 @@ index 000000000..a4f922dab
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/data/AddonChannelBridge.kt b/app/src/main/java/com/nuvio/tv/livetv/data/AddonChannelBridge.kt
 new file mode 100644
-index 000000000..0891770b2
+index 000000000..a75217c6f
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/data/AddonChannelBridge.kt
-@@ -0,0 +1,311 @@
+@@ -0,0 +1,357 @@
 +package com.nuvio.tv.livetv.data
 +
 +import android.content.Context
@@ -441291,6 +441289,8 @@ index 000000000..0891770b2
 +        private const val TAG = "AddonChannelBridge"
 +        /** The channel list on disk is asked for again after this long — in the background, with the saved list shown meanwhile. */
 +        private const val LIST_TTL_MS = 6 * 60 * 60_000L
++        /** Least time between two refresh attempts (a failing addon isn't asked over and over). */
++        private const val REFRESH_SPACING_MS = 5 * 60_000L
 +        /** A resolved stream link is reused for this long before the addon is asked again for it. */
 +        private const val RESOLVED_TTL_MS = 12 * 60 * 60_000L
 +        private const val PLAY_RESOLVE_TIMEOUT_MS = 20_000L
@@ -441317,6 +441317,9 @@ index 000000000..0891770b2
 +    private val resolvedByKey = ConcurrentHashMap<String, ResolvedEntry>()
 +
 +    @Volatile private var lastRefreshAt = 0L
++    /** Once per app run the saved list is refreshed even when it isn't stale yet. */
++    @Volatile private var refreshedThisRun = false
++    @Volatile private var lastRefreshAttemptAt = 0L
 +    private val refreshMutex = Mutex()
 +    private val resolvePermits = Semaphore(/* permits */ 4)
 +    private val cacheFile by lazy { File(File(context.cacheDir, "addon_live_channels"), "cache.json").also { it.parentFile?.mkdirs() } }
@@ -441360,7 +441363,14 @@ index 000000000..0891770b2
 +    /** The guide's current addon channels, refreshing in the background when the copy is stale. */
 +    fun current(startNumber: Int): List<LiveChannel> {
 +        val now = System.currentTimeMillis()
-+        if (now - lastRefreshAt > LIST_TTL_MS && refreshMutex.tryLock()) {
++        // A saved copy is shown as it is, but it is always brought up to date once per app run —
++        // channels the addons added since it was written (or that a throttled run missed) join
++        // the guide while you watch. Later refreshes wait for the copy to go stale, with this
++        // much space between attempts so a failing addon isn't asked over and over.
++        val due = !refreshedThisRun || now - lastRefreshAt > LIST_TTL_MS
++        if (due && now - lastRefreshAttemptAt > REFRESH_SPACING_MS && refreshMutex.tryLock()) {
++            lastRefreshAttemptAt = now
++            refreshedThisRun = true
 +            scope.launch {
 +                try { refreshLocked(startNumber) }
 +                catch (t: Throwable) { Log.w(TAG, "Addon channel refresh failed", t) }
@@ -441373,6 +441383,7 @@ index 000000000..0891770b2
 +    /** Drops the cache so the next guide build asks the addons again. */
 +    fun invalidate() {
 +        lastRefreshAt = 0L
++        lastRefreshAttemptAt = 0L
 +    }
 +
 +    /**
@@ -441410,6 +441421,39 @@ index 000000000..0891770b2
 +    /** Puts a channel's freshly resolved link back into the guide's list. */
 +    private fun publishResolved(resolved: LiveChannel) {
 +        _channels.update { list -> list.map { if (it.key == resolved.key) resolved else it } }
++    }
++
++    /**
++     * One copy of an addon channel's stream: its link, request headers, and the name the addon
++     * gave the copy ("DaddyLive | Willow Cricket 🇮🇳") — what a picker lists them apart by.
++     */
++    class StreamOption(val url: String, val headers: Map<String, String>, val label: String)
++
++    /** A channel's whole stream list, kept so the answer isn't asked for again this session. */
++    private val streamOptions = ConcurrentHashMap<String, List<StreamOption>>()
++
++    /**
++     * Every copy the addon offers for [channel], best first (what playing it would use, with the
++     * names as the addon wrote them). Null when the addon gave nothing. The player uses this to
++     * fill a game's stream list (Sports) the way the classic screen's watch flow does.
++     */
++    suspend fun resolveAddonStreamOptions(channel: LiveChannel): List<StreamOption>? {
++        streamOptions[channel.key]?.let { return it.ifEmpty { null } }
++        if (channel.sourceId != SOURCE_ID) return null
++        val row = rowsByKey[channel.key] ?: return null
++        val streams = resolvePermits.withPermit {
++            withTimeoutOrNull(PLAY_RESOLVE_TIMEOUT_MS) {
++                tvChannelsRepository.resolveAddonLiveStreams(row)
++            }
++        }.orEmpty()
++        val out = streams.map { StreamOption(it.url, it.headers, it.label) }
++        streamOptions[channel.key] = out
++        return out.ifEmpty { null }
++    }
++
++    /** Forgets a channel's kept stream list (a refreshed guide's channels resolve anew). */
++    fun forgetStreamOptions(channelKey: String) {
++        streamOptions.remove(channelKey)
 +    }
 +
 +    @VisibleForTesting
@@ -456732,10 +456776,10 @@ index 000000000..d4888bfb7
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/multiview/MultiviewPlaybackSession.kt b/app/src/main/java/com/nuvio/tv/livetv/multiview/MultiviewPlaybackSession.kt
 new file mode 100644
-index 000000000..361d13850
+index 000000000..90f75856c
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/multiview/MultiviewPlaybackSession.kt
-@@ -0,0 +1,646 @@
+@@ -0,0 +1,711 @@
 +package com.nuvio.tv.livetv.multiview
 +
 +import android.os.SystemClock
@@ -456983,6 +457027,10 @@ index 000000000..361d13850
 +    private var streamUrl: String? = null
 +    private var streamMime: String? = null
 +    private var formatGuess = 0
++    /** An addon channel's headers, and its links after the one playing (tried in order on failure). */
++    private var addonHeaders: Map<String, String> = emptyMap()
++    private var addonLinks: List<String>? = null
++    private var addonLinkIndex = 0
 +    private val listener = object : Player.Listener {
 +        override fun onEvents(player: Player, events: Player.Events) {
 +            if (!released) onChanged()
@@ -457002,6 +457050,7 @@ index 000000000..361d13850
 +            // A failed pane must not retain an adaptive manifest refresh or provider connection.
 +            player.stop()
 +            player.clearMediaItems()
++            if (tryNextAddonLink(error)) return
 +            if (tryOtherFormat(error)) return
 +            if (MultiviewPlaybackErrors.isRetryable(error) && scheduleReconnect(error.errorCodeName)) return
 +            fail(message, error.errorCodeName)
@@ -457017,6 +457066,28 @@ index 000000000..361d13850
 +                fail(LOST_MESSAGE)
 +            }
 +        }
++    }
++
++    /**
++     * The addon channel's next link when the one playing failed (the first is prepared, the rest
++     * follow before any reconnect or backup). True when another try was started.
++     */
++    private fun tryNextAddonLink(error: PlaybackException): Boolean {
++        val links = addonLinks ?: return false
++        val next = links.getOrNull(addonLinkIndex + 1) ?: return false
++        val ch = channel ?: return false
++        addonLinkIndex += 1
++        streamUrl = next
++        streamMime = null
++        formatGuess = 0
++        LiveTvLoadReport.add(
++            "Multiview: ${ch.name} failed (${error.errorCodeName}); trying its addon link " +
++                "${addonLinkIndex + 1} of ${links.size + 1}"
++        )
++        prepareResolved(ch.copy(url = next, headers = addonHeaders))
++        player.playWhenReady = wantPlaying
++        onChanged()
++        return true
 +    }
 +
 +    /**
@@ -457165,6 +457236,8 @@ index 000000000..361d13850
 +        streamUrl = if (channel.key in LiveStreamFormats.tsInstead) LiveStreamFormats.tsLinkFor(channel.url) ?: channel.url else channel.url
 +        streamMime = if (channel.key in LiveStreamFormats.plainTs) MimeTypes.VIDEO_MP2T else null
 +        formatGuess = 0
++        addonLinks = null
++        addonLinkIndex = 0
 +        connect(channel)
 +    }
 +
@@ -457174,8 +457247,41 @@ index 000000000..361d13850
 +        mediaPolicy = null
 +        val expected = ++generation
 +        error = null
-+        resolving = channel.stalkerRef != null
-+        if (channel.stalkerRef != null) {
++        // An addon channel (IPTV V2) has no link of its own: ask the addon now, like the
++        // full-screen player does, then play the first link and keep the rest as backups.
++        val addonBlank = channel.stalkerRef == null &&
++            channel.sourceId == com.nuvio.tv.livetv.data.AddonChannelBridge.SOURCE_ID && channel.url.isBlank()
++        resolving = addonBlank || channel.stalkerRef != null
++        if (addonBlank) {
++            player.stop()
++            player.clearMediaItems()
++            onChanged()
++            resolveJob = scope.launch {
++                try {
++                    val bridge = EntryPointAccessors.fromApplication(appContext, StalkerPlayerEntryPoint::class.java).addonChannelBridge()
++                    val resolution = bridge.resolveOnPlay(channel)
++                    if (released || expected != generation) return@launch
++                    resolving = false
++                    val resolved = resolution?.channel
++                    if (resolved == null || resolved.url.isBlank()) {
++                        fail("Couldn't load \"${channel.name}\" from its addon. Retry, or choose another channel.")
++                    } else {
++                        addonHeaders = resolved.headers
++                        addonLinks = resolution.fallbackUrls
++                        addonLinkIndex = 0
++                        prepareResolved(resolved)
++                        player.playWhenReady = wantPlaying
++                        onChanged()
++                    }
++                } catch (cancelled: kotlinx.coroutines.CancellationException) {
++                    throw cancelled
++                } catch (failure: Exception) {
++                    if (released || expected != generation) return@launch
++                    resolving = false
++                    fail("Couldn't load \"${channel.name}\" from its addon. Retry, or choose another channel.")
++                }
++            }
++        } else if (channel.stalkerRef != null) {
 +            player.stop()
 +            player.clearMediaItems()
 +            onChanged()
@@ -457254,6 +457360,9 @@ index 000000000..361d13850
 +@InstallIn(SingletonComponent::class)
 +interface StalkerPlayerEntryPoint {
 +    fun stalkerGateway(): StalkerGateway
++
++    /** Addon channels (IPTV V2) only get their stream link when something asks to play them. */
++    fun addonChannelBridge(): com.nuvio.tv.livetv.data.AddonChannelBridge
 +}
 +
 +/** The Android request belongs to the whole session; individual panes never request focus. */
@@ -460320,10 +460429,10 @@ index 000000000..6433a1470
 +)
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandHomeScreen.kt b/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandHomeScreen.kt
 new file mode 100644
-index 000000000..c606d7948
+index 000000000..cf96c0434
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandHomeScreen.kt
-@@ -0,0 +1,640 @@
+@@ -0,0 +1,632 @@
 +package com.nuvio.tv.livetv.ondemand
 +
 +import androidx.compose.foundation.background
@@ -460559,17 +460668,9 @@ index 000000000..c606d7948
 +    // provider's own details for titles your addons don't know.
 +    val open: (String) -> Unit = { metaId ->
 +        val item = viewModel.homeItem(metaId)
-+        if (item != null && !opening) {
-+            opening = true
-+            scope.launch {
-+                try {
-+                    when (val t = viewModel.targetFor(item)) {
-+                        is OnDemandTarget.Details -> onOpenDetail(t.itemId, t.itemType, t.addonBaseUrl, t.uid)
-+                        is OnDemandTarget.Provider -> providerItem = item
-+                    }
-+                } finally { opening = false }
-+            }
-+        }
++        // Every title opens its provider page (seasons, episodes, play) — never Nuvio's
++        // details page. Details stay reachable through the card's long-press menu.
++        if (item != null) providerItem = item
 +    }
 +    val onNavigateToDetail: (String, String, String) -> Unit = { id, _, _ -> open(id) }
 +    val onItemFocus: (MetaPreview) -> Unit = { lastFocusedCard = it.id; viewModel.focusHome(it.id) }
@@ -462646,10 +462747,10 @@ index 000000000..302794944
 +// the repository and can't delete files.
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandSearch.kt b/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandSearch.kt
 new file mode 100644
-index 000000000..fff00a24f
+index 000000000..1566d62bb
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandSearch.kt
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,152 @@
 +package com.nuvio.tv.livetv.ondemand
 +
 +import androidx.compose.foundation.ExperimentalFoundationApi
@@ -462675,7 +462776,6 @@ index 000000000..fff00a24f
 +import androidx.compose.runtime.mutableStateOf
 +import androidx.compose.runtime.produceState
 +import androidx.compose.runtime.remember
-+import androidx.compose.runtime.rememberCoroutineScope
 +import androidx.compose.runtime.setValue
 +import androidx.compose.ui.Alignment
 +import androidx.compose.ui.Modifier
@@ -462742,9 +462842,7 @@ index 000000000..fff00a24f
 +) {
 +    val viewModel = results.viewModel ?: return
 +    if (results.items.isEmpty()) return
-+    val scope = rememberCoroutineScope()
 +    var providerItem by remember { mutableStateOf<VodItem?>(null) }
-+    var opening by remember { mutableStateOf(false) }
 +    com.nuvio.tv.livetv.ui.SearchResultsRow(title = "On Demand", modifier = modifier) {
 +        itemsIndexed(results.items, key = { _, it -> it.uid }) { index, item ->
 +            OnDemandSearchCard(
@@ -462755,17 +462853,9 @@ index 000000000..fff00a24f
 +                    .then(if (index == 0 && entryFocusRequester != null) Modifier.focusRequester(entryFocusRequester) else Modifier)
 +                    .focusProperties { if (upFocusRequester != null) up = upFocusRequester },
 +                onClick = {
-+                    if (!opening) {
-+                        opening = true
-+                        scope.launch {
-+                            try {
-+                                when (val t = viewModel.targetFor(item)) {
-+                                    is OnDemandTarget.Details -> onOpenDetail(t.itemId, t.itemType, t.addonBaseUrl, t.uid)
-+                                    is OnDemandTarget.Provider -> providerItem = item
-+                                }
-+                            } finally { opening = false }
-+                        }
-+                    }
++                    // Same rule as the On Demand page: the provider page opens, never the
++                    // details page (details stay on the card's long-press menu).
++                    providerItem = item
 +                }
 +            )
 +        }
@@ -484539,10 +484629,10 @@ index 000000000..c55b8a501
 +internal fun RecBadge() = SportsBadge("● REC", Color(0xFFE53935), Color.White)
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/sports/SportsRepository.kt b/app/src/main/java/com/nuvio/tv/livetv/sports/SportsRepository.kt
 new file mode 100644
-index 000000000..13c8f691a
+index 000000000..9a6d06dec
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/sports/SportsRepository.kt
-@@ -0,0 +1,2751 @@
+@@ -0,0 +1,2787 @@
 +package com.nuvio.tv.livetv.sports
 +
 +import android.content.Context
@@ -484605,6 +484695,7 @@ index 000000000..13c8f691a
 +    private val guideDb: EpgDatabase,
 +    private val playback: LiveTvPlaybackController,
 +    private val addonSource: SportsAddonSource,
++    private val addonChannels: com.nuvio.tv.livetv.data.AddonChannelBridge,
 +    youTube: com.nuvio.tv.data.trailer.InAppYouTubeExtractor
 +) {
 +    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -484962,8 +485053,10 @@ index 000000000..13c8f691a
 +        }
 +        addonJobs[ev.id] = scope.launch {
 +            var round = 0
++            expandAddonStreams(ev)
 +            while (kotlinx.coroutines.currentCoroutineContext().isActive) {
 +                val got = lookInAddons(ev)
++                expandAddonStreams(ev)
 +                if (ev.state == GameState.POST || got || ++round >= 20) break
 +                delay(90_000L)
 +            }
@@ -485067,6 +485160,39 @@ index 000000000..13c8f691a
 +    /** The game page was closed: stop looking. */
 +    fun closeGame(eventId: String) {
 +        addonJobs.remove(eventId)?.cancel()
++        streamsExpanded.remove(eventId)
++    }
++
++    /** Games whose guide addon channels have already been opened up into their stream copies. */
++    private val streamsExpanded = java.util.concurrent.ConcurrentHashMap<String, MutableSet<String>>()
++
++    /**
++     * A guide addon channel ("Australia vs England — Nuvio Live Sports") that shows this game
++     * stands for several streams: ask its addon for every copy and list each under its own name,
++     * the way the classic screen's watch flow does — then any copy, not just the first, is one
++     * press away. Runs while the game page is open; the bridge keeps the answers.
++     */
++    private suspend fun expandAddonStreams(ev: SportsEvent) {
++        val done = streamsExpanded.getOrPut(ev.id) { java.util.concurrent.ConcurrentHashMap.newKeySet() }
++        val blanks = (_matches.value[ev.id].orEmpty() + _addonLive.value[ev.id].orEmpty())
++            .filter { it.channel.sourceId == com.nuvio.tv.livetv.data.AddonChannelBridge.SOURCE_ID && it.channel.url.isBlank() }
++            .filter { done.add(it.channel.key) } // a set's add: true only the first time
++        for (m in blanks) {
++            val options = runCatching { addonChannels.resolveAddonStreamOptions(m.channel) }.getOrNull().orEmpty()
++            if (options.isEmpty()) continue
++            val rows = options.mapIndexed { i, o ->
++                m.copy(
++                    channel = m.channel.copy(
++                        key = m.channel.key + "#" + i,
++                        url = o.url,
++                        headers = o.headers,
++                        name = o.label.ifBlank { m.channel.name }
++                    ),
++                    how = "From ${m.channel.sourceName}"
++                )
++            }
++            _addonLive.update { it + (ev.id to (it[ev.id].orEmpty() + rows)) }
++        }
 +    }
 +
 +    /** Live TV's "Switch to a backup channel" setting: also covers moving to another channel showing the game. */
@@ -487574,10 +487700,10 @@ index 000000000..6c7bef16b
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/sports/SportsScreen.kt b/app/src/main/java/com/nuvio/tv/livetv/sports/SportsScreen.kt
 new file mode 100644
-index 000000000..50ff32e6e
+index 000000000..adcc6d1fc
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/sports/SportsScreen.kt
-@@ -0,0 +1,1972 @@
+@@ -0,0 +1,1974 @@
 +@file:OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class, androidx.compose.ui.ExperimentalComposeUiApi::class)
 +
 +package com.nuvio.tv.livetv.sports
@@ -488994,7 +489120,9 @@ index 000000000..50ff32e6e
 +    var pickRegion by remember(ev.id) { mutableStateOf(false) }
 +    var otherRegions by remember(ev.id, regionChoice) { mutableStateOf(false) }
 +    val inRegion = if (regionChoice.isBlank()) matches else matches.filterIndexed { i, m ->
-+        m.score >= 150 || m.channel.sourceId == SportsAddonSource.SOURCE_ID || (videoOn && playingKey == m.channel.key) || ChannelRegions.includes(regionCodes[i], regionChoice)
++        m.score >= 150 || m.channel.sourceId == SportsAddonSource.SOURCE_ID ||
++            m.channel.sourceId == com.nuvio.tv.livetv.data.AddonChannelBridge.SOURCE_ID ||
++            (videoOn && playingKey == m.channel.key) || ChannelRegions.includes(regionCodes[i], regionChoice)
 +    }
 +    // None of them from that region: show them all (with a line saying so) rather than nothing.
 +    val noneInRegion = regionChoice.isNotBlank() && matches.isNotEmpty() && inRegion.isEmpty()
@@ -499264,10 +499392,10 @@ index 000000000..a6b1f797b
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/ui/LiveTvGuideScreen.kt b/app/src/main/java/com/nuvio/tv/livetv/ui/LiveTvGuideScreen.kt
 new file mode 100644
-index 000000000..7edb25dd3
+index 000000000..ef5646531
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/ui/LiveTvGuideScreen.kt
-@@ -0,0 +1,5088 @@
+@@ -0,0 +1,5076 @@
 +package com.nuvio.tv.livetv.ui
 +
 +import com.nuvio.tv.livetv.data.LiveTvRepository
@@ -499644,8 +499772,6 @@ index 000000000..7edb25dd3
 +
 +    val gridFocus = remember { FocusRequester() }
 +    val groupsFocus = remember { FocusRequester() }
-+    /** The header's ● button: a picked channel's preview hands the focus over to it (Down comes back to the guide). */
-+    val headerRecordFocus = remember { FocusRequester() }
 +    val contentFocus = LocalContentFocusRequester.current
 +
 +    var column by remember { mutableStateOf(GuideColumn.CHANNEL) }
@@ -500188,13 +500314,7 @@ index 000000000..7edb25dd3
 +    fun playChannel(ch: LiveChannel) {
 +        val alreadyPreviewing = playback.channelKey == ch.key && playback.catchupTitle == null
 +        viewModel.preview(ch)
-+        if (!settings.showPreview || settings.openFullscreenOnSelect || alreadyPreviewing) {
-+            goFullscreen()
-+        } else {
-+            // The preview is on and playing in the panel above: the focus follows it, onto the
-+            // ● Recordings button (Down, or any guide key, brings you back into the guide).
-+            runCatching { headerRecordFocus.requestFocus() }
-+        }
++        if (!settings.showPreview || settings.openFullscreenOnSelect || alreadyPreviewing) goFullscreen()
 +    }
 +
 +    fun activate() {
@@ -500411,7 +500531,6 @@ index 000000000..7edb25dd3
 +                onPreviewBounds = { previewBounds = it },
 +                onGlassBounds = { headerGlassBounds = it },
 +                gearFocus = guideGearFocus,
-+                recordingsFocus = headerRecordFocus,
 +                onGear = { guideGearOpen = true },
 +                // Down from the ● / ⚙ in the info bar: to Search when the group list is showing,
 +                // otherwise to the top channel.
@@ -501795,9 +501914,6 @@ index 000000000..7edb25dd3
 +    onGlassBounds: (androidx.compose.ui.geometry.Rect?) -> Unit = {},
 +    /** The ⚙ that opens the Guide display panel (Up from the first channel reaches it). */
 +    gearFocus: FocusRequester = FocusRequester(),
-+    /** The ● Recordings button: where a picked channel's preview hands the focus over, so the
-+     *  header (Recordings, Multiview, ⚙) is reachable without leaving the guide. */
-+    recordingsFocus: FocusRequester = FocusRequester(),
 +    onGear: () -> Unit = {},
 +    onGearDown: () -> Unit = {},
 +    /** Opens Recordings (the ● beside the ⚙). */
@@ -501815,7 +501931,7 @@ index 000000000..7edb25dd3
 +            Spacer(Modifier.width(16.dp))
 +            GuideMultiviewButton(onOpen = onMultiview, onDown = onGearDown)
 +            Spacer(Modifier.width(6.dp))
-+            GuideRecordingsButton(Modifier.focusRequester(recordingsFocus), onOpen = onRecordings, onDown = onGearDown)
++            GuideRecordingsButton(onOpen = onRecordings, onDown = onGearDown)
 +            Spacer(Modifier.width(6.dp))
 +            GuideGearButton(Modifier.focusRequester(gearFocus), onOpen = onGear, onDown = onGearDown)
 +            Spacer(Modifier.width(10.dp))
@@ -501968,7 +502084,7 @@ index 000000000..7edb25dd3
 +        Row {
 +            GuideMultiviewButton(onOpen = onMultiview, onDown = onGearDown)
 +            Spacer(Modifier.width(6.dp))
-+            GuideRecordingsButton(Modifier.focusRequester(recordingsFocus), onOpen = onRecordings, onDown = onGearDown)
++            GuideRecordingsButton(onOpen = onRecordings, onDown = onGearDown)
 +            Spacer(Modifier.width(6.dp))
 +            GuideGearButton(Modifier.focusRequester(gearFocus), onOpen = onGear, onDown = onGearDown)
 +        }
