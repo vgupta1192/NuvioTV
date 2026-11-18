@@ -460429,7 +460429,7 @@ index 000000000..6433a1470
 +)
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandHomeScreen.kt b/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandHomeScreen.kt
 new file mode 100644
-index 000000000..cf96c0434
+index 000000000..d4fb84624
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandHomeScreen.kt
 @@ -0,0 +1,632 @@
@@ -460514,7 +460514,7 @@ index 000000000..cf96c0434
 +fun OnDemandHomeScreen(
 +    homeSettings: HomeUiState?,
 +    onOpenDetail: (itemId: String, itemType: String, addonBaseUrl: String?, onDemandUid: String) -> Unit,
-+    onPlay: (url: String, title: String, type: String, poster: String?, contentId: String, contentName: String, season: Int?, episode: Int?, episodeName: String?) -> Unit,
++    onPlay: (url: String, title: String, type: String, poster: String?, contentId: String, contentName: String, season: Int?, episode: Int?, episodeName: String?, headers: Map<String, String>) -> Unit,
 +    /** The search button: Nuvio's own search. */
 +    onOpenSearch: () -> Unit,
 +    /** Home's own trailer lookup and results (trailers follow Nuvio's trailer settings). */
@@ -460947,12 +460947,12 @@ index 000000000..cf96c0434
 +            item = item,
 +            viewModel = viewModel,
 +            onDismiss = { providerItem = null },
-+            onPlay = { url, title, poster, season, episode, episodeName ->
++            onPlay = { url, title, poster, season, episode, episodeName, headers ->
 +                providerItem = null
 +                // Played with the title's id, so Nuvio tracks progress: resumes, and Continue Watching.
 +                onPlay(
 +                    url, title, if (item.kind == VodKind.SERIES) "series" else "movie", poster,
-+                    VodHomeIds.metaId(item.uid), OnDemandDatabase.displayTitle(item.name), season, episode, episodeName
++                    VodHomeIds.metaId(item.uid), OnDemandDatabase.displayTitle(item.name), season, episode, episodeName, headers
 +                )
 +            }
 +        )
@@ -461165,10 +461165,10 @@ index 000000000..589c65919
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandProviderDialog.kt b/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandProviderDialog.kt
 new file mode 100644
-index 000000000..c8a516f73
+index 000000000..5c47951b6
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandProviderDialog.kt
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,232 @@
 +package com.nuvio.tv.livetv.ondemand
 +
 +import androidx.compose.foundation.ExperimentalFoundationApi
@@ -461255,12 +461255,16 @@ index 000000000..c8a516f73
 +    item: VodItem,
 +    viewModel: OnDemandViewModel,
 +    onDismiss: () -> Unit,
-+    onPlay: (url: String, title: String, poster: String?, season: Int?, episode: Int?, episodeName: String?) -> Unit
++    onPlay: (url: String, title: String, poster: String?, season: Int?, episode: Int?, episodeName: String?, headers: Map<String, String>) -> Unit
 +) {
 +    val scope = rememberCoroutineScope()
 +    val info by produceState<VodInfo?>(initialValue = null, item.uid) { value = viewModel.info(item) }
 +    val poster by produceState<String?>(initialValue = item.icon, item.uid) { viewModel.posterFor(item)?.let { value = it } }
 +    var season by remember { mutableStateOf<Int?>(null) }
++    // Addon links answer on press (a cold addon can take a moment or come back empty once):
++    // show it while asking, and say so when there is nothing playable instead of staying silent.
++    var resolving by remember { mutableStateOf(false) }
++    var resolveError by remember { mutableStateOf<String?>(null) }
 +    val first = remember { FocusRequester() }
 +    LiveDialog(onDismiss = onDismiss, width = 760.dp) {
 +        Row(horizontalArrangement = Arrangement.spacedBy(18.dp)) {
@@ -461287,6 +461291,10 @@ index 000000000..c8a516f73
 +                    val versions by produceState<List<OnDemandRepository.Version>>(initialValue = emptyList(), item.uid) {
 +                        value = viewModel.versions(item)
 +                    }
++                    // The version list replaces the plain Play button when it lands late; put focus back.
++                    LaunchedEffect(versions) {
++                        if (versions.size > 1) { delay(80); runCatching { first.requestFocus() } }
++                    }
 +                    if (versions.size > 1) {
 +                        // Several copies: pick one (best quality first).
 +                        LiveText("Choose a version", color = NuvioTheme.colors.TextSecondary, size = 13.sp)
@@ -461297,12 +461305,26 @@ index 000000000..c8a516f73
 +                                    "Play · ${v.label}" + if (v.detail.isNotBlank()) "  —  ${v.detail}" else "",
 +                                    if (v == versions.first()) Modifier.focusRequester(first) else Modifier
 +                                ) {
-+                                    scope.launch { viewModel.movieUrl(v.item)?.let { onPlay(it, item.name, poster, null, null, null) } }
++                                    if (resolving) return@MenuItem
++                                    resolveError = null; resolving = true
++                                    scope.launch {
++                                        val stream = viewModel.movieStream(v.item)
++                                        resolving = false
++                                        if (stream == null) resolveError = "The provider didn't send a playable stream. Press it again to retry."
++                                        else onPlay(stream.url, item.name, poster, null, null, null, stream.headers)
++                                    }
 +                                }
 +                            }
 +                        }
-+                    } else MenuItem("Play", Modifier.focusRequester(first)) {
-+                        scope.launch { viewModel.movieUrl(item)?.let { onPlay(it, item.name, poster, null, null, null) } }
++                    } else MenuItem(if (resolving) "Getting the stream…" else "Play", Modifier.focusRequester(first)) {
++                        if (resolving) return@MenuItem
++                        resolveError = null; resolving = true
++                        scope.launch {
++                            val stream = viewModel.movieStream(item)
++                            resolving = false
++                            if (stream == null) resolveError = "The provider didn't send a playable stream. Press Play to try again."
++                            else onPlay(stream.url, item.name, poster, null, null, null, stream.headers)
++                        }
 +                    }
 +                } else {
 +                    val episodes = info?.episodes.orEmpty()
@@ -461321,13 +461343,30 @@ index 000000000..c8a516f73
 +                                    "${ep.episode}.  ${ep.title}",
 +                                    if (ep == episodes.firstOrNull { it.season == current }) Modifier.focusRequester(first) else Modifier
 +                                ) {
-+                                    onPlay(ep.url, "${item.name} · S${ep.season}E${ep.episode}", poster, ep.season, ep.episode, ep.title)
++                                    if (resolving) return@MenuItem
++                                    resolveError = null; resolving = true
++                                    scope.launch {
++                                        // An addon episode's link answers on press; ep.url is only
++                                        // filled by providers that hand out direct links.
++                                        val stream = viewModel.episodeStream(ep)
++                                        resolving = false
++                                        if (stream == null) resolveError = "The provider didn't send a playable stream for this episode. Press it again to retry."
++                                        else onPlay(stream.url, "${item.name} · S${ep.season}E${ep.episode}", poster, ep.season, ep.episode, ep.title, stream.headers)
++                                    }
 +                                }
 +                            }
 +                        }
 +                    } else if (info != null) {
 +                        LiveText("The provider didn't list any episodes.", color = NuvioTheme.colors.TextSecondary, size = 13.sp)
 +                    }
++                }
++                if (resolving) {
++                    Spacer(Modifier.height(6.dp))
++                    LiveText("Getting the stream from your provider…", color = NuvioTheme.colors.TextSecondary, size = 13.sp)
++                }
++                resolveError?.let { message ->
++                    Spacer(Modifier.height(6.dp))
++                    LiveText(message, color = NuvioTheme.colors.TextSecondary, size = 13.sp)
 +                }
 +            }
 +        }
@@ -461364,10 +461403,10 @@ index 000000000..c8a516f73
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandRepository.kt b/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandRepository.kt
 new file mode 100644
-index 000000000..bba521e0d
+index 000000000..0cb9b6150
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandRepository.kt
-@@ -0,0 +1,1364 @@
+@@ -0,0 +1,1400 @@
 +package com.nuvio.tv.livetv.ondemand
 +
 +import android.content.Context
@@ -462350,6 +462389,42 @@ index 000000000..bba521e0d
 +        else -> episode.url
 +    }
 +
++    /** A stream ready to play: its URL and any request headers the addon asks for it. */
++    data class PlayableStream(val url: String, val headers: Map<String, String> = emptyMap())
++
++    /**
++     * The stream to play for a movie: addons answer on play (asked twice — a cold addon can
++     * come back empty the first time, which is why Play seemed to need a second press),
++     * everything else builds its link; the addon's request headers ride along so guarded
++     * links open.
++     */
++    suspend fun movieStream(item: VodItem): PlayableStream? = withContext(Dispatchers.IO) {
++        if (isAddonPlaylist(item.playlistId)) {
++            val type = item.id.substringBefore(':')
++            val metaId = item.id.substringAfter(':', missingDelimiterValue = "")
++            if (metaId.isEmpty()) return@withContext null
++            return@withContext addonPlayableStream(manifestOf(item.playlistId), type, metaId)
++        }
++        movieUrl(item)?.let { PlayableStream(it) }
++    }
++
++    /** The stream to play for one episode — the same routing as [episodeUrl], with headers. */
++    suspend fun episodeStream(episode: VodEpisode): PlayableStream? = withContext(Dispatchers.IO) {
++        if (isAddonPlaylist(episode.playlistId)) {
++            return@withContext addonPlayableStream(manifestOf(episode.playlistId), "series", episode.id)
++        }
++        episodeUrl(episode)?.let { PlayableStream(it) }
++    }
++
++    /** An addon's best playable answer for a movie or episode; one retry when it comes back empty. */
++    private suspend fun addonPlayableStream(baseUrl: String, type: String, id: String): PlayableStream? {
++        val streams = tvChannelsRepository.resolveAddonVodStreams(baseUrl, type, id)
++        if (streams.isNotEmpty()) return PlayableStream(streams.first().url, streams.first().headers)
++        kotlinx.coroutines.delay(600)
++        val again = tvChannelsRepository.resolveAddonVodStreams(baseUrl, type, id)
++        return again.firstOrNull()?.let { PlayableStream(it.url, it.headers) }
++    }
++
 +    private suspend fun stalkerInfo(item: VodItem, pl: PlaylistSource): VodInfo {
 +        val episodes = ArrayList<VodEpisode>()
 +        val identity = com.nuvio.tv.livetv.stalker.StalkerGateway.identity(pl)
@@ -462747,7 +462822,7 @@ index 000000000..302794944
 +// the repository and can't delete files.
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandSearch.kt b/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandSearch.kt
 new file mode 100644
-index 000000000..1566d62bb
+index 000000000..a9d36e9f2
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandSearch.kt
 @@ -0,0 +1,152 @@
@@ -462836,7 +462911,7 @@ index 000000000..1566d62bb
 +    entryFocusRequester: FocusRequester?,
 +    upFocusRequester: FocusRequester?,
 +    onOpenDetail: (itemId: String, itemType: String, addonBaseUrl: String?, onDemandUid: String) -> Unit,
-+    onPlay: (url: String, title: String, type: String, poster: String?, contentId: String, contentName: String, season: Int?, episode: Int?, episodeName: String?) -> Unit,
++    onPlay: (url: String, title: String, type: String, poster: String?, contentId: String, contentName: String, season: Int?, episode: Int?, episodeName: String?, headers: Map<String, String>) -> Unit,
 +    modifier: Modifier = Modifier,
 +    posterCardStyle: com.nuvio.tv.ui.components.PosterCardStyle = com.nuvio.tv.ui.components.PosterCardDefaults.Style
 +) {
@@ -462865,12 +462940,12 @@ index 000000000..1566d62bb
 +            item = item,
 +            viewModel = viewModel,
 +            onDismiss = { providerItem = null },
-+            onPlay = { url, title, poster, season, episode, episodeName ->
++            onPlay = { url, title, poster, season, episode, episodeName, headers ->
 +                providerItem = null
 +                // Played with the title's id, so Nuvio tracks progress: resumes, and Continue Watching.
 +                onPlay(
 +                    url, title, if (item.kind == VodKind.SERIES) "series" else "movie", poster,
-+                    VodHomeIds.metaId(item.uid), OnDemandDatabase.displayTitle(item.name), season, episode, episodeName
++                    VodHomeIds.metaId(item.uid), OnDemandDatabase.displayTitle(item.name), season, episode, episodeName, headers
 +                )
 +            }
 +        )
@@ -463367,10 +463442,10 @@ index 000000000..561a82f91
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandViewModel.kt b/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandViewModel.kt
 new file mode 100644
-index 000000000..7c0907123
+index 000000000..6bd2444cc
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandViewModel.kt
-@@ -0,0 +1,931 @@
+@@ -0,0 +1,934 @@
 +package com.nuvio.tv.livetv.ondemand
 +
 +import androidx.lifecycle.ViewModel
@@ -463749,6 +463824,9 @@ index 000000000..7c0907123
 +
 +    suspend fun info(item: VodItem): VodInfo? = repository.info(item)
 +    suspend fun movieUrl(item: VodItem): String? = repository.movieUrl(item)
++    /** The stream to play (url + the addon's request headers), resolved on press. */
++    suspend fun movieStream(item: VodItem): OnDemandRepository.PlayableStream? = repository.movieStream(item)
++    suspend fun episodeStream(episode: VodEpisode): OnDemandRepository.PlayableStream? = repository.episodeStream(episode)
 +
 +    // ------------------------------------------------------------------ loading
 +
@@ -514515,7 +514593,7 @@ index 000000000..110d484a3
 +fun isDetailPageLeaving(currentRoute: String?, visibleRoutes: List<String?>): Boolean =
 +    currentRoute?.startsWith("detail/") != true && visibleRoutes.any { it?.startsWith("detail/") == true }
 diff --git a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
-index 0133c760c..ff1f49d75 100644
+index 0133c760c..c46d71d9b 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
 @@ -6,6 +6,14 @@ import com.nuvio.tv.ui.components.LocalPlaybackAvailability
@@ -514747,7 +514825,42 @@ index 0133c760c..ff1f49d75 100644
                      // YouTube fork: a video that ends by itself carries on with the next one, if autoplay is on.
                      val endedYouTubeId = args?.getString("contentId")
                          ?.takeIf { com.nuvio.tv.youtube.YouTubeProgress.isYouTubeId(it) }
-@@ -1632,33 +1749,308 @@ private fun PlaybackNavHost(
+@@ -1587,7 +1704,33 @@ private fun PlaybackNavHost(
+                         Screen.CatalogSeeAll.createRoute(catalogId, addonId, type, fromSearch = true)
+                     )
+                 },
+-                onOpenDiscover = { navController.navigate(Screen.Discover.route) }
++                onOpenDiscover = { navController.navigate(Screen.Discover.route) },
++                // Live TV fork: the On Demand row's provider page (Play), and its long-press
++                // "Go to details" (the details page remembers which On Demand title opened it).
++                onOpenOnDemand = { itemId, itemType, addonBaseUrl, onDemandUid ->
++                    navController.navigate(Screen.Detail.createRoute(itemId, itemType, addonBaseUrl ?: ""))
++                    navController.currentBackStackEntry?.savedStateHandle?.set(
++                        com.nuvio.tv.livetv.ondemand.OnDemandPlay.KEY, onDemandUid
++                    )
++                },
++                onPlayOnDemand = { url, title, type, poster, contentId, contentName, season, episode, episodeName, headers ->
++                    navController.navigate(
++                        Screen.Player.createRoute(
++                            streamUrl = url,
++                            title = title,
++                            contentId = contentId,
++                            contentType = type,
++                            contentName = contentName,
++                            poster = poster,
++                            videoId = if (type == "series" && season != null && episode != null) "$contentId:$season:$episode" else contentId,
++                            season = season,
++                            episode = episode,
++                            episodeTitle = episodeName,
++                            headers = headers,
++                            addonName = com.nuvio.tv.livetv.ondemand.OnDemandStreams.GROUP_NAME
++                        )
++                    )
++                }
+             )
+         }
+ 
+@@ -1632,33 +1775,310 @@ private fun PlaybackNavHost(
              )
          }
  
@@ -514910,10 +515023,10 @@ index 0133c760c..ff1f49d75 100644
 +                        launchSingleTop = true
 +                        restoreState = true
 +                    }
-                 }
-             )
-         }
- 
++                }
++            )
++        }
++
 +        forkPageComposable(Screen.Sports.route) { sportsEntry ->
 +            // A Sports page that isn't the one on screen (left behind by a page switch that got
 +            // cut short) stays drawn and working out of sight, a second copy alongside the real one,
@@ -514952,10 +515065,10 @@ index 0133c760c..ff1f49d75 100644
 +                            restoreState = true
 +                        }
 +                    }
-+                }
-+            )
-+        }
-+
+                 }
+             )
+         }
+ 
 +        forkPageComposable(Screen.OnDemand.route) {
 +            // Live TV fork: On Demand in Nuvio's own home layout (Classic, Grid or Modern, as set
 +            // for Home), with every layout option taken from Home itself.
@@ -514982,7 +515095,7 @@ index 0133c760c..ff1f49d75 100644
 +                        com.nuvio.tv.livetv.ondemand.OnDemandPlay.KEY, onDemandUid
 +                    )
 +                },
-+                onPlay = { url, title, type, poster, contentId, contentName, season, episode, episodeName ->
++                onPlay = { url, title, type, poster, contentId, contentName, season, episode, episodeName, headers ->
 +                    navController.navigate(
 +                        Screen.Player.createRoute(
 +                            streamUrl = url,
@@ -514995,6 +515108,8 @@ index 0133c760c..ff1f49d75 100644
 +                            season = season,
 +                            episode = episode,
 +                            episodeTitle = episodeName,
++                            // The addon's request headers (guarded links answer 403 without them).
++                            headers = headers,
 +                            addonName = com.nuvio.tv.livetv.ondemand.OnDemandStreams.GROUP_NAME
 +                        )
 +                    )
@@ -515074,7 +515189,7 @@ index 0133c760c..ff1f49d75 100644
          composable(Screen.Library.route) {
              LibraryScreen(
                  showBuiltInHeader = !hideBuiltInHeaders,
-@@ -1702,6 +2094,114 @@ private fun PlaybackNavHost(
+@@ -1702,6 +2122,114 @@ private fun PlaybackNavHost(
              )
          }
  
@@ -515189,7 +515304,7 @@ index 0133c760c..ff1f49d75 100644
          composable(Screen.Settings.route) {
              SettingsScreen(
                  showBuiltInHeader = !hideBuiltInHeaders,
-@@ -1718,7 +2218,9 @@ private fun PlaybackNavHost(
+@@ -1718,7 +2246,9 @@ private fun PlaybackNavHost(
                  onNavigateToLicensesAttributions = {
                      navController.navigate(Screen.LicensesAttributions.route)
                  },
@@ -515200,7 +515315,7 @@ index 0133c760c..ff1f49d75 100644
              )
          }
  
-@@ -1978,3 +2480,25 @@ private fun PlaybackNavHost(
+@@ -1978,3 +2508,25 @@ private fun PlaybackNavHost(
          }
      }
  }
@@ -536718,7 +536833,7 @@ index fd8553816..eb2fd4c54 100644
              Box(
                  modifier = Modifier
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/search/SearchScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/search/SearchScreen.kt
-index 3b1b214bd..f8772534e 100644
+index 3b1b214bd..a9f1ee000 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/search/SearchScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/search/SearchScreen.kt
 @@ -1,5 +1,12 @@
@@ -536743,7 +536858,7 @@ index 3b1b214bd..f8772534e 100644
 +    onOpenLiveTv: () -> Unit = {},
 +    // Live TV fork: your provider's On Demand titles (the On Demand row).
 +    onOpenOnDemand: (itemId: String, itemType: String, addonBaseUrl: String?, onDemandUid: String) -> Unit = { _, _, _, _ -> },
-+    onPlayOnDemand: (url: String, title: String, type: String, poster: String?, contentId: String, contentName: String, season: Int?, episode: Int?, episodeName: String?) -> Unit = { _, _, _, _, _, _, _, _, _ -> }
++    onPlayOnDemand: (url: String, title: String, type: String, poster: String?, contentId: String, contentName: String, season: Int?, episode: Int?, episodeName: String?, headers: Map<String, String>) -> Unit = { _, _, _, _, _, _, _, _, _, _ -> }
  ) {
 +    // Nuvio fork (Arc parity): V2 search gets the ambient backdrop and page shift.
 +    val isV2 = com.nuvio.tv.ui.v2.appearance.LocalV2Appearance.current != null
