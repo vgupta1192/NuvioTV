@@ -344127,7 +344127,7 @@ index 000000000..c96b5766b
 +    }
 +}
 diff --git a/app/src/full/java/com/nuvio/tv/core/plugin/PluginManager.kt b/app/src/full/java/com/nuvio/tv/core/plugin/PluginManager.kt
-index 444fe7dd5..73cbfc219 100644
+index 444fe7dd5..4cb05b40d 100644
 --- a/app/src/full/java/com/nuvio/tv/core/plugin/PluginManager.kt
 +++ b/app/src/full/java/com/nuvio/tv/core/plugin/PluginManager.kt
 @@ -15,6 +15,7 @@ import com.nuvio.tv.domain.model.PluginRepository
@@ -344138,7 +344138,30 @@ index 444fe7dd5..73cbfc219 100644
  import com.nuvio.tv.domain.model.ScraperManifestInfo
  import com.squareup.moshi.Moshi
  import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
-@@ -702,11 +703,25 @@ class PluginManager @Inject constructor(
+@@ -237,7 +238,21 @@ class PluginManager @Inject constructor(
+     val pluginsEnabled: Flow<Boolean> = dataStore.pluginsEnabled
+ 
+     val groupStreamsByRepository: Flow<Boolean> = dataStore.groupStreamsByRepository
+-    
++
++    val sourceLanguages = dataStore.sourceLanguages
++
++    suspend fun setSourceLanguages(languages: Set<String>) = dataStore.setSourceLanguages(languages.mapNotNull(com.nuvio.tv.core.plugin.SourceLanguages::normalize).toSet())
++
++    suspend fun installedSourceLanguages(): Map<String, Int> = withContext(Dispatchers.IO) {
++        val counts = mutableMapOf<String, Int>()
++        dataStore.scrapers.first().filter { it.type == RepositoryType.EXTERNAL_DEX }.forEach { scraper ->
++            externalExtensionLoader.loadExtension(scraper.id).forEach { api ->
++                com.nuvio.tv.core.plugin.SourceLanguages.normalize(api.lang)?.let { code -> counts[code] = (counts[code] ?: 0) + 1 }
++            }
++        }
++        counts
++    }
++
+     private val syncScope = kotlinx.coroutines.CoroutineScope(
+         kotlinx.coroutines.SupervisorJob() + Dispatchers.IO
+     )
+@@ -702,11 +717,25 @@ class PluginManager @Inject constructor(
       * Execute all enabled scrapers and emit results as each scraper completes.
       * Returns a Flow that emits (scraperName, results) pairs.
       */
@@ -344165,6 +344188,46 @@ index 444fe7dd5..73cbfc219 100644
      ): Flow<Pair<ScraperInfo, List<LocalScraperResult>>> = channelFlow {
          val enabledList = enabledScrapers.first()
              .filter { it.supportsType(mediaType) }
+diff --git a/app/src/full/java/com/nuvio/tv/core/plugin/cloudstream/ExternalExtensionRunner.kt b/app/src/full/java/com/nuvio/tv/core/plugin/cloudstream/ExternalExtensionRunner.kt
+index 4c1caaf3c..595dee196 100644
+--- a/app/src/full/java/com/nuvio/tv/core/plugin/cloudstream/ExternalExtensionRunner.kt
++++ b/app/src/full/java/com/nuvio/tv/core/plugin/cloudstream/ExternalExtensionRunner.kt
+@@ -31,6 +31,7 @@ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.async
+ import kotlinx.coroutines.awaitAll
+ import kotlinx.coroutines.coroutineScope
++import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.withContext
+ import kotlinx.coroutines.withTimeoutOrNull
+ import javax.inject.Inject
+@@ -56,7 +57,8 @@ class ExternalExtensionRunner @Inject constructor(
+     private val extensionLoader: ExternalExtensionLoader,
+     private val extractorRegistry: ExternalExtractorRegistry,
+     private val tmdbMetadataService: TmdbMetadataService,
+-    private val tmdbService: TmdbService
++    private val tmdbService: TmdbService,
++    private val pluginDataStore: com.nuvio.tv.data.local.PluginDataStore? = null
+ ) {
+     suspend fun execute(
+         scraperId: String,
+@@ -100,11 +102,15 @@ class ExternalExtensionRunner @Inject constructor(
+         extensionLoader.ensureExtractorsLoaded(listOf(scraperId), diagnostics)
+ 
+         diagnostics.addStep("Loading DEX extension...")
+-        val apis = extensionLoader.loadExtensionWithDiagnostics(scraperId, diagnostics)
++        val loadedApis = extensionLoader.loadExtensionWithDiagnostics(scraperId, diagnostics)
++        val languages = pluginDataStore?.sourceLanguages?.first().orEmpty()
++        val apis = if (languages.isEmpty()) loadedApis else loadedApis.filter {
++            com.nuvio.tv.core.plugin.SourceLanguages.allows(it.lang, languages)
++        }
+         val api = apis.firstOrNull()
+ 
+         if (api == null) {
+-            diagnostics.addStep("No MainAPI available after load")
++            diagnostics.addStep(if (loadedApis.isEmpty()) "No MainAPI available after load" else "No sources match selected languages")
+             return@withContext emptyList()
+         }
+ 
 diff --git a/app/src/full/java/com/nuvio/tv/updater/ApkInstaller.kt b/app/src/full/java/com/nuvio/tv/updater/ApkInstaller.kt
 index 175511641..cf71f35eb 100644
 --- a/app/src/full/java/com/nuvio/tv/updater/ApkInstaller.kt
@@ -344179,8 +344242,36 @@ index 175511641..cf71f35eb 100644
  
      fun canRequestPackageInstalls(context: Context): Boolean {
          return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+diff --git a/app/src/full/java/com/nuvio/tv/updater/UpdateJobService.kt b/app/src/full/java/com/nuvio/tv/updater/UpdateJobService.kt
+index c781a2222..9fcd0dfa0 100644
+--- a/app/src/full/java/com/nuvio/tv/updater/UpdateJobService.kt
++++ b/app/src/full/java/com/nuvio/tv/updater/UpdateJobService.kt
+@@ -25,7 +25,6 @@ private const val TAG = "UpdateJobs"
+ private const val JOB_ID_CHECK = 10_020
+ private const val JOB_ID_INSTALL = 10_021
+ private const val JOB_ID_CHECK_NOW = 10_022
+-private const val CHECK_INTERVAL_MS = 12 * 60 * 60_000L
+ 
+ /**
+  * Background update work. The periodic job checks for a new release and downloads it, so the banner can offer an
+@@ -110,12 +109,12 @@ class UpdateJobService : JobService() {
+         fun canInstallSilently(context: Context): Boolean =
+             Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && ApkInstaller.canRequestPackageInstalls(context)
+ 
+-        fun schedulePeriodicCheck(context: Context) {
++        fun schedulePeriodicCheck(context: Context, intervalMs: Long) {
+             val scheduler = context.jobScheduler()
+-            if (scheduler.allPendingJobs.any { it.id == JOB_ID_CHECK }) return
++            if (runCatching { scheduler.getPendingJob(JOB_ID_CHECK)?.intervalMillis }.getOrNull() == intervalMs) return
+             val job = JobInfo.Builder(JOB_ID_CHECK, ComponentName(context, UpdateJobService::class.java))
+                 .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
+-                .setPeriodic(CHECK_INTERVAL_MS)
++                .setPeriodic(intervalMs)
+                 .setPersisted(true)
+                 .build()
+             scheduler.schedule(job)
 diff --git a/app/src/full/java/com/nuvio/tv/updater/UpdatePreferences.kt b/app/src/full/java/com/nuvio/tv/updater/UpdatePreferences.kt
-index 6c3a0170c..2bb52fdb9 100644
+index 6c3a0170c..308a2ca7b 100644
 --- a/app/src/full/java/com/nuvio/tv/updater/UpdatePreferences.kt
 +++ b/app/src/full/java/com/nuvio/tv/updater/UpdatePreferences.kt
 @@ -2,11 +2,13 @@ package com.nuvio.tv.updater
@@ -344212,7 +344303,13 @@ index 6c3a0170c..2bb52fdb9 100644
  
  @Singleton
  class UpdatePreferences @Inject constructor(
-@@ -32,6 +40,7 @@ class UpdatePreferences @Inject constructor(
+@@ -27,11 +35,13 @@ class UpdatePreferences @Inject constructor(
+     private val lastCheckAtKey = longPreferencesKey("last_check_at_ms")
+     private val updateBannerEnabledKey = booleanPreferencesKey("update_banner_enabled")
+     private val updateChannelKey = stringPreferencesKey("update_channel")
++    private val frequencyKey = stringPreferencesKey("update_check_frequency")
+     private val autoInstallEnabledKey = booleanPreferencesKey("auto_install_enabled")
+     private val downloadedTagKey = stringPreferencesKey("downloaded_release_tag")
      private val downloadedApkPathKey = stringPreferencesKey("downloaded_apk_path")
      private val autoInstalledTagKey = stringPreferencesKey("auto_installed_release_tag")
      private val autoInstallNoticeEnabledKey = booleanPreferencesKey("auto_install_notice_enabled")
@@ -344220,7 +344317,21 @@ index 6c3a0170c..2bb52fdb9 100644
  
      val ignoredTag: Flow<String?> = dataStore.data.map { prefs ->
          prefs[ignoredTagKey]
-@@ -70,6 +79,17 @@ class UpdatePreferences @Inject constructor(
+@@ -50,6 +60,13 @@ class UpdatePreferences @Inject constructor(
+             ?: UpdateChannel.defaultForVersion(BuildConfig.VERSION_NAME)
+     }
+ 
++    val checkFrequency: Flow<UpdateCheckFrequency> = dataStore.data.map { prefs ->
++        UpdateCheckFrequency.entries.firstOrNull { it.name == prefs[frequencyKey] }
++            ?: if (prefs[updateBannerEnabledKey] == false && prefs[autoInstallEnabledKey] != true) {
++                UpdateCheckFrequency.NEVER
++            } else UpdateCheckFrequency.ALWAYS
++    }
++
+     val autoInstallEnabled: Flow<Boolean> = dataStore.data.map { prefs ->
+         prefs[autoInstallEnabledKey] ?: false
+     }
+@@ -70,6 +87,17 @@ class UpdatePreferences @Inject constructor(
          prefs[autoInstallNoticeEnabledKey] ?: true
      }
  
@@ -344238,11 +344349,29 @@ index 6c3a0170c..2bb52fdb9 100644
      suspend fun getOrInitializeUpdateChannel(): UpdateChannel {
          val defaultChannel = UpdateChannel.defaultForVersion(BuildConfig.VERSION_NAME)
          var resolvedChannel = defaultChannel
+@@ -93,6 +121,12 @@ class UpdatePreferences @Inject constructor(
+         }
+     }
+ 
++    suspend fun setCheckFrequency(value: UpdateCheckFrequency) {
++        dataStore.edit { prefs ->
++            prefs[frequencyKey] = value.name
++        }
++    }
++
+     suspend fun setUpdateBannerEnabled(enabled: Boolean) {
+         dataStore.edit { prefs ->
+             prefs[updateBannerEnabledKey] = enabled
 diff --git a/app/src/full/java/com/nuvio/tv/updater/UpdateViewModel.kt b/app/src/full/java/com/nuvio/tv/updater/UpdateViewModel.kt
-index 57c58ca92..18156db86 100644
+index 57c58ca92..70c10e191 100644
 --- a/app/src/full/java/com/nuvio/tv/updater/UpdateViewModel.kt
 +++ b/app/src/full/java/com/nuvio/tv/updater/UpdateViewModel.kt
-@@ -41,8 +41,9 @@ data class UpdateUiState(
+@@ -37,12 +37,14 @@ data class UpdateUiState(
+     val feedbackMessage: String? = null,
+     val updateBannerEnabled: Boolean = true,
+     val updateChannel: UpdateChannel = UpdateChannel.STABLE,
++    val checkFrequency: UpdateCheckFrequency = UpdateCheckFrequency.ALWAYS,
+     val autoInstallEnabled: Boolean = false,
      val autoInstallSupported: Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S,
      val autoInstallNoticeEnabled: Boolean = true,
      /** Release installed automatically since the last launch, shown in the banner until dismissed. */
@@ -344254,7 +344383,74 @@ index 57c58ca92..18156db86 100644
  
  @HiltViewModel
  class UpdateViewModel @Inject constructor(
-@@ -376,4 +377,9 @@ class UpdateViewModel @Inject constructor(
+@@ -60,12 +62,14 @@ class UpdateViewModel @Inject constructor(
+         viewModelScope.launch {
+             val enabled = updatePreferences.updateBannerEnabled.first()
+             val channel = updatePreferences.getOrInitializeUpdateChannel()
++            val checkFrequency = updatePreferences.checkFrequency.first()
+             val autoInstallEnabled = updatePreferences.autoInstallEnabled.first()
+             val autoInstallNoticeEnabled = updatePreferences.autoInstallNoticeEnabled.first()
+             _uiState.update {
+                 it.copy(
+                     updateBannerEnabled = enabled,
+                     updateChannel = channel,
++                    checkFrequency = checkFrequency,
+                     autoInstallEnabled = autoInstallEnabled,
+                     autoInstallNoticeEnabled = autoInstallNoticeEnabled
+                 )
+@@ -81,10 +85,12 @@ class UpdateViewModel @Inject constructor(
+     }
+ 
+     fun checkForUpdates(force: Boolean, showNoUpdateFeedback: Boolean) {
+-        if (!force && !_uiState.value.updateBannerEnabled) return
++        if (!force && (!_uiState.value.updateBannerEnabled ||
++                _uiState.value.checkFrequency == UpdateCheckFrequency.NEVER)) return
+ 
+         updateCheckJob?.cancel()
+         updateCheckJob = viewModelScope.launch {
++            if (!force && !_uiState.value.checkFrequency.isDue(updatePreferences.lastCheckAtMs.first(), System.currentTimeMillis())) return@launch
+             val channel = _uiState.value.updateChannel
+             _uiState.update {
+                 it.copy(
+@@ -108,7 +114,8 @@ class UpdateViewModel @Inject constructor(
+                     val installedUpdate = _uiState.value.installedUpdate?.let { installed ->
+                         if (installed.tag == update.tag) update else installed
+                     }
+-                    if (remoteNewer && downloadedFile == null && update.tag != dismissedTag && !BuildConfig.IS_DEBUG_BUILD) {
++                    if (remoteNewer && downloadedFile == null && update.tag != dismissedTag && !BuildConfig.IS_DEBUG_BUILD &&
++                        _uiState.value.checkFrequency != UpdateCheckFrequency.NEVER) {
+                         UpdateJobService.scheduleCheckNow(context)
+                     }
+                     val shouldShow = UpdateBannerPolicy.shouldShow(
+@@ -361,12 +368,23 @@ class UpdateViewModel @Inject constructor(
+         }
+     }
+ 
+-    // Background checks run while the banner or automatic installs are on; the idle install job only with the latter.
+-    private fun syncBackgroundJobs() {
++    fun setCheckFrequency(frequency: UpdateCheckFrequency) {
++        viewModelScope.launch {
++            updatePreferences.setCheckFrequency(frequency)
++            syncBackgroundJobs()
++        }
++    }
++
++    // Background checks run on the chosen cadence while the banner or automatic installs are on;
++    // the idle install job only with the latter.
++    private suspend fun syncBackgroundJobs() {
++        val frequency = updatePreferences.checkFrequency.first()
++        _uiState.update { it.copy(checkFrequency = frequency) }
+         if (BuildConfig.IS_DEBUG_BUILD) return
+         val state = _uiState.value
+-        if (state.updateBannerEnabled || state.autoInstallEnabled) {
+-            UpdateJobService.schedulePeriodicCheck(context)
++        val interval = if (state.updateBannerEnabled || state.autoInstallEnabled) frequency.backgroundIntervalMs else null
++        if (interval != null) {
++            UpdateJobService.schedulePeriodicCheck(context, interval)
+         } else {
+             UpdateJobService.cancelPeriodicCheck(context)
+         }
+@@ -376,4 +394,9 @@ class UpdateViewModel @Inject constructor(
      fun openUnknownSourcesSettings() {
          ApkInstaller.buildUnknownSourcesSettingsIntent(context)?.let(context::startActivity)
      }
@@ -414344,7 +414540,7 @@ index 000000000..b1a32a5b9
 +internal fun isFreshLaunchIntent(hasSavedInstanceState: Boolean, intentFlags: Int): Boolean =
 +    !hasSavedInstanceState && intentFlags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY == 0
 diff --git a/app/src/main/java/com/nuvio/tv/MainActivity.kt b/app/src/main/java/com/nuvio/tv/MainActivity.kt
-index 89d1031ea..b3d5f41e2 100644
+index 89d1031ea..7bd465333 100644
 --- a/app/src/main/java/com/nuvio/tv/MainActivity.kt
 +++ b/app/src/main/java/com/nuvio/tv/MainActivity.kt
 @@ -34,6 +34,7 @@ import androidx.compose.foundation.clickable
@@ -414488,7 +414684,29 @@ index 89d1031ea..b3d5f41e2 100644
  
      /** Activity-level launcher for external video players. Survives all navigation changes. */
      private val externalPlayerLauncher = registerForActivityResult(
-@@ -706,6 +772,32 @@ open class MainActivity : ComponentActivity() {
+@@ -382,6 +448,9 @@ open class MainActivity : ComponentActivity() {
+     /** True until the first onResume after onCreate completes. */
+     private var isFirstResumeAfterCreate = false
+ 
++    /** A user database this build cannot open: the notice is up, nothing else runs. */
++    private var databaseCompatibilityBlocked = false
++
+     @OptIn(ExperimentalTvMaterial3Api::class, ExperimentalFoundationApi::class)
+     override fun attachBaseContext(newBase: Context) {
+         val tag = LocaleCache.localeTag.takeIf { it != LocaleCache.UNSET }
+@@ -404,6 +473,11 @@ open class MainActivity : ComponentActivity() {
+     override fun onCreate(savedInstanceState: Bundle?) {
+         installSplashScreen()
+         super.onCreate(savedInstanceState)
++        com.nuvio.tv.core.storage.DatabaseVersions.blockingIssue(this)?.let { issue ->
++            databaseCompatibilityBlocked = true
++            com.nuvio.tv.ui.components.DatabaseCompatibilityNotice.show(this, issue)
++            return
++        }
+         isFirstResumeAfterCreate = true
+         window?.setBackgroundDrawable(ColorDrawable(android.graphics.Color.TRANSPARENT))
+ 
+@@ -706,6 +780,32 @@ open class MainActivity : ComponentActivity() {
              }
              val discoverLocation = mainUiPrefs.discoverLocation
  
@@ -414521,7 +414739,7 @@ index 89d1031ea..b3d5f41e2 100644
              NuvioTheme(
                  appTheme = mainUiPrefs.theme,
                  customThemeColors = mainUiPrefs.customThemeColors,
-@@ -714,7 +806,9 @@ open class MainActivity : ComponentActivity() {
+@@ -714,7 +814,9 @@ open class MainActivity : ComponentActivity() {
                  amoledSurfacesMode = mainUiPrefs.amoledSurfacesMode,
                  quietFocus = mainUiPrefs.quietFocus,
                  glassIntensity = mainUiPrefs.glassIntensity,
@@ -414532,7 +414750,7 @@ index 89d1031ea..b3d5f41e2 100644
              ) {
                  val defaultBringIntoViewSpec = LocalBringIntoViewSpec.current
                  val bringIntoViewSpec = if (mainUiPrefs.smoothBringIntoViewEnabled) {
-@@ -807,6 +901,8 @@ open class MainActivity : ComponentActivity() {
+@@ -807,6 +909,8 @@ open class MainActivity : ComponentActivity() {
                      )
                  }
                  CompositionLocalProvider(
@@ -414541,7 +414759,7 @@ index 89d1031ea..b3d5f41e2 100644
                      LocalDensity provides clampedFontScaleDensity,
                      LocalBringIntoViewSpec provides bringIntoViewSpec,
                      LocalFastHorizontalNavigationEnabled provides mainUiPrefs.fastHorizontalNavigationEnabled,
-@@ -970,10 +1066,20 @@ open class MainActivity : ComponentActivity() {
+@@ -970,10 +1074,20 @@ open class MainActivity : ComponentActivity() {
                          )
                      } else {
                      val sidebarCollapsed = mainUiPrefs.sidebarCollapsed
@@ -414565,7 +414783,7 @@ index 89d1031ea..b3d5f41e2 100644
  
                      val startDestination = when {
                          needsExperienceSelection -> Screen.ExperienceModeSelection.route
-@@ -985,6 +1091,22 @@ open class MainActivity : ComponentActivity() {
+@@ -985,6 +1099,22 @@ open class MainActivity : ComponentActivity() {
                      var optimisticRoute by remember { mutableStateOf<String?>(null) }
                      val navBackStackEntry by navController.currentBackStackEntryAsState()
                      val actualRoute = navBackStackEntry?.destination?.route
@@ -414588,7 +414806,7 @@ index 89d1031ea..b3d5f41e2 100644
                      val currentRoute = optimisticRoute ?: actualRoute
                      startupDestination = startupDestinationForRoute(actualRoute ?: startDestination)
  
-@@ -1170,13 +1292,100 @@ open class MainActivity : ComponentActivity() {
+@@ -1170,13 +1300,100 @@ open class MainActivity : ComponentActivity() {
                          }
                      }
  
@@ -414690,7 +414908,7 @@ index 89d1031ea..b3d5f41e2 100644
                              add(Screen.YouTube.route)
                              add(Screen.Settings.route)
                              if (discoverLocation == DiscoverLocation.IN_SIDEBAR) {
-@@ -1185,11 +1394,28 @@ open class MainActivity : ComponentActivity() {
+@@ -1185,11 +1402,28 @@ open class MainActivity : ComponentActivity() {
                          }
                      }
  
@@ -414719,7 +414937,7 @@ index 89d1031ea..b3d5f41e2 100644
                      val strNavLibrary = stringResource(R.string.nav_library)
                      val strNavGenres = stringResource(R.string.nav_genres)
                      val strNavSettings = stringResource(R.string.nav_settings)
-@@ -1198,6 +1424,7 @@ open class MainActivity : ComponentActivity() {
+@@ -1198,6 +1432,7 @@ open class MainActivity : ComponentActivity() {
                      val drawerItems = remember(
                          hiddenPages,
                          pageOrder,
@@ -414727,7 +414945,7 @@ index 89d1031ea..b3d5f41e2 100644
                          strNavHome,
                          strNavDiscover,
                          strNavTvChannels,
-@@ -1205,8 +1432,41 @@ open class MainActivity : ComponentActivity() {
+@@ -1205,8 +1440,41 @@ open class MainActivity : ComponentActivity() {
                          strNavLibrary,
                          strNavGenres,
                          strNavSettings,
@@ -414770,7 +414988,7 @@ index 89d1031ea..b3d5f41e2 100644
                          buildList {
                              // Nuvio fork: per-profile hidden pages (Home and Settings are never hidden)
                              fun addPage(item: DrawerItem) {
-@@ -1228,7 +1488,8 @@ open class MainActivity : ComponentActivity() {
+@@ -1228,7 +1496,8 @@ open class MainActivity : ComponentActivity() {
                                      )
                                  )
                              }
@@ -414780,7 +414998,7 @@ index 89d1031ea..b3d5f41e2 100644
                                  DrawerItem(
                                      route = Screen.TvChannels.route,
                                      label = strNavTvChannels,
-@@ -1257,6 +1518,24 @@ open class MainActivity : ComponentActivity() {
+@@ -1257,6 +1526,24 @@ open class MainActivity : ComponentActivity() {
                                      iconRes = R.raw.sidebar_library
                                  )
                              )
@@ -414805,7 +415023,7 @@ index 89d1031ea..b3d5f41e2 100644
                              addPage(
                                  DrawerItem(
                                      route = Screen.YouTube.route,
-@@ -1347,18 +1626,52 @@ open class MainActivity : ComponentActivity() {
+@@ -1347,18 +1634,52 @@ open class MainActivity : ComponentActivity() {
                              }
                          }
                          Box(modifier = Modifier.fillMaxSize()) {
@@ -414862,7 +415080,7 @@ index 89d1031ea..b3d5f41e2 100644
                                          modernSidebarBlurEnabled = modernSidebarBlurEnabled,
                                          hideBuiltInHeaders = hideBuiltInHeadersForFloatingPill,
                                          activeProfileName = activeProfile?.name ?: "",
-@@ -1468,7 +1781,16 @@ open class MainActivity : ComponentActivity() {
+@@ -1468,7 +1789,16 @@ open class MainActivity : ComponentActivity() {
          }
  
          jankStats = JankStats.createAndTrack(window) { frameData ->
@@ -414880,15 +415098,17 @@ index 89d1031ea..b3d5f41e2 100644
                  Log.w(
                      "JankStats",
                      "JANK: ${frameData.frameDurationUiNanos / 1_000_000}ms | states: ${frameData.states}"
-@@ -1480,6 +1802,7 @@ open class MainActivity : ComponentActivity() {
+@@ -1479,7 +1809,9 @@ open class MainActivity : ComponentActivity() {
+ 
      override fun onResume() {
          super.onResume()
++        if (databaseCompatibilityBlocked) return
          ambientIdleController.dismiss()
 +        qualityGovernor.resume(System.nanoTime())
          if (::jankStats.isInitialized) jankStats.isTrackingEnabled = true
          memberAccessRepository.refreshIfStale()
          lifecycleScope.launch {
-@@ -1518,6 +1841,7 @@ open class MainActivity : ComponentActivity() {
+@@ -1518,6 +1850,7 @@ open class MainActivity : ComponentActivity() {
  
      override fun onPause() {
          super.onPause()
@@ -414896,7 +415116,7 @@ index 89d1031ea..b3d5f41e2 100644
          if (::jankStats.isInitialized) jankStats.isTrackingEnabled = false
      }
  
-@@ -1539,6 +1863,11 @@ open class MainActivity : ComponentActivity() {
+@@ -1539,6 +1872,11 @@ open class MainActivity : ComponentActivity() {
      }
  
      override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -414908,7 +415128,15 @@ index 89d1031ea..b3d5f41e2 100644
          // Nuvio fork: OLED screensaver — while the dim overlay is visible, the first key
          // press wakes it and the whole press (down, repeats, matching up) is swallowed so
          // waking never also navigates (ported from Nuvio-KE).
-@@ -1595,6 +1924,8 @@ open class MainActivity : ComponentActivity() {
+@@ -1584,6 +1922,7 @@ open class MainActivity : ComponentActivity() {
+     }
+ 
+     override fun onStart() {
++        if (databaseCompatibilityBlocked) { super.onStart(); return }
+         // Returning from an external player: raise the auto-next loader before the player's
+         // result is dispatched and before the window repaints, so the transition shows the
+         // loader instantly with no episode-list flash. No-op unless a series episode is being
+@@ -1595,9 +1934,12 @@ open class MainActivity : ComponentActivity() {
          androidTvChannelSyncService.onForegroundChanged(true)
          // Nuvio fork: a quick return is not idle for the nightly self-trim.
          nightlySelfTrim.onAppForegrounded()
@@ -414917,7 +415145,11 @@ index 89d1031ea..b3d5f41e2 100644
      }
  
      override fun onStop() {
-@@ -1606,6 +1937,8 @@ open class MainActivity : ComponentActivity() {
++        if (databaseCompatibilityBlocked) { super.onStop(); return }
+         externalPlaybackTracker.onExternalPlayerCoveredApp()
+         super.onStop()
+         startupSyncService.stopPeriodicSurfacePulls()
+@@ -1606,11 +1948,13 @@ open class MainActivity : ComponentActivity() {
          androidTvChannelSyncService.onForegroundChanged(false)
          // Nuvio fork: schedule the nightly self-trim while backgrounded.
          nightlySelfTrim.onAppBackgrounded()
@@ -414926,7 +415158,13 @@ index 89d1031ea..b3d5f41e2 100644
      }
  
      override fun onDestroy() {
-@@ -1881,14 +2214,36 @@ private fun LegacySidebarScaffold(
+         super.onDestroy()
+-        PluginRuntimeHooks.onActivityDestroy()
++        if (!databaseCompatibilityBlocked) PluginRuntimeHooks.onActivityDestroy()
+     }
+ }
+ 
+@@ -1881,14 +2225,36 @@ private fun LegacySidebarScaffold(
                          }
                      }
  
@@ -414968,7 +415206,7 @@ index 89d1031ea..b3d5f41e2 100644
                          drawerItems.forEach { item ->
                              key(item.route) {
                                  LegacySidebarButton(
-@@ -1917,6 +2272,7 @@ private fun LegacySidebarScaffold(
+@@ -1917,6 +2283,7 @@ private fun LegacySidebarScaffold(
                          }
                      }
                  }
@@ -414976,7 +415214,7 @@ index 89d1031ea..b3d5f41e2 100644
              }
          }
          }
-@@ -1979,9 +2335,43 @@ private fun LegacySidebarScaffold(
+@@ -1979,9 +2346,43 @@ private fun LegacySidebarScaffold(
                      }
                  }
          ) {
@@ -415021,7 +415259,7 @@ index 89d1031ea..b3d5f41e2 100644
              ) {
                  NuvioNavHost(
                      navController = navController,
-@@ -2104,8 +2494,9 @@ private fun LegacySidebarButton(
+@@ -2104,8 +2505,9 @@ private fun LegacySidebarButton(
  private fun ModernSidebarScaffold(
      longPressBackHeld: MutableState<Boolean>,
      navController: NavHostController,
@@ -415032,7 +415270,7 @@ index 89d1031ea..b3d5f41e2 100644
      rootRoutes: Set<String>,
      drawerItems: List<DrawerItem>,
      selectedDrawerRoute: String?,
-@@ -2123,6 +2514,7 @@ private fun ModernSidebarScaffold(
+@@ -2123,6 +2525,7 @@ private fun ModernSidebarScaffold(
  ) {
      val showSidebar = currentRoute in rootRoutes && !LiveTvPlayerSidebarGate.playerActive
      val sidebarTokens = NuvioComponents.tokens.sidebar
@@ -415040,7 +415278,7 @@ index 89d1031ea..b3d5f41e2 100644
      val collapsedSidebarWidth = if (sidebarCollapsed) NuvioTheme.spacing.none else sidebarTokens.collapsedWidth
      val openSidebarWidth = sidebarTokens.expandedWidth
  
-@@ -2137,6 +2529,18 @@ private fun ModernSidebarScaffold(
+@@ -2137,6 +2540,18 @@ private fun ModernSidebarScaffold(
      var pendingContentFocusTransfer by remember { mutableStateOf(false) }
      var pendingSidebarFocusRequest by remember { mutableStateOf(false) }
      var focusedDrawerIndex by remember { mutableStateOf(-1) }
@@ -415059,7 +415297,7 @@ index 89d1031ea..b3d5f41e2 100644
      var isFloatingPillIconOnly by remember { mutableStateOf(false) }
      var pillExpandRequestCount by remember { mutableIntStateOf(0) }
      val keepFloatingPillExpanded = false
-@@ -2216,9 +2620,16 @@ private fun ModernSidebarScaffold(
+@@ -2216,9 +2631,16 @@ private fun ModernSidebarScaffold(
      }
  
      val sidebarVisible = showSidebar && (isSidebarExpanded || !sidebarCollapsed)
@@ -415078,7 +415316,7 @@ index 89d1031ea..b3d5f41e2 100644
      // re-layouts and haze doesn't re-render blur every frame.
      val sidebarWidth = if (sidebarVisible) openSidebarWidth else collapsedSidebarWidth
      val animationDuration = if (sidebarVisible) 400 else 300
-@@ -2230,7 +2641,6 @@ private fun ModernSidebarScaffold(
+@@ -2230,7 +2652,6 @@ private fun ModernSidebarScaffold(
          animationSpec = tween(durationMillis = if (isSidebarExpanded) 280 else 200, easing = animationEasing),
          label = "sidebarSurfaceAlpha"
      )
@@ -415086,7 +415324,7 @@ index 89d1031ea..b3d5f41e2 100644
      val sidebarTransition = updateTransition(
          targetState = isSidebarExpanded,
          label = "sidebarTransition"
-@@ -2238,7 +2648,7 @@ private fun ModernSidebarScaffold(
+@@ -2238,7 +2659,7 @@ private fun ModernSidebarScaffold(
      // Labels and icons are always at full size — the panel is rendered
      // complete and the open/close animation is purely graphicsLayer.
      val sidebarLabelAlpha = 1f
@@ -415095,7 +415333,7 @@ index 89d1031ea..b3d5f41e2 100644
          transitionSpec = {
              if (targetState) {
                  tween(durationMillis = NuvioMotion.tokens.durations.sidebarPanelIn, easing = FastOutSlowInEasing)
-@@ -2250,11 +2660,67 @@ private fun ModernSidebarScaffold(
+@@ -2250,11 +2671,67 @@ private fun ModernSidebarScaffold(
      ) { expanded ->
          if (expanded) 1f else 0f
      }
@@ -415163,7 +415401,7 @@ index 89d1031ea..b3d5f41e2 100644
  
      val sidebarIconScale = 1f
      val sidebarBloomScale = 1f
-@@ -2298,6 +2764,14 @@ private fun ModernSidebarScaffold(
+@@ -2298,6 +2775,14 @@ private fun ModernSidebarScaffold(
          modifier = Modifier
              .fillMaxSize()
              .onPreviewKeyEvent { keyEvent ->
@@ -415178,7 +415416,7 @@ index 89d1031ea..b3d5f41e2 100644
                  // Consume all Back key events after long-press until released,
                  // preventing the exit-app BackHandler from firing during the hold.
                  if (longPressBackHeld.value && keyEvent.key == Key.Back) {
-@@ -2311,7 +2785,7 @@ private fun ModernSidebarScaffold(
+@@ -2311,7 +2796,7 @@ private fun ModernSidebarScaffold(
              modifier = Modifier
                  .fillMaxSize()
                  .then(
@@ -415187,7 +415425,7 @@ index 89d1031ea..b3d5f41e2 100644
                      else Modifier
                  )
                  .onPreviewKeyEvent { keyEvent ->
-@@ -2342,7 +2816,10 @@ private fun ModernSidebarScaffold(
+@@ -2342,7 +2827,10 @@ private fun ModernSidebarScaffold(
                      if (
                          isSidebarExpanded &&
                          !sidebarCollapsePending &&
@@ -415199,7 +415437,7 @@ index 89d1031ea..b3d5f41e2 100644
                          keyEvent.type == KeyEventType.KeyDown &&
                          isBlockedContentKey(keyEvent.key)
                      ) {
-@@ -2381,33 +2858,77 @@ private fun ModernSidebarScaffold(
+@@ -2381,33 +2869,77 @@ private fun ModernSidebarScaffold(
                      }
                  }
          ) {
@@ -415287,7 +415525,7 @@ index 89d1031ea..b3d5f41e2 100644
                          transformOrigin = TransformOrigin(0f, 0f)
                      }
                      .selectableGroup()
-@@ -2419,10 +2940,18 @@ private fun ModernSidebarScaffold(
+@@ -2419,10 +2951,18 @@ private fun ModernSidebarScaffold(
                              Key.DirectionUp -> {
                                  if (focusedDrawerIndex == sidebarTopBoundaryIndex) {
                                      true
@@ -415307,7 +415545,7 @@ index 89d1031ea..b3d5f41e2 100644
                                      true
                                  }
                              }
-@@ -2440,7 +2969,9 @@ private fun ModernSidebarScaffold(
+@@ -2440,7 +2980,9 @@ private fun ModernSidebarScaffold(
                                      }
                                      true
                                  } else {
@@ -415318,7 +415556,7 @@ index 89d1031ea..b3d5f41e2 100644
                                      true
                                  }
                              }
-@@ -2448,7 +2979,10 @@ private fun ModernSidebarScaffold(
+@@ -2448,7 +2990,10 @@ private fun ModernSidebarScaffold(
                              Key.DirectionRight, Key.DirectionLeft -> {
                                  val collapseKey = if (isRtl) Key.DirectionLeft else Key.DirectionRight
                                  if (keyEvent.key == collapseKey) {
@@ -415330,7 +415568,7 @@ index 89d1031ea..b3d5f41e2 100644
                                      sidebarCollapsePending = true
                                      true
                                  } else {
-@@ -2460,29 +2994,59 @@ private fun ModernSidebarScaffold(
+@@ -2460,29 +3005,59 @@ private fun ModernSidebarScaffold(
                          }
                      }
              ) {
@@ -415399,7 +415637,7 @@ index 89d1031ea..b3d5f41e2 100644
                              pendingSidebarFocusRequest = false
                              isSidebarExpanded = false
                              sidebarCollapsePending = false
-@@ -2502,13 +3066,37 @@ private fun ModernSidebarScaffold(
+@@ -2502,13 +3077,37 @@ private fun ModernSidebarScaffold(
                  sidebarShowCollapsedPill &&
                  selectedDrawerRoute != Screen.Search.route
              ) {
@@ -415440,7 +415678,7 @@ index 89d1031ea..b3d5f41e2 100644
                      modifier = Modifier
                          .align(Alignment.TopStart)
                          .offset {
-@@ -2548,13 +3136,16 @@ private fun CollapsedSidebarPill(
+@@ -2548,13 +3147,16 @@ private fun CollapsedSidebarPill(
      onExpand: () -> Unit
  ) {
      val pillShape = RoundedCornerShape(NuvioRadii.tokens.full)
@@ -415459,7 +415697,7 @@ index 89d1031ea..b3d5f41e2 100644
          Brush.verticalGradient(listOf(
              Color(0xFF1C1C1E).copy(alpha = alpha),
              Color(0xFF1C1C1E).copy(alpha = alpha)
-@@ -2575,18 +3166,21 @@ private fun CollapsedSidebarPill(
+@@ -2575,18 +3177,21 @@ private fun CollapsedSidebarPill(
          Box(
              modifier = Modifier
                  .height(NuvioTheme.sizes.player.control)
@@ -415489,7 +415727,7 @@ index 89d1031ea..b3d5f41e2 100644
          ) {
              Row(
                  modifier = Modifier
-@@ -2640,6 +3234,24 @@ private fun CollapsedSidebarPill(
+@@ -2640,6 +3245,24 @@ private fun CollapsedSidebarPill(
      }
  }
  
@@ -415514,7 +415752,7 @@ index 89d1031ea..b3d5f41e2 100644
  private fun navigateToDrawerRoute(
      navController: NavHostController,
      currentRoute: String?,
-@@ -2682,7 +3294,7 @@ private fun isBlockedContentKey(key: Key): Boolean {
+@@ -2682,7 +3305,7 @@ private fun isBlockedContentKey(key: Key): Boolean {
  }
  
  @Composable
@@ -415523,7 +415761,7 @@ index 89d1031ea..b3d5f41e2 100644
      iconRes: Int?,
      icon: ImageVector?,
      modifier: Modifier = Modifier,
-@@ -2722,6 +3334,15 @@ private fun DrawerItemIcon(
+@@ -2722,6 +3345,15 @@ private fun DrawerItemIcon(
  object LocaleCache {
      const val UNSET = "__UNSET__"
  
@@ -416907,10 +417145,18 @@ index 5852a58ab..c3faa9f41 100644
 +    }
  }
 diff --git a/app/src/main/java/com/nuvio/tv/core/di/NetworkModule.kt b/app/src/main/java/com/nuvio/tv/core/di/NetworkModule.kt
-index e817ac31a..0b9ab18ce 100644
+index e817ac31a..258839c4b 100644
 --- a/app/src/main/java/com/nuvio/tv/core/di/NetworkModule.kt
 +++ b/app/src/main/java/com/nuvio/tv/core/di/NetworkModule.kt
-@@ -113,7 +113,7 @@ object NetworkModule {
+@@ -4,6 +4,7 @@ import android.content.Context
+ import android.util.Log
+ import com.nuvio.tv.BuildConfig
+ import com.nuvio.tv.core.network.NoDelaySocketFactory
++import com.nuvio.tv.core.network.traktEndpoint
+ import com.nuvio.tv.data.remote.api.AddonApi
+ import com.nuvio.tv.data.remote.api.AniSkipApi
+ import com.nuvio.tv.data.remote.api.AnimeSkipApi
+@@ -113,7 +114,7 @@ object NetworkModule {
              .connectTimeout(30, TimeUnit.SECONDS)
              .readTimeout(60, TimeUnit.SECONDS)
              .addInterceptor { chain ->
@@ -416919,7 +417165,7 @@ index e817ac31a..0b9ab18ce 100644
                  val request = chain.request().newBuilder()
                      .header("User-Agent", "Nuvio/$version")
                      .header("Accept-Language", buildAcceptLanguageHeader())
-@@ -206,7 +206,7 @@ object NetworkModule {
+@@ -206,7 +207,7 @@ object NetworkModule {
          .connectTimeout(30, TimeUnit.SECONDS)
          .readTimeout(60, TimeUnit.SECONDS)
          .addInterceptor { chain ->
@@ -416928,7 +417174,7 @@ index e817ac31a..0b9ab18ce 100644
              val request = chain.request().newBuilder()
                  .header("User-Agent", "Nuvio/$version")
                  .header("Accept-Language", buildAcceptLanguageHeader())
-@@ -229,7 +229,7 @@ object NetworkModule {
+@@ -229,7 +230,7 @@ object NetworkModule {
              .connectTimeout(30, TimeUnit.SECONDS)
              .readTimeout(30, TimeUnit.SECONDS)
              .addInterceptor { chain ->
@@ -416937,7 +417183,7 @@ index e817ac31a..0b9ab18ce 100644
                  val request = chain.request().newBuilder()
                      .header("User-Agent", "Nuvio/$version")
                      .header("Accept-Language", buildAcceptLanguageHeader())
-@@ -242,7 +242,11 @@ object NetworkModule {
+@@ -242,7 +243,11 @@ object NetworkModule {
      @Provides
      @Singleton
      @Named("simkl")
@@ -416950,15 +417196,17 @@ index e817ac31a..0b9ab18ce 100644
          .dns(IPv4FirstDns())
          .socketFactory(NoDelaySocketFactory)
          .connectTimeout(30, TimeUnit.SECONDS)
-@@ -280,7 +284,7 @@ object NetworkModule {
+@@ -280,8 +285,9 @@ object NetworkModule {
      ): OkHttpClient = okHttpClient.newBuilder()
          .addInterceptor { chain ->
              val request = chain.request()
 -            val version = BuildConfig.VERSION_NAME.ifBlank { "dev" }
 +            val version = BuildConfig.NUVIO_BASE_VERSION.ifBlank { BuildConfig.VERSION_NAME }.ifBlank { "dev" } // Live TV fork: identify as the Nuvio version it is built on
              val newRequest = request.newBuilder()
++                .url(request.url.traktEndpoint())
                  .header("Content-Type", "application/json")
                  .header("User-Agent", "Nuvio/$version")
+                 .header("trakt-api-key", BuildConfig.TRAKT_CLIENT_ID)
 diff --git a/app/src/main/java/com/nuvio/tv/core/image/HomePosterSizing.kt b/app/src/main/java/com/nuvio/tv/core/image/HomePosterSizing.kt
 new file mode 100644
 index 000000000..cc17766b2
@@ -417046,6 +417294,50 @@ index 000000000..657c5ecb0
 +        }
 +        previousMaxBytes = null
 +        appliedMaxBytes = null
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/image/RevalidationCooldown.kt b/app/src/main/java/com/nuvio/tv/core/image/RevalidationCooldown.kt
+new file mode 100644
+index 000000000..0133267a9
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/image/RevalidationCooldown.kt
+@@ -0,0 +1,38 @@
++package com.nuvio.tv.core.image
++
++/** A small, bounded cooldown shared by image workers. All expiry and writes use one lock. */
++internal class RevalidationCooldown(
++    private val durationMs: Long,
++    private val maxEntries: Int = 4096,
++    private val nowMs: () -> Long = { System.nanoTime() / 1_000_000L }
++) {
++    init {
++        require(durationMs > 0 && maxEntries > 0)
++    }
++
++    private val completed = LinkedHashMap<String, Long>()
++
++    @Synchronized
++    fun contains(url: String): Boolean {
++        expire(nowMs())
++        return url in completed
++    }
++
++    @Synchronized
++    fun record(url: String) {
++        val now = nowMs()
++        expire(now)
++        // Keep write order, including when an existing URL completes again.
++        completed.remove(url)
++        completed[url] = now
++        while (completed.size > maxEntries) completed.remove(completed.keys.first())
++    }
++
++    private fun expire(now: Long) {
++        val entries = completed.entries.iterator()
++        while (entries.hasNext()) {
++            if (now - entries.next().value < durationMs) break
++            entries.remove()
++        }
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/core/image/ScoutMixArt.kt b/app/src/main/java/com/nuvio/tv/core/image/ScoutMixArt.kt
@@ -417318,6 +417610,57 @@ index 000000000..091996b80
 +        return ImageFetchResult(image = out.asImage(), isSampled = false, dataSource = DataSource.NETWORK)
 +    }
 +}
+diff --git a/app/src/main/java/com/nuvio/tv/core/image/StaleWhileRevalidateCacheStrategy.kt b/app/src/main/java/com/nuvio/tv/core/image/StaleWhileRevalidateCacheStrategy.kt
+index a3b5d4f6d..9bc42396f 100644
+--- a/app/src/main/java/com/nuvio/tv/core/image/StaleWhileRevalidateCacheStrategy.kt
++++ b/app/src/main/java/com/nuvio/tv/core/image/StaleWhileRevalidateCacheStrategy.kt
+@@ -40,7 +40,7 @@ class StaleWhileRevalidateCacheStrategy(
+         private const val REVALIDATION_COOLDOWN_MS = 10L * 60 * 1000 // 10 min
+         private const val REVALIDATION_MAX_REQUESTS = 8
+         private val revalidatingUrls = ConcurrentHashMap.newKeySet<String>()
+-        private val revalidatedAt = ConcurrentHashMap<String, Long>()
++        private val recentlyRevalidated = RevalidationCooldown(REVALIDATION_COOLDOWN_MS)
+     }
+ 
+     private val revalidationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+@@ -67,11 +67,7 @@ class StaleWhileRevalidateCacheStrategy(
+             )
+         ) {
+             val url = networkRequest.url
+-            val lastRevalidated = revalidatedAt[url]
+-            val now = System.currentTimeMillis()
+-            if (lastRevalidated == null || (now - lastRevalidated) > REVALIDATION_COOLDOWN_MS) {
+-                scheduleBackgroundRevalidation(url, cacheResponse)
+-            }
++            scheduleBackgroundRevalidation(url, cacheResponse)
+         }
+         return CacheStrategy.ReadResult(cacheResponse)
+     }
+@@ -96,6 +92,10 @@ class StaleWhileRevalidateCacheStrategy(
+     }
+ 
+     private fun scheduleBackgroundRevalidation(url: String, cachedResponse: NetworkResponse) {
++        if (recentlyRevalidated.contains(url)) {
++            revalidatingUrls.remove(url)
++            return
++        }
+         if (!revalidatingUrls.add(url)) return
+ 
+         revalidationScope.launch {
+@@ -138,8 +138,11 @@ class StaleWhileRevalidateCacheStrategy(
+                     Log.w(TAG, "Revalidation error: ${url.take(80)} - ${e.message}")
+                 }
+             } finally {
+-                revalidatingUrls.remove(url)
+-                revalidatedAt[url] = System.currentTimeMillis()
++                try {
++                    recentlyRevalidated.record(url)
++                } finally {
++                    revalidatingUrls.remove(url)
++                }
+             }
+         }
+     }
 diff --git a/app/src/main/java/com/nuvio/tv/core/logging/LogDiagnostics.kt b/app/src/main/java/com/nuvio/tv/core/logging/LogDiagnostics.kt
 index 6e9a154a7..ad584de4b 100644
 --- a/app/src/main/java/com/nuvio/tv/core/logging/LogDiagnostics.kt
@@ -417342,6 +417685,64 @@ index 6e9a154a7..ad584de4b 100644
      if (value.isBlank()) return value
      return if (value.length <= maxLength) value else "${value.take(maxLength)}..."
  }
+diff --git a/app/src/main/java/com/nuvio/tv/core/network/CancellableHttpCall.kt b/app/src/main/java/com/nuvio/tv/core/network/CancellableHttpCall.kt
+new file mode 100644
+index 000000000..55e241e9f
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/network/CancellableHttpCall.kt
+@@ -0,0 +1,33 @@
++package com.nuvio.tv.core.network
++
++import kotlinx.coroutines.suspendCancellableCoroutine
++import okhttp3.Call
++import okhttp3.Callback
++import okhttp3.Response
++import java.io.IOException
++import kotlin.coroutines.resume
++import kotlin.coroutines.resumeWithException
++
++/** Cancellation closes the socket even while a response body is being read. */
++internal suspend fun <T> Call.consumeCancellableResponse(consume: (Response) -> T): T =
++    suspendCancellableCoroutine { continuation ->
++        continuation.invokeOnCancellation { cancel() }
++        if (!continuation.isActive) return@suspendCancellableCoroutine
++        enqueue(object : Callback {
++            override fun onFailure(call: Call, e: IOException) {
++                if (continuation.isActive) continuation.resumeWithException(e)
++            }
++
++            override fun onResponse(call: Call, response: Response) {
++                try {
++                    response.use {
++                        if (!continuation.isActive) return
++                        val result = consume(it)
++                        if (continuation.isActive) continuation.resume(result)
++                    }
++                } catch (error: Exception) {
++                    if (continuation.isActive) continuation.resumeWithException(error)
++                }
++            }
++        })
++    }
+diff --git a/app/src/main/java/com/nuvio/tv/core/network/TraktAuthEndpoint.kt b/app/src/main/java/com/nuvio/tv/core/network/TraktAuthEndpoint.kt
+new file mode 100644
+index 000000000..287f81b67
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/network/TraktAuthEndpoint.kt
+@@ -0,0 +1,13 @@
++package com.nuvio.tv.core.network
++
++import okhttp3.HttpUrl
++
++private val traktAuthPaths = setOf("/oauth/device/code", "/oauth/device/token", "/oauth/token", "/oauth/revoke")
++
++// Trakt now serves secret-free device authentication separately from catalogue/account requests.
++internal fun HttpUrl.traktEndpoint(): HttpUrl =
++    if (host == "api.trakt.tv" && encodedPath in traktAuthPaths) {
++        newBuilder().host("auth.trakt.tv").build()
++    } else {
++        this
++    }
 diff --git a/app/src/main/java/com/nuvio/tv/core/party/PartyAvatars.kt b/app/src/main/java/com/nuvio/tv/core/party/PartyAvatars.kt
 new file mode 100644
 index 000000000..c7c866096
@@ -418134,6 +418535,31 @@ index 000000000..64cd3b96b
 +        }
 +    }
 +    return favoriteId
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/plugin/SourceLanguages.kt b/app/src/main/java/com/nuvio/tv/core/plugin/SourceLanguages.kt
+new file mode 100644
+index 000000000..759b6569d
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/plugin/SourceLanguages.kt
+@@ -0,0 +1,19 @@
++package com.nuvio.tv.core.plugin
++
++import java.util.Locale
++
++/** Source language codes follow CloudStream's MainAPI.lang, including its regional aliases. */
++object SourceLanguages {
++    private val aliases = mapOf("mx" to "es", "jp" to "ja", "cn" to "zh", "kr" to "ko", "iw" to "he", "in" to "id")
++    private val universal = setOf("multi", "mul", "uni", "xx", "und", "all")
++    fun normalize(language: String?): String? {
++        val code = language?.trim()?.lowercase(Locale.ROOT)?.substringBefore('-')?.substringBefore('_')
++            ?.takeIf { it.isNotBlank() && it !in universal } ?: return null
++        return aliases[code] ?: code
++    }
++    fun allows(language: String?, selected: Set<String>): Boolean =
++        selected.isEmpty() || normalize(language)?.let { it in selected } != false
++
++    fun displayName(code: String): String = Locale.forLanguageTag(code).getDisplayLanguage(Locale.getDefault())
++        .takeIf { it.isNotBlank() } ?: code
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/core/profile/LocalProfileAvatars.kt b/app/src/main/java/com/nuvio/tv/core/profile/LocalProfileAvatars.kt
 new file mode 100644
@@ -426641,6 +427067,76 @@ index 000000000..c1859c284
 +        append('"')
 +    }
 +}
+diff --git a/app/src/main/java/com/nuvio/tv/core/storage/DatabaseVersions.kt b/app/src/main/java/com/nuvio/tv/core/storage/DatabaseVersions.kt
+new file mode 100644
+index 000000000..be0702af8
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/storage/DatabaseVersions.kt
+@@ -0,0 +1,64 @@
++package com.nuvio.tv.core.storage
++
++import android.content.Context
++import android.database.sqlite.SQLiteDatabase
++import android.database.sqlite.SQLiteException
++
++/** Disposable means every row can be reconstructed without losing a user choice. */
++data class LocalDatabaseSchema(val fileName: String, val displayName: String, val version: Int, val rebuildable: Boolean)
++
++object DatabaseVersions {
++    val guide = LocalDatabaseSchema("livetv_guide2.db", "TV guide", 2, true)
++    val posters = LocalDatabaseSchema("livetv_posters.db", "Poster lookup", 3, true)
++    // poster_fix contains manual corrections: preserve the whole database.
++    val onDemand = LocalDatabaseSchema("livetv_on_demand.db", "On Demand", 11, false)
++    val all = listOf(guide, posters, onDemand)
++
++    /** Read-only preflight before feature startup. Never recreate a user database. */
++    fun blockingIssue(context: Context): DatabaseVersionIssue? {
++        for (schema in all.filterNot { it.rebuildable }) {
++            val path = context.getDatabasePath(schema.fileName)
++            if (!path.exists()) continue
++            val stored = try {
++                SQLiteDatabase.openDatabase(path.path, null, SQLiteDatabase.OPEN_READONLY).use { it.version }
++            } catch (_: SQLiteException) {
++                return DatabaseVersionIssue(schema, null)
++            }
++            if (stored > schema.version) return DatabaseVersionIssue(schema, stored)
++        }
++        return null
++    }
++}
++
++data class DatabaseVersionIssue(val schema: LocalDatabaseSchema, val storedVersion: Int?) {
++    val description: String get() = if (storedVersion == null)
++        "${schema.displayName} data could not be opened safely. Your data has not been changed. Try restarting, or reinstall the build that created it."
++    else "${schema.displayName} data was saved by a newer version of NuvioTV. This build supports version ${schema.version}, but the saved data uses version $storedVersion. Your data has not been changed. Reinstall a compatible newer build to continue."
++}
++
++class NewerUserDatabaseException(val issue: DatabaseVersionIssue) : SQLiteException(issue.description)
++
++/** SQLiteOpenHelper calls this within its schema transaction: failure rolls back. */
++internal fun rebuildCacheDatabase(db: SQLiteDatabase, schema: LocalDatabaseSchema, create: (SQLiteDatabase) -> Unit) {
++    require(schema.rebuildable) { "${schema.displayName} contains user data and cannot be rebuilt" }
++    check(db.inTransaction()) { "Cache rebuild must be atomic" }
++    data class Object(val type: String, val name: String, val virtual: Boolean)
++    val objects = db.rawQuery(
++        "SELECT type,name,sql FROM sqlite_master WHERE type IN ('trigger','view','table') " +
++            "AND name!='android_metadata' AND substr(name,1,7)!='sqlite_'", null
++    ).use { cursor -> buildList {
++        while (cursor.moveToNext()) add(Object(cursor.getString(0), cursor.getString(1),
++            cursor.getString(2)?.trimStart()?.startsWith("CREATE VIRTUAL TABLE", ignoreCase = true) == true))
++    } }
++    // Dropping an FTS parent also drops its shadow tables. IF EXISTS handles that.
++    for (entry in objects.sortedBy { when {
++        it.type == "trigger" -> 0
++        it.type == "view" -> 1
++        it.virtual -> 2
++        else -> 3
++    } }) {
++        val identifier = entry.name.replace("\"", "\"\"")
++        db.execSQL("DROP ${entry.type} IF EXISTS \"$identifier\"")
++    }
++    create(db)
++}
 diff --git a/app/src/main/java/com/nuvio/tv/core/streams/PlaybackAvailability.kt b/app/src/main/java/com/nuvio/tv/core/streams/PlaybackAvailability.kt
 index 2986d211d..4066de374 100644
 --- a/app/src/main/java/com/nuvio/tv/core/streams/PlaybackAvailability.kt
@@ -427518,6 +428014,60 @@ index 544d5e306..a1299c058 100644
 +
 +/** One episode across local and tracker progress: the show's id and the episode's number. */
 +fun mixPlayKey(contentId: String, season: Int?, episode: Int?): String = "$contentId|${season ?: ""}|${episode ?: ""}"
+diff --git a/app/src/main/java/com/nuvio/tv/data/local/FreshInstallDefaults.kt b/app/src/main/java/com/nuvio/tv/data/local/FreshInstallDefaults.kt
+new file mode 100644
+index 000000000..be2d5caf9
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/local/FreshInstallDefaults.kt
+@@ -0,0 +1,48 @@
++package com.nuvio.tv.data.local
++
++import androidx.datastore.core.DataMigration
++import androidx.datastore.preferences.core.Preferences
++import androidx.datastore.preferences.core.booleanPreferencesKey
++import androidx.datastore.preferences.core.intPreferencesKey
++import androidx.datastore.preferences.core.stringPreferencesKey
++
++/** Seeds real preferences once. Ordinary defaults and existing installations stay intact. */
++internal class FreshInstallDefaults(private val feature: String) : DataMigration<Preferences> {
++    override suspend fun shouldMigrate(currentData: Preferences) = currentData.asMap().isEmpty()
++
++    override suspend fun migrate(currentData: Preferences): Preferences {
++        if (currentData.asMap().isNotEmpty()) return currentData
++        val prefs = currentData.toMutablePreferences()
++        when (feature) {
++            "player_settings" -> {
++                prefs[stringPreferencesKey("stream_auto_play_mode")] = "FIRST_STREAM"
++                prefs[stringPreferencesKey("stream_auto_play_source")] = "INSTALLED_ADDONS_ONLY"
++                prefs[booleanPreferencesKey("stream_auto_play_addons_enabled")] = true
++                prefs[booleanPreferencesKey("stream_auto_play_plugins_enabled")] = false
++                prefs[booleanPreferencesKey("stream_auto_play_playlists_enabled")] = true
++                prefs[intPreferencesKey("stream_auto_play_timeout_seconds")] = 8
++                prefs[booleanPreferencesKey("stream_auto_play_any_source_fallback_enabled")] = true
++                prefs[intPreferencesKey("stream_auto_play_any_source_fallback_seconds")] = 25
++            }
++            "layout_settings" -> {
++                prefs[booleanPreferencesKey("hero_section_enabled")] = true
++                prefs[booleanPreferencesKey("random_episode_enabled")] = true
++                prefs[stringPreferencesKey("detail_imdb_ratings_visibility")] = "SHOW_ALL"
++                prefs[booleanPreferencesKey("modern_hero_full_screen_backdrop")] = false
++                prefs[booleanPreferencesKey("focused_poster_backdrop_expand_enabled")] = true
++                prefs[intPreferencesKey("focused_poster_backdrop_expand_delay_seconds")] = 2
++                prefs[booleanPreferencesKey("focused_poster_backdrop_trailer_enabled")] = true
++                prefs[booleanPreferencesKey("focused_poster_backdrop_trailer_muted")] = false
++                prefs[stringPreferencesKey("focused_poster_backdrop_trailer_playback_target")] = "HERO_MEDIA"
++            }
++            "trailer_settings" -> {
++                prefs[booleanPreferencesKey("trailer_enabled")] = true
++                prefs[intPreferencesKey("trailer_delay_seconds")] = 5
++                prefs[booleanPreferencesKey("trailer_play_in_background")] = false
++            }
++        }
++        return prefs.toPreferences()
++    }
++
++    override suspend fun cleanUp() = Unit
++}
 diff --git a/app/src/main/java/com/nuvio/tv/data/local/LayoutPreferenceDataStore.kt b/app/src/main/java/com/nuvio/tv/data/local/LayoutPreferenceDataStore.kt
 index e1b5abd5a..bf1293c67 100644
 --- a/app/src/main/java/com/nuvio/tv/data/local/LayoutPreferenceDataStore.kt
@@ -428012,19 +428562,20 @@ index 54df8bee3..2ab24fc90 100644
      suspend fun setUseForcedSubtitles(enabled: Boolean) {
          store().edit { prefs ->
 diff --git a/app/src/main/java/com/nuvio/tv/data/local/PluginDataStore.kt b/app/src/main/java/com/nuvio/tv/data/local/PluginDataStore.kt
-index fd5eb7941..eeacc7afe 100644
+index fd5eb7941..161375737 100644
 --- a/app/src/main/java/com/nuvio/tv/data/local/PluginDataStore.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/local/PluginDataStore.kt
-@@ -4,6 +4,8 @@ import android.content.Context
+@@ -4,6 +4,9 @@ import android.content.Context
  import androidx.datastore.preferences.core.booleanPreferencesKey
  import androidx.datastore.preferences.core.edit
  import androidx.datastore.preferences.core.stringPreferencesKey
++import androidx.datastore.preferences.core.stringSetPreferencesKey
 +import com.nuvio.tv.core.plugin.PluginProviderPlayStat
 +import com.nuvio.tv.core.plugin.pluginProviderPlayStats
  import com.nuvio.tv.core.profile.ProfileManager
  import com.nuvio.tv.domain.model.PluginRepository
  import com.nuvio.tv.domain.model.ScraperInfo
-@@ -34,6 +36,7 @@ class PluginDataStore @Inject constructor(
+@@ -34,6 +37,7 @@ class PluginDataStore @Inject constructor(
      companion object {
          internal const val FEATURE = "plugin_settings"
          internal const val GROUP_STREAMS_BY_REPOSITORY = "group_streams_by_repository"
@@ -428032,7 +428583,7 @@ index fd5eb7941..eeacc7afe 100644
      }
  
      private fun effectiveProfileId(): Int {
-@@ -76,7 +79,11 @@ class PluginDataStore @Inject constructor(
+@@ -76,7 +80,11 @@ class PluginDataStore @Inject constructor(
      private val scrapersKey = stringPreferencesKey("scrapers")
      private val pluginsEnabledKey = booleanPreferencesKey("plugins_enabled")
      private val groupStreamsByRepositoryKey = booleanPreferencesKey(GROUP_STREAMS_BY_REPOSITORY)
@@ -428044,7 +428595,26 @@ index fd5eb7941..eeacc7afe 100644
  
      private val repoListType = Types.newParameterizedType(List::class.java, PluginRepository::class.java)
      private val scraperListType = Types.newParameterizedType(List::class.java, ScraperInfo::class.java)
-@@ -272,4 +279,34 @@ class PluginDataStore @Inject constructor(
+@@ -206,6 +214,18 @@ class PluginDataStore @Inject constructor(
+         }
+     }
+ 
++    private val sourceLanguagesKey = stringSetPreferencesKey("cloudstream_languages")
++
++    // An empty selection includes every source, including installations made before this setting existed.
++    val sourceLanguages: Flow<Set<String>> = profileState { pid ->
++        factory.get(pid, FEATURE).data.map { it[sourceLanguagesKey] ?: emptySet() }
++    }
++
++    suspend fun setSourceLanguages(languages: Set<String>) {
++        if (sharedPluginWriteBlocked()) return
++        store().edit { it[sourceLanguagesKey] = languages }
++    }
++
+     // Scraper code storage
+     fun getScraperCodeFile(scraperId: String): File {
+         return File(codeDir, "$scraperId.js")
+@@ -272,4 +292,34 @@ class PluginDataStore @Inject constructor(
              p[scraperSettingsKey] = json
          }
      }
@@ -428079,6 +428649,60 @@ index fd5eb7941..eeacc7afe 100644
 +        }
 +    }
  }
+diff --git a/app/src/main/java/com/nuvio/tv/data/local/ProfileDataStoreFactory.kt b/app/src/main/java/com/nuvio/tv/data/local/ProfileDataStoreFactory.kt
+index f8bbc1d49..aba4e2567 100644
+--- a/app/src/main/java/com/nuvio/tv/data/local/ProfileDataStoreFactory.kt
++++ b/app/src/main/java/com/nuvio/tv/data/local/ProfileDataStoreFactory.kt
+@@ -61,6 +61,23 @@ class ProfileDataStoreFactory @Inject constructor(
+     private val cache = ConcurrentHashMap<String, ScopedDataStore>()
+     private val deletedProfileIds = ConcurrentHashMap.newKeySet<Int>()
+     private val lock = Any()
++
++    // Persist installation provenance before opening profile stores. PackageManager timestamps
++    // distinguish an actual new installation from an update with unset preferences.
++    private val freshInstallDefaultsEnabled: Boolean = run {
++        val policy = context.getSharedPreferences("reseq_install_defaults", Context.MODE_PRIVATE)
++        if (policy.contains("enabled")) policy.getBoolean("enabled", false)
++        else {
++            val fresh = runCatching {
++                val info = context.packageManager.getPackageInfo(context.packageName, 0)
++                info.firstInstallTime > 0L && info.firstInstallTime == info.lastUpdateTime
++            }.getOrDefault(false)
++            if (fresh && !policy.edit().putBoolean("enabled", true).commit()) {
++                throw java.io.IOException("Unable to persist installation defaults policy")
++            }
++            fresh
++        }
++    }
+     private val retainedStandaloneDataStoreNames = setOf(
+         "app_onboarding",
+         "auth_session_notice_store",
+@@ -150,9 +167,15 @@ class ProfileDataStoreFactory @Inject constructor(
+         // doesn't exist yet and a race condition occurs. Pre-create an empty file
+         // to avoid this edge case (DataStore will overwrite on first write).
+         val targetFile = File(dataStoreDir, "$fileName.preferences_pb")
+-        if (!targetFile.exists()) {
++        val existingSettingsFile = targetFile.exists()
++        if (!existingSettingsFile) {
+             try { targetFile.createNewFile() } catch (_: Exception) { }
+         }
++        val feature = fileName.replace(Regex("_p[0-9]+$"), "")
++        val installMigrations = if (freshInstallDefaultsEnabled && !existingSettingsFile &&
++            feature in setOf("player_settings", "layout_settings", "trailer_settings")) {
++            listOf(FreshInstallDefaults(feature))
++        } else emptyList()
+         val store = PreferenceDataStoreFactory.create(
+             corruptionHandler = androidx.datastore.core.handlers.ReplaceFileCorruptionHandler { ex ->
+                 Log.e("ProfileDataStoreFactory", "DataStore corrupted ($fileName): ${ex.message} — attempting shadow copy recovery")
+@@ -167,7 +190,7 @@ class ProfileDataStoreFactory @Inject constructor(
+                 }
+             },
+             scope = scope,
+-            migrations = migrations,
++            migrations = installMigrations + migrations,
+             produceFile = { context.preferencesDataStoreFile(fileName) }
+         )
+ 
 diff --git a/app/src/main/java/com/nuvio/tv/data/local/ScoutMixStore.kt b/app/src/main/java/com/nuvio/tv/data/local/ScoutMixStore.kt
 new file mode 100644
 index 000000000..98e0e48e0
@@ -430457,7 +431081,7 @@ index 8518d4102..b0a6bdd6b 100644
          val desired = changes.desiredMembership
          val requestedChanges = trackingProviders.providers().mapNotNull { provider ->
 diff --git a/app/src/main/java/com/nuvio/tv/data/repository/MetaRepositoryImpl.kt b/app/src/main/java/com/nuvio/tv/data/repository/MetaRepositoryImpl.kt
-index e4031c3cc..17022d7aa 100644
+index e4031c3cc..43ffee56b 100644
 --- a/app/src/main/java/com/nuvio/tv/data/repository/MetaRepositoryImpl.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/repository/MetaRepositoryImpl.kt
 @@ -12,6 +12,9 @@ import com.nuvio.tv.data.remote.api.AddonApi
@@ -430481,6 +431105,15 @@ index e4031c3cc..17022d7aa 100644
  ) : MetaRepository {
      companion object {
          private const val TAG = "MetaRepository"
+@@ -132,7 +137,7 @@ class MetaRepositoryImpl @Inject constructor(
+     private val serverMetaCache = createLruCacheMap<String, CachedMeta>(MAX_META_CACHE_ENTRIES)
+ 
+     // In-flight deduplication: prevents concurrent coroutines from firing duplicate requests
+-    private val inFlightMeta = ConcurrentHashMap<String, Deferred<Meta?>>()
++    private val inFlightMeta = SharedMetadataRequests<Meta?>(repositoryScope)
+     private val inFlightAddonMeta = ConcurrentHashMap<String, Deferred<MetaLookupResult>>()
+     private val inFlightPrimaryMeta = ConcurrentHashMap<String, Deferred<Meta?>>()
+ 
 @@ -145,6 +150,12 @@ class MetaRepositoryImpl @Inject constructor(
              emitAll(serverMeta(ref))
              return@flow
@@ -430494,7 +431127,58 @@ index e4031c3cc..17022d7aa 100644
          if (ServerCatalog.isServerAddon(addonBaseUrl)) {
              emitAll(getMetaFromAllAddons(type, id))
              return@flow
-@@ -244,6 +255,12 @@ class MetaRepositoryImpl @Inject constructor(
+@@ -201,33 +212,28 @@ class MetaRepositoryImpl @Inject constructor(
+         emit(NetworkResult.Loading)
+ 
+         val url = buildMetaUrl(addonBaseUrl, effectiveType, id)
+-        val deferred = inFlightMeta.getOrPut(cacheKey) {
+-            repositoryScope.async {
+-                try {
+-                    val response = api.getMeta(url)
+-                    if (response.isSuccessful) {
+-                        val metaDto = response.body()?.meta ?: return@async null
+-                        val meta = metaDto.toDomain(context.getString(R.string.episodes_episode))
+-                        val ttlMs = parseMaxAgeMs(response.headers()["Cache-Control"])
+-                        val cached = CachedMeta(meta, System.currentTimeMillis() + ttlMs)
+-                        metaCache[cacheKey] = cached
+-                        addonMetaCache[metaLookupCacheKey(requestedType, id)] = cached
+-                        meta
+-                    } else {
+-                        null
+-                    }
+-                } catch (e: kotlinx.coroutines.CancellationException) {
+-                    throw e
+-                } catch (e: Exception) {
+-                    Log.w(TAG, "getMeta failed for $url: ${e.message}")
++        val meta = inFlightMeta.await(cacheKey) {
++            try {
++                val response = api.getMeta(url)
++                if (response.isSuccessful) {
++                    val metaDto = response.body()?.meta ?: return@await null
++                    val meta = metaDto.toDomain(context.getString(R.string.episodes_episode))
++                    val ttlMs = parseMaxAgeMs(response.headers()["Cache-Control"])
++                    val cached = CachedMeta(meta, System.currentTimeMillis() + ttlMs)
++                    metaCache[cacheKey] = cached
++                    addonMetaCache[metaLookupCacheKey(requestedType, id)] = cached
++                    meta
++                } else {
+                     null
+-                } finally {
+-                    inFlightMeta.remove(cacheKey)
+                 }
++            } catch (e: kotlinx.coroutines.CancellationException) {
++                throw e
++            } catch (e: Exception) {
++                Log.w(TAG, "getMeta failed for $url: ${e.message}")
++                null
+             }
+         }
+ 
+-        val meta = deferred.await()
+         if (meta != null) {
+             emit(NetworkResult.Success(meta))
+         } else {
+@@ -244,6 +250,12 @@ class MetaRepositoryImpl @Inject constructor(
              emitAll(serverMeta(ref))
              return@flow
          }
@@ -430507,7 +431191,7 @@ index e4031c3cc..17022d7aa 100644
          val cacheKey = metaLookupCacheKey(type, id)
          addonMetaCache[cacheKey]?.let { cached ->
              if (!cached.isExpired()) {
-@@ -505,6 +522,12 @@ class MetaRepositoryImpl @Inject constructor(
+@@ -505,6 +517,12 @@ class MetaRepositoryImpl @Inject constructor(
              emitAll(serverMeta(ref))
              return@flow
          }
@@ -430520,7 +431204,7 @@ index e4031c3cc..17022d7aa 100644
          val cacheKey = metaLookupCacheKey(type, id)
          primaryAddonMetaCache[cacheKey]?.let { cached ->
              if (!cached.isExpired()) {
-@@ -786,6 +809,55 @@ class MetaRepositoryImpl @Inject constructor(
+@@ -786,6 +804,55 @@ class MetaRepositoryImpl @Inject constructor(
          inFlightPrimaryMeta.clear()
      }
  
@@ -430576,6 +431260,47 @@ index e4031c3cc..17022d7aa 100644
      private fun serverMeta(ref: ServerItemRef): Flow<NetworkResult<Meta>> = flow {
          val key = ref.encode()
          serverMetaCache[key]?.takeIf { !it.isExpired() }?.let { cached ->
+diff --git a/app/src/main/java/com/nuvio/tv/data/repository/SharedMetadataRequests.kt b/app/src/main/java/com/nuvio/tv/data/repository/SharedMetadataRequests.kt
+new file mode 100644
+index 000000000..a64cd965e
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/data/repository/SharedMetadataRequests.kt
+@@ -0,0 +1,35 @@
++package com.nuvio.tv.data.repository
++
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.CoroutineStart
++import kotlinx.coroutines.Deferred
++import kotlinx.coroutines.async
++
++/** Deduplicate requests without letting abandoned screen work outlive its last caller. */
++internal class SharedMetadataRequests<T>(private val scope: CoroutineScope) {
++    private class Load<T>(val result: Deferred<T>, var waiters: Int = 0)
++    private val active = mutableMapOf<String, Load<T>>()
++
++    suspend fun await(key: String, fetch: suspend () -> T): T {
++        val load = synchronized(active) {
++            active.getOrPut(key) { Load(scope.async(start = CoroutineStart.LAZY) { fetch() }) }
++                .also { it.waiters++ }
++        }
++        try {
++            return load.result.await()
++        } finally {
++            synchronized(active) {
++                if (--load.waiters == 0 && active[key] === load) {
++                    active.remove(key)
++                    load.result.cancel()
++                }
++            }
++        }
++    }
++
++    fun clear() = synchronized(active) {
++        val removed = active.values.toList()
++        active.clear()
++        removed.forEach { it.result.cancel() }
++    }
++}
 diff --git a/app/src/main/java/com/nuvio/tv/data/repository/SkipIntroRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/SkipIntroRepository.kt
 index 50b9f7c5b..972323158 100644
 --- a/app/src/main/java/com/nuvio/tv/data/repository/SkipIntroRepository.kt
@@ -442269,10 +442994,10 @@ index 000000000..e5ad17bdb
 +    distinctUntilChanged { a, b -> a.nameRemovals == b.nameRemovals && a.cleanGroupNames == b.cleanGroupNames }
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/data/EpgDatabase.kt b/app/src/main/java/com/nuvio/tv/livetv/data/EpgDatabase.kt
 new file mode 100644
-index 000000000..516f7da28
+index 000000000..23aa3f9c7
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/data/EpgDatabase.kt
-@@ -0,0 +1,1154 @@
+@@ -0,0 +1,1157 @@
 +package com.nuvio.tv.livetv.data
 +
 +import android.content.ContentValues
@@ -442354,6 +443079,9 @@ index 000000000..516f7da28
 +            db.execSQL("ALTER TABLE listings ADD COLUMN provider_source TEXT")
 +        }
 +    }
++
++    override fun onDowngrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) =
++        com.nuvio.tv.core.storage.rebuildCacheDatabase(db, com.nuvio.tv.core.storage.DatabaseVersions.guide, ::onCreate)
 +
 +    /** A playlist channel's guide: a guide file ([sourceId]), a channel in it, and how far its times are moved. */
 +    class GuideLink(val sourceId: String, val xmltvId: String, val shiftMs: Long = 0L)
@@ -445104,10 +445832,10 @@ index 000000000..cf695ae63
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/data/LiveTvPosterStore.kt b/app/src/main/java/com/nuvio/tv/livetv/data/LiveTvPosterStore.kt
 new file mode 100644
-index 000000000..f19a9743d
+index 000000000..745796306
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/data/LiveTvPosterStore.kt
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,60 @@
 +package com.nuvio.tv.livetv.data
 +
 +import android.content.ContentValues
@@ -445137,6 +445865,9 @@ index 000000000..f19a9743d
 +        db.execSQL("DROP TABLE IF EXISTS posters")
 +        onCreate(db)
 +    }
++
++    override fun onDowngrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) =
++        com.nuvio.tv.core.storage.rebuildCacheDatabase(db, com.nuvio.tv.core.storage.DatabaseVersions.posters, ::onCreate)
 +
 +    /** null = not known (look it up); "" = looked up, nothing found; else the poster. */
 +    fun get(key: String): String? = runCatching {
@@ -459626,10 +460357,10 @@ index 000000000..b4006886b
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandDatabase.kt b/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandDatabase.kt
 new file mode 100644
-index 000000000..6802adc05
+index 000000000..4213f066d
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandDatabase.kt
-@@ -0,0 +1,942 @@
+@@ -0,0 +1,947 @@
 +package com.nuvio.tv.livetv.ondemand
 +
 +import android.content.ContentValues
@@ -459819,6 +460550,11 @@ index 000000000..6802adc05
 +        // Version 11: episodes of series read from an M3U playlist's own entries (a new table;
 +        // everything already imported is kept).
 +        if (oldVersion < 11) createM3uEpisodeTable(db)
++    }
++
++    override fun onDowngrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
++        throw com.nuvio.tv.core.storage.NewerUserDatabaseException(
++            com.nuvio.tv.core.storage.DatabaseVersionIssue(com.nuvio.tv.core.storage.DatabaseVersions.onDemand, oldVersion))
 +    }
 +
 +    private fun fixYearsFromNames(db: SQLiteDatabase) {
@@ -465839,15 +466575,20 @@ index 000000000..aba53f06c
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/player/LiveHttp.kt b/app/src/main/java/com/nuvio/tv/livetv/player/LiveHttp.kt
 new file mode 100644
-index 000000000..27525dc1e
+index 000000000..158457ef0
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/player/LiveHttp.kt
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,78 @@
 +package com.nuvio.tv.livetv.player
 +
 +import java.net.HttpURLConnection
 +import java.net.URL
++import com.nuvio.tv.core.network.consumeCancellableResponse
 +import com.nuvio.tv.livetv.stalker.StalkerMediaPolicy
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.Response
++import java.util.concurrent.TimeUnit
 +
 +/**
 + * Opens a provider link for recording, following redirects all the way, including between
@@ -465855,6 +466596,30 @@ index 000000000..27525dc1e
 + * provider that sends you on to its stream server answered "HTTP 302" and nothing was recorded).
 + */
 +object LiveHttp {
++    private val recordingHttp by lazy {
++        OkHttpClient.Builder().dns(com.nuvio.tv.core.network.IPv4FirstDns())
++            .connectTimeout(15, TimeUnit.SECONDS).readTimeout(20, TimeUnit.SECONDS)
++            .followRedirects(true).followSslRedirects(true).build()
++    }
++
++    internal suspend fun <T> consume(url: String, headers: Map<String, String>, policy: StalkerMediaPolicy? = null, block: (Response) -> T): T {
++        val request = Request.Builder().url(url).apply {
++            val requestHeaders = if (policy == null) headers else StalkerMediaPolicy.withoutPortalHeaders(headers) + policy.headersFor(url, URL(url).protocol.equals("https", true))
++            requestHeaders.forEach { (key, value) -> header(key, value) }
++            if (requestHeaders.keys.none { it.equals("User-Agent", true) }) header("User-Agent", com.nuvio.tv.livetv.data.LiveTvRepository.DEFAULT_UA)
++        }.build()
++        return com.nuvio.vpn.android.VpnHttpClient.wrap(recordingHttp).newCall(request).consumeCancellableResponse { response ->
++            if (!response.isSuccessful) throw java.io.IOException("HTTP ${response.code}")
++            block(response)
++        }
++    }
++
++    internal suspend fun fetchCancellable(url: String, headers: Map<String, String>, policy: StalkerMediaPolicy? = null): Pair<String, String> =
++        consume(url, headers, policy) { response ->
++            val body = response.body ?: throw java.io.IOException("The provider returned no response body")
++            body.string() to response.request.url.toString()
++        }
++
 +    /** The connection after the last redirect (its [HttpURLConnection.getURL] is where it ended up). */
 +    fun open(url: String, headers: Map<String, String>, readTimeoutMs: Int = 20_000, policy: StalkerMediaPolicy? = null): HttpURLConnection {
 +        var current = url
@@ -465994,12 +466759,27 @@ index 000000000..4a33ced21
 +        target.translationY = parent.height / 2f - (r.top + r.height() / 2f)
 +    }
 +}
+diff --git a/app/src/main/java/com/nuvio/tv/livetv/player/LiveStreamDiagnostics.kt b/app/src/main/java/com/nuvio/tv/livetv/player/LiveStreamDiagnostics.kt
+new file mode 100644
+index 000000000..fad5385c7
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/livetv/player/LiveStreamDiagnostics.kt
+@@ -0,0 +1,9 @@
++package com.nuvio.tv.livetv.player
++
++/** Keep channel/stream identifiers useful while excluding account and session credentials. */
++internal fun redactLiveStreamUrl(text: String): String = text
++    .replace(Regex("""(/(?:timeshift|live|movie|series)/)[^/]+/[^/]+/"""), "$1***/***/")
++    .replace(Regex("""(?i)([?&](?:username|password|pass|mac|sn|sn2|serial|device_id2?|signature|[a-z_]*token|authorization))=[^&#\s]*"""), "$1=***")
++    .replace(Regex("""(?i)(https?://)[^/@\s]+:[^/@\s]+@"""), "$1***@")
++    // Xtream links without "/live": http://host:port/user/pass/123.ts
++    .replace(Regex("""^(https?://[^/]+)/(?!\*\*\*)[^/]+/[^/]+/(\d+(?:\.[A-Za-z0-9]+)?(?:\?.*)?)$"""), "$1/***/***/$2")
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/player/LiveStreamFormats.kt b/app/src/main/java/com/nuvio/tv/livetv/player/LiveStreamFormats.kt
 new file mode 100644
-index 000000000..01fc150f9
+index 000000000..a5ce34cb0
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/player/LiveStreamFormats.kt
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,59 @@
 +package com.nuvio.tv.livetv.player
 +
 +import androidx.media3.common.MimeTypes
@@ -466057,18 +466837,14 @@ index 000000000..01fc150f9
 +    }
 +
 +    /** A link for the start-up report, with the username and password hidden. */
-+    fun redact(url: String): String =
-+        url.replace(Regex("""(/(?:timeshift|live|movie|series)/)[^/]+/[^/]+/"""), "$1***/***/")
-+            .replace(Regex("""(username|password)=[^&]*"""), "$1=***")
-+            // Xtream links without "/live": http://host:port/user/pass/123.ts
-+            .replace(Regex("""^(https?://[^/]+)/(?!\*\*\*)[^/]+/[^/]+/(\d+(?:\.[A-Za-z0-9]+)?(?:\?.*)?)$"""), "$1/***/***/$2")
++    fun redact(url: String): String = redactLiveStreamUrl(url)
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/player/LiveTvPlaybackController.kt b/app/src/main/java/com/nuvio/tv/livetv/player/LiveTvPlaybackController.kt
 new file mode 100644
-index 000000000..9575bdce0
+index 000000000..3b61f88a3
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/player/LiveTvPlaybackController.kt
-@@ -0,0 +1,2403 @@
+@@ -0,0 +1,2400 @@
 +package com.nuvio.tv.livetv.player
 +
 +import android.content.Context
@@ -468275,10 +469051,7 @@ index 000000000..9575bdce0
 +
 +    /** A link for the start-up report, with the username and password hidden. */
 +    private fun redact(url: String): String =
-+        if (currentChannel?.stalkerRef != null || url.startsWith("stalker:")) "[Stalker stream]" else url.replace(Regex("""(/(?:timeshift|live|movie|series)/)[^/]+/[^/]+/"""), "$1***/***/")
-+            .replace(Regex("""(username|password)=[^&]*"""), "$1=***")
-+            // Xtream links without "/live": http://host:port/user/pass/123.ts
-+            .replace(Regex("""^(https?://[^/]+)/(?!\*\*\*)[^/]+/[^/]+/(\d+(?:\.[A-Za-z0-9]+)?(?:\?.*)?)$"""), "$1/***/***/$2")
++        if (currentChannel?.stalkerRef != null || url.startsWith("stalker:")) "[Stalker stream]" else redactLiveStreamUrl(url)
 +
 +    /**
 +     * A live channel failed twice in a row (or never started): Live TV may switch to a backup
@@ -468598,7 +469371,7 @@ index 000000000..39f46ac0d
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/player/LiveTvTimeshift.kt b/app/src/main/java/com/nuvio/tv/livetv/player/LiveTvTimeshift.kt
 new file mode 100644
-index 000000000..5d56f1cee
+index 000000000..32bfebbaf
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/player/LiveTvTimeshift.kt
 @@ -0,0 +1,394 @@
@@ -468861,7 +469634,7 @@ index 000000000..5d56f1cee
 +        var policy = initialPolicy
 +        val connect: (String, Map<String, String>) -> HttpURLConnection = { address, requestHeaders -> LiveHttp.open(address, requestHeaders, 20_000, policy) }
 +        try {
-+            val (firstText, firstUrl) = LiveHttp.fetch(url, headers, policy)
++            val (firstText, firstUrl) = LiveHttp.fetchCancellable(url, headers, policy)
 +            val choice = if (HlsPieces.isMaster(firstText)) {
 +                HlsPieces.pick(firstUrl, firstText, audioLanguage) ?: return
 +            } else null
@@ -468889,7 +469662,7 @@ index 000000000..5d56f1cee
 +                if (fresh.mimeType == StalkerMimeProbe.DASH) throw java.io.IOException(StalkerMimeProbe.DASH_RECORDING_UNAVAILABLE)
 +                if (policy !== fresh.policy) policy?.retire()
 +                policy = fresh.policy
-+                val (text, servedAt) = LiveHttp.fetch(fresh.url, fresh.headers, policy)
++                val (text, servedAt) = LiveHttp.fetchCancellable(fresh.url, fresh.headers, policy)
 +                val refreshed = if (HlsPieces.isMaster(text)) HlsPieces.pick(servedAt, text, audioLanguage) else null
 +                if ((refreshed?.audioUrl != null) != (audio != null)) throw IllegalStateException("The portal changed its audio format.")
 +                video.url = refreshed?.videoUrl ?: servedAt
@@ -497317,6 +498090,46 @@ index 000000000..76c3cbfa1
 +        else channels.firstOrNull { keyOf(it) == key }
 +    }
 +}
+diff --git a/app/src/main/java/com/nuvio/tv/livetv/ui/GuideBackGesture.kt b/app/src/main/java/com/nuvio/tv/livetv/ui/GuideBackGesture.kt
+new file mode 100644
+index 000000000..430339fb7
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/livetv/ui/GuideBackGesture.kt
+@@ -0,0 +1,7 @@
++package com.nuvio.tv.livetv.ui
++
++internal const val GUIDE_BACK_HOLD_MS = 500L
++
++/** Respect the platform/remote timeout as well as remotes that only send Down and Up. */
++internal fun isGuideBackHold(elapsedMs: Long, reportedLongPress: Boolean): Boolean =
++    reportedLongPress || elapsedMs >= GUIDE_BACK_HOLD_MS
+diff --git a/app/src/main/java/com/nuvio/tv/livetv/ui/GuideFocusSelection.kt b/app/src/main/java/com/nuvio/tv/livetv/ui/GuideFocusSelection.kt
+new file mode 100644
+index 000000000..92050f941
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/livetv/ui/GuideFocusSelection.kt
+@@ -0,0 +1,21 @@
++package com.nuvio.tv.livetv.ui
++
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.combine
++import kotlinx.coroutines.flow.filterNotNull
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.withTimeoutOrNull
++
++/** Never let an old group's focus overwrite a newer playlist selection while its model loads. */
++internal suspend fun awaitGuideSelection(
++    states: StateFlow<LiveTvUiState>,
++    requested: StateFlow<String?>,
++    timeoutMs: Long = 5_000L
++): LiveTvUiState? = withTimeoutOrNull(timeoutMs) {
++    combine(states, requested) { state, target ->
++        state.takeIf {
++            target == null || it.selectedGroupId == target ||
++                (it.groups.isNotEmpty() && it.groups.none { group -> group.id == target })
++        }
++    }.filterNotNull().first()
++}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/ui/GuideGearPanel.kt b/app/src/main/java/com/nuvio/tv/livetv/ui/GuideGearPanel.kt
 new file mode 100644
 index 000000000..c333bf8b8
@@ -497626,6 +498439,47 @@ index 000000000..c333bf8b8
 +        )
 +    }
 +}
+diff --git a/app/src/main/java/com/nuvio/tv/livetv/ui/GuidePlaybackPriority.kt b/app/src/main/java/com/nuvio/tv/livetv/ui/GuidePlaybackPriority.kt
+new file mode 100644
+index 000000000..29919d90e
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/livetv/ui/GuidePlaybackPriority.kt
+@@ -0,0 +1,22 @@
++package com.nuvio.tv.livetv.ui
++
++/** Leave CPU time for the picture while a held remote button moves through the guide. */
++internal class GuideNavigationRepeatGate {
++    private var lastKeyCode: Int? = null
++    private var lastAcceptedAtMs = 0L
++
++    fun shouldConsume(keyCode: Int, repeated: Boolean, eventTimeMs: Long, playbackActive: Boolean): Boolean {
++        if (playbackActive && repeated && keyCode == lastKeyCode &&
++            eventTimeMs - lastAcceptedAtMs in 0 until REPEAT_INTERVAL_MS
++        ) return true
++        lastKeyCode = keyCode
++        lastAcceptedAtMs = eventTimeMs
++        return false
++    }
++
++    private companion object {
++        const val REPEAT_INTERVAL_MS = 100L
++    }
++}
++
++internal const val PLAYING_GUIDE_DETAILS_DELAY_MS = 350L
+diff --git a/app/src/main/java/com/nuvio/tv/livetv/ui/GuidePriorityChannels.kt b/app/src/main/java/com/nuvio/tv/livetv/ui/GuidePriorityChannels.kt
+new file mode 100644
+index 000000000..6bbfe5f92
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/livetv/ui/GuidePriorityChannels.kt
+@@ -0,0 +1,7 @@
++package com.nuvio.tv.livetv.ui
++
++import com.nuvio.tv.livetv.model.LiveChannel
++
++/** The guide only prioritises its first 400 channels, even for a very large playlist. */
++internal fun guidePriorityChannelKeys(channels: List<LiveChannel>): List<String> =
++    channels.take(400).map { it.key }
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/ui/GuidePrograms.kt b/app/src/main/java/com/nuvio/tv/livetv/ui/GuidePrograms.kt
 new file mode 100644
 index 000000000..44a328cdd
@@ -497942,6 +498796,24 @@ index 000000000..646a322c6
 +    fun release(view: View) {
 +        holders = (holders - 1).coerceAtLeast(0)
 +        if (holders == 0) view.keepScreenOn = false
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/livetv/ui/LiveGuideClock.kt b/app/src/main/java/com/nuvio/tv/livetv/ui/LiveGuideClock.kt
+new file mode 100644
+index 000000000..811f12524
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/livetv/ui/LiveGuideClock.kt
+@@ -0,0 +1,12 @@
++package com.nuvio.tv.livetv.ui
++
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.flow
++
++internal fun liveGuideClock(wallTime: () -> Long = System::currentTimeMillis) = flow {
++    while (true) {
++        val time = wallTime()
++        emit(time)
++        delay(30_000L - Math.floorMod(time, 30_000L))
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/ui/LivePosterImage.kt b/app/src/main/java/com/nuvio/tv/livetv/ui/LivePosterImage.kt
@@ -499789,10 +500661,10 @@ index 000000000..a6b1f797b
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/ui/LiveTvGuideScreen.kt b/app/src/main/java/com/nuvio/tv/livetv/ui/LiveTvGuideScreen.kt
 new file mode 100644
-index 000000000..7d6dda1d3
+index 000000000..701a0046b
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/ui/LiveTvGuideScreen.kt
-@@ -0,0 +1,5076 @@
+@@ -0,0 +1,5113 @@
 +package com.nuvio.tv.livetv.ui
 +
 +import com.nuvio.tv.livetv.data.LiveTvRepository
@@ -499906,6 +500778,7 @@ index 000000000..7d6dda1d3
 +import com.nuvio.tv.livetv.model.LiveChannel
 +import com.nuvio.tv.livetv.model.LiveTvSettings
 +import com.nuvio.tv.livetv.model.effectiveGuideSize
++import com.nuvio.tv.ui.components.tvTextFieldNavigation
 +import com.nuvio.tv.ui.theme.NuvioTheme
 +import dev.chrisbanes.haze.hazeSource
 +import dev.chrisbanes.haze.hazeEffect
@@ -500106,6 +500979,7 @@ index 000000000..7d6dda1d3
 +    // A channel playing in the preview window: keep the TV awake (no screen saver), like full
 +    // screen does (full screen keeps it awake too; see KeepScreenAwake).
 +    val previewPlaying = playback.channelKey != null && (playback.isPlaying || playback.isBuffering) && !playback.userPaused
++    val navigationRepeatGate = remember { GuideNavigationRepeatGate() }
 +    KeepScreenAwake(previewPlaying)
 +    val now by viewModel.now.collectAsStateWithLifecycle()
 +    val scope = rememberCoroutineScope()
@@ -500396,11 +501270,14 @@ index 000000000..7d6dda1d3
 +    }
 +    fun focusGroups() {
 +        groupsOpen = true
-+        // If the group on screen sits in a folded playlist, unfold it so it can take focus.
-+        ui.groups.firstOrNull { it.id == ui.selectedGroupId }?.sourceId?.let { src ->
-+            if (src in viewModel.collapsedPlaylists.value) viewModel.togglePlaylistCollapsed(src)
-+        }
 +        scope.launch {
++            // Right may arrive before a large guide model reflects the requested playlist.
++            // Focusing the old tile would select that old group again after its debounce.
++            val selected = awaitGuideSelection(viewModel.uiState, viewModel.requestedGroupId) ?: return@launch
++            // If the group on screen sits in a folded playlist, unfold it so it can take focus.
++            selected.groups.firstOrNull { it.id == selected.selectedGroupId }?.sourceId?.let { src ->
++                if (src in viewModel.collapsedPlaylists.value) viewModel.togglePlaylistCollapsed(src)
++            }
 +            // Let an unfolded playlist's groups appear first.
 +            repeat(2) { androidx.compose.runtime.withFrameNanos { } }
 +            // Where the group really is in the list. With playlist headings, the headings are
@@ -500408,7 +501285,7 @@ index 000000000..7d6dda1d3
 +            // somewhere else: on a second playlist the group was never scrolled into view, and
 +            // Left from the channels (or from full screen) couldn't reach the groups at all.
 +            val idx = groupListIndex(
-+                ui.groups, ui.selectedGroupId, settings.groupPlaylistHeadings, viewModel.collapsedPlaylists.value
++                selected.groups, selected.selectedGroupId, settings.groupPlaylistHeadings, viewModel.collapsedPlaylists.value
 +            ).coerceAtLeast(0)
 +            // Only a tile that is wholly on screen is left where it is: one that is partly cut off
 +            // would be scrolled into view by a fraction of a row, out of line with the channels.
@@ -500672,7 +501549,7 @@ index 000000000..7d6dda1d3
 +        // poster replaces it when found.
 +        if (LiveTvRepository.isPlaceholderTitle(p.title)) return@produceState // channel logo
 +        value = p.icon
-+        delay(250) // don't look up every show while scrolling quickly
++        delay(if (previewPlaying) PLAYING_GUIDE_DETAILS_DELAY_MS else 250L) // don't look up every show while scrolling quickly
 +        viewModel.posterFor(p.title, p, headerChannel)?.let { value = it }
 +    }
 +
@@ -500811,6 +501688,8 @@ index 000000000..7d6dda1d3
 +    var headerGlassBounds by remember { mutableStateOf<androidx.compose.ui.geometry.Rect?>(null) }
 +    // Only a Back press that *started* in the guide counts as "hold Back" here.
 +    var backPressStartedHere by remember { mutableStateOf(false) }
++    var backHoldJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
++    DisposableEffect(Unit) { onDispose { backHoldJob?.cancel() } }
 +    // Guide left alone for 2 minutes while a channel plays in the preview, with the guide itself
 +    // on screen (not a menu, a dialog or the side menu): back to full screen.
 +    var lastKeyAt by remember { mutableStateOf(System.currentTimeMillis()) }
@@ -500837,7 +501716,12 @@ index 000000000..7d6dda1d3
 +    }
 +    FrameMeter("Guide")
 +    androidx.compose.runtime.CompositionLocalProvider(
-+        LocalShowDetails provides { key, p -> viewModel.details(key, p) },
++        LocalShowDetails provides { key, p ->
++            // Cancelled when the highlight moves again: don't read details for every row
++            // passed while holding a direction, especially while a stream needs the CPU.
++            if (previewPlaying) delay(PLAYING_GUIDE_DETAILS_DELAY_MS)
++            viewModel.details(key, p)
++        },
 +        LocalChannelAbout provides { ch, title -> viewModel.channelAbout(ch, title) }
 +    ) {
 +    Box(
@@ -500853,6 +501737,17 @@ index 000000000..7d6dda1d3
 +                lastKeyAt = System.currentTimeMillis()
 +                // Full screen handles its own keys.
 +                if (fullscreen) return@onPreviewKeyEvent false
++                val navigationKey = when (e.key) {
++                    Key.DirectionUp, Key.DirectionDown, Key.DirectionLeft, Key.DirectionRight,
++                    Key.PageUp, Key.PageDown, Key.ChannelUp, Key.ChannelDown -> true
++                    else -> false
++                }
++                if (navigationKey && e.type == KeyEventType.KeyDown && navigationRepeatGate.shouldConsume(
++                        keyCode = e.nativeKeyEvent.keyCode,
++                        repeated = e.nativeKeyEvent.repeatCount > 0,
++                        eventTimeMs = e.nativeKeyEvent.eventTime,
++                        playbackActive = previewPlaying
++                    )) return@onPreviewKeyEvent true
 +                val playingNow = playback.channelKey != null
 +                fun returnToPlaying() {
 +                    // Remember where you were browsing, to come back to it afterwards.
@@ -500880,11 +501775,22 @@ index 000000000..7d6dda1d3
 +                when {
 +                    e.type == KeyEventType.KeyDown && native.repeatCount == 0 && !native.isLongPress -> {
 +                        backPressStartedHere = true
++                        backHoldJob?.cancel()
++                        if (playingNow) backHoldJob = scope.launch {
++                            delay(GUIDE_BACK_HOLD_MS)
++                            if (backPressStartedHere && viewModel.playbackState.value.channelKey != null) {
++                                backPressStartedHere = false
++                                hostActivity?.longPressBackHeld?.value = true
++                                returnToPlaying()
++                            }
++                        }
 +                        false
 +                    }
 +                    // Remotes that repeat a held button: act while it's still held.
 +                    e.type == KeyEventType.KeyDown -> {
-+                        if (!backPressStartedHere || !playingNow) return@onPreviewKeyEvent false
++                        if (!backPressStartedHere || !playingNow ||
++                            !isGuideBackHold(native.eventTime - native.downTime, native.isLongPress)) return@onPreviewKeyEvent false
++                        backHoldJob?.cancel()
 +                        backPressStartedHere = false
 +                        // Nuvio then swallows the rest of this Back press (so letting go doesn't
 +                        // also count as a normal Back and leave full screen again).
@@ -500895,9 +501801,11 @@ index 000000000..7d6dda1d3
 +                    // Remotes that don't repeat (many Fire TV and Google TV remotes): a press
 +                    // held for half a second or more counts as "hold", judged on release.
 +                    e.type == KeyEventType.KeyUp -> {
++                        backHoldJob?.cancel()
 +                        val started = backPressStartedHere
 +                        backPressStartedHere = false
-+                        if (started && playingNow && native.eventTime - native.downTime >= 500) {
++                        if (started && playingNow && !native.isCanceled &&
++                            isGuideBackHold(native.eventTime - native.downTime, native.isLongPress)) {
 +                            returnToPlaying()
 +                            true
 +                        } else false
@@ -504362,6 +505270,7 @@ index 000000000..7d6dda1d3
 +            modifier = Modifier
 +                .fillMaxWidth()
 +                .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
++                .tvTextFieldNavigation()
 +                .onFocusChanged { focused = it.isFocused }
 +        )
 +    }
@@ -509893,10 +510802,10 @@ index 000000000..d87d48d55
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/ui/LiveTvViewModel.kt b/app/src/main/java/com/nuvio/tv/livetv/ui/LiveTvViewModel.kt
 new file mode 100644
-index 000000000..bdbdc15bc
+index 000000000..67f1bb85b
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/ui/LiveTvViewModel.kt
-@@ -0,0 +1,1868 @@
+@@ -0,0 +1,1869 @@
 +package com.nuvio.tv.livetv.ui
 +
 +import androidx.lifecycle.ViewModel
@@ -510056,9 +510965,10 @@ index 000000000..bdbdc15bc
 +
 +    val status: StateFlow<LiveTvStatus> = repository.status
 +    val playbackState: StateFlow<LivePlaybackState> = playback.state
++    val requestedGroupId: StateFlow<String?> = session.currentGroupId
 +
 +    private val _now = MutableStateFlow(System.currentTimeMillis())
-+    val now: StateFlow<Long> = _now
++    val now = liveGuideClock().stateIn(viewModelScope, SharingStarted.WhileSubscribed(), System.currentTimeMillis())
 +
 +    private val searchQuery = MutableStateFlow("")
 +
@@ -510882,7 +511792,7 @@ index 000000000..bdbdc15bc
 +        viewModelScope.launch {
 +            combine(
 +                // Only the first 400 are used: don't list every channel of a huge playlist.
-+                uiState.map { it.channels.take(400).map { c -> c.key } }.distinctUntilChanged(),
++                uiState.map { guidePriorityChannelKeys(it.channels) }.distinctUntilChanged(),
 +                userState.map { it.favorites }.distinctUntilChanged(),
 +                homeRowKeys
 +            ) { a, b, c -> c + b + a }
@@ -510895,7 +511805,7 @@ index 000000000..bdbdc15bc
 +        }
 +        // The group you open: its listings straight away, if they aren't loaded yet.
 +        viewModelScope.launch {
-+            uiState.map { it.channels.take(400).map { c -> c.key } }.distinctUntilChanged()
++            uiState.map { guidePriorityChannelKeys(it.channels) }.distinctUntilChanged()
 +                .flowOn(Dispatchers.Default).collect { keys ->
 +                repository.loadChannelsNow(keys)
 +            }
@@ -513325,6 +514235,55 @@ index 7274c11a9..4354b23bc 100644
  ) {
      val isPlayEnabled = LocalPlaybackAvailability.current.canStream(item)
      val title = when (item) {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/components/DatabaseCompatibilityNotice.kt b/app/src/main/java/com/nuvio/tv/ui/components/DatabaseCompatibilityNotice.kt
+new file mode 100644
+index 000000000..d3e87f485
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/components/DatabaseCompatibilityNotice.kt
+@@ -0,0 +1,43 @@
++package com.nuvio.tv.ui.components
++
++import android.app.Activity
++import android.graphics.Color
++import android.view.Gravity
++import android.view.ViewGroup
++import android.widget.Button
++import android.widget.LinearLayout
++import android.widget.TextView
++import com.nuvio.tv.R
++import com.nuvio.tv.core.storage.DatabaseVersionIssue
++
++/** Independent of the feature graph that cannot safely open its data. */
++object DatabaseCompatibilityNotice {
++    fun show(activity: Activity, issue: DatabaseVersionIssue) {
++        val inset = (48 * activity.resources.displayMetrics.density).toInt()
++        val layout = LinearLayout(activity).apply {
++            orientation = LinearLayout.VERTICAL
++            gravity = Gravity.CENTER_VERTICAL
++            setPadding(inset, inset, inset, inset)
++            setBackgroundColor(Color.BLACK)
++        }
++        layout.addView(TextView(activity).apply {
++            text = activity.getString(R.string.database_compatibility_title)
++            textSize = 28f
++            setTextColor(Color.WHITE)
++            setPadding(0, 0, 0, inset / 2)
++        })
++        layout.addView(TextView(activity).apply {
++            text = issue.description
++            textSize = 22f
++            setTextColor(Color.WHITE)
++            setPadding(0, 0, 0, inset / 2)
++        })
++        val close = Button(activity).apply {
++            text = activity.getString(R.string.action_close)
++            setOnClickListener { activity.finish() }
++        }
++        layout.addView(close, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
++        activity.setContentView(layout)
++        close.requestFocus()
++    }
++}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/components/GridContentCard.kt b/app/src/main/java/com/nuvio/tv/ui/components/GridContentCard.kt
 index edaa95106..efd4a0b37 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/components/GridContentCard.kt
@@ -514780,6 +515739,41 @@ index 000000000..547963ef6
 +                }
 +            }
 +        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/components/TvTextFieldNavigation.kt b/app/src/main/java/com/nuvio/tv/ui/components/TvTextFieldNavigation.kt
+new file mode 100644
+index 000000000..82d950af6
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/components/TvTextFieldNavigation.kt
+@@ -0,0 +1,29 @@
++package com.nuvio.tv.ui.components
++
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.focus.FocusDirection
++import androidx.compose.ui.input.key.Key
++import androidx.compose.ui.input.key.KeyEventType
++import androidx.compose.ui.input.key.key
++import androidx.compose.ui.input.key.onPreviewKeyEvent
++import androidx.compose.ui.input.key.type
++import androidx.compose.ui.platform.LocalFocusManager
++import androidx.compose.ui.platform.LocalSoftwareKeyboardController
++
++/** A dismissed TV keyboard must not leave Up/Down trapped in a single-line editor. */
++@Composable
++internal fun Modifier.tvTextFieldNavigation(): Modifier {
++    val focus = LocalFocusManager.current
++    val keyboard = LocalSoftwareKeyboardController.current
++    return onPreviewKeyEvent { event ->
++        val direction = when (event.key) {
++            Key.DirectionUp -> FocusDirection.Up
++            Key.DirectionDown -> FocusDirection.Down
++            else -> null
++        }
++        if (event.type == KeyEventType.KeyDown && direction != null) {
++            focus.moveFocus(direction).also { moved -> if (moved) keyboard?.hide() }
++        } else false
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/components/WatchedPosterLocals.kt b/app/src/main/java/com/nuvio/tv/ui/components/WatchedPosterLocals.kt
@@ -522029,39 +523023,25 @@ index 03efeb764..08849c115 100644
      }
  }
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerDebugStatsOverlay.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerDebugStatsOverlay.kt
-index 7d84c3156..0952e6183 100644
+index 7d84c3156..52b41400a 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerDebugStatsOverlay.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerDebugStatsOverlay.kt
-@@ -179,6 +179,7 @@ private class DebugStatsSampler(context: Context) {
-     private var cpuSamples = 0
-     private var faultTotal = 0.0
-     private var faultSamples = 0
-+    private var headroomMisses = 0
+@@ -337,12 +337,14 @@ private class DebugStatsSampler(context: Context) {
+     }
  
-     fun sample(snapshot: PlayerSnapshot?): List<DebugStat> = buildList {
-         val proc = readProcTimes()
-@@ -342,7 +343,12 @@ private class DebugStatsSampler(context: Context) {
+     // Headroom is normalised so 1.00 is the throttling point; the status line only matters once it trips.
++    private val thermalHeadroom = ThermalHeadroomPoller()
++
+     private fun thermalStats(): List<DebugStat> {
+         val pm = powerManager ?: return listOf(DebugStat("thermal", UNAVAILABLE))
          if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
              return listOf(DebugStat("thermal", UNAVAILABLE))
          }
 -        val headroom = runCatching { pm.getThermalHeadroom(0) }.getOrDefault(Float.NaN)
-+        val headroom = if (headroomMisses >= MAX_HEADROOM_MISSES) {
-+            Float.NaN
-+        } else {
-+            runCatching { pm.getThermalHeadroom(0) }.getOrDefault(Float.NaN)
-+        }
-+        headroomMisses = if (headroom.isNaN()) headroomMisses + 1 else 0
++        val headroom = thermalHeadroom.sample(android.os.SystemClock.elapsedRealtime()) { pm.getThermalHeadroom(0) }
          val status = runCatching { pm.currentThermalStatus }.getOrDefault(PowerManager.THERMAL_STATUS_NONE)
          val headroomStat = DebugStat(
              label = "thermal",
-@@ -367,6 +373,7 @@ private class DebugStatsSampler(context: Context) {
- 
-     private companion object {
-         const val MB = 1024L * 1024L
-+        const val MAX_HEADROOM_MISSES = 3
- 
-         // A row carrying this is one the device will never fill in, so it is dropped rather than
-         // taking a line; the warmup placeholder is left alone so no row appears a second later.
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerLetterboxMask.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerLetterboxMask.kt
 new file mode 100644
 index 000000000..95252af2f
@@ -526774,6 +527754,29 @@ index 4fbde4583..da738bc60 100644
              style = MaterialTheme.typography.bodySmall,
              color = Color.White,
              maxLines = 1,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/ThermalHeadroomPoller.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/ThermalHeadroomPoller.kt
+new file mode 100644
+index 000000000..f858af802
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/ThermalHeadroomPoller.kt
+@@ -0,0 +1,17 @@
++package com.nuvio.tv.ui.screens.player
++
++/** Respect the thermal API's sampling interval and retry transient NaNs at a bounded rate. */
++internal class ThermalHeadroomPoller {
++    private var nextSampleMs = 0L
++    private var misses = 0
++    private var last = Float.NaN
++
++    fun sample(nowMs: Long, read: () -> Float): Float {
++        if (nowMs < nextSampleMs) return last
++        last = runCatching(read).getOrDefault(Float.NaN)
++        misses = if (last.isNaN()) (misses + 1).coerceAtMost(3) else 0
++        val retryMs = (10_000L shl misses).coerceAtMost(60_000L)
++        nextSampleMs = nowMs + retryMs
++        return last
++    }
++}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/SubtitleSyncStatusOverlay.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/SubtitleSyncStatusOverlay.kt
 index 241eff1d6..c14cbb1a3 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/SubtitleSyncStatusOverlay.kt
@@ -527850,7 +528853,7 @@ index 000000000..a631656b3
 +internal fun pluginFocusedFill(): Color =
 +    if (isV2Settings()) settingsFocusFillColor() else NuvioTheme.colors.FocusBackground
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginScreen.kt
-index 401d25b31..6635fe576 100644
+index 401d25b31..1c1846586 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginScreen.kt
 @@ -2,6 +2,10 @@
@@ -527872,7 +528875,15 @@ index 401d25b31..6635fe576 100644
  import androidx.compose.ui.Alignment
  import androidx.compose.ui.Modifier
  import androidx.compose.ui.focus.FocusRequester
-@@ -84,6 +89,8 @@ import androidx.compose.ui.unit.dp
+@@ -71,6 +76,7 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+ import androidx.compose.ui.semantics.Role
+ import androidx.compose.ui.semantics.contentDescription
+ import androidx.compose.ui.semantics.role
++import androidx.compose.ui.semantics.selected
+ import androidx.compose.ui.semantics.semantics
+ import androidx.compose.ui.semantics.toggleableState
+ import androidx.compose.ui.state.ToggleableState
+@@ -84,6 +90,8 @@ import androidx.compose.ui.unit.dp
  import androidx.hilt.navigation.compose.hiltViewModel
  import androidx.compose.foundation.lazy.LazyColumn
  import androidx.compose.foundation.lazy.items
@@ -527881,7 +528892,7 @@ index 401d25b31..6635fe576 100644
  import androidx.tv.material3.Border
  import androidx.tv.material3.Button
  import androidx.tv.material3.ButtonDefaults
-@@ -134,11 +141,24 @@ fun PluginScreenContent(
+@@ -134,11 +142,24 @@ fun PluginScreenContent(
      showHeader: Boolean = true
  ) {
      var repoUrl by remember { mutableStateOf("") }
@@ -527906,7 +528917,7 @@ index 401d25b31..6635fe576 100644
      // Clear messages after delay
      LaunchedEffect(uiState.successMessage) {
          if (uiState.successMessage != null) {
-@@ -165,9 +185,12 @@ fun PluginScreenContent(
+@@ -165,9 +186,12 @@ fun PluginScreenContent(
                  .padding(horizontal = NuvioTheme.spacing.xxxl, vertical = NuvioTheme.spacing.xl)
          ) {
              LazyColumn(
@@ -527920,7 +528931,7 @@ index 401d25b31..6635fe576 100644
              ) {
              if (viewModel.isReadOnly) {
                  item {
-@@ -205,7 +228,10 @@ fun PluginScreenContent(
+@@ -205,7 +229,10 @@ fun PluginScreenContent(
  
                  // Manage from phone card
                  item {
@@ -527932,7 +528943,22 @@ index 401d25b31..6635fe576 100644
                  }
              }
  
-@@ -337,27 +363,26 @@ private fun PluginStreamGroupingCard(
+@@ -227,6 +254,14 @@ fun PluginScreenContent(
+                 )
+             }
+ 
++            item {
++                CloudStreamPreferences(
++                    uiState,
++                    viewModel.isReadOnly,
++                    onLanguage = { viewModel.onEvent(PluginUiEvent.ToggleSourceLanguage(it)) }
++                )
++            }
++
+             // Repositories section
+             item {
+                 Text(
+@@ -337,27 +372,26 @@ private fun PluginStreamGroupingCard(
          },
          modifier = Modifier
              .fillMaxWidth()
@@ -527968,7 +528994,7 @@ index 401d25b31..6635fe576 100644
              verticalAlignment = Alignment.CenterVertically,
              horizontalArrangement = Arrangement.SpaceBetween
          ) {
-@@ -403,27 +428,26 @@ private fun PluginsEnabledCard(
+@@ -403,27 +437,26 @@ private fun PluginsEnabledCard(
          },
          modifier = Modifier
              .fillMaxWidth()
@@ -528004,7 +529030,7 @@ index 401d25b31..6635fe576 100644
              verticalAlignment = Alignment.CenterVertically,
              horizontalArrangement = Arrangement.SpaceBetween
          ) {
-@@ -476,11 +500,11 @@ private fun AddRepositoryInline(
+@@ -476,11 +509,11 @@ private fun AddRepositoryInline(
      }
  
      Card(
@@ -528020,7 +529046,7 @@ index 401d25b31..6635fe576 100644
              Text(
                  text = stringResource(R.string.plugin_add_repository),
                  style = MaterialTheme.typography.titleMedium,
-@@ -495,22 +519,19 @@ private fun AddRepositoryInline(
+@@ -495,22 +528,19 @@ private fun AddRepositoryInline(
                  // Surface always stays in the tree for stable D-pad focus
                  Surface(
                      onClick = { isEditing = true },
@@ -528048,7 +529074,7 @@ index 401d25b31..6635fe576 100644
                      scale = ClickableSurfaceDefaults.scale(focusedScale = 1f)
                  ) {
                      Box(modifier = Modifier.padding(NuvioTheme.spacing.md)) {
-@@ -577,10 +598,7 @@ private fun AddRepositoryInline(
+@@ -577,10 +607,7 @@ private fun AddRepositoryInline(
                          focusedContentColor = NuvioTheme.colors.OnSecondaryVariant
                      ),
                      border = ButtonDefaults.border(
@@ -528060,7 +529086,7 @@ index 401d25b31..6635fe576 100644
                      )
                  ) {
                      if (isLoading) {
-@@ -601,32 +619,33 @@ private fun AddRepositoryInline(
+@@ -601,32 +628,33 @@ private fun AddRepositoryInline(
  }
  
  @Composable
@@ -528103,7 +529129,7 @@ index 401d25b31..6635fe576 100644
              horizontalArrangement = Arrangement.SpaceBetween,
              verticalAlignment = Alignment.CenterVertically
          ) {
-@@ -725,13 +744,10 @@ private fun QrCodeOverlay(
+@@ -725,13 +753,10 @@ private fun QrCodeOverlay(
                      .semantics { role = Role.Button },
                  colors = ClickableSurfaceDefaults.colors(
                      containerColor = NuvioTheme.colors.Surface,
@@ -528119,7 +529145,7 @@ index 401d25b31..6635fe576 100644
                  ),
                  shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(50)),
                  scale = ClickableSurfaceDefaults.scale(focusedScale = 1f)
-@@ -897,13 +913,10 @@ private fun ConfirmRepoChangesDialog(
+@@ -897,13 +922,10 @@ private fun ConfirmRepoChangesDialog(
                              modifier = Modifier.semantics { role = Role.Button },
                              colors = ClickableSurfaceDefaults.colors(
                                  containerColor = NuvioTheme.colors.Surface,
@@ -528135,7 +529161,7 @@ index 401d25b31..6635fe576 100644
                              ),
                              shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(50))
                          ) {
-@@ -935,10 +948,7 @@ private fun ConfirmRepoChangesDialog(
+@@ -935,10 +957,7 @@ private fun ConfirmRepoChangesDialog(
                                  focusedContainerColor = NuvioTheme.colors.SecondaryVariant
                              ),
                              border = ClickableSurfaceDefaults.border(
@@ -528147,7 +529173,7 @@ index 401d25b31..6635fe576 100644
                              ),
                              shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(50))
                          ) {
-@@ -1010,13 +1020,10 @@ private fun ConfirmScraperEnableDialog(
+@@ -1010,13 +1029,10 @@ private fun ConfirmScraperEnableDialog(
                          modifier = Modifier.semantics { role = Role.Button },
                          colors = ClickableSurfaceDefaults.colors(
                              containerColor = NuvioTheme.colors.Surface,
@@ -528163,7 +529189,7 @@ index 401d25b31..6635fe576 100644
                          ),
                          shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(50))
                      ) {
-@@ -1048,10 +1055,7 @@ private fun ConfirmScraperEnableDialog(
+@@ -1048,10 +1064,7 @@ private fun ConfirmScraperEnableDialog(
                              focusedContainerColor = NuvioTheme.colors.SecondaryVariant
                          ),
                          border = ClickableSurfaceDefaults.border(
@@ -528175,7 +529201,7 @@ index 401d25b31..6635fe576 100644
                          ),
                          shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(50))
                      ) {
-@@ -1096,11 +1100,11 @@ private fun RepositoryCard(
+@@ -1096,11 +1109,11 @@ private fun RepositoryCard(
      var isRemoveFocused by remember { mutableStateOf(false) }
      val isCardFocused = isToggleFocused || isRefreshFocused || isRemoveFocused
      val cardBorderColor by animateColorAsState(
@@ -528189,7 +529215,7 @@ index 401d25b31..6635fe576 100644
          label = "repositoryCardScale"
      )
  
-@@ -1113,12 +1117,12 @@ private fun RepositoryCard(
+@@ -1113,12 +1126,12 @@ private fun RepositoryCard(
              }
              .background(
                  color = NuvioTheme.colors.BackgroundCard,
@@ -528204,7 +529230,7 @@ index 401d25b31..6635fe576 100644
              )
      ) {
          Row(
-@@ -1155,6 +1159,7 @@ private fun RepositoryCard(
+@@ -1155,6 +1168,7 @@ private fun RepositoryCard(
                      Surface(
                          onClick = { onToggleAll(!anyEnabled) },
                          modifier = Modifier
@@ -528212,7 +529238,7 @@ index 401d25b31..6635fe576 100644
                              .onFocusChanged { isToggleFocused = it.isFocused }
                              .semantics {
                                  role = Role.Switch
-@@ -1162,15 +1167,12 @@ private fun RepositoryCard(
+@@ -1162,15 +1176,12 @@ private fun RepositoryCard(
                              },
                          colors = ClickableSurfaceDefaults.colors(
                              containerColor = NuvioTheme.colors.Surface,
@@ -528231,7 +529257,7 @@ index 401d25b31..6635fe576 100644
                          scale = ClickableSurfaceDefaults.scale(focusedScale = 1f)
                      ) {
                          Row(
-@@ -1199,15 +1201,16 @@ private fun RepositoryCard(
+@@ -1199,15 +1210,16 @@ private fun RepositoryCard(
                      onClick = onRefresh,
                      enabled = !isLoading,
                      modifier = Modifier
@@ -528250,7 +529276,7 @@ index 401d25b31..6635fe576 100644
                  ) {
                      Icon(
                          imageVector = Icons.Default.Refresh,
-@@ -1219,15 +1222,16 @@ private fun RepositoryCard(
+@@ -1219,15 +1231,16 @@ private fun RepositoryCard(
                      onClick = onRemove,
                      enabled = !isLoading,
                      modifier = Modifier
@@ -528269,7 +529295,7 @@ index 401d25b31..6635fe576 100644
                  ) {
                      Icon(
                          imageVector = Icons.Default.Delete,
-@@ -1254,11 +1258,11 @@ private fun ScraperCard(
+@@ -1254,11 +1267,11 @@ private fun ScraperCard(
      var isToggleFocused by remember { mutableStateOf(false) }
      val isCardFocused = isTestFocused || isToggleFocused
      val cardBorderColor by animateColorAsState(
@@ -528283,7 +529309,7 @@ index 401d25b31..6635fe576 100644
          label = "scraperCardScale"
      )
  
-@@ -1276,12 +1280,12 @@ private fun ScraperCard(
+@@ -1276,12 +1289,12 @@ private fun ScraperCard(
              }
              .background(
                  color = NuvioTheme.colors.BackgroundCard,
@@ -528298,7 +529324,7 @@ index 401d25b31..6635fe576 100644
              )
      ) {
          Column(
-@@ -1330,15 +1334,16 @@ private fun ScraperCard(
+@@ -1330,15 +1343,16 @@ private fun ScraperCard(
                          enabled = !isTesting && scraper.enabled,
                          modifier = Modifier
                              .focusProperties { left = FocusRequester.Cancel }
@@ -528317,7 +529343,7 @@ index 401d25b31..6635fe576 100644
                      ) {
                          if (isTesting) {
                              LoadingIndicator(modifier = Modifier.size(NuvioTheme.spacing.lg))
-@@ -1361,6 +1366,7 @@ private fun ScraperCard(
+@@ -1361,6 +1375,7 @@ private fun ScraperCard(
                          Surface(
                              onClick = { onToggle(!scraper.enabled) },
                              modifier = Modifier
@@ -528325,7 +529351,7 @@ index 401d25b31..6635fe576 100644
                                  .onFocusChanged { isToggleFocused = it.isFocused }
                                  .semantics {
                                      role = Role.Switch
-@@ -1369,15 +1375,12 @@ private fun ScraperCard(
+@@ -1369,15 +1384,12 @@ private fun ScraperCard(
                                  },
                              colors = ClickableSurfaceDefaults.colors(
                                  containerColor = NuvioTheme.colors.Surface,
@@ -528344,7 +529370,7 @@ index 401d25b31..6635fe576 100644
                              scale = ClickableSurfaceDefaults.scale(focusedScale = 1f)
                          ) {
                              Row(
-@@ -1418,13 +1421,14 @@ private fun ScraperCard(
+@@ -1418,13 +1430,14 @@ private fun ScraperCard(
                              ),
                              shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(6.dp)),
                              border = ClickableSurfaceDefaults.border(
@@ -528360,7 +529386,7 @@ index 401d25b31..6635fe576 100644
                                  .semantics { role = Role.Button }
                          ) {
                              Column(modifier = Modifier.padding(NuvioTheme.spacing.sm)) {
-@@ -1583,7 +1587,7 @@ private fun MessageOverlay(
+@@ -1583,7 +1596,7 @@ private fun MessageOverlay(
                      else
                          NuvioPrimitives.red600.copy(alpha = 0.9f)
                  ),
@@ -528369,11 +529395,84 @@ index 401d25b31..6635fe576 100644
              ) {
                  Row(
                      modifier = Modifier.padding(horizontal = 20.dp, vertical = NuvioTheme.spacing.md),
+@@ -1610,3 +1623,51 @@ private fun formatDate(timestamp: Long): String {
+     val locale = Locale.getDefault()
+     return SimpleDateFormat(android.text.format.DateFormat.getBestDateTimePattern(locale, "dMMMy"), locale).format(Date(timestamp))
+ }
++
++@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
++@Composable
++internal fun CloudStreamPreferences(
++    state: PluginUiState,
++    readOnly: Boolean,
++    onLanguage: (String?) -> Unit
++) {
++    Column(
++        modifier = Modifier
++            .fillMaxWidth()
++            .background(NuvioTheme.colors.BackgroundCard, RoundedCornerShape(18.dp))
++            .padding(18.dp),
++        verticalArrangement = Arrangement.spacedBy(12.dp)
++    ) {
++        Text(stringResource(R.string.plugin_source_languages_title), style = MaterialTheme.typography.titleMedium)
++        Text(stringResource(R.string.plugin_source_languages_description), style = MaterialTheme.typography.bodyMedium)
++        androidx.compose.foundation.layout.FlowRow(
++            horizontalArrangement = Arrangement.spacedBy(12.dp),
++            verticalArrangement = Arrangement.spacedBy(12.dp)
++        ) {
++            @Composable
++            fun Choice(label: String, selected: Boolean, action: () -> Unit) {
++                Button(
++                    onClick = action,
++                    enabled = !readOnly,
++                    modifier = Modifier.semantics { this.selected = selected },
++                    colors = ButtonDefaults.colors(
++                        containerColor = if (selected) NuvioTheme.colors.Secondary else NuvioTheme.colors.Surface,
++                        contentColor = if (selected) NuvioTheme.colors.OnSecondary else NuvioTheme.colors.TextPrimary
++                    )
++                ) {
++                    Text(label)
++                }
++            }
++            Choice(stringResource(R.string.plugin_all_source_languages), state.sourceLanguages.isEmpty()) {
++                onLanguage(null)
++            }
++            val languages = (state.installedLanguages.keys + state.sourceLanguages)
++                .sortedBy { com.nuvio.tv.core.plugin.SourceLanguages.displayName(it) }
++            languages.forEach { code ->
++                val name = com.nuvio.tv.core.plugin.SourceLanguages.displayName(code)
++                val label = "$name · ${state.installedLanguages[code] ?: 0}"
++                Choice(label, code in state.sourceLanguages) { onLanguage(code) }
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginUiState.kt b/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginUiState.kt
+index e75186013..ac213a29b 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginUiState.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginUiState.kt
+@@ -7,6 +7,8 @@ import com.nuvio.tv.domain.model.PluginRepository
+ import com.nuvio.tv.domain.model.ScraperInfo
+ 
+ data class PluginUiState(
++    val sourceLanguages: Set<String> = emptySet(),
++    val installedLanguages: Map<String, Int> = emptyMap(),
+     val pluginsEnabled: Boolean = true,
+     val groupStreamsByRepository: Boolean = false,
+     val repositories: List<PluginRepository> = emptyList(),
+@@ -43,6 +45,7 @@ data class PendingScraperEnableInfo(
+ )
+ 
+ sealed interface PluginUiEvent {
++    data class ToggleSourceLanguage(val language: String?) : PluginUiEvent
+     data class AddRepository(val url: String) : PluginUiEvent
+     data class RemoveRepository(val repoId: String) : PluginUiEvent
+     data class RefreshRepository(val repoId: String) : PluginUiEvent
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginViewModel.kt
-index c97a69dd6..999559cb8 100644
+index c97a69dd6..4649cf3ef 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginViewModel.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginViewModel.kt
-@@ -11,6 +11,7 @@ import com.nuvio.tv.core.profile.ProfileManager
+@@ -11,12 +11,14 @@ import com.nuvio.tv.core.profile.ProfileManager
  import com.nuvio.tv.core.qr.QrCodeGenerator
  import com.nuvio.tv.core.server.DeviceIpAddress
  import com.nuvio.tv.core.server.RepositoryConfigServer
@@ -528381,7 +529480,14 @@ index c97a69dd6..999559cb8 100644
  import dagger.hilt.android.lifecycle.HiltViewModel
  import dagger.hilt.android.qualifiers.ApplicationContext
  import kotlinx.coroutines.flow.MutableStateFlow
-@@ -39,17 +40,12 @@ class PluginViewModel @Inject constructor(
+ import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.flow.asStateFlow
+ import kotlinx.coroutines.flow.combine
++import kotlinx.coroutines.flow.collectLatest
+ import kotlinx.coroutines.flow.update
+ import kotlinx.coroutines.delay
+ import kotlinx.coroutines.launch
+@@ -39,15 +41,17 @@ class PluginViewModel @Inject constructor(
          }
  
      private var repoServer: RepositoryConfigServer? = null
@@ -528391,15 +529497,33 @@ index c97a69dd6..999559cb8 100644
      init {
 -        loadLogoBytes()
          observePluginData()
-     }
- 
--    private fun loadLogoBytes() {
--        logoBytes = context.readAppLogoBytes()
 -    }
 -
+-    private fun loadLogoBytes() {
+-        logoBytes = context.readAppLogoBytes()
++        viewModelScope.launch { pluginManager.sourceLanguages.collect { languages ->
++            _uiState.update { it.copy(sourceLanguages = languages) }
++        } }
++        viewModelScope.launch { pluginManager.scrapers.collectLatest {
++            val languages = pluginManager.installedSourceLanguages()
++            _uiState.update { it.copy(installedLanguages = languages) }
++        } }
+     }
+ 
      private fun observePluginData() {
-         viewModelScope.launch {
-             combine(
+@@ -84,6 +88,12 @@ class PluginViewModel @Inject constructor(
+ 
+     fun onEvent(event: PluginUiEvent) {
+         when (event) {
++            is PluginUiEvent.ToggleSourceLanguage -> if (!isReadOnly) viewModelScope.launch {
++                val current = _uiState.value.sourceLanguages
++                val next = if (event.language == null) emptySet() else
++                    if (event.language in current) current - event.language else current + event.language
++                pluginManager.setSourceLanguages(next)
++            }
+             is PluginUiEvent.AddRepository -> addRepository(event.url)
+             is PluginUiEvent.RemoveRepository -> removeRepository(event.repoId)
+             is PluginUiEvent.RefreshRepository -> refreshRepository(event.repoId)
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/profile/ProfileSelectionScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/profile/ProfileSelectionScreen.kt
 index 806583a12..50d51be96 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/profile/ProfileSelectionScreen.kt
@@ -537243,7 +538367,7 @@ index fd8553816..eb2fd4c54 100644
              Box(
                  modifier = Modifier
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/search/SearchScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/search/SearchScreen.kt
-index 3b1b214bd..a9f1ee000 100644
+index 3b1b214bd..72e81b58c 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/search/SearchScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/search/SearchScreen.kt
 @@ -1,5 +1,12 @@
@@ -537259,7 +538383,15 @@ index 3b1b214bd..a9f1ee000 100644
  import com.nuvio.tv.ui.theme.NuvioTheme
  import com.nuvio.tv.ui.screens.home.HeroBackdropState
  
-@@ -150,8 +157,14 @@ fun SearchScreen(
+@@ -106,6 +113,7 @@ import com.nuvio.tv.ui.components.CatalogRowSection
+ import com.nuvio.tv.ui.components.EmptyScreenState
+ import com.nuvio.tv.ui.components.ErrorState
+ import com.nuvio.tv.ui.components.LoadingIndicator
++import com.nuvio.tv.ui.components.tvTextFieldNavigation
+ import com.nuvio.tv.ui.components.PosterCardDefaults
+ import com.nuvio.tv.ui.components.PosterCardStyle
+ import com.nuvio.tv.domain.model.DiscoverLocation
+@@ -150,8 +158,14 @@ fun SearchScreen(
      viewModel: SearchViewModel = hiltViewModel(),
      onNavigateToDetail: (String, String, String) -> Unit,
      onNavigateToSeeAll: (catalogId: String, addonId: String, type: String) -> Unit = { _, _, _ -> },
@@ -537275,7 +538407,7 @@ index 3b1b214bd..a9f1ee000 100644
      val uiState by viewModel.uiState.collectAsState()
      val watchedMovieIds by viewModel.watchedMovieIds.collectAsState()
      val watchedSeriesIds by viewModel.watchedSeriesIds.collectAsState()
-@@ -202,6 +215,10 @@ fun SearchScreen(
+@@ -202,6 +216,10 @@ fun SearchScreen(
      val topInputFocusRequester = remember(isVoiceSearchAvailable) {
          if (isVoiceSearchAvailable) voiceFocusRequester else searchFocusRequester
      }
@@ -537286,7 +538418,7 @@ index 3b1b214bd..a9f1ee000 100644
      val speechRecognizer = remember(context, isVoiceSearchAvailable) {
          if (isVoiceSearchAvailable) {
              runCatching { SpeechRecognizer.createSpeechRecognizer(context) }.getOrNull()
-@@ -339,6 +356,27 @@ fun SearchScreen(
+@@ -339,6 +357,27 @@ fun SearchScreen(
  
      val trimmedQuery = remember(uiState.query) { uiState.query.trim() }
      val trimmedSubmittedQuery = remember(uiState.submittedQuery) { uiState.submittedQuery.trim() }
@@ -537314,7 +538446,7 @@ index 3b1b214bd..a9f1ee000 100644
  
      // Stable per-row state maps — mirrors ClassicHomeContent pattern so
      // CatalogRowSection keeps focus when placeholder→real data transitions.
-@@ -373,8 +411,42 @@ fun SearchScreen(
+@@ -373,8 +412,42 @@ fun SearchScreen(
      }
      // Stable list of non-empty catalog rows — mirrors ClassicHomeContent's
      // visibleHomeRows pattern so the LazyColumn receives a remember'd list.
@@ -537359,7 +538491,7 @@ index 3b1b214bd..a9f1ee000 100644
      }
      // Down from the field can come before a target is known; the first row with titles takes it then.
      val firstRealRowKey = remember(visibleCatalogRows) {
-@@ -436,6 +508,15 @@ fun SearchScreen(
+@@ -436,6 +509,15 @@ fun SearchScreen(
              pendingFocusMoveToResultsQuery = null
          }
      }
@@ -537375,7 +538507,7 @@ index 3b1b214bd..a9f1ee000 100644
      val handleQueryChanged: (String) -> Unit = { nextQuery ->
          // A real edit is user intent. An IME that re-commits the same text on dismiss is not.
          if (nextQuery != uiState.query) backToFieldLatched = false
-@@ -573,6 +654,9 @@ fun SearchScreen(
+@@ -573,6 +655,9 @@ fun SearchScreen(
              .background(NuvioTheme.colors.Background),
          contentAlignment = Alignment.TopCenter
      ) {
@@ -537385,7 +538517,7 @@ index 3b1b214bd..a9f1ee000 100644
          val listState = rememberLazyListState()
  
          // Search results hero (Nuvio-KE port): a non-focusable backdrop panel above the result
-@@ -629,7 +713,7 @@ fun SearchScreen(
+@@ -629,7 +714,7 @@ fun SearchScreen(
                  backToFieldLatched = true
                  coroutineScope.launch {
                      listState.scrollToItem(0)
@@ -537394,7 +538526,7 @@ index 3b1b214bd..a9f1ee000 100644
                      // The focus request can start an input session and show the keyboard.
                      keyboardController?.hide()
                  }
-@@ -653,6 +737,7 @@ fun SearchScreen(
+@@ -653,6 +738,7 @@ fun SearchScreen(
  
          LazyColumn(
              modifier = Modifier
@@ -537402,7 +538534,7 @@ index 3b1b214bd..a9f1ee000 100644
                  .fillMaxSize()
                  .recompositionHighlighter()
                  .dpadRepeatThrottle(),
-@@ -667,10 +752,14 @@ fun SearchScreen(
+@@ -667,10 +753,14 @@ fun SearchScreen(
                  SearchInputField(
                      modifier = Modifier.onFocusChanged { inputRowHasFocus = it.hasFocus },
                      query = uiState.query,
@@ -537419,7 +538551,7 @@ index 3b1b214bd..a9f1ee000 100644
                      onQueryChanged = handleQueryChanged,
                      onSubmit = {
                          submitCurrentQuery(uiState.query.trim())
-@@ -683,7 +772,14 @@ fun SearchScreen(
+@@ -683,7 +773,14 @@ fun SearchScreen(
                          // D-pad down from the text field is the user's confirmation that the
                          // live-search results are useful, even before a particular card opens.
                          viewModel.onEvent(SearchEvent.RememberSearchFromTextInput)
@@ -537435,7 +538567,7 @@ index 3b1b214bd..a9f1ee000 100644
                      },
                      onOpenDiscover = {
                          // Arm the restore so coming back lands on this button rather than the
-@@ -731,6 +827,40 @@ fun SearchScreen(
+@@ -731,6 +828,40 @@ fun SearchScreen(
                  // instruction is wrong, and it was re-appearing on every keystroke. Neither the
                  // mobile nor the desktop client shows an equivalent message.
  
@@ -537476,7 +538608,7 @@ index 3b1b214bd..a9f1ee000 100644
                  when {
                      trimmedSubmittedQuery.length < MIN_SEARCH_QUERY_LENGTH && !hasPendingUnsubmittedQuery -> {
                          item {
-@@ -770,7 +900,7 @@ fun SearchScreen(
+@@ -770,7 +901,7 @@ fun SearchScreen(
                      // mobile it only applies with an empty screen: mobile swaps results out for
                      // skeletons on every keystroke, which on a remote reads as flicker because each
                      // letter outlasts the debounce, so existing results are kept instead.
@@ -537485,7 +538617,7 @@ index 3b1b214bd..a9f1ee000 100644
                          items(SEARCH_SKELETON_ROW_COUNT, key = { "search_skeleton_$it" }) { index ->
                              val skeletonRow = remember(index) {
                                  com.nuvio.tv.domain.model.CatalogRow(
-@@ -808,7 +938,7 @@ fun SearchScreen(
+@@ -808,7 +939,7 @@ fun SearchScreen(
                          }
                      }
  
@@ -537494,7 +538626,7 @@ index 3b1b214bd..a9f1ee000 100644
                          item {
                              ErrorState(
                                  message = uiState.error ?: stringResource(R.string.search_error_failed),
-@@ -817,7 +947,23 @@ fun SearchScreen(
+@@ -817,7 +948,23 @@ fun SearchScreen(
                          }
                      }
  
@@ -537519,7 +538651,7 @@ index 3b1b214bd..a9f1ee000 100644
                          item {
                              EmptyScreenState(
                                  title = stringResource(R.string.search_no_results_title),
-@@ -873,7 +1019,7 @@ fun SearchScreen(
+@@ -873,7 +1020,7 @@ fun SearchScreen(
                                  rowFocusRequester = rowFocusRequester,
                                  entryFocusRequester = entryFocusRequester,
                                  // Anchor Up to the field; geometric focus varies with the card.
@@ -537528,7 +538660,7 @@ index 3b1b214bd..a9f1ee000 100644
                                  listState = listState,
                                  restorerFocusedIndex = if (restoringSearchFocus.value && catalogKey == viewModel.savedFocusRowKey) {
                                      viewModel.savedFocusItemIndex
-@@ -987,12 +1133,15 @@ fun SearchScreen(
+@@ -987,12 +1134,15 @@ fun SearchScreen(
                          }
                      }
                  }
@@ -537544,7 +538676,7 @@ index 3b1b214bd..a9f1ee000 100644
          state = posterOptionsState,
          controller = viewModel.posterOptions,
          onNavigateToDetail = { id, type, addonBaseUrl ->
-@@ -1065,15 +1214,16 @@ private fun RecentSearchesSection(
+@@ -1065,15 +1215,16 @@ private fun RecentSearchesSection(
              Button(
                  onClick = onClearHistory,
                  modifier = Modifier
@@ -537564,7 +538696,7 @@ index 3b1b214bd..a9f1ee000 100644
                  ),
                  shape = ButtonDefaults.shape(RoundedCornerShape(NuvioTheme.radii.md))
              ) {
-@@ -1104,7 +1254,7 @@ private fun RecentSearchesSection(
+@@ -1104,7 +1255,7 @@ private fun RecentSearchesSection(
                  ) {
                      var isSearchFocused by remember(recentQuery) { mutableStateOf(false) }
                      val searchScale by animateFloatAsState(
@@ -537573,7 +538705,7 @@ index 3b1b214bd..a9f1ee000 100644
                          animationSpec = tween(durationMillis = 140),
                          label = "recentSearchScale"
                      )
-@@ -1112,6 +1262,7 @@ private fun RecentSearchesSection(
+@@ -1112,6 +1263,7 @@ private fun RecentSearchesSection(
                          onClick = { onSearchSelected(recentQuery) },
                          modifier = Modifier
                              .weight(1f)
@@ -537581,7 +538713,7 @@ index 3b1b214bd..a9f1ee000 100644
                              .focusRequester(searchFocusRequester)
                              .focusProperties {
                                  if (isRtl) {
-@@ -1130,10 +1281,10 @@ private fun RecentSearchesSection(
+@@ -1130,10 +1282,10 @@ private fun RecentSearchesSection(
                                  )
                              },
                          colors = ButtonDefaults.colors(
@@ -537595,7 +538727,7 @@ index 3b1b214bd..a9f1ee000 100644
                          ),
                          scale = ButtonDefaults.scale(focusedScale = 1f),
                          shape = ButtonDefaults.shape(RoundedCornerShape(NuvioTheme.radii.md))
-@@ -1179,7 +1330,7 @@ private fun RecentSearchesSection(
+@@ -1179,7 +1331,7 @@ private fun RecentSearchesSection(
                              .onFocusChanged { isRemoveFocused = it.isFocused }
                              .size(36.dp)
                              .then(
@@ -537604,7 +538736,7 @@ index 3b1b214bd..a9f1ee000 100644
                                      Modifier.border(
                                          width = NuvioTheme.spacing.xxs,
                                          color = NuvioTheme.colors.FocusRing,
-@@ -1191,7 +1342,7 @@ private fun RecentSearchesSection(
+@@ -1191,7 +1343,7 @@ private fun RecentSearchesSection(
                              ),
                          colors = TvIconButtonDefaults.colors(
                              containerColor = Color.Transparent,
@@ -537613,7 +538745,7 @@ index 3b1b214bd..a9f1ee000 100644
                              contentColor = NuvioTheme.colors.TextPrimary,
                              focusedContentColor = NuvioTheme.colors.TextPrimary
                          ),
-@@ -1224,6 +1375,7 @@ private fun SearchInputField(
+@@ -1224,6 +1376,7 @@ private fun SearchInputField(
      voiceFocusRequester: FocusRequester?,
      searchFocusRequester: FocusRequester,
      onSearchFieldFocusChanged: (Boolean) -> Unit,
@@ -537621,7 +538753,7 @@ index 3b1b214bd..a9f1ee000 100644
      onQueryChanged: (String) -> Unit,
      onSubmit: () -> Unit,
      showVoiceSearch: Boolean,
-@@ -1238,6 +1390,8 @@ private fun SearchInputField(
+@@ -1238,6 +1391,8 @@ private fun SearchInputField(
      clearHistoryFocusRequester: FocusRequester?,
      isScreenActive: Boolean = true
  ) {
@@ -537630,7 +538762,7 @@ index 3b1b214bd..a9f1ee000 100644
      var isDiscoverButtonFocused by remember { mutableStateOf(false) }
      var isVoiceButtonFocused by remember { mutableStateOf(false) }
      val isRtl = LocalLayoutDirection.current == LayoutDirection.Rtl
-@@ -1257,14 +1411,15 @@ private fun SearchInputField(
+@@ -1257,14 +1412,15 @@ private fun SearchInputField(
                          discoverFocusRequester?.let { Modifier.focusRequester(it) } ?: Modifier
                      )
                      .onFocusChanged { isDiscoverButtonFocused = it.isFocused }
@@ -537648,7 +538780,7 @@ index 3b1b214bd..a9f1ee000 100644
                          shape = RoundedCornerShape(NuvioTheme.radii.md)
                      )
              ) {
-@@ -1349,15 +1504,18 @@ private fun SearchInputField(
+@@ -1349,15 +1505,18 @@ private fun SearchInputField(
                                  Modifier
                              }
                          )
@@ -537670,7 +538802,7 @@ index 3b1b214bd..a9f1ee000 100644
                              shape = RoundedCornerShape(NuvioTheme.radii.md)
                          )
                  ) {
-@@ -1377,11 +1535,15 @@ private fun SearchInputField(
+@@ -1377,11 +1536,15 @@ private fun SearchInputField(
              onValueChange = onQueryChanged,
              modifier = Modifier
                  .weight(1f)
@@ -537686,7 +538818,17 @@ index 3b1b214bd..a9f1ee000 100644
                      onSearchFieldFocusChanged(focusState.isFocused)
                  }
                  .onPreviewKeyEvent { keyEvent ->
-@@ -1464,14 +1626,15 @@ private fun SearchInputField(
+@@ -1418,7 +1581,8 @@ private fun SearchInputField(
+                         }
+                     }
+                     false
+-                },
++                }
++                .tvTextFieldNavigation(),
+             keyboardOptions = KeyboardOptions.Default.copy(
+                  imeAction = ImeAction.Done,
+                  autoCorrectEnabled = false
+@@ -1464,14 +1628,15 @@ private fun SearchInputField(
                  },
                  modifier = Modifier
                      .onFocusChanged { isClearButtonFocused = it.isFocused }
@@ -539213,10 +540355,10 @@ index 86279a489..beabb6c3d 100644
          }
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LiveTvSettingsContent.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LiveTvSettingsContent.kt
 new file mode 100644
-index 000000000..ed02626a1
+index 000000000..ddc36bced
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LiveTvSettingsContent.kt
-@@ -0,0 +1,3137 @@
+@@ -0,0 +1,3138 @@
 +package com.nuvio.tv.ui.screens.settings
 +
 +import android.content.Context
@@ -539299,6 +540441,7 @@ index 000000000..ed02626a1
 +import com.nuvio.tv.livetv.ui.LiveTvSettingsViewModel
 +import com.nuvio.tv.livetv.ui.TextInputDialog
 +import com.nuvio.tv.ui.components.NuvioDialog
++import com.nuvio.tv.ui.components.tvTextFieldNavigation
 +import com.nuvio.tv.livetv.model.effectiveGuideSize
 +import com.nuvio.tv.ui.screens.collection.NuvioTextField
 +import com.nuvio.tv.ui.theme.NuvioTheme
@@ -541995,7 +543138,7 @@ index 000000000..ed02626a1
 +                NuvioTextField(
 +                    value = values[i].value,
 +                    onValueChange = { values[i].value = it },
-+                    modifier = Modifier.fillMaxWidth(),
++                    modifier = Modifier.fillMaxWidth().tvTextFieldNavigation(),
 +                    placeholder = field.hint,
 +                    prefixText = if (field.defaultHttp) playlistAddressPrefix(values[i].value) else null,
 +                    focusRequester = if (i == 0) firstField else null
@@ -546683,10 +547826,26 @@ index 4729d247d..9880868a6 100644
          item {
              SettingsGroupCard(
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/UpdateChannelSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/UpdateChannelSettings.kt
-index d2db01bf7..d7ed03d70 100644
+index d2db01bf7..73dfe74db 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/UpdateChannelSettings.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/UpdateChannelSettings.kt
-@@ -54,6 +54,17 @@ internal fun UpdateChannelSettings(
+@@ -18,6 +18,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
+ import androidx.lifecycle.compose.collectAsStateWithLifecycle
+ import com.nuvio.tv.R
+ import com.nuvio.tv.updater.UpdateChannel
++import com.nuvio.tv.updater.UpdateCheckFrequency
+ import com.nuvio.tv.updater.UpdateViewModel
+ 
+ @Composable
+@@ -29,6 +30,7 @@ internal fun UpdateChannelSettings(
+     val viewModel: UpdateViewModel = hiltViewModel(context as ComponentActivity)
+     val state by viewModel.uiState.collectAsStateWithLifecycle()
+     var showChannelDialog by rememberSaveable { mutableStateOf(false) }
++    var showFrequencyDialog by rememberSaveable { mutableStateOf(false) }
+     val channelName = when (state.updateChannel) {
+         UpdateChannel.STABLE -> stringResource(R.string.update_channel_stable)
+         UpdateChannel.BETA -> stringResource(R.string.update_channel_beta)
+@@ -54,6 +56,17 @@ internal fun UpdateChannelSettings(
          }
      )
  
@@ -546704,6 +547863,46 @@ index d2db01bf7..d7ed03d70 100644
      if (state.autoInstallSupported) {
          SettingsToggleRow(
              title = stringResource(R.string.about_update_auto_install_title),
+@@ -84,6 +97,13 @@ internal fun UpdateChannelSettings(
+         }
+     )
+ 
++    SettingsActionRow(
++        title = stringResource(R.string.about_update_check_frequency),
++        subtitle = stringResource(R.string.about_update_check_frequency_summary),
++        value = stringResource(state.checkFrequency.label),
++        onClick = { showFrequencyDialog = true }
++    )
++
+     if (showChannelDialog) {
+         SettingsSingleChoiceDialog(
+             title = stringResource(R.string.about_update_channel_title),
+@@ -110,4 +130,25 @@ internal fun UpdateChannelSettings(
+             maxHeight = 320.dp
+         )
+     }
++
++    if (showFrequencyDialog) {
++        SettingsSingleChoiceDialog(
++            title = stringResource(R.string.about_update_check_frequency),
++            subtitle = stringResource(R.string.about_update_check_frequency_summary),
++            options = UpdateCheckFrequency.entries.map { frequency ->
++                SettingsPickerOption(
++                    value = frequency,
++                    title = stringResource(frequency.label)
++                )
++            },
++            selectedValue = state.checkFrequency,
++            onOptionSelected = { frequency ->
++                viewModel.setCheckFrequency(frequency)
++                showFrequencyDialog = false
++            },
++            onDismiss = { showFrequencyDialog = false },
++            width = 500.dp,
++            maxHeight = 320.dp
++        )
++    }
+ }
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/V2PreferenceControls.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/V2PreferenceControls.kt
 new file mode 100644
 index 000000000..bfb89d43e
@@ -551244,6 +552443,39 @@ index 000000000..c9eaa9028
 +            "Logical canvas (${referenceWidthDp.toInt()} x ${referenceHeightDp.toInt()} dp reference)",
 +            calibrationPercent = (raw * 100).roundToInt()
 +        )
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/updater/UpdateCheckFrequency.kt b/app/src/main/java/com/nuvio/tv/updater/UpdateCheckFrequency.kt
+new file mode 100644
+index 000000000..51ced982f
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/updater/UpdateCheckFrequency.kt
+@@ -0,0 +1,27 @@
++package com.nuvio.tv.updater
++
++import androidx.annotation.StringRes
++import com.nuvio.tv.R
++import java.util.concurrent.TimeUnit
++
++enum class UpdateCheckFrequency(@StringRes val label: Int, private val days: Int) {
++    ALWAYS(R.string.about_update_check_always, 0),
++    DAILY(R.string.about_update_check_daily, 1),
++    TWO_DAYS(R.string.about_update_check_two_days, 2),
++    THREE_DAYS(R.string.about_update_check_three_days, 3),
++    WEEKLY(R.string.about_update_check_weekly, 7),
++    NEVER(R.string.about_update_check_never, 0);
++
++    val backgroundIntervalMs: Long?
++        get() = when (this) {
++            NEVER -> null
++            ALWAYS -> TimeUnit.HOURS.toMillis(12)
++            else -> TimeUnit.DAYS.toMillis(days.toLong())
++        }
++
++    fun isDue(lastCheckMs: Long, nowMs: Long): Boolean = when (this) {
++        ALWAYS -> true
++        NEVER -> false
++        else -> lastCheckMs <= 0 || lastCheckMs > nowMs || nowMs - lastCheckMs >= TimeUnit.DAYS.toMillis(days.toLong())
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubePlayerPanel.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubePlayerPanel.kt
@@ -757981,7 +759213,7 @@ index 000000000..824575f29
 +    <string name="scout_menu_visible_sub">Scout\'s Home rows keep their own switches</string>
 +</resources>
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index b4264552c..eac2573e1 100644
+index b4264552c..285063bfb 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
 @@ -343,6 +343,8 @@
@@ -758002,7 +759234,26 @@ index b4264552c..eac2573e1 100644
      <string name="about_update_channel_title">Update channel</string>
      <string name="about_update_channel_subtitle">Choose the type of app updates to receive</string>
      <string name="about_check_updates">Check for updates</string>
-@@ -803,6 +807,19 @@
+@@ -446,6 +450,18 @@
+     <string name="update_channel_dialog_subtitle">Choose the type of updates you want to receive</string>
+     <string name="update_channel_stable_description">Intended for everyday use.</string>
+     <string name="update_channel_beta_description">Early updates that may contain bugs, break features, or behave unexpectedly.</string>
++    <string name="about_update_check_frequency">App update check frequency</string>
++    <string name="about_update_check_frequency_summary">Choose how often Nuvio checks for a new version.</string>
++    <string name="about_update_check_always">Always</string>
++    <string name="about_update_check_daily">Daily</string>
++    <string name="about_update_check_two_days">2 Days</string>
++    <string name="about_update_check_three_days">3 Days</string>
++    <string name="about_update_check_weekly">Weekly</string>
++    <string name="about_update_check_never">Never</string>
++    <string name="database_compatibility_title">A newer build is needed</string>
++    <string name="plugin_source_languages_title">Source languages</string>
++    <string name="plugin_source_languages_description">Choose which languages’ CloudStream sources search for streams. Sources with an unspecified or multilingual language are always included.</string>
++    <string name="plugin_all_source_languages">All languages</string>
+     <string name="about_privacy_policy">Privacy Policy</string>
+     <string name="about_privacy_policy_subtitle">View our privacy policy</string>
+     <string name="support_nuvio_name">Support Nuvio</string>
+@@ -803,6 +819,19 @@
      <string name="playback_auto_quality_sub">Adapts the video quality of adaptive streams to the measured connection speed, without restarting playback. Picking a quality in the player pauses it until Auto is picked again.</string>
      <string name="playback_fast_start">Fast start</string>
      <string name="playback_fast_start_sub">Starts adaptive streams at the lowest quality and steps up automatically once the first buffering completes and the connection allows it. Requires Auto quality.</string>
@@ -758022,7 +759273,7 @@ index b4264552c..eac2573e1 100644
      <string name="playback_external_forward_subtitles">Forward subtitles to external player</string>
      <string name="playback_external_forward_subtitles_sub">Fetch subtitles in your preferred language from addons and pass them to the external player.</string>
      <string name="playback_external_send_skip_segments">Send intro and outro timestamps</string>
-@@ -835,9 +852,10 @@
+@@ -835,9 +864,10 @@
      <string name="video_section">Video</string>
      <string name="playback_true_black_letterbox">True black bars</string>
      <string name="playback_true_black_letterbox_sub">Leave the bars around the picture unpainted so HDR stays true black. Keep this off if a bright line appears on the bars.</string>
@@ -758036,7 +759287,7 @@ index b4264552c..eac2573e1 100644
      <string name="audio_trailer_section">Trailer</string>
      <string name="audio_autoplay_trailers">Auto-play Trailers</string>
      <string name="audio_autoplay_trailers_sub">Automatically play trailers on detail and post-play screens</string>
-@@ -850,6 +868,17 @@
+@@ -850,6 +880,17 @@
      <string name="audio_preferred_lang">Preferred Audio Language</string>
      <string name="audio_skip_silence">Skip Silence</string>
      <string name="audio_skip_silence_sub">Skip silent portions of audio during playback</string>
@@ -758054,7 +759305,7 @@ index b4264552c..eac2573e1 100644
      <string name="audio_remember_delay_per_device">Remember audio delay per device</string>
      <string name="audio_remember_delay_per_device_sub">Save and restore the in-player audio delay for the current audio output route</string>
      <string name="audio_advanced_section">Advanced Audio</string>
-@@ -940,10 +969,35 @@
+@@ -940,10 +981,35 @@
      <string name="sub_outline">Outline</string>
      <string name="sub_outline_sub">Add outline around subtitle text for better visibility</string>
      <string name="sub_outline_color">Outline Color</string>
@@ -758091,7 +759342,7 @@ index b4264552c..eac2573e1 100644
      <string name="sub_advanced_section">Advanced Subtitle Rendering</string>
      <string name="sub_libass">Use libass for ASS/SSA subtitles</string>
      <string name="sub_libass_sub">Advanced ASS/SSA rendering (styles, positioning, animations)</string>
-@@ -1133,6 +1187,14 @@
+@@ -1133,6 +1199,14 @@
      <string name="layout_cw_sort_streaming_desc">Released items first, upcoming at the end</string>
      <string name="layout_cw_sort_split_upcoming">Separate Upcoming Row</string>
      <string name="layout_cw_sort_split_upcoming_desc">Move unaired episodes to a separate Upcoming row</string>
@@ -758106,7 +759357,7 @@ index b4264552c..eac2573e1 100644
      <string name="upcoming_section_title">Upcoming</string>
      <string name="layout_trailer_button">Show Trailer Button</string>
      <string name="layout_trailer_button_sub">Show trailer button on detail page (only when trailer is available).</string>
-@@ -1235,6 +1297,8 @@
+@@ -1235,6 +1309,8 @@
      <!-- Custom Poster Web Page -->
      <string name="layout_always_show_landscape_clearlogo">Always Backdrop with Logo for Landscape Posters</string>
      <string name="layout_always_show_landscape_clearlogo_sub">Ignore landscape poster from addon and use backdrop with clearlogo overlay instead.</string>
@@ -758115,7 +759366,7 @@ index b4264552c..eac2573e1 100644
      <string name="web_custom_poster_title">Custom Poster Source</string>
      <string name="web_custom_poster_subtitle">Paste a poster URL pattern below and press Save.</string>
      <string name="web_custom_poster_label">URL Pattern</string>
-@@ -1251,6 +1315,13 @@
+@@ -1251,6 +1327,13 @@
      <string name="web_custom_poster_none">No pattern set</string>
      <string name="web_custom_poster_loading">Loading…</string>
      <string name="web_custom_poster_placeholders_info">Placeholders: {id} passes all content IDs. {imdb_id}, {tmdb_id}, {tvdb_id}, {kitsu_id} target a single ID type - if unavailable, the original poster is kept. {imdb_id|tmdb_id|kitsu_id} declares supported ID types - the matching one is used, or the original poster is kept. Add ? to make a placeholder optional, resolving to empty instead of skipping: {imdb_id?}. Other placeholders: {id_type}, {typed_id}, {type}, {shape}.</string>
@@ -758129,7 +759380,7 @@ index b4264552c..eac2573e1 100644
  
  
      <string name="mdblist_name">MDBList</string>
-@@ -1781,6 +1852,13 @@
+@@ -1781,6 +1864,13 @@
      <string name="addon_installing">Installing</string>
      <string name="addon_install_btn">Install</string>
      <string name="addon_install_success">Installed %1$s</string>
@@ -758143,7 +759394,7 @@ index b4264552c..eac2573e1 100644
      <string name="addon_error_invalid_url">Enter a valid addon URL</string>
      <string name="addon_error_invalid_scheme">Addon URL must start with http or https</string>
      <string name="addon_installed_section">Installed</string>
-@@ -2061,6 +2139,12 @@
+@@ -2061,6 +2151,12 @@
      <string name="audio_center_mix_unavailable">Center mix is only available when FFmpeg downmix is active.</string>
      <string name="audio_maintain_original_audio_on_downmix_title">Maintain original audio on downmix</string>
      <string name="audio_maintain_original_audio_on_downmix_subtitle">When disabled, downmix normalization can reduce overall volume.</string>
@@ -758156,7 +759407,7 @@ index b4264552c..eac2573e1 100644
  
      <string name="subtitle_dialog_title">Subtitles</string>
      <string name="subtitle_no_builtin">No built-in subtitles available</string>
-@@ -2254,15 +2338,12 @@
+@@ -2254,15 +2350,12 @@
      <string name="library_status_dropped">Dropped</string>
      <string name="library_syncing_library">Syncing library\u2026</string>
      <string name="library_type_all">All</string>
@@ -758176,7 +759427,7 @@ index b4264552c..eac2573e1 100644
      <string name="library_empty_simkl_not_auth_title">Simkl not connected</string>
      <string name="library_empty_simkl_not_auth_subtitle">Connect your Simkl account in Settings to view your Simkl library</string>
      <string name="library_list_create_dialog_title">Create List</string>
-@@ -2586,6 +2667,8 @@
+@@ -2586,6 +2679,8 @@
      <string name="update_checking">Checking for updates…</string>
      <string name="update_waiting_for_stable">You’ll receive the next stable release when it becomes available</string>
      <string name="update_download_complete">Download complete. Ready to install.</string>
@@ -758185,7 +759436,7 @@ index b4264552c..eac2573e1 100644
      <string name="update_installed_automatically">Updated automatically while the device was idle</string>
      <string name="update_up_to_date">System is up to date. Latest changes:</string>
      <string name="update_close">Close</string>
-@@ -2678,6 +2761,13 @@
+@@ -2678,6 +2773,13 @@
      <string name="cd_switch_player_engine">Switch player engine</string>
      <string name="cd_episodes">Episodes</string>
      <string name="player_chapter_number">Chapter %1$d</string>
@@ -758199,7 +759450,7 @@ index b4264552c..eac2573e1 100644
      <string name="player_chapters">Chapters</string>
      <string name="player_chapters_title">Chapters (%1$d)</string>
      <string name="player_chapter_remaining">%1$s left</string>
-@@ -3508,17 +3598,17 @@
+@@ -3508,17 +3610,17 @@
      <string name="stream_test_no_stream">No playback recorded. Play a video to run diagnostic tests on its host.</string>
      <string name="stream_test_btn_start">Start Test</string>
      <string name="stream_test_btn_measuring_baseline">Measuring Baseline...</string>
@@ -758225,7 +759476,7 @@ index b4264552c..eac2573e1 100644
      <string name="stream_test_error_prefix">Error: %1$s</string>
      <string name="stream_test_video_bitrate">Average Video Bitrate: %1$s</string>
      <string name="stream_test_error_connection">Connection failed. The last played stream link may have expired or is unreachable. Please play the video again and retry.</string>
-@@ -3585,9 +3675,7 @@
+@@ -3585,9 +3687,7 @@
      <string name="autosync_tolerance_value">%1$d ms</string>
      <string name="autosync_thorough_title">Thorough Auto Sync Search</string>
      <string name="autosync_thorough_description">Keep comparing other subtitles and embedded tracks for a closer match before syncing. When off, the first strong match is used sooner. Only confident matches are ever applied.</string>
@@ -758236,7 +759487,7 @@ index b4264552c..eac2573e1 100644
      <string name="autosync_label_synced">Auto synced</string>
      <string name="stream_resume_from_time">Resume from %1$s</string>
      <string name="stream_resume_from_percent">Resume from %1$d%%</string>
-@@ -3743,4 +3831,16 @@
+@@ -3743,4 +3843,16 @@
      <string name="iptv_free_channel_count">%1$d channels</string>
      <string name="iptv_free_source_summary">Free channels · %1$d countries · %2$d channels</string>
      <string name="iptv_free_source_summary_short">Free channels · %1$d countries</string>
