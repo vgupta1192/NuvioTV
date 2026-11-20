@@ -1,16 +1,21 @@
 diff --git a/app/build.gradle.kts b/app/build.gradle.kts
-index d2ff9910e..7bfa58b9c 100644
+index d2ff9910e..91f70f83a 100644
 --- a/app/build.gradle.kts
 +++ b/app/build.gradle.kts
-@@ -145,6 +145,7 @@ android {
+@@ -144,7 +144,12 @@ android {
+         buildConfigField("String", "TRAILER_API_URL", "\"${localProperties.getProperty("TRAILER_API_URL", "")}\"")
          buildConfigField("String", "IMDB_RATINGS_API_BASE_URL", "\"${localProperties.getProperty("IMDB_RATINGS_API_BASE_URL", "")}\"")
          buildConfigField("String", "IMDB_TAPFRAME_API_BASE_URL", "\"${localProperties.getProperty("IMDB_TAPFRAME_API_BASE_URL", "")}\"")
++        buildConfigField("String", "SPORTS_BASE_FEED_URL", buildConfigString(
++            providers.environmentVariable("NUVIO_SPORTS_BASE_FEED_URL").orNull
++                ?: resolveProperty(devProperties, localProperties, "SPORTS_BASE_FEED_URL").ifBlank { "https://abbaskip.github.io/Nuvio-ReSeq/sports-base.json" }
++        ))
          buildConfigField("String", "TRAKT_CLIENT_ID", "\"${localProperties.getProperty("TRAKT_CLIENT_ID", "")}\"")
 +        buildConfigField("boolean", "SCOUT_ENABLED", "true")
          buildConfigField("String", "TRAKT_CLIENT_SECRET", "\"${localProperties.getProperty("TRAKT_CLIENT_SECRET", "")}\"")
          buildConfigField("String", "TRAKT_API_URL", "\"${localProperties.getProperty("TRAKT_API_URL", "https://api.trakt.tv/")}\"")
          buildConfigField("String", "TRAKT_REDIRECT_URI", "\"${localProperties.getProperty("TRAKT_REDIRECT_URI", "urn:ietf:wg:oauth:2.0:oob")}\"")
-@@ -307,7 +308,10 @@ android {
+@@ -307,7 +312,10 @@ android {
  
      splits {
          abi {
@@ -22,7 +27,7 @@ index d2ff9910e..7bfa58b9c 100644
              reset()
              include("armeabi-v7a") // fork: the workflow publishes only the v7a APK - skip building the other ABIs + universal
              isUniversalApk = false
-@@ -324,13 +328,13 @@ android {
+@@ -324,13 +332,13 @@ android {
      }
  
      compileOptions {
@@ -39,7 +44,7 @@ index d2ff9910e..7bfa58b9c 100644
          }
      }
      buildFeatures {
-@@ -432,6 +436,25 @@ val rust = tasks.register<CargoNdkBuild>("buildRust") {
+@@ -432,6 +440,25 @@ val rust = tasks.register<CargoNdkBuild>("buildRust") {
      ndk = layout.dir(ndkPath.map { File(it) })
      jniLibs = layout.buildDirectory.dir("cargo/jniLibs")
  }
@@ -65,7 +70,7 @@ index d2ff9910e..7bfa58b9c 100644
  
  androidComponents {
      onVariants { variant ->
-@@ -457,6 +480,13 @@ androidComponents {
+@@ -457,6 +484,13 @@ androidComponents {
      }
  }
  
@@ -79,7 +84,7 @@ index d2ff9910e..7bfa58b9c 100644
  afterEvaluate {
      tasks.withType<L8DexDesugarLibTask>().configureEach {
          if (name.endsWith("AndroidTest")) {
-@@ -524,6 +554,8 @@ sentry {
+@@ -524,6 +558,8 @@ sentry {
  }
  
  dependencies {
@@ -88,7 +93,7 @@ index d2ff9910e..7bfa58b9c 100644
      coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
      val composeBom = platform("androidx.compose:compose-bom:2026.05.01")
  
-@@ -634,7 +666,7 @@ dependencies {
+@@ -634,7 +670,7 @@ dependencies {
      implementation(files("libs/nuvio-libass-release.aar"))
      // Local nextlib-mediainfo fork (static FFmpeg; no libav*.so in final AAR)
      implementation(files("libs/nextlib-mediainfo-local.aar"))
@@ -97,7 +102,18 @@ index d2ff9910e..7bfa58b9c 100644
      implementation("dev.chrisbanes.haze:haze-android:1.7.2") {
          exclude(group = "org.jetbrains.compose.ui")
          exclude(group = "org.jetbrains.compose.foundation")
-@@ -664,6 +696,10 @@ dependencies {
+@@ -648,6 +684,10 @@ dependencies {
+     add("fullImplementation", "com.fasterxml.jackson.module:jackson-module-kotlin:2.17.0")
+     add("fullImplementation", libs.nicehttp)
+     add("fullImplementation", libs.conscrypt.android)
++    // StreamPlay and other recent CS3 packages call runBlockingK. 1.11 also retains the older ABI.
++    add("fullImplementation", "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
++    // Downloaded CloudStream settings fragments use Material Views (including bottom sheets).
++    add("fullImplementation", "com.google.android.material:material:1.12.0")
+     add("fullImplementation", "com.github.recloudstream.cloudstream:library:${libs.versions.cloudstream.get()}") {
+         exclude(group = "org.mozilla", module = "rhino")
+         exclude(group = "com.github.AmarullisVFX", module = "newpipeextractor")
+@@ -664,6 +704,10 @@ dependencies {
      implementation(libs.nanohttpd)
      implementation(libs.zxing.core)
  
@@ -108,7 +124,7 @@ index d2ff9910e..7bfa58b9c 100644
  
      // Supabase
      implementation(platform(libs.supabase.bom))
-@@ -688,6 +724,9 @@ dependencies {
+@@ -688,6 +732,9 @@ dependencies {
      androidTestImplementation(libs.androidx.test.ext.junit)
      androidTestImplementation(libs.androidx.test.runner)
      testImplementation("junit:junit:4.13.2")
@@ -344137,108 +344153,2735 @@ index 000000000..c96b5766b
 +        assertEquals("es", spanish.languageTag)
 +    }
 +}
+diff --git a/app/src/full/AndroidManifest.xml b/app/src/full/AndroidManifest.xml
+index ffd100a9e..859b97ed3 100644
+--- a/app/src/full/AndroidManifest.xml
++++ b/app/src/full/AndroidManifest.xml
+@@ -5,6 +5,8 @@
+     <uses-permission android:name="android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION" />
+ 
+     <application>
++        <activity android:name=".core.plugin.cloudstream.ExtensionSettingsActivity"
++            android:exported="false" android:theme="@style/Theme.ReSeq.ExtensionSettings" />
+         <service
+             android:name=".updater.UpdateJobService"
+             android:exported="false"
+diff --git a/app/src/full/java/com/lagradost/cloudstream3/CloudStreamApp.kt b/app/src/full/java/com/lagradost/cloudstream3/CloudStreamApp.kt
+index 546c1115d..3b6f6de90 100644
+--- a/app/src/full/java/com/lagradost/cloudstream3/CloudStreamApp.kt
++++ b/app/src/full/java/com/lagradost/cloudstream3/CloudStreamApp.kt
+@@ -5,6 +5,7 @@ package com.lagradost.cloudstream3
+ import android.app.Activity
+ import android.content.Context
+ import android.content.ContextWrapper
++import com.lagradost.cloudstream3.utils.DataStore
+ import java.lang.ref.WeakReference
+ 
+ /**
+@@ -46,37 +47,50 @@ open class CloudStreamApp {
+             return null
+         }
+ 
+-        // --- DataStore stubs (no-op, matching real CloudStreamApp API) ---
++        @JvmStatic
++        fun removeKeys(folder: String): Int? = with(DataStore) { context?.removeKeys(folder) }
++
++        @JvmStatic
++        fun <T> setKey(path: String, value: T) {
++            with(DataStore) {
++                if (value == null) context?.removeKey(path) else context?.setKey(path, value)
++            }
++        }
+ 
+         @JvmStatic
+-        fun removeKeys(folder: String): Int? = null
++        fun <T> setKey(folder: String, path: String, value: T) =
++            setKey(DataStore.getFolderName(folder, path), value)
+ 
+         @JvmStatic
+-        fun <T> setKey(path: String, value: T) {}
++        fun <T : Any> setKeyClass(path: String, value: T) = setKey(path, value)
+ 
+         @JvmStatic
+-        fun <T> setKey(folder: String, path: String, value: T) {}
++        fun <T : Any> getKeyClass(path: String, valueType: Class<T>): T? =
++            with(DataStore) { context?.getKey(path, valueType) }
+ 
+         @JvmStatic
+-        inline fun <reified T : Any> getKey(path: String, defVal: T?): T? = defVal
++        inline fun <reified T : Any> getKey(path: String, defVal: T?): T? =
++            getKeyClass(path, T::class.java) ?: defVal
+ 
+         @JvmStatic
+-        inline fun <reified T : Any> getKey(path: String): T? = null
++        inline fun <reified T : Any> getKey(path: String): T? = getKeyClass(path, T::class.java)
+ 
+         @JvmStatic
+-        inline fun <reified T : Any> getKey(folder: String, path: String): T? = null
++        inline fun <reified T : Any> getKey(folder: String, path: String): T? =
++            getKeyClass(DataStore.getFolderName(folder, path), T::class.java)
+ 
+         @JvmStatic
+-        inline fun <reified T : Any> getKey(folder: String, path: String, defVal: T?): T? = defVal
++        inline fun <reified T : Any> getKey(folder: String, path: String, defVal: T?): T? =
++            getKey<T>(folder, path) ?: defVal
+ 
+         @JvmStatic
+-        fun getKeys(folder: String): List<String>? = null
++        fun getKeys(folder: String): List<String>? = with(DataStore) { context?.getKeys(folder) }
+ 
+         @JvmStatic
+-        fun removeKey(folder: String, path: String) {}
++        fun removeKey(folder: String, path: String) = removeKey(DataStore.getFolderName(folder, path))
+ 
+         @JvmStatic
+-        fun removeKey(path: String) {}
++        fun removeKey(path: String) { with(DataStore) { context?.removeKey(path) } }
+ 
+         @JvmStatic
+         fun openBrowser(url: String, fallbackWebView: Boolean = false) {}
+diff --git a/app/src/full/java/com/lagradost/cloudstream3/CommonActivity.kt b/app/src/full/java/com/lagradost/cloudstream3/CommonActivity.kt
+index 0a95db730..4e4632078 100644
+--- a/app/src/full/java/com/lagradost/cloudstream3/CommonActivity.kt
++++ b/app/src/full/java/com/lagradost/cloudstream3/CommonActivity.kt
+@@ -3,12 +3,24 @@
+ package com.lagradost.cloudstream3
+ 
+ import android.app.Activity
++import android.widget.Toast
+ 
+ /** Stub for CommonActivity referenced by some extensions. */
+ object CommonActivity {
+-    var activity: Activity? = null
++    @JvmField var activity: Activity? = null
++    fun getActivity(): Activity? = activity
++    fun setActivity(value: Activity?) { activity = value }
+ 
+-    fun showToast(message: String, duration: Int = 0) {
+-        // No-op stub — extensions may call this for user notifications
++    // Keep the primitive signature for older extensions and the boxed duration for newer ones.
++    fun showToast(message: String, duration: Int = Toast.LENGTH_SHORT) = toast(message, duration)
++    fun showToast(message: String?, duration: Int? = null) = toast(message, duration ?: Toast.LENGTH_SHORT)
++    fun showToast(activity: Activity?, message: String?, duration: Int? = null) {
++        if (activity == null) toast(message, duration ?: Toast.LENGTH_SHORT)
++        else if (message != null) activity.runOnUiThread { Toast.makeText(activity, message, duration ?: Toast.LENGTH_SHORT).show() }
++    }
++
++    private fun toast(message: String?, duration: Int) {
++        val host = activity ?: AcraApplication.getActivity() ?: return
++        if (message != null) host.runOnUiThread { Toast.makeText(host, message, duration).show() }
+     }
+ }
+diff --git a/app/src/full/java/com/lagradost/cloudstream3/plugins/Plugin.kt b/app/src/full/java/com/lagradost/cloudstream3/plugins/Plugin.kt
+index 47057e2e7..d3988c0d8 100644
+--- a/app/src/full/java/com/lagradost/cloudstream3/plugins/Plugin.kt
++++ b/app/src/full/java/com/lagradost/cloudstream3/plugins/Plugin.kt
+@@ -2,65 +2,18 @@ package com.lagradost.cloudstream3.plugins
+ 
+ import android.app.Activity
+ import android.content.Context
+-import android.util.Log
+-import com.lagradost.cloudstream3.MainAPI
+-import com.lagradost.cloudstream3.utils.ExtractorApi
++import android.content.res.Resources
++import com.lagradost.cloudstream3.APIHolder
+ import com.lagradost.cloudstream3.utils.extractorApis
+ 
+-/**
+- * The base class that CloudStream extensions extend in NuvioTV.
+- * Kept standalone (not extending BasePlugin) because BasePlugin's registration
+- * methods are final and can't be overridden. Extensions compiled against the
+- * real CloudStream app reference this class directly.
+- */
+-open class Plugin {
+-    private val _registeredMainAPIs = mutableListOf<MainAPI>()
+-    private val _registeredExtractorAPIs = mutableListOf<ExtractorApi>()
+-
+-    val registeredMainAPIs: List<MainAPI> get() = _registeredMainAPIs
+-    val registeredExtractorAPIs: List<ExtractorApi> get() = _registeredExtractorAPIs
+-
+-    /** Extensions can set this to provide a settings UI callback. No-op in NuvioTV. */
++/** Android extension ABI. The legacy Activity overload also supports older ReSeq plugins. */
++open class Plugin : BasePlugin() {
++    var resources: Resources? = null
+     var openSettings: ((Context) -> Unit)? = null
+ 
+-    /** Full file path to the plugin (matches BasePlugin's property). */
+-    var filename: String? = null
+-
+-    /**
+-     * No-arg load matching BasePlugin's pattern. Extensions compiled against
+-     * CloudStream may override this instead of load(Activity?).
+-     */
+-    open fun load() {}
+-
+-    /**
+-     * Called when the plugin is loaded. Override to register APIs.
+-     * The [activity] parameter may be null when loaded outside an Activity context.
+-     * Delegates to no-arg load() so BasePlugin-style extensions get invoked.
+-     */
+-    @Suppress("UNUSED_PARAMETER")
+-    open fun load(activity: Activity?) {
+-        load()
+-    }
+-
+-    fun registerMainAPI(element: MainAPI) {
+-        Log.d("CS3Plugin", "registerMainAPI called: ${element.name} (${element.javaClass.name})")
+-        _registeredMainAPIs.add(element)
+-        // Also register globally for extensions that access APIHolder directly
+-        element.sourcePlugin = this.filename
+-        try {
+-            com.lagradost.cloudstream3.APIHolder.addPluginMapping(element)
+-        } catch (_: Exception) {}
+-    }
+-
+-    fun registerExtractorAPI(element: ExtractorApi) {
+-        Log.d("CS3Plugin", "registerExtractorAPI called: ${element.name} (${element.javaClass.name})")
+-        _registeredExtractorAPIs.add(element)
+-        element.sourcePlugin = this.filename
+-        extractorApis.add(element)
+-    }
++    val registeredMainAPIs get() = APIHolder.allProviders.filter { filename != null && it.sourcePlugin == filename }
++    val registeredExtractorAPIs get() = extractorApis.filter { filename != null && it.sourcePlugin == filename }
+ 
+-    // Some extensions call these overloads
+-    open fun load(context: Context) {
+-        load(context as? Activity)
+-    }
++    open fun load(context: Context) = load(context as? Activity)
++    open fun load(activity: Activity?) = load()
+ }
+diff --git a/app/src/full/java/com/lagradost/cloudstream3/plugins/PluginManagerStub.kt b/app/src/full/java/com/lagradost/cloudstream3/plugins/PluginManagerStub.kt
+index fe5594956..ccc809ea6 100644
+--- a/app/src/full/java/com/lagradost/cloudstream3/plugins/PluginManagerStub.kt
++++ b/app/src/full/java/com/lagradost/cloudstream3/plugins/PluginManagerStub.kt
+@@ -2,15 +2,22 @@
+ 
+ package com.lagradost.cloudstream3.plugins
+ 
+-/** Stub for CloudStream PluginManager referenced by some extensions. */
++/** Binary interface used by CS3 extensions to look up installed companion packages. */
++data class PluginData(
++    val internalName: String,
++    val url: String?,
++    val isOnline: Boolean,
++    val filePath: String,
++    val version: Int
++)
++
+ object PluginManager {
+-    data class PluginData(
+-        val name: String = "",
+-        val url: String = "",
+-        val internalName: String = "",
+-        val version: Int = 0
+-    )
++    @Volatile private var online: Array<PluginData> = emptyArray()
++
++    internal fun setOnline(plugins: List<PluginData>) {
++        online = plugins.toTypedArray()
++    }
+ 
+-    fun getPluginsOnline(): Array<PluginData> = emptyArray()
++    fun getPluginsOnline(): Array<PluginData> = online.copyOf()
+     fun unloadPlugin(filePath: String) {}
+ }
 diff --git a/app/src/full/java/com/nuvio/tv/core/plugin/PluginManager.kt b/app/src/full/java/com/nuvio/tv/core/plugin/PluginManager.kt
-index 444fe7dd5..4cb05b40d 100644
+index 444fe7dd5..0e441c3b9 100644
 --- a/app/src/full/java/com/nuvio/tv/core/plugin/PluginManager.kt
 +++ b/app/src/full/java/com/nuvio/tv/core/plugin/PluginManager.kt
-@@ -15,6 +15,7 @@ import com.nuvio.tv.domain.model.PluginRepository
- import com.nuvio.tv.domain.model.RemotePluginInfo
+@@ -1,10 +1,14 @@
+ package com.nuvio.tv.core.plugin
+ 
++import com.lagradost.cloudstream3.plugins.PluginData
++import com.lagradost.cloudstream3.plugins.PluginManager as CloudStreamPluginManager
++import com.nuvio.tv.domain.model.StreamContentContext
+ import android.util.Log
+-import com.nuvio.tv.core.plugin.cloudstream.toNuvioType
+-import com.nuvio.tv.core.plugin.cloudstream.tvTypeFromString
++import com.nuvio.tv.core.plugin.cloudstream.cloudStreamContentTypes
++import com.nuvio.tv.core.plugin.cloudstream.unwrapCloudStreamUrl
+ import com.nuvio.tv.core.plugin.cloudstream.ExternalExtensionLoader
+ import com.nuvio.tv.core.plugin.cloudstream.ExternalExtensionRunner
++import com.nuvio.tv.core.plugin.cloudstream.ExternalRepoParseResult
+ import com.nuvio.tv.core.plugin.cloudstream.ExternalRepoParser
+ import com.nuvio.tv.data.local.PluginDataStore
+ import com.nuvio.tv.data.local.PluginSyncProfile
+@@ -16,9 +20,13 @@ import com.nuvio.tv.domain.model.RemotePluginInfo
  import com.nuvio.tv.domain.model.RepositoryType
  import com.nuvio.tv.domain.model.ScraperInfo
-+import com.nuvio.tv.domain.model.Stream
  import com.nuvio.tv.domain.model.ScraperManifestInfo
++import com.nuvio.tv.domain.model.Stream
++import com.nuvio.tv.domain.model.scraperIdFromPluginBingeGroup
  import com.squareup.moshi.Moshi
  import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
-@@ -237,7 +238,21 @@ class PluginManager @Inject constructor(
-     val pluginsEnabled: Flow<Boolean> = dataStore.pluginsEnabled
++import kotlinx.coroutines.CancellationException
+ import kotlinx.coroutines.CoroutineDispatcher
++import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.ExperimentalCoroutinesApi
+ import kotlinx.coroutines.asCoroutineDispatcher
+@@ -30,6 +38,7 @@ import kotlinx.coroutines.coroutineScope
+ import kotlinx.coroutines.flow.Flow
+ import kotlinx.coroutines.flow.channelFlow
+ import kotlinx.coroutines.flow.combine
++import kotlinx.coroutines.flow.collect
+ import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.sync.Semaphore
+@@ -97,7 +106,7 @@ class PluginManager @Inject constructor(
+      * External repos often use schemes like "cloudstreamrepo://" or "stremio://".
+      */
+     private fun sanitizeScheme(url: String): String {
+-        val trimmed = url.trim()
++        val trimmed = unwrapCloudStreamUrl(url)
+         // Replace any non-http(s) scheme with https://
+         val schemeEnd = trimmed.indexOf("://")
+         if (schemeEnd > 0) {
+@@ -242,6 +251,27 @@ class PluginManager @Inject constructor(
+         kotlinx.coroutines.SupervisorJob() + Dispatchers.IO
+     )
  
-     val groupStreamsByRepository: Flow<Boolean> = dataStore.groupStreamsByRepository
--    
-+
 +    val sourceLanguages = dataStore.sourceLanguages
++    val extensionDns = dataStore.extensionDns
++    val searchConfiguration: Flow<String> = combine(sourceLanguages, extensionDns) { languages, dns ->
++        "${languages.sorted()}:$dns"
++    }
 +
-+    suspend fun setSourceLanguages(languages: Set<String>) = dataStore.setSourceLanguages(languages.mapNotNull(com.nuvio.tv.core.plugin.SourceLanguages::normalize).toSet())
-+
++    init {
++        syncScope.launch { extensionDns.collect { com.nuvio.tv.core.runtime.ExtensionDns.select(it) } }
++    }
++    suspend fun setSourceLanguages(languages: Set<String>) = dataStore.setSourceLanguages(languages.mapNotNull(SourceLanguages::normalize).toSet())
++    suspend fun setExtensionDns(mode: String) = dataStore.setExtensionDns(mode)
 +    suspend fun installedSourceLanguages(): Map<String, Int> = withContext(Dispatchers.IO) {
 +        val counts = mutableMapOf<String, Int>()
 +        dataStore.scrapers.first().filter { it.type == RepositoryType.EXTERNAL_DEX }.forEach { scraper ->
 +            externalExtensionLoader.loadExtension(scraper.id).forEach { api ->
-+                com.nuvio.tv.core.plugin.SourceLanguages.normalize(api.lang)?.let { code -> counts[code] = (counts[code] ?: 0) + 1 }
++                SourceLanguages.normalize(api.lang)?.let { code -> counts[code] = (counts[code] ?: 0) + 1 }
 +            }
 +        }
 +        counts
 +    }
 +
-     private val syncScope = kotlinx.coroutines.CoroutineScope(
-         kotlinx.coroutines.SupervisorJob() + Dispatchers.IO
-     )
-@@ -702,11 +717,25 @@ class PluginManager @Inject constructor(
-      * Execute all enabled scrapers and emit results as each scraper completes.
-      * Returns a Flow that emits (scraperName, results) pairs.
-      */
+     var isSyncingFromRemote = false
+ 
+     /** Prevents concurrent reconciliation from StartupSyncService and AccountViewModel */
+@@ -423,9 +453,24 @@ class PluginManager @Inject constructor(
+         return Result.success(repo)
+     }
+ 
++    // Keep files and persisted versions aligned if sync and a manual import/refresh overlap.
++    private val externalInstallMutex = Mutex()
++
+     private suspend fun addExternalRepository(
+         repoUrl: String,
+-        parseResult: com.nuvio.tv.core.plugin.cloudstream.ExternalRepoParseResult
++        parseResult: ExternalRepoParseResult
++    ): Result<PluginRepository> {
++        val profileId = dataStore.writablePluginProfile()
++            ?: return Result.failure(Exception("This profile shares its plugin list"))
++        return externalInstallMutex.withLock {
++            withContext(PluginSyncProfile(profileId)) { installExternalRepository(repoUrl, parseResult, profileId) }
++        }
++    }
++
++    private suspend fun installExternalRepository(
++        repoUrl: String,
++        parseResult: ExternalRepoParseResult,
++        profileId: Int
+     ): Result<PluginRepository> {
+         // Prevent duplicate repos by URL
+         val existingRepo = dataStore.repositories.first()
+@@ -446,12 +491,11 @@ class PluginManager @Inject constructor(
+             type = RepositoryType.EXTERNAL_DEX
+         )
+ 
+-        dataStore.addRepository(repo)
+-        downloadDexExtensions(repo.id, parseResult.plugins)
+-
+-        Log.d(TAG, "External repository added: ${repo.name} with ${parseResult.plugins.size} extensions")
++        val installed = downloadDexExtensions(repo.id, parseResult.plugins)
++        if (installed.isEmpty()) return Result.failure(Exception("No extensions could be installed"))
++        val installedRepo = dataStore.storeExternalDownloads(profileId, repo, installed, refresh = false)
+         triggerRemoteSync()
+-        return Result.success(repo)
++        return Result.success(installedRepo)
+     }
+     
+     /**
+@@ -595,23 +639,17 @@ class PluginManager @Inject constructor(
+     }
+ 
+     private suspend fun refreshExternalRepository(repo: PluginRepository): Result<Unit> {
+-        val parseResult = externalRepoParser.tryParse(repo.url)
+-            ?: return Result.failure(Exception("Failed to parse external repository"))
+-
+-        // Evict stale class loaders for old scrapers
+-        val oldScrapers = dataStore.scrapers.first().filter { it.repositoryId == repo.id }
+-        oldScrapers.forEach { externalExtensionLoader.evictCache(it.id) }
+-
+-        val updatedRepo = repo.copy(
+-            name = parseResult.name,
+-            lastUpdated = System.currentTimeMillis(),
+-            scraperCount = parseResult.plugins.size
+-        )
+-        dataStore.updateRepository(updatedRepo)
+-
+-        downloadDexExtensions(repo.id, parseResult.plugins)
+-
+-        return Result.success(Unit)
++        val profileId = dataStore.writablePluginProfile()
++            ?: return Result.failure(Exception("This profile shares its plugin list"))
++        return externalInstallMutex.withLock {
++            val parseResult = externalRepoParser.tryParse(repo.url)
++                ?: return@withLock Result.failure(Exception("Failed to parse external repository"))
++            val installed = downloadDexExtensions(repo.id, parseResult.plugins)
++            if (installed.isEmpty()) return@withLock Result.failure(Exception("No extension could be refreshed"))
++            val updated = repo.copy(name = parseResult.name, description = parseResult.description)
++            dataStore.storeExternalDownloads(profileId, updated, installed, refresh = true)
++            Result.success(Unit)
++        }
+     }
+     
+     /**
+@@ -646,7 +684,37 @@ class PluginManager @Inject constructor(
+     suspend fun setGroupStreamsByRepository(enabled: Boolean) {
+         dataStore.setGroupStreamsByRepository(enabled)
+     }
+-    
++
++    /**
++     * Remember a plugin provider the user actually played.
++     * The most-played provider then starts before the others, and its binge group
++     * lets autoplay continue that same provider on the next episode.
++     */
 +    fun recordPluginProviderPlay(stream: Stream) {
 +        recordPluginProviderPlay(stream.behaviorHints?.bingeGroup)
 +    }
 +
 +    fun recordPluginProviderPlay(bingeGroup: String?) {
-+        val scraperId = com.nuvio.tv.domain.model.scraperIdFromPluginBingeGroup(bingeGroup) ?: return
++        val scraperId = scraperIdFromPluginBingeGroup(bingeGroup) ?: return
 +        syncScope.launch {
 +            runCatching { dataStore.recordPluginProviderPlay(scraperId) }
 +                .onFailure { error -> Log.w(TAG, "Failed to record plugin provider play", error) }
 +        }
 +    }
 +
-     fun executeScrapersStreaming(
++    private suspend fun scrapersInRunOrder(
++        scrapers: List<ScraperInfo>,
++        priorityBingeGroup: String?
++    ): List<ScraperInfo> {
++        if (scrapers.size < 2) return scrapers
++        val stats = runCatching { dataStore.pluginProviderPlayStats() }.getOrElse { emptyMap() }
++        return scrapers.orderForPluginPlayback(
++            id = { it.id },
++            priorityBingeGroup = priorityBingeGroup,
++            stats = stats
++        )
++    }
++
+     /**
+      * Execute all enabled scrapers for a given media
+      */
+@@ -654,14 +722,17 @@ class PluginManager @Inject constructor(
+         tmdbId: String,
+         mediaType: String,
+         season: Int? = null,
+-        episode: Int? = null
++        episode: Int? = null,
++        priorityBingeGroup: String? = null
+     ): List<LocalScraperResult> = coroutineScope {
+         if (!dataStore.pluginsEnabled.first()) {
+             return@coroutineScope emptyList()
+         }
+         
+-        val enabledScraperList = enabledScrapers.first()
+-            .filter { it.supportsType(mediaType) }
++        val enabledScraperList = scrapersInRunOrder(
++            enabledScrapers.first().filter { it.supportsType(mediaType) },
++            priorityBingeGroup
++        )
+         
+         if (enabledScraperList.isEmpty()) {
+             return@coroutineScope emptyList()
+@@ -669,20 +740,7 @@ class PluginManager @Inject constructor(
+         
+         Log.d(TAG, "Executing ${enabledScraperList.size} scrapers for $mediaType:$tmdbId")
+ 
+-        // Preload all extractors from EXTERNAL_DEX repos before any scraper runs
+-        val dexScraperIds = enabledScraperList
+-            .filter { it.type == RepositoryType.EXTERNAL_DEX }
+-            .map { it.id }
+-        if (dexScraperIds.isNotEmpty()) {
+-            // Also load ALL dex scrapers from the same repos (not just enabled ones)
+-            // since extractors can live in any .cs3 file
+-            val allDexIds = dataStore.scrapers.first()
+-                .filter { it.type == RepositoryType.EXTERNAL_DEX }
+-                .map { it.id }
+-            withContext(Dispatchers.IO) {
+-                externalExtensionLoader.ensureExtractorsLoaded(allDexIds)
+-            }
+-        }
++        preloadDexExtractors(enabledScraperList)
+ 
+         val results = enabledScraperList.mapIndexed { index, scraper ->
+             async(scraperOrchestrationDispatcher) {
+@@ -706,38 +764,102 @@ class PluginManager @Inject constructor(
          tmdbId: String,
          mediaType: String,
          season: Int? = null,
 -        episode: Int? = null
 +        episode: Int? = null,
 +        priorityBingeGroup: String? = null,
-+        preferredPluginOnly: Boolean = false
++        preferredPluginOnly: Boolean = false,
++        content: StreamContentContext? = null
      ): Flow<Pair<ScraperInfo, List<LocalScraperResult>>> = channelFlow {
-         val enabledList = enabledScrapers.first()
-             .filter { it.supportsType(mediaType) }
+-        val enabledList = enabledScrapers.first()
+-            .filter { it.supportsType(mediaType) }
++        val enabledList = enabledScrapers.first().filter {
++            it.supportsType(mediaType) && (!tmdbId.startsWith("tt") || it.type == RepositoryType.EXTERNAL_DEX)
++        }
+         
+         if (enabledList.isEmpty() || !dataStore.pluginsEnabled.first()) {
+             return@channelFlow
+         }
+-        
+-        Log.d(TAG, "Streaming execution of ${enabledList.size} scrapers for $mediaType:$tmdbId")
+- 
+-        // Preload all extractors from EXTERNAL_DEX repos before any scraper runs
+-        val dexScraperIds = enabledList.filter { it.type == RepositoryType.EXTERNAL_DEX }.map { it.id }
+-        if (dexScraperIds.isNotEmpty()) {
+-            val allDexIds = dataStore.scrapers.first()
+-                .filter { it.type == RepositoryType.EXTERNAL_DEX }
+-                .map { it.id }
+-            withContext(Dispatchers.IO) {
+-                externalExtensionLoader.ensureExtractorsLoaded(allDexIds)
++
++        val stats = runCatching { dataStore.pluginProviderPlayStats() }.getOrElse { emptyMap() }
++        val plan = enabledList.planPluginRun(
++            id = { it.id },
++            priorityBingeGroup = priorityBingeGroup,
++            stats = stats,
++            preferredOnly = preferredPluginOnly
++        )
++        val preferred = plan.preferred
++        if (preferred != null) {
++            Log.d(TAG, "Trying preferred plugin first: ${preferred.name}")
++            preloadDexExtractors(listOf(preferred))
++            val results = try {
++                executeScraperWithSingleFlight(preferred, tmdbId, mediaType, season, episode, content)
++            } catch (error: CancellationException) {
++                throw error
++            } catch (error: Exception) {
++                Log.e(TAG, "Preferred plugin ${preferred.name} failed: ${error.message}")
++                emptyList()
++            }
++            if (results.isNotEmpty()) {
++                Log.d(TAG, "Preferred plugin ${preferred.name} returned ${results.size}; skipping ${plan.others.size} scrapers")
++                send(preferred to results)
++                return@channelFlow
+             }
++            Log.d(TAG, "Preferred plugin ${preferred.name} returned nothing; running ${plan.others.size} other scrapers")
++        } else {
++            Log.d(TAG, "Streaming execution of ${plan.others.size} scrapers for $mediaType:$tmdbId")
++        }
++
++        preloadDexExtractors(plan.others)
++        launchPluginScrapers(
++            scrapers = plan.others,
++            tmdbId = tmdbId,
++            mediaType = mediaType,
++            season = season,
++            episode = episode,
++            content = content
++        ) { scraper, results ->
++            send(scraper to results)
+         }
+- 
+-        enabledList.forEachIndexed { index, scraper ->
++    }
++
++    private suspend fun preloadDexExtractors(scrapers: List<ScraperInfo>) {
++        if (scrapers.none { it.type == RepositoryType.EXTERNAL_DEX }) return
++        // Extractors can be supplied by a separate installed package or repository.
++        com.nuvio.tv.core.runtime.ExtensionDns.select(extensionDns.first())
++        val ids = registerInstalledExtensions().map { it.id }
++        withContext(Dispatchers.IO) { externalExtensionLoader.ensureExtractorsLoaded(ids) }
++    }
++
++    private suspend fun registerInstalledExtensions(): List<ScraperInfo> {
++        val extensions = dataStore.scrapers.first().filter { it.type == RepositoryType.EXTERNAL_DEX }
++        CloudStreamPluginManager.setOnline(extensions.map { extension ->
++            PluginData(
++                internalName = extension.id.removePrefix("${extension.repositoryId}:"),
++                url = extension.filename,
++                isOnline = true,
++                filePath = externalExtensionLoader.extensionFile(extension.id).absolutePath,
++                version = extension.version.toIntOrNull() ?: 0
++            )
++        })
++        return extensions
++    }
++
++    private fun CoroutineScope.launchPluginScrapers(
++        scrapers: List<ScraperInfo>,
++        tmdbId: String,
++        mediaType: String,
++        season: Int?,
++        episode: Int?,
++        content: StreamContentContext?,
++        onResult: suspend (ScraperInfo, List<LocalScraperResult>) -> Unit
++    ) {
++        scrapers.forEachIndexed { index, scraper ->
+             launch(scraperOrchestrationDispatcher) {
+                 if (index > 0) {
+                     kotlinx.coroutines.delay(index * 60L)
+                 }
+                 try {
+-                    val results = executeScraperWithSingleFlight(scraper, tmdbId, mediaType, season, episode)
+-                    if (results.isNotEmpty()) {
+-                        send(scraper to results)
+-                    }
++                    val results = executeScraperWithSingleFlight(scraper, tmdbId, mediaType, season, episode, content)
++                    if (results.isNotEmpty()) onResult(scraper, results)
++                } catch (e: CancellationException) {
++                    throw e
+                 } catch (e: Exception) {
+                     Log.e(TAG, "Scraper ${scraper.name} failed in streaming: ${e.message}")
+                 }
+@@ -753,9 +875,10 @@ class PluginManager @Inject constructor(
+         tmdbId: String,
+         mediaType: String,
+         season: Int?,
+-        episode: Int?
++        episode: Int?,
++        content: StreamContentContext? = null
+     ): List<LocalScraperResult> {
+-        val cacheKey = "${scraper.id}:$tmdbId:$mediaType:$season:$episode"
++        val cacheKey = "${scraper.id}:$tmdbId:$mediaType:$season:$episode:${content?.title}:${content?.year}:${searchConfiguration.first()}"
+         
+         // Check if already in flight
+         val existing = inFlightScrapers[cacheKey]
+@@ -771,7 +894,7 @@ class PluginManager @Inject constructor(
+         return coroutineScope {
+             val deferred = async {
+                 scraperSemaphore.withPermit {
+-                    executeScraper(scraper, tmdbId, mediaType, season, episode)
++                    executeScraper(scraper, tmdbId, mediaType, season, episode, content)
+                 }
+             }
+             
+@@ -796,10 +919,11 @@ class PluginManager @Inject constructor(
+         tmdbId: String,
+         mediaType: String,
+         season: Int?,
+-        episode: Int?
++        episode: Int?,
++        content: StreamContentContext? = null
+     ): List<LocalScraperResult> {
+         return when (scraper.type) {
+-            RepositoryType.EXTERNAL_DEX -> executeExternalDexScraper(scraper, tmdbId, mediaType, season, episode)
++            RepositoryType.EXTERNAL_DEX -> executeExternalDexScraper(scraper, tmdbId, mediaType, season, episode, content)
+             RepositoryType.NUVIO_JS -> executeJsScraper(scraper, tmdbId, mediaType, season, episode)
+         }
+     }
+@@ -870,7 +994,8 @@ class PluginManager @Inject constructor(
+         tmdbId: String,
+         mediaType: String,
+         season: Int?,
+-        episode: Int?
++        episode: Int?,
++        content: StreamContentContext? = null
+     ): List<LocalScraperResult> {
+         return try {
+             Log.d(TAG, "Executing DEX scraper: ${scraper.name}")
+@@ -879,7 +1004,7 @@ class PluginManager @Inject constructor(
+                 // Wrap on the low-priority pool for the same reason as the JS
+                 // path: keep their CPU footprint out of ExoPlayer's way.
+                 withContext(pluginDispatcher) {
+-                    externalExtensionRunner.execute(scraper.id, tmdbId, mediaType, season, episode)
++                    externalExtensionRunner.execute(scraper.id, tmdbId, mediaType, season, episode, content)
+                 }
+             }
+             if (results == null) {
+@@ -897,6 +1022,15 @@ class PluginManager @Inject constructor(
+     /**
+      * Test a scraper with sample data, returning results along with diagnostic steps.
+      */
++    suspend fun hasExtensionSettings(scraperId: String): Boolean = withContext(Dispatchers.IO) {
++        registerInstalledExtensions()
++        externalExtensionLoader.settingsCallback(scraperId) != null
++    }
++
++    fun openExtensionSettings(activity: android.app.Activity, scraperId: String) {
++        com.nuvio.tv.core.plugin.cloudstream.ExtensionSettingsActivity.open(activity, scraperId)
++    }
++
+     suspend fun testScraper(scraperId: String): Result<Pair<List<LocalScraperResult>, TestDiagnostics>> {
+         val diagnostics = TestDiagnostics()
+         val scraper = dataStore.scrapers.first().find { it.id == scraperId }
+@@ -907,20 +1041,13 @@ class PluginManager @Inject constructor(
+ 
+         diagnostics.addStep("Scraper: ${scraper.name} (type=${scraper.type})")
+ 
+-        // Use a popular movie for testing (The Matrix - 603)
+-        val testTmdbId = "603"
+-        val testMediaType = if (scraper.supportsType("movie")) "movie" else "series"
+-        diagnostics.addStep("Test: TMDB $testTmdbId ($testMediaType)")
+-
+-        // Preload extractors from ALL .cs3 files in the same repo(s)
+-        if (scraper.type == RepositoryType.EXTERNAL_DEX) {
+-            val allDexIds = dataStore.scrapers.first()
+-                .filter { it.type == RepositoryType.EXTERNAL_DEX }
+-                .map { it.id }
+-            withContext(Dispatchers.IO) {
+-                externalExtensionLoader.ensureExtractorsLoaded(allDexIds, diagnostics)
+-            }
+-        }
++        val movie = scraper.supportsType("movie")
++        val testTmdbId = if (movie) "603" else "1396"
++        val testMediaType = if (movie) "movie" else "series"
++        val testContent = if (movie) StreamContentContext(testTmdbId, "The Matrix", 1999)
++            else StreamContentContext(testTmdbId, "Breaking Bad", 2008)
++        diagnostics.addStep("Test: ${testContent.title} (TMDB $testTmdbId, $testMediaType)")
++        preloadDexExtractors(listOf(scraper))
+ 
+         val testSeason = if (testMediaType == "movie") null else 1
+         val testEpisode = if (testMediaType == "movie") null else 1
+@@ -929,7 +1056,7 @@ class PluginManager @Inject constructor(
+             val results = when (scraper.type) {
+                 RepositoryType.EXTERNAL_DEX -> {
+                     externalExtensionRunner.executeWithDiagnostics(
+-                        scraper.id, testTmdbId, testMediaType, testSeason, testEpisode, diagnostics
++                        scraper.id, testTmdbId, testMediaType, testSeason, testEpisode, diagnostics, testContent
+                     )
+                 }
+                 RepositoryType.NUVIO_JS -> {
+@@ -1070,15 +1197,13 @@ class PluginManager @Inject constructor(
+     /**
+      * Download .cs3 DEX extensions in parallel and register them as scrapers.
+      * Uses a semaphore to limit concurrent downloads and avoid overwhelming
+-     * the network. Scrapers are saved incrementally in batches.
++     * the network. Results retain the order from the repository list.
+      */
+     private suspend fun downloadDexExtensions(
+         repoId: String,
+         plugins: List<ExternalPluginEntry>
+-    ) = withContext(Dispatchers.IO) {
+-        val existingScrapers = dataStore.scrapers.first().toMutableList()
++    ): List<ScraperInfo> = withContext(Dispatchers.IO) {
+         val downloadSemaphore = Semaphore(MAX_PARALLEL_DOWNLOADS)
+-        val newScrapers = java.util.Collections.synchronizedList(mutableListOf<ScraperInfo>())
+ 
+         // Download all extensions in parallel with limited concurrency
+         val jobs = plugins.map { plugin ->
+@@ -1087,27 +1212,20 @@ class PluginManager @Inject constructor(
+                     try {
+                         val scraperId = "$repoId:${plugin.internalName}"
+ 
+-                        val file = externalExtensionLoader.downloadExtension(scraperId, plugin.url)
++                        val file = externalExtensionLoader.downloadExtension(scraperId, plugin.url, plugin.fileHash)
+                         if (file == null) {
+                             Log.e(TAG, "Failed to download extension: ${plugin.name}")
+-                            return@withPermit
++                            return@withPermit null
+                         }
+ 
+-                        val supportedTypes = plugin.tvTypes
+-                            ?.mapNotNull { tvTypeFromString(it) }
+-                            ?.map { it.toNuvioType() }
+-                            ?.distinct()
+-                            ?.ifEmpty { listOf("movie", "tv") }
+-                            ?: listOf("movie", "tv")
+-
+-                        val scraper = ScraperInfo(
++                        ScraperInfo(
+                             id = scraperId,
+                             repositoryId = repoId,
+                             name = plugin.name,
+                             description = plugin.description ?: "",
+                             version = plugin.version.toString(),
+                             filename = plugin.url,
+-                            supportedTypes = supportedTypes,
++                            supportedTypes = cloudStreamContentTypes(plugin.tvTypes),
+                             enabled = true,
+                             manifestEnabled = plugin.status == 1,
+                             logo = plugin.iconUrl,
+@@ -1115,25 +1233,17 @@ class PluginManager @Inject constructor(
+                             formats = null,
+                             type = RepositoryType.EXTERNAL_DEX
+                         )
+-
+-                        newScrapers.add(scraper)
+-                        Log.d(TAG, "Downloaded DEX extension: ${plugin.name} (${file.length()} bytes)")
++                    } catch (e: CancellationException) {
++                        throw e
+                     } catch (e: Exception) {
+                         Log.e(TAG, "Error downloading extension ${plugin.name}: ${e.message}", e)
++                        null
+                     }
+                 }
+             }
+         }
+ 
+-        jobs.awaitAll()
+-
+-        // Merge new scrapers into existing list
+-        val newScraperIds = newScrapers.map { it.id }.toSet()
+-        existingScrapers.removeAll { it.id in newScraperIds }
+-        existingScrapers.addAll(newScrapers)
+-        dataStore.saveScrapers(existingScrapers)
+-
+-        Log.d(TAG, "Downloaded ${newScrapers.size}/${plugins.size} extensions for repo $repoId")
++        jobs.awaitAll().filterNotNull()
+     }
+ 
+     companion object {
+diff --git a/app/src/full/java/com/nuvio/tv/core/plugin/cloudstream/ExtensionPackage.kt b/app/src/full/java/com/nuvio/tv/core/plugin/cloudstream/ExtensionPackage.kt
+new file mode 100644
+index 000000000..81f3de396
+--- /dev/null
++++ b/app/src/full/java/com/nuvio/tv/core/plugin/cloudstream/ExtensionPackage.kt
+@@ -0,0 +1,62 @@
++package com.nuvio.tv.core.plugin.cloudstream
++
++import java.io.DataInputStream
++import java.io.File
++import java.io.IOException
++import java.io.InputStream
++import java.security.MessageDigest
++import java.util.zip.ZipFile
++import okhttp3.ResponseBody
++
++private const val MAX_DEX_SIZE = 10L * 1024 * 1024
++
++/** Build a replacement alongside the installed extension so a failed refresh leaves it usable. */
++internal fun stageExtension(directory: File, body: ResponseBody, fileHash: String?): File {
++    require(body.contentLength() <= MAX_DEX_SIZE) { "Extension exceeds size limit" }
++    val temp = File.createTempFile("download-", ".cs3", directory)
++    try {
++        val digest = MessageDigest.getInstance("SHA-256")
++        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
++        var count = 0L
++        body.byteStream().use { input ->
++            temp.outputStream().use { output ->
++                while (true) {
++                    val size = input.read(buffer)
++                    if (size < 0) break
++                    count += size
++                    require(count <= MAX_DEX_SIZE) { "Extension exceeds size limit" }
++                    output.write(buffer, 0, size)
++                    digest.update(buffer, 0, size)
++                }
++            }
++        }
++        if (body.contentLength() >= 0 && count != body.contentLength()) throw IOException("Incomplete download")
++        if (!fileHash.isNullOrBlank()) {
++            val hex = digest.digest().joinToString("") { "%02x".format(it) }
++            require(fileHash.trim().equals("sha256-$hex", ignoreCase = true)) { "Invalid extension checksum" }
++        }
++        // Older repositories also distribute raw DEX. Standard .cs3 archives contain classes.dex.
++        if (!temp.inputStream().use(::hasDexHeader)) {
++            ZipFile(temp).use { archive ->
++                val dex = requireNotNull(archive.getEntry("classes.dex")) { "Missing classes.dex" }
++                require(archive.getInputStream(dex).use(::hasDexHeader)) { "Invalid classes.dex" }
++            }
++        }
++        return temp
++    } catch (failure: Throwable) {
++        temp.delete()
++        throw failure
++    }
++}
++
++private fun hasDexHeader(input: InputStream): Boolean {
++    val header = ByteArray(8)
++    try {
++        DataInputStream(input).readFully(header)
++    } catch (_: java.io.EOFException) {
++        return false
++    }
++    return header[0] == 'd'.code.toByte() && header[1] == 'e'.code.toByte() &&
++        header[2] == 'x'.code.toByte() && header[3] == '\n'.code.toByte() &&
++        (4..6).all { header[it].toInt() in '0'.code..'9'.code } && header[7] == 0.toByte()
++}
+diff --git a/app/src/full/java/com/nuvio/tv/core/plugin/cloudstream/ExtensionSettingsActivity.kt b/app/src/full/java/com/nuvio/tv/core/plugin/cloudstream/ExtensionSettingsActivity.kt
+new file mode 100644
+index 000000000..f23431f77
+--- /dev/null
++++ b/app/src/full/java/com/nuvio/tv/core/plugin/cloudstream/ExtensionSettingsActivity.kt
+@@ -0,0 +1,112 @@
++package com.nuvio.tv.core.plugin.cloudstream
++
++import android.app.Activity
++import android.content.Context
++import android.content.Intent
++import android.os.Bundle
++import android.util.Log
++import android.widget.Toast
++import androidx.appcompat.app.AppCompatActivity
++import androidx.fragment.app.Fragment
++import androidx.fragment.app.FragmentManager
++import androidx.lifecycle.lifecycleScope
++import com.lagradost.cloudstream3.AcraApplication
++import com.lagradost.cloudstream3.CommonActivity
++import com.nuvio.tv.R
++import dagger.hilt.android.AndroidEntryPoint
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import javax.inject.Inject
++
++/** Hosts the extension's native UI above the TV provider list, following Nuvio Echo's AppCompat approach. */
++@AndroidEntryPoint
++class ExtensionSettingsActivity : AppCompatActivity() {
++    @Inject lateinit var loader: ExternalExtensionLoader
++
++    private var previousCommon: Activity? = null
++    private var previousAcra: Activity? = null
++    private var pending: ((Context) -> Unit)? = null
++    private var callbackStarted = false
++    private var dialogTookFocus = false
++
++    private val fragments = object : FragmentManager.FragmentLifecycleCallbacks() {
++        override fun onFragmentDestroyed(fm: FragmentManager, f: Fragment) {
++            window.decorView.post {
++                if (!isDestroyed && !isFinishing && !isChangingConfigurations &&
++                    fm.fragments.none { !it.isRemoving }) finish()
++            }
++        }
++    }
++
++    override fun onCreate(savedInstanceState: Bundle?) {
++        // Plugin fragments may require constructor arguments and a DEX class loader. On recreation
++        // reopen via the plugin rather than asking Android to instantiate its old fragment by name.
++        super.onCreate(null)
++        val id = intent.getStringExtra(EXTRA_ID)
++        if (id == null) { finish(); return }
++        supportFragmentManager.registerFragmentLifecycleCallbacks(fragments, false)
++        lifecycleScope.launch {
++            try {
++                pending = withContext(Dispatchers.IO) { checkNotNull(loader.settingsCallback(id)) }
++                if (hasWindowFocus()) showPendingSettings()
++            } catch (e: CancellationException) {
++                throw e
++            } catch (e: Throwable) {
++                failed(e)
++            }
++        }
++    }
++
++    private fun showPendingSettings() {
++        val callback = pending ?: return
++        pending = null
++        previousCommon = CommonActivity.activity
++        previousAcra = AcraApplication.getActivity()
++        CommonActivity.activity = this
++        AcraApplication.setActivity(this)
++        callbackStarted = true
++        try {
++            callback(this)
++            supportFragmentManager.executePendingTransactions()
++        } catch (e: Throwable) {
++            failed(e)
++        }
++    }
++
++    private fun failed(e: Throwable) {
++        if (e is VirtualMachineError || e is ThreadDeath) throw e
++        if (e is LinkageError) {
++            Log.w("ExtensionSettings", "Settings callback linkage failure", e)
++        } else {
++            Log.w("ExtensionSettings", "Settings callback failed: ${e.javaClass.simpleName}")
++        }
++        Toast.makeText(this, R.string.plugin_extension_settings_failed, Toast.LENGTH_SHORT).show()
++        finish()
++    }
++
++    // A plain AlertDialog has no fragment lifecycle. Close the host when that window gives focus back.
++    override fun onWindowFocusChanged(hasFocus: Boolean) {
++        super.onWindowFocusChanged(hasFocus)
++        if (hasFocus && pending != null) { showPendingSettings(); return }
++        if (!callbackStarted) return
++        if (!hasFocus) dialogTookFocus = true
++        else if (dialogTookFocus && supportFragmentManager.fragments.isEmpty()) finish()
++    }
++
++    override fun onDestroy() {
++        supportFragmentManager.unregisterFragmentLifecycleCallbacks(fragments)
++        if (CommonActivity.activity === this) CommonActivity.activity = previousCommon?.takeUnless { it.isDestroyed }
++        if (AcraApplication.getActivity() === this) AcraApplication.setActivity(previousAcra?.takeUnless { it.isDestroyed })
++        super.onDestroy()
++    }
++
++    companion object {
++        private const val EXTRA_ID = "scraper_id"
++
++        fun open(activity: Activity, scraperId: String) {
++            activity.startActivity(Intent(activity, ExtensionSettingsActivity::class.java).putExtra(EXTRA_ID, scraperId))
++        }
++    }
++}
+diff --git a/app/src/full/java/com/nuvio/tv/core/plugin/cloudstream/ExternalExtensionLoader.kt b/app/src/full/java/com/nuvio/tv/core/plugin/cloudstream/ExternalExtensionLoader.kt
+index 033a7c569..e223ed931 100644
+--- a/app/src/full/java/com/nuvio/tv/core/plugin/cloudstream/ExternalExtensionLoader.kt
++++ b/app/src/full/java/com/nuvio/tv/core/plugin/cloudstream/ExternalExtensionLoader.kt
+@@ -3,94 +3,55 @@ package com.nuvio.tv.core.plugin.cloudstream
+ import android.content.Context
+ import android.os.Build
+ import android.util.Log
+-import com.lagradost.cloudstream3.AcraApplication
+ import com.lagradost.cloudstream3.APIHolder
++import com.lagradost.cloudstream3.AcraApplication
+ import com.lagradost.cloudstream3.MainAPI
+ import com.lagradost.cloudstream3.plugins.BasePlugin
+-import com.lagradost.cloudstream3.plugins.Plugin
+ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
++import com.lagradost.cloudstream3.plugins.Plugin
+ import com.lagradost.cloudstream3.utils.ExtractorApi
+ import com.lagradost.cloudstream3.utils.extractorApis
++import com.nuvio.tv.core.network.IPv4FirstDns
+ import com.nuvio.tv.core.plugin.TestDiagnostics
+-import dalvik.system.DexClassLoader
+ import dagger.hilt.android.qualifiers.ApplicationContext
+-import kotlinx.coroutines.Dispatchers
+-import kotlinx.coroutines.withContext
+-import com.nuvio.tv.core.network.IPv4FirstDns
+-import okhttp3.OkHttpClient
+-import okhttp3.Request
+-import org.json.JSONObject
++import dalvik.system.DexClassLoader
+ import java.io.File
+-import java.util.concurrent.ConcurrentHashMap
+ import java.util.concurrent.TimeUnit
+ import java.util.zip.ZipFile
+ import javax.inject.Inject
+ import javax.inject.Singleton
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import org.json.JSONObject
+ 
+ private const val TAG = "ExtExtensionLoader"
+ 
+-/**
+- * Checks whether an instance looks like a CloudStream plugin by checking if it has
+- * plugin-like methods. Covers three cases:
+- * 1. Our Plugin class: load(Activity?), load(Context), getRegisteredMainAPIs()
+- * 2. Library's BasePlugin: load() (no-arg), registerMainAPI()
+- * 3. Foreign plugins with similar signatures
+- */
+-private fun looksLikePlugin(instance: Any): Boolean {
+-    // Fast path: check if it's an instance of the library's BasePlugin
+-    if (instance is BasePlugin) return true
+-
+-    val clazz = instance.javaClass
+-    // Check for any form of load() method
+-    val hasLoad = try {
+-        clazz.getMethod("load", Context::class.java) != null
+-    } catch (_: NoSuchMethodException) {
+-        try {
+-            clazz.getMethod("load", android.app.Activity::class.java) != null
+-        } catch (_: NoSuchMethodException) {
+-            try {
+-                // BasePlugin-style no-arg load()
+-                clazz.getMethod("load") != null
+-            } catch (_: NoSuchMethodException) {
+-                false
+-            }
+-        }
++/** Legacy entry points occasionally expose the registration API without extending BasePlugin. */
++private fun looksLikePlugin(instance: Any): Boolean = instance.javaClass.methods.any { method ->
++    when (method.name) {
++        "getRegisteredMainAPIs" -> method.parameterCount == 0
++        "load" -> method.parameterCount == 0 || method.parameterTypes.toList() in listOf(
++            listOf(Context::class.java), listOf(android.app.Activity::class.java)
++        )
++        else -> false
+     }
+-    val hasRegisteredAPIs = try {
+-        clazz.getMethod("getRegisteredMainAPIs") != null
+-    } catch (_: NoSuchMethodException) {
+-        false
+-    }
+-    return hasLoad || hasRegisteredAPIs
+ }
+ 
+-/**
+- * Wraps a plugin instance loaded from a foreign classloader or with a non-standard base class.
+- * Handles three plugin patterns:
+- * 1. Our Plugin: load(Activity?), load(Context), getRegisteredMainAPIs()
+- * 2. Library's BasePlugin: load() no-arg, registers to APIHolder.allProviders + extractorApis
+- * 3. Foreign plugins with similar signatures
+- */
+ private class ReflectivePluginWrapper(private val foreignInstance: Any) : Plugin() {
+     override fun load(activity: android.app.Activity?) {
+         load(activity as? Context ?: AcraApplication.context ?: return)
+     }
+ 
+     override fun load(context: Context) {
+-        // Snapshot global registries before load() to detect what this plugin adds
+-        val providersBefore = synchronized(APIHolder.allProviders) {
+-            APIHolder.allProviders.toList()
+-        }
+-        val extractorsBefore = extractorApis.toList()
+-
+         val clazz = foreignInstance.javaClass
+-        var loaded = false
+ 
+         // Try load(Context) first
+         try {
+             val m = clazz.getMethod("load", Context::class.java)
+             m.invoke(foreignInstance, context)
+-            loaded = true
+         } catch (e: java.lang.reflect.InvocationTargetException) {
+             val cause = e.cause
+             if (cause is ClassCastException) {
+@@ -98,7 +59,6 @@ private class ReflectivePluginWrapper(private val foreignInstance: Any) : Plugin
+                 try {
+                     val m = clazz.getMethod("load", android.app.Activity::class.java)
+                     m.invoke(foreignInstance, null)
+-                    loaded = true
+                 } catch (e2: Exception) {
+                     Log.w(TAG, "ReflectivePluginWrapper: load(Activity) also failed: ${e2.message}")
+                 }
+@@ -110,13 +70,11 @@ private class ReflectivePluginWrapper(private val foreignInstance: Any) : Plugin
+             try {
+                 val m = clazz.getMethod("load", android.app.Activity::class.java)
+                 m.invoke(foreignInstance, null)
+-                loaded = true
+             } catch (_: NoSuchMethodException) {
+                 // Try no-arg load() (BasePlugin pattern)
+                 try {
+                     val m = clazz.getMethod("load")
+                     m.invoke(foreignInstance)
+-                    loaded = true
+                     Log.d(TAG, "ReflectivePluginWrapper: loaded via no-arg load()")
+                 } catch (e: Exception) {
+                     Log.w(TAG, "ReflectivePluginWrapper: load() (no-arg) failed: ${e.message}")
+@@ -128,42 +86,16 @@ private class ReflectivePluginWrapper(private val foreignInstance: Any) : Plugin
+             Log.w(TAG, "ReflectivePluginWrapper: load() failed: ${e.message}")
+         }
+ 
+-        // First try reading local registration lists (our Plugin pattern)
+-        try {
+-            val getter = clazz.getMethod("getRegisteredMainAPIs")
+-            @Suppress("UNCHECKED_CAST")
+-            val apis = getter.invoke(foreignInstance) as? List<MainAPI> ?: emptyList()
+-            apis.forEach { registerMainAPI(it) }
+-        } catch (_: Exception) {
+-            // No local list — check global APIHolder for newly registered providers
+-            // (BasePlugin.registerMainAPI adds to APIHolder.allProviders)
+-            val newProviders = synchronized(APIHolder.allProviders) {
+-                APIHolder.allProviders.toList()
+-            } - providersBefore.toSet()
+-            if (newProviders.isNotEmpty()) {
+-                Log.d(TAG, "ReflectivePluginWrapper: found ${newProviders.size} providers via APIHolder")
+-                newProviders.forEach { registerMainAPI(it) }
+-            }
+-        }
+-
+-        try {
+-            val getter = clazz.getMethod("getRegisteredExtractorAPIs")
+-            @Suppress("UNCHECKED_CAST")
+-            val extractors = getter.invoke(foreignInstance) as? List<ExtractorApi> ?: emptyList()
+-            extractors.forEach { registerExtractorAPI(it) }
+-        } catch (_: Exception) {
+-            // Check global extractorApis for newly registered extractors
+-            val newExtractors = extractorApis.toList() - extractorsBefore.toSet()
+-            if (newExtractors.isNotEmpty()) {
+-                Log.d(TAG, "ReflectivePluginWrapper: found ${newExtractors.size} extractors via extractorApis")
+-                newExtractors.forEach { registerExtractorAPI(it) }
+-            }
+-        }
++        // Non-standard plugins may only expose local registration lists.
++        val apis = clazz.methods.find { it.name == "getRegisteredMainAPIs" && it.parameterCount == 0 }
++            ?.invoke(foreignInstance) as? List<*>
++        apis.orEmpty().filterIsInstance<MainAPI>().filterNot { it in APIHolder.allProviders }.forEach(::registerMainAPI)
++        val extractors = clazz.methods.find { it.name == "getRegisteredExtractorAPIs" && it.parameterCount == 0 }
++            ?.invoke(foreignInstance) as? List<*>
++        extractors.orEmpty().filterIsInstance<ExtractorApi>().filterNot { it in extractorApis }.forEach(::registerExtractorAPI)
+     }
+ }
+ 
+-private const val MAX_DEX_SIZE = 10 * 1024 * 1024L // 10MB max per .cs3 file
+-
+ /**
+  * Manages downloading, loading, and caching of DEX-based external extensions (.cs3 files).
+  */
+@@ -179,14 +111,14 @@ class ExternalExtensionLoader @Inject constructor(
+         .followRedirects(true)
+         .build()
+ 
+-    /** Cache of loaded MainAPI instances by scraper ID */
+-    private val apiCache = ConcurrentHashMap<String, MainAPI>()
+-
+-    /** Cache of loaded class loaders by scraper ID */
+-    private val classLoaderCache = ConcurrentHashMap<String, DexClassLoader>()
++    private data class LoadedExtension(
++        val plugin: BasePlugin?,
++        val providers: List<MainAPI>,
++        val extractors: List<ExtractorApi>
++    )
+ 
+-    /** Tracks which scraper IDs have already been scanned for extractors */
+-    private val extractorPreloadedIds = java.util.Collections.synchronizedSet(mutableSetOf<String>())
++    private val loaded = mutableMapOf<String, LoadedExtension>()
++    private val preloaded = mutableSetOf<String>()
+ 
+     private val extensionsDir: File
+         get() = File(context.filesDir, "cs_extensions").also { it.mkdirs() }
+@@ -194,6 +126,8 @@ class ExternalExtensionLoader @Inject constructor(
+     private val codeCacheDir: File
+         get() = File(context.codeCacheDir, "cs_dex_cache").also { it.mkdirs() }
+ 
++    fun extensionFile(scraperId: String): File = File(extensionsDir, "${safeFileName(scraperId)}.cs3")
++
+     /** Sanitize scraper ID for use as a filename (colons are not safe on all filesystems). */
+     private fun safeFileName(scraperId: String): String =
+         scraperId.replace(':', '_').replace('/', '_')
+@@ -202,17 +136,10 @@ class ExternalExtensionLoader @Inject constructor(
+      * Download a .cs3 DEX file for the given scraper.
+      * Returns the local file path, or null on failure.
+      */
+-    suspend fun downloadExtension(scraperId: String, downloadUrl: String): File? = withContext(Dispatchers.IO) {
++    suspend fun downloadExtension(scraperId: String, downloadUrl: String, fileHash: String? = null): File? = withContext(Dispatchers.IO) {
+         com.nuvio.tv.core.runtime.PluginRuntimeHooks.ensureCloudstreamInitialized()
+         try {
+-            val targetFile = File(extensionsDir, "${safeFileName(scraperId)}.cs3")
+-
+-            // Remove existing read-only file before writing (DEX files are set
+-            // read-only for API 28+ compat, so overwriting would fail with EACCES)
+-            if (targetFile.exists()) {
+-                targetFile.setWritable(true)
+-                targetFile.delete()
+-            }
++            val targetFile = extensionFile(scraperId)
+ 
+             val request = Request.Builder()
+                 .url(downloadUrl)
+@@ -225,445 +152,153 @@ class ExternalExtensionLoader @Inject constructor(
+                     return@withContext null
+                 }
+ 
+-                val contentLength = response.header("Content-Length")?.toLongOrNull() ?: 0
+-                if (contentLength > MAX_DEX_SIZE) {
+-                    Log.w(TAG, "Extension $scraperId too large: $contentLength bytes")
+-                    return@withContext null
+-                }
+-
+-                val bytes = response.body?.bytes() ?: return@withContext null
+-                if (bytes.size > MAX_DEX_SIZE) {
+-                    Log.w(TAG, "Extension $scraperId too large: ${bytes.size} bytes")
+-                    return@withContext null
+-                }
+-
+-                targetFile.writeBytes(bytes)
+-
+-                // Fix for Android API 28+: DEX files must be read-only
+-                // Writing writable DEX files is blocked on newer Android versions
+-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+-                    targetFile.setReadOnly()
+-                    Log.d(TAG, "Set DEX file read-only for API ${Build.VERSION.SDK_INT}")
++                val body = response.body ?: return@withContext null
++                val staged = stageExtension(targetFile.parentFile!!, body, fileHash)
++                try {
++                    synchronized(this@ExternalExtensionLoader) {
++                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
++                            check(staged.setReadOnly()) { "Could not mark extension read-only" }
++                        }
++                        // Same directory and filesystem. POSIX rename replaces the old package atomically.
++                        android.system.Os.rename(staged.absolutePath, targetFile.absolutePath)
++                        evictCache(scraperId)
++                    }
++                } finally {
++                    staged.delete()
+                 }
+-
+-                Log.d(TAG, "Downloaded extension $scraperId: ${bytes.size} bytes -> ${targetFile.absolutePath}")
+                 targetFile
+             }
++        } catch (e: CancellationException) {
++            throw e
+         } catch (e: Exception) {
+             Log.e(TAG, "Error downloading extension $scraperId: ${e.message}", e)
+             null
+         }
+     }
+ 
+-    /**
+-     * Load a .cs3 DEX file and return the MainAPI instance(s) registered by the plugin.
+-     */
+-    fun loadExtension(scraperId: String): List<MainAPI> {
+-        // Check cache first
+-        apiCache[scraperId]?.let { return listOf(it) }
++    @Synchronized
++    fun loadExtension(scraperId: String, diagnostics: TestDiagnostics? = null): List<MainAPI> {
++        loaded[scraperId]?.providers?.let {
++            diagnostics?.addStep("Cached providers: ${it.joinToString { api -> api.name }}")
++            return it
++        }
+         com.nuvio.tv.core.runtime.PluginRuntimeHooks.ensureCloudstreamInitialized()
+-
+-        val dexFile = File(extensionsDir, "${safeFileName(scraperId)}.cs3")
+-        if (!dexFile.exists()) {
+-            Log.e(TAG, "DEX file not found for $scraperId: ${dexFile.absolutePath}")
++        val file = extensionFile(scraperId)
++        if (!file.isFile) {
++            diagnostics?.addStep("Missing extension: ${file.name}")
+             return emptyList()
+         }
+ 
+-        // Ensure DEX file is read-only (fix for existing downloads on API 28+)
+-        ensureDexReadOnly(dexFile)
+-
+-        return try {
+-            val classLoader = DexClassLoader(
+-                dexFile.absolutePath,
+-                codeCacheDir.absolutePath,
+-                null,
+-                context.classLoader
+-            )
+-            classLoaderCache[scraperId] = classLoader
+-
+-            // Check for critical class shadowing
+-            try {
+-                @Suppress("DEPRECATION")
+-                val inspectDex = dalvik.system.DexFile(dexFile)
+-                val allEntries = inspectDex.entries().toList()
+-                inspectDex.close()
+-                val criticalShadows = allEntries.filter { className ->
+-                    className == "com.lagradost.cloudstream3.MainActivityKt" ||
+-                    className == "com.lagradost.cloudstream3.MainAPIKt" ||
+-                    className == "com.lagradost.cloudstream3.utils.ExtractorApiKt" ||
+-                    className == "com.lagradost.cloudstream3.utils.AppUtilsKt"
+-                }
+-                if (criticalShadows.isNotEmpty()) {
+-                    Log.w(TAG, "Extension $scraperId shadows critical classes: $criticalShadows")
+-                }
+-            } catch (_: Exception) {}
+-
+-            // Find and instantiate the plugin class
+-            val plugin = findAndLoadPlugin(classLoader, dexFile)
+-            if (plugin == null) {
+-                Log.e(TAG, "No @CloudstreamPlugin class found in $scraperId")
+-                return emptyList()
+-            }
+-
+-            // Ensure global stubs are initialized for extensions
++        try {
++            ensureDexReadOnly(file)
++            val loader = DexClassLoader(file.path, codeCacheDir.path, null, context.classLoader)
+             AcraApplication.context = context
+             extractorRegistry.installGlobal()
+-
+-            // Call load() to trigger registerMainAPI() calls.
+-            // Dispatch on Context so plugins that override load(Context) — upstream's
+-            // primary overload — get their impl invoked. Plugins that only override
+-            // load(Activity?) or no-arg load() still work: stub's load(Context) casts
+-            // the arg to Activity? and chains through.
+-            val activity = AcraApplication.getActivity()
+-            try {
+-                plugin.load((activity as Context?) ?: context)
+-            } catch (e: Exception) {
+-                Log.w(TAG, "plugin.load() threw (partial load, ${plugin.registeredMainAPIs.size} APIs so far): ${e.message}", e)
+-            } catch (e: Error) {
+-                val missingClass = extractMissingClassName(e)
+-                if (missingClass != null) {
+-                    Log.w(TAG, "plugin.load() MISSING CLASS: $missingClass (${plugin.registeredMainAPIs.size} APIs so far)", e)
+-                } else {
+-                    Log.w(TAG, "plugin.load() linkage error (partial load, ${plugin.registeredMainAPIs.size} APIs so far): ${e.message}", e)
+-                }
+-            }
+-
+-            // Register any extractors the plugin provides
+-            extractorRegistry.registerAll(plugin.registeredExtractorAPIs)
+-
+-            var apis = plugin.registeredMainAPIs
+-            Log.d(TAG, "After load(): ${apis.size} MainAPIs, ${plugin.registeredExtractorAPIs.size} extractors")
+-
+-            // FALLBACK: If load() registered 0 APIs or 0 extractors, scan DEX directly.
+-            if (apis.isEmpty() || plugin.registeredExtractorAPIs.isEmpty()) {
+-                Log.d(TAG, "Fallback: scanning DEX for MainAPI/ExtractorApi subclasses in $scraperId")
+-                val fallbackApis = mutableListOf<MainAPI>()
+-                val fallbackExtractors = mutableListOf<ExtractorApi>()
++            val providersBefore = synchronized(APIHolder.allProviders) { APIHolder.allProviders.toSet() }
++            val extractorsBefore = extractorApis.toSet()
++            val plugin = findAndLoadPlugin(loader, file)
++            if (plugin != null) {
+                 try {
+-                    @Suppress("DEPRECATION")
+-                    val inspectDex = dalvik.system.DexFile(dexFile)
+-                    val allClasses = inspectDex.entries().toList()
+-                    inspectDex.close()
+-
+-                    val candidates = allClasses.filter { className ->
+-                        !className.contains('$') &&
+-                        !className.contains("Plugin") &&
+-                        !className.contains("Fragment") &&
+-                        className.startsWith("com.")
+-                    }
+-
+-                    for (className in candidates) {
+-                        try {
+-                            val clazz = classLoader.loadClass(className)
+-                            if (apis.isEmpty()
+-                                && MainAPI::class.java.isAssignableFrom(clazz)
+-                                && !java.lang.reflect.Modifier.isAbstract(clazz.modifiers)
+-                                && !clazz.isInterface) {
+-                                val instance = clazz.getDeclaredConstructor().newInstance() as MainAPI
+-                                fallbackApis.add(instance)
+-                                Log.d(TAG, "Fallback found MainAPI: ${instance.name} ($className)")
+-                            } else if (ExtractorApi::class.java.isAssignableFrom(clazz)
+-                                && !java.lang.reflect.Modifier.isAbstract(clazz.modifiers)) {
+-                                val instance = clazz.getDeclaredConstructor().newInstance() as ExtractorApi
+-                                fallbackExtractors.add(instance)
+-                                Log.d(TAG, "Fallback found ExtractorApi: ${instance.name} (${instance.mainUrl})")
+-                            }
+-                        } catch (e: Error) {
+-                            val missing = extractMissingClassName(e)
+-                            if (missing != null) {
+-                                Log.w(TAG, "Fallback skip $className: MISSING $missing")
+-                            }
+-                        } catch (_: Exception) {
+-                            // Skip classes that can't be instantiated
+-                        }
+-                    }
++                    if (plugin is Plugin) plugin.load((AcraApplication.getActivity() as Context?) ?: context)
++                    else plugin.load()
+                 } catch (e: Exception) {
+-                    Log.w(TAG, "Fallback DEX scan failed: ${e.message}")
+-                }
+-
+-                if (fallbackApis.isNotEmpty()) {
+-                    Log.d(TAG, "Fallback found ${fallbackApis.size} MainAPIs")
+-                    apis = fallbackApis
+-                }
+-                if (fallbackExtractors.isNotEmpty()) {
+-                    Log.d(TAG, "Fallback found ${fallbackExtractors.size} ExtractorApis")
+-                    extractorRegistry.registerAll(fallbackExtractors)
++                    reportLoadFailure(scraperId, e, diagnostics)
++                } catch (e: LinkageError) {
++                    reportLoadFailure(scraperId, e, diagnostics)
++                } catch (e: NotImplementedError) {
++                    reportLoadFailure(scraperId, e, diagnostics)
+                 }
+             }
+-
+-            apis.forEach { api ->
+-                apiCache["$scraperId:${api.name}"] = api
++            val providers = synchronized(APIHolder.allProviders) {
++                APIHolder.allProviders.filterNot { it in providersBefore }.toMutableList()
+             }
+-
+-            // Also cache the first API under the plain scraper ID
+-            if (apis.isNotEmpty()) {
+-                apiCache[scraperId] = apis.first()
+-            }
+-
+-            Log.d(TAG, "Loaded extension $scraperId: ${apis.size} providers (${apis.joinToString { it.name }})")
+-            apis
+-        } catch (e: Exception) {
+-            Log.e(TAG, "Failed to load extension $scraperId: ${e.message}", e)
+-            emptyList()
+-        } catch (e: Error) {
+-            val missingClass = extractMissingClassName(e)
+-            if (missingClass != null) {
+-                Log.e(TAG, "Failed to load extension $scraperId: MISSING CLASS: $missingClass (${e.javaClass.simpleName})", e)
+-            } else {
+-                Log.e(TAG, "Failed to load extension $scraperId (linkage error): ${e.message}", e)
+-            }
+-            emptyList()
+-        }
+-    }
+-
+-    /**
+-     * Get a cached MainAPI for the given scraper ID, loading if necessary.
+-     */
+-    fun getApi(scraperId: String): MainAPI? {
+-        return apiCache[scraperId] ?: run {
+-            val apis = loadExtension(scraperId)
+-            apis.firstOrNull()
+-        }
+-    }
+-
+-    /**
+-     * Load extension with diagnostic output.
+-     */
+-    fun loadExtensionWithDiagnostics(scraperId: String, diagnostics: TestDiagnostics): List<MainAPI> {
+-        apiCache[scraperId]?.let {
+-            diagnostics.addStep("MainAPI cached: ${it.name}")
+-            return listOf(it)
+-        }
+-        com.nuvio.tv.core.runtime.PluginRuntimeHooks.ensureCloudstreamInitialized()
+-
+-        val dexFile = File(extensionsDir, "${safeFileName(scraperId)}.cs3")
+-        if (!dexFile.exists()) {
+-            diagnostics.addStep("DEX file NOT FOUND: ${dexFile.name}")
+-            return emptyList()
+-        }
+-        diagnostics.addStep("DEX: ${dexFile.length()} bytes")
+-
+-        // Ensure read-only
+-        ensureDexReadOnly(dexFile)
+-
+-        return try {
+-            val classLoader = DexClassLoader(
+-                dexFile.absolutePath,
+-                codeCacheDir.absolutePath,
+-                null,
+-                context.classLoader
+-            )
+-            classLoaderCache[scraperId] = classLoader
+-
+-            val allClasses: List<String>
+-            try {
++            val extractors = extractorApis.filterNot { it in extractorsBefore }.toMutableList()
++            val scanProviders = plugin != null && providers.isEmpty()
++            val scanExtractors = extractors.isEmpty()
++            if (scanProviders || scanExtractors) {
++                // Preserve ReSeq's fallback for old packages which omit registrations or an entry point.
+                 @Suppress("DEPRECATION")
+-                val inspectDex = dalvik.system.DexFile(dexFile)
+-                allClasses = inspectDex.entries().toList()
+-                inspectDex.close()
+-            } catch (e: Exception) {
+-                diagnostics.addStep("DEX inspection failed: ${e.message?.take(100)}")
+-                return emptyList()
+-            }
+-
+-            val shadowsPlugin = allClasses.any { it == "com.lagradost.cloudstream3.plugins.Plugin" }
+-            if (shadowsPlugin) {
+-                diagnostics.addStep("WARNING: DEX contains its own Plugin class!")
+-            }
+-
+-            val plugin = findAndLoadPlugin(classLoader, dexFile)
+-            if (plugin == null) {
+-                diagnostics.addStep("No @CloudstreamPlugin found in DEX")
+-                return emptyList()
+-            }
+-
+-            val sameClass = plugin.javaClass.superclass == Plugin::class.java
+-            diagnostics.addStep("Plugin: ${plugin.javaClass.simpleName}, sameBaseClass=$sameClass, isWrapper=${plugin is ReflectivePluginWrapper}")
+-
+-            AcraApplication.context = context
+-            extractorRegistry.installGlobal()
+-
+-            val activity = AcraApplication.getActivity()
+-            try {
+-                plugin.load((activity as Context?) ?: context)
+-                diagnostics.addStep("load(Context): OK, ${plugin.registeredMainAPIs.size} APIs")
+-            } catch (e: Exception) {
+-                diagnostics.addStep("load() FAILED: ${e.javaClass.simpleName}: ${e.message?.take(120)}")
+-            } catch (e: Error) {
+-                val missing = extractMissingClassName(e)
+-                diagnostics.addStep("load() ERROR: ${missing ?: e.message?.take(120)}")
+-            }
+-
+-            extractorRegistry.registerAll(plugin.registeredExtractorAPIs)
+-
+-            var apis = plugin.registeredMainAPIs
+-
+-            if (apis.isEmpty() || plugin.registeredExtractorAPIs.isEmpty()) {
+-                diagnostics.addStep("Fallback: scanning DEX for MainAPI + ExtractorApi subclasses...")
+-                val fallbackApis = mutableListOf<MainAPI>()
+-                val fallbackExtractors = mutableListOf<ExtractorApi>()
+-                val candidates = allClasses.filter { className ->
+-                    !className.contains('$') &&
+-                    !className.contains("Plugin") &&
+-                    !className.contains("Fragment") &&
+-                    className.startsWith("com.")
++                val classes = try {
++                    dexClassNames(file)
++                } catch (e: Exception) {
++                    reportLoadFailure(scraperId, e, diagnostics)
++                    emptyList()
+                 }
+-
+-                for (className in candidates) {
++                for (name in classes.filterNot { '$' in it }) {
+                     try {
+-                        val clazz = classLoader.loadClass(className)
+-                        if (apis.isEmpty()
+-                            && MainAPI::class.java.isAssignableFrom(clazz)
+-                            && !java.lang.reflect.Modifier.isAbstract(clazz.modifiers)
+-                            && !clazz.isInterface) {
+-                            val instance = clazz.getDeclaredConstructor().newInstance() as MainAPI
+-                            fallbackApis.add(instance)
+-                            diagnostics.addStep("Found API: ${instance.name} (${clazz.simpleName})")
+-                        } else if (ExtractorApi::class.java.isAssignableFrom(clazz)
+-                            && !java.lang.reflect.Modifier.isAbstract(clazz.modifiers)) {
+-                            val instance = clazz.getDeclaredConstructor().newInstance() as ExtractorApi
+-                            fallbackExtractors.add(instance)
+-                            diagnostics.addStep("Found Extractor: ${instance.name} (${instance.mainUrl})")
+-                        }
+-                    } catch (e: Error) {
+-                        val missing = extractMissingClassName(e)
+-                        if (missing != null) {
+-                            diagnostics.addStep("${className.substringAfterLast('.')}: MISSING $missing")
+-                        }
+-                    } catch (e: Exception) {
+-                        val cause = e.cause ?: e
+-                        if (cause is Error) {
+-                            val missing = extractMissingClassName(cause as Error)
+-                            if (missing != null) {
+-                                diagnostics.addStep("${className.substringAfterLast('.')}: MISSING $missing")
+-                            }
++                        val clazz = loader.loadClass(name)
++                        if (java.lang.reflect.Modifier.isAbstract(clazz.modifiers)) continue
++                        if (scanProviders && MainAPI::class.java.isAssignableFrom(clazz)) {
++                            providers += clazz.getDeclaredConstructor().newInstance() as MainAPI
++                        } else if (scanExtractors && ExtractorApi::class.java.isAssignableFrom(clazz)) {
++                            extractors += clazz.getDeclaredConstructor().newInstance() as ExtractorApi
+                         }
++                    } catch (_: ReflectiveOperationException) {
++                        // Fallback scanning can encounter unrelated classes without default constructors.
++                    } catch (_: LinkageError) {
++                        // An optional dependency of this candidate is unavailable.
+                     }
+                 }
+-
+-                if (fallbackApis.isNotEmpty()) {
+-                    diagnostics.addStep("Fallback found ${fallbackApis.size} APIs")
+-                    apis = fallbackApis
+-                }
+-                if (fallbackExtractors.isNotEmpty()) {
+-                    diagnostics.addStep("Fallback found ${fallbackExtractors.size} extractors")
+-                    extractorRegistry.registerAll(fallbackExtractors)
+-                }
+-            }
+-
+-            apis.forEach { api ->
+-                apiCache["$scraperId:${api.name}"] = api
+             }
+-            if (apis.isNotEmpty()) {
+-                apiCache[scraperId] = apis.first()
++            extractorRegistry.registerAll(extractors)
++            diagnostics?.addStep("Loaded ${providers.size} providers, ${extractors.size} extractors")
++            if (providers.isNotEmpty() || extractors.isNotEmpty() || (plugin as? Plugin)?.openSettings != null) {
++                loaded[scraperId] = LoadedExtension(plugin, providers.toList(), extractors)
+             }
+-
+-            apis
++            return providers
+         } catch (e: Exception) {
+-            diagnostics.addStep("FAILED: ${e.javaClass.simpleName}: ${e.message?.take(200)}")
+-            emptyList()
++            reportLoadFailure(scraperId, e, diagnostics)
+         } catch (e: Error) {
+-            val missing = extractMissingClassName(e)
+-            diagnostics.addStep("FAILED: ${missing ?: e.message?.take(200)}")
+-            emptyList()
++            if (e is VirtualMachineError || e is ThreadDeath) throw e
++            reportLoadFailure(scraperId, e, diagnostics)
+         }
++        return emptyList()
+     }
+ 
+-    /**
+-     * Eagerly load all ExtractorApi subclasses from the given .cs3 files.
+-     */
+-    fun ensureExtractorsLoaded(scraperIds: List<String>, diagnostics: TestDiagnostics? = null) {
+-        com.nuvio.tv.core.runtime.PluginRuntimeHooks.ensureCloudstreamInitialized()
+-        val idsToLoad = scraperIds.filter { it !in extractorPreloadedIds }
+-        if (idsToLoad.isEmpty()) {
+-            diagnostics?.addStep("Extractors: all ${scraperIds.size} already preloaded")
+-            return
+-        }
+-
+-        AcraApplication.context = context
+-        extractorRegistry.installGlobal()
+-
+-        var totalExtractors = 0
+-        var totalScanned = 0
+-
+-        for (scraperId in idsToLoad) {
+-            extractorPreloadedIds.add(scraperId)
+-
+-            val dexFile = File(extensionsDir, "${safeFileName(scraperId)}.cs3")
+-            if (!dexFile.exists()) continue
+-
+-            // Ensure read-only
+-            ensureDexReadOnly(dexFile)
+-
+-            totalScanned++
+-            try {
+-                val classLoader = classLoaderCache.getOrPut(scraperId) {
+-                    DexClassLoader(
+-                        dexFile.absolutePath,
+-                        codeCacheDir.absolutePath,
+-                        null,
+-                        context.classLoader
+-                    )
+-                }
+-
+-                val plugin = findAndLoadPlugin(classLoader, dexFile)
+-                if (plugin != null) {
+-                    val activity = AcraApplication.getActivity()
+-                    try {
+-                        plugin.load((activity as Context?) ?: context)
+-                    } catch (_: Exception) {
+-                    } catch (_: Error) {
+-                    }
+-                    if (plugin.registeredExtractorAPIs.isNotEmpty()) {
+-                        extractorRegistry.registerAll(plugin.registeredExtractorAPIs)
+-                        totalExtractors += plugin.registeredExtractorAPIs.size
+-                        continue
+-                    }
+-                }
++    /** Use the same plugin instance that registered the providers and attached its resources. */
++    @Synchronized
++    fun settingsCallback(scraperId: String): ((Context) -> Unit)? {
++        loadExtension(scraperId)
++        return (loaded[scraperId]?.plugin as? Plugin)?.openSettings
++    }
+ 
+-                @Suppress("DEPRECATION")
+-                val inspectDex = dalvik.system.DexFile(dexFile)
+-                val allClasses = inspectDex.entries().toList()
+-                inspectDex.close()
++    private fun reportLoadFailure(id: String, error: Throwable, diagnostics: TestDiagnostics?) {
++        Log.w(TAG, "Could not fully load extension $id", error)
++        diagnostics?.addStep("Load error: ${error.javaClass.simpleName}: ${error.message?.take(160)}")
++    }
+ 
+-                for (className in allClasses) {
+-                    if (className.contains('$')) continue
+-                    try {
+-                        val clazz = classLoader.loadClass(className)
+-                        if (ExtractorApi::class.java.isAssignableFrom(clazz)
+-                            && !java.lang.reflect.Modifier.isAbstract(clazz.modifiers)
+-                        ) {
+-                            val instance = clazz.getDeclaredConstructor().newInstance() as ExtractorApi
+-                            extractorRegistry.registerExtractor(instance)
+-                            totalExtractors++
+-                        }
+-                    } catch (_: Exception) {
+-                    } catch (_: Error) {
+-                    }
+-                }
+-            } catch (e: Exception) {
+-                Log.w(TAG, "ensureExtractorsLoaded: failed for $scraperId: ${e.message}")
+-            } catch (e: Error) {
+-                Log.w(TAG, "ensureExtractorsLoaded: linkage error for $scraperId: ${e.message}")
+-            }
++    fun ensureExtractorsLoaded(scraperIds: List<String>, diagnostics: TestDiagnostics? = null) {
++        // Broken packages should not be rescanned on every search. An actual provider request can retry.
++        // Release the registry lock between packages so visible rows can resolve their Settings button.
++        for (id in scraperIds) synchronized(this) {
++            if (preloaded.add(id)) loadExtension(id, diagnostics)
+         }
+-
+-        Log.d(TAG, "ensureExtractorsLoaded: scanned $totalScanned .cs3 files, registered $totalExtractors extractors")
+-        diagnostics?.addStep("Preloaded $totalExtractors extractors from $totalScanned .cs3 files")
+     }
+ 
++    @Synchronized
+     fun deleteExtension(scraperId: String) {
+-        apiCache.keys.filter { it.startsWith(scraperId) }.forEach { apiCache.remove(it) }
+-        classLoaderCache.remove(scraperId)
+-        extractorPreloadedIds.remove(scraperId)
+-        File(extensionsDir, "${safeFileName(scraperId)}.cs3").delete()
+-        Log.d(TAG, "Deleted extension $scraperId")
++        evictCache(scraperId)
++        extensionFile(scraperId).delete()
+     }
+ 
+-    fun evictCache(scraperId: String) {
+-        apiCache.keys.filter { it.startsWith(scraperId) }.forEach { apiCache.remove(it) }
+-        classLoaderCache.remove(scraperId)
+-        extractorPreloadedIds.remove(scraperId)
++    @Synchronized
++    private fun evictCache(scraperId: String) {
++        preloaded.remove(scraperId)
++        val extension = loaded.remove(scraperId) ?: return
++        try {
++            extension.plugin?.beforeUnload()
++        } catch (failure: Throwable) {
++            if (failure is VirtualMachineError || failure is ThreadDeath) throw failure
++            Log.w(TAG, "Extension unload hook failed", failure)
++        } finally {
++            synchronized(APIHolder.allProviders) {
++                extension.providers.forEach { api ->
++                    APIHolder.allProviders.remove(api)
++                    APIHolder.removePluginMapping(api)
++                }
++            }
++            extractorApis.removeAll(extension.extractors.toSet())
++        }
+     }
+ 
+     /**
+@@ -677,20 +312,30 @@ class ExternalExtensionLoader @Inject constructor(
+         }
+     }
+ 
+-    private fun extractMissingClassName(e: Error): String? {
+-        val msg = e.message ?: return null
+-        val match = Regex("""(?:L?)([\w/.]+)(?:;)?""").find(msg)
+-        return match?.groupValues?.get(1)?.replace('/', '.')
++    private fun findAndLoadPlugin(classLoader: DexClassLoader, cs3File: File): BasePlugin? {
++        val manifest = readManifest(cs3File)
++        val pluginClassName = manifest?.optString("pluginClassName")?.takeIf { it.isNotBlank() }
++        val plugin = instantiatePlugin(classLoader, cs3File, pluginClassName) ?: return null
++        plugin.filename = cs3File.absolutePath
++        if (plugin is Plugin && manifest?.optBoolean("requiresResources") == true) {
++            // Same resource-loading contract as NuvioMobile-Enhanced's Android runtime.
++            val assets = android.content.res.AssetManager::class.java.getDeclaredConstructor().newInstance()
++            val cookie = assets.javaClass.getMethod("addAssetPath", String::class.java)
++                .invoke(assets, cs3File.absolutePath) as Int
++            check(cookie != 0) { "Could not load extension resources" }
++            @Suppress("DEPRECATION")
++            plugin.resources = android.content.res.Resources(assets, context.resources.displayMetrics, context.resources.configuration)
++        }
++        return plugin
+     }
+ 
+-    private fun findAndLoadPlugin(classLoader: DexClassLoader, cs3File: File): Plugin? {
+-        val pluginClassName = readPluginClassNameFromZip(cs3File)
++    private fun instantiatePlugin(classLoader: DexClassLoader, cs3File: File, pluginClassName: String?): BasePlugin? {
+         if (pluginClassName != null) {
+             try {
+                 Log.d(TAG, "Loading plugin class from manifest: $pluginClassName")
+                 val clazz = classLoader.loadClass(pluginClassName)
+                 val instance = clazz.getDeclaredConstructor().newInstance()
+-                if (instance is Plugin) {
++                if (instance is BasePlugin) {
+                     return instance
+                 }
+                 if (looksLikePlugin(instance)) {
+@@ -708,13 +353,12 @@ class ExternalExtensionLoader @Inject constructor(
+         return scanForPluginClass(classLoader, cs3File)
+     }
+ 
+-    private fun readPluginClassNameFromZip(cs3File: File): String? {
++    private fun readManifest(cs3File: File): JSONObject? {
+         return try {
+             ZipFile(cs3File).use { zip ->
+                 val manifestEntry = zip.getEntry("manifest.json") ?: return null
+                 val json = zip.getInputStream(manifestEntry).bufferedReader().readText()
+-                val obj = JSONObject(json)
+-                obj.optString("pluginClassName", null)
++                JSONObject(json)
+             }
+         } catch (e: Exception) {
+             Log.d(TAG, "Could not read manifest.json from ZIP: ${e.message}")
+@@ -722,26 +366,25 @@ class ExternalExtensionLoader @Inject constructor(
+         }
+     }
+ 
+-    private fun scanForPluginClass(classLoader: DexClassLoader, cs3File: File): Plugin? {
+-        try {
+-            @Suppress("DEPRECATION")
+-            val dex = dalvik.system.DexFile(cs3File)
+-            val entries = dex.entries()
++    @Suppress("DEPRECATION")
++    private fun dexClassNames(file: File): List<String> {
++        val dex = dalvik.system.DexFile(file)
++        return try { dex.entries().toList() } finally { dex.close() }
++    }
+ 
+-            while (entries.hasMoreElements()) {
+-                val className = entries.nextElement()
++    private fun scanForPluginClass(classLoader: DexClassLoader, cs3File: File): BasePlugin? {
++        try {
++            for (className in dexClassNames(cs3File)) {
+                 try {
+                     val clazz = classLoader.loadClass(className)
+                     if (clazz.isAnnotationPresent(CloudstreamPlugin::class.java)) {
+                         Log.d(TAG, "Found plugin class via scan: $className")
+                         val instance = clazz.getDeclaredConstructor().newInstance()
+-                        if (instance is Plugin) {
+-                            dex.close()
++                        if (instance is BasePlugin) {
+                             return instance
+                         }
+                         if (looksLikePlugin(instance)) {
+                             Log.d(TAG, "Using reflective wrapper for $className (non-standard base class)")
+-                            dex.close()
+                             return ReflectivePluginWrapper(instance)
+                         }
+                         Log.w(TAG, "Annotated class $className has no plugin methods")
+@@ -753,7 +396,6 @@ class ExternalExtensionLoader @Inject constructor(
+                 }
+             }
+ 
+-            dex.close()
+         } catch (e: Exception) {
+             Log.d(TAG, "DexFile scan fallback failed: ${e.message}")
+         }
 diff --git a/app/src/full/java/com/nuvio/tv/core/plugin/cloudstream/ExternalExtensionRunner.kt b/app/src/full/java/com/nuvio/tv/core/plugin/cloudstream/ExternalExtensionRunner.kt
-index 4c1caaf3c..595dee196 100644
+index 4c1caaf3c..dd3835f21 100644
 --- a/app/src/full/java/com/nuvio/tv/core/plugin/cloudstream/ExternalExtensionRunner.kt
 +++ b/app/src/full/java/com/nuvio/tv/core/plugin/cloudstream/ExternalExtensionRunner.kt
-@@ -31,6 +31,7 @@ import kotlinx.coroutines.Dispatchers
+@@ -1,40 +1,41 @@
+ package com.nuvio.tv.core.plugin.cloudstream
+ 
++import com.nuvio.tv.domain.model.StreamContentContext
+ import android.util.Log
+ import com.lagradost.cloudstream3.AnimeLoadResponse
++import com.lagradost.cloudstream3.AnimeSearchResponse
+ import com.lagradost.cloudstream3.Episode
+-import com.lagradost.cloudstream3.LoadResponse
+ import com.lagradost.cloudstream3.LiveStreamLoadResponse
++import com.lagradost.cloudstream3.LoadResponse
+ import com.lagradost.cloudstream3.MainAPI
+ import com.lagradost.cloudstream3.MovieLoadResponse
+ import com.lagradost.cloudstream3.MovieSearchResponse
+-import com.lagradost.cloudstream3.TvSeriesSearchResponse
+-import com.lagradost.cloudstream3.AnimeSearchResponse
+ import com.lagradost.cloudstream3.SearchResponse
+ import com.lagradost.cloudstream3.SubtitleFile
+ import com.lagradost.cloudstream3.TvSeriesLoadResponse
++import com.lagradost.cloudstream3.TvSeriesSearchResponse
+ import com.lagradost.cloudstream3.TvType
+-import com.lagradost.cloudstream3.metaproviders.TmdbLink
+ import com.lagradost.cloudstream3.metaproviders.TmdbProvider
+-import com.lagradost.cloudstream3.utils.AppUtils.toJson
+ import com.lagradost.cloudstream3.utils.ExtractorLink
+ import com.lagradost.cloudstream3.utils.ExtractorLinkType
+ import com.lagradost.cloudstream3.utils.Qualities
+-import com.lagradost.cloudstream3.app
+ import com.nuvio.tv.core.plugin.TestDiagnostics
+ import com.nuvio.tv.core.plugin.matchPluginEpisodeIndex
+ import com.nuvio.tv.core.tmdb.TmdbMetadataService
+-import com.nuvio.tv.core.tmdb.TmdbService
+ import com.nuvio.tv.domain.model.ContentType
+ import com.nuvio.tv.domain.model.LocalScraperResult
++import kotlinx.coroutines.flow.first
++import javax.inject.Inject
++import javax.inject.Singleton
++import kotlinx.coroutines.CancellationException
+ import kotlinx.coroutines.Dispatchers
  import kotlinx.coroutines.async
  import kotlinx.coroutines.awaitAll
  import kotlinx.coroutines.coroutineScope
-+import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.sync.Semaphore
++import kotlinx.coroutines.sync.withPermit
  import kotlinx.coroutines.withContext
  import kotlinx.coroutines.withTimeoutOrNull
- import javax.inject.Inject
-@@ -56,7 +57,8 @@ class ExternalExtensionRunner @Inject constructor(
+-import javax.inject.Inject
+-import javax.inject.Singleton
+ 
+ private const val TAG = "ExtExtensionRunner"
+ private const val EXECUTION_TIMEOUT_MS = 120_000L
+@@ -54,39 +55,18 @@ private const val MAX_ALT_TITLES = 8
+ @Singleton
+ class ExternalExtensionRunner @Inject constructor(
      private val extensionLoader: ExternalExtensionLoader,
-     private val extractorRegistry: ExternalExtractorRegistry,
+-    private val extractorRegistry: ExternalExtractorRegistry,
      private val tmdbMetadataService: TmdbMetadataService,
 -    private val tmdbService: TmdbService
-+    private val tmdbService: TmdbService,
 +    private val pluginDataStore: com.nuvio.tv.data.local.PluginDataStore? = null
  ) {
      suspend fun execute(
          scraperId: String,
-@@ -100,11 +102,15 @@ class ExternalExtensionRunner @Inject constructor(
-         extensionLoader.ensureExtractorsLoaded(listOf(scraperId), diagnostics)
+         tmdbId: String,
+         mediaType: String,
+         season: Int?,
+-        episode: Int?
++        episode: Int?,
++        content: StreamContentContext? = null
+     ): List<LocalScraperResult> = withContext(Dispatchers.IO) {
+-        extensionLoader.ensureExtractorsLoaded(listOf(scraperId))
+-
+-        val api = extensionLoader.getApi(scraperId)
+-        if (api == null) {
+-            Log.e(TAG, "No API loaded for scraper: $scraperId")
+-            return@withContext emptyList()
+-        }
+-
+-        try {
+-            executeInternal(api, tmdbId, mediaType, season, episode)
+-        } catch (e: Exception) {
+-            Log.e(TAG, "Extension ${api.name} failed: ${e.javaClass.simpleName}: ${e.message}", e)
+-            emptyList()
+-        } catch (e: Error) {
+-            val missing = extractMissingClass(e)
+-            if (missing != null) {
+-                Log.e(TAG, "Extension ${api.name} MISSING CLASS: $missing", e)
+-            } else {
+-                Log.e(TAG, "Extension ${api.name} linkage error: ${e.javaClass.simpleName}: ${e.message}", e)
+-            }
+-            emptyList()
+-        }
++        executeProviders(scraperId, tmdbId, mediaType, season, episode, diagnostics = null, content = content)
+     }
  
-         diagnostics.addStep("Loading DEX extension...")
+     suspend fun executeWithDiagnostics(
+@@ -95,245 +75,61 @@ class ExternalExtensionRunner @Inject constructor(
+         mediaType: String,
+         season: Int?,
+         episode: Int?,
+-        diagnostics: TestDiagnostics
++        diagnostics: TestDiagnostics,
++        content: StreamContentContext? = null
+     ): List<LocalScraperResult> = withContext(Dispatchers.IO) {
+-        extensionLoader.ensureExtractorsLoaded(listOf(scraperId), diagnostics)
+-
+-        diagnostics.addStep("Loading DEX extension...")
 -        val apis = extensionLoader.loadExtensionWithDiagnostics(scraperId, diagnostics)
-+        val loadedApis = extensionLoader.loadExtensionWithDiagnostics(scraperId, diagnostics)
+-        val api = apis.firstOrNull()
+-
+-        if (api == null) {
+-            diagnostics.addStep("No MainAPI available after load")
+-            return@withContext emptyList()
+-        }
+-
+-        diagnostics.addStep("Using MainAPI: ${api.name} (${api.javaClass.simpleName})")
+-        val isTmdb = api is TmdbProvider
+-        diagnostics.addStep("Provider type: ${if (isTmdb) "TmdbProvider" else "search-based"}")
+-
+-        withTimeoutOrNull(EXECUTION_TIMEOUT_MS) {
+-            try {
+-                if (isTmdb) {
+-                    executeTmdbProviderWithDiagnostics(api, tmdbId, mediaType, season, episode, diagnostics)
+-                } else {
+-                    executeSearchBasedWithDiagnostics(api, tmdbId, mediaType, season, episode, diagnostics)
+-                }
+-            } catch (e: Error) {
+-                Log.e(TAG, "Diagnostic ${api.name} error: ${e.javaClass.simpleName}: ${e.message}", e)
+-                diagnostics.addStep("Runtime error: ${e.javaClass.simpleName}")
+-                diagnostics.addStep("Detail: ${e.message?.take(300)}")
+-                emptyList()
+-            } catch (e: Exception) {
+-                Log.e(TAG, "Diagnostic ${api.name} exception: ${e.javaClass.simpleName}: ${e.message}", e)
+-                diagnostics.addStep("Runtime exception: ${e.javaClass.simpleName}: ${e.message?.take(300)}")
+-                emptyList()
+-            }
+-        } ?: run {
+-            diagnostics.addStep("TIMEOUT after ${EXECUTION_TIMEOUT_MS}ms")
+-            emptyList()
+-        }
+-    }
+-
+-    private suspend fun executeTmdbProviderWithDiagnostics(
+-        api: MainAPI,
+-        tmdbId: String,
+-        mediaType: String,
+-        season: Int?,
+-        episode: Int?,
+-        diagnostics: TestDiagnostics
+-    ): List<LocalScraperResult> {
+-        val tmdbIdInt = tmdbId.toIntOrNull()
+-        val contentType = when (mediaType.lowercase()) {
+-            "movie" -> ContentType.MOVIE
+-            else -> ContentType.SERIES
+-        }
+-
+-        diagnostics.addStep("Fetching TMDB metadata...")
+-        val enrichment = tmdbMetadataService.fetchEnrichment(tmdbId, contentType)
+-        val movieName = enrichment?.localizedTitle
+-        diagnostics.addStep("TMDB title: ${movieName ?: "(null)"}")
+-
+-        val imdbId = if (tmdbIdInt != null) tmdbService.tmdbToImdb(tmdbIdInt, mediaType) else null
+-        diagnostics.addStep("IMDB ID: ${imdbId ?: "(not found)"}")
+-
+-        val tmdbLink = TmdbLink(
+-            imdbID = imdbId,
+-            tmdbID = tmdbIdInt,
+-            episode = episode,
+-            season = season,
+-            movieName = movieName
+-        )
+-        val data = tmdbLink.toJson()
+-        diagnostics.addStep("TmdbLink JSON: ${data.take(120)}")
+-
+-        diagnostics.addStep("Calling loadLinks()...")
+-        val links = mutableListOf<ExtractorLink>()
+-        val subtitles = mutableListOf<SubtitleFile>()
+-
+-        // Instrument loadExtractor to log each call's result
+-        data class ExtractorCall(val url: String, var matched: Boolean = false, var linkCount: Int = 0, var error: String? = null)
+-        val extractorCalls = mutableListOf<ExtractorCall>()
+-
+-        val success = try {
+-            api.loadLinks(
+-                data = data,
+-                isCasting = false,
+-                subtitleCallback = { subtitles.add(it) },
+-                callback = { links.add(it) }
+-            )
+-        } catch (e: Throwable) {
+-            diagnostics.addStep("loadLinks THREW: ${e.javaClass.simpleName}: ${e.message?.take(120)}")
+-            false
+-        }
+-
+-        diagnostics.addStep("loadLinks returned: success=$success, ${links.size} links, ${subtitles.size} subs")
+-
+-        // Show missing extractor domains
+-        val missing = extractorRegistry.getMissingExtractorDomains()
+-        if (missing.isNotEmpty()) {
+-            diagnostics.addStep("Missing extractors: ${missing.take(5).joinToString()}")
+-        }
+-
+-        val domainSubtitles = subtitles.toDomainSubtitles(api.name)
+-        return links.filterValid().map { it.toLocalScraperResult(api.name, domainSubtitles) }
++        executeProviders(scraperId, tmdbId, mediaType, season, episode, diagnostics, content)
+     }
+ 
+-    private suspend fun executeSearchBasedWithDiagnostics(
+-        api: MainAPI,
++    private suspend fun executeProviders(
++        scraperId: String,
+         tmdbId: String,
+         mediaType: String,
+         season: Int?,
+         episode: Int?,
+-        diagnostics: TestDiagnostics
+-    ): List<LocalScraperResult> {
+-        val contentType = when (mediaType.lowercase()) {
+-            "movie" -> ContentType.MOVIE
+-            else -> ContentType.SERIES
+-        }
+-
+-        diagnostics.addStep("Fetching TMDB metadata...")
+-        val enrichment = tmdbMetadataService.fetchEnrichment(tmdbId, contentType)
+-        if (enrichment == null) {
+-            diagnostics.addStep("TMDB enrichment FAILED")
+-            return emptyList()
+-        }
+-
+-        val title = enrichment.localizedTitle
+-        if (title == null) {
+-            diagnostics.addStep("TMDB returned no title")
+-            return emptyList()
+-        }
+-        val year = enrichment.releaseInfo?.take(4)?.toIntOrNull()
+-        diagnostics.addStep("TMDB: \"$title\" ($year)")
+-
+-        // Check if search() is actually overridden
+-        val searchMethod = try {
+-            api.javaClass.getMethod("search", String::class.java, kotlin.coroutines.Continuation::class.java)
+-        } catch (_: Exception) { null }
+-        val declaringClass = searchMethod?.declaringClass?.name ?: "unknown"
+-        diagnostics.addStep("search() declared in: $declaringClass")
+-
+-        // Install temporary HTTP logging on the app singleton
+-        val httpLog = mutableListOf<String>()
+-        val originalClient = app.baseClient
+-        val loggingClient = originalClient.newBuilder()
+-            .addInterceptor { chain ->
+-                val req = chain.request()
+-                httpLog.add("→ ${req.method} ${req.url}")
+-                try {
+-                    val resp = chain.proceed(req)
+-                    httpLog.add("← ${resp.code} (${resp.body?.contentLength() ?: "?"} bytes)")
+-                    resp
+-                } catch (e: Exception) {
+-                    httpLog.add("← FAILED: ${e.javaClass.simpleName}: ${e.message?.take(80)}")
+-                    throw e
++        diagnostics: TestDiagnostics?,
++        content: StreamContentContext?
++    ): List<LocalScraperResult> = coroutineScope {
 +        val languages = pluginDataStore?.sourceLanguages?.first().orEmpty()
++        val loadedApis = extensionLoader.loadExtension(scraperId, diagnostics)
 +        val apis = if (languages.isEmpty()) loadedApis else loadedApis.filter {
 +            com.nuvio.tv.core.plugin.SourceLanguages.allows(it.lang, languages)
 +        }
-         val api = apis.firstOrNull()
++        if (apis.isEmpty()) {
++            diagnostics?.addStep(if (loadedApis.isEmpty()) "No MainAPI available after load" else "No sources match selected languages")
++            return@coroutineScope emptyList()
++        }
++        val slots = Semaphore(3)
++        val steps = apis.map { diagnostics?.let { TestDiagnostics() } }
++        val results = Array<List<LocalScraperResult>>(apis.size) { emptyList() }
++        suspend fun searchAll() = coroutineScope {
++            apis.mapIndexed { index, api ->
++                async {
++                    slots.withPermit {
++                        val trace = steps[index]
++                        try {
++                            trace?.addStep("Using MainAPI: ${api.name} (${api.javaClass.simpleName})")
++                            results[index] = executeInternal(api, tmdbId, mediaType, season, episode, trace, content)
++                            trace?.addStep("Found ${results[index].size} playable streams")
++                        } catch (e: CancellationException) {
++                            throw e
++                        } catch (e: Exception) {
++                            trace?.addStep("Provider failed: ${e.javaClass.simpleName}")
++                            Log.w(TAG, "Provider ${api.name} failed", e)
++                        } catch (e: Error) {
++                            if (e is VirtualMachineError || e is ThreadDeath) throw e
++                            trace?.addStep("Runtime error: ${e.message?.take(200)}")
++                            Log.w(TAG, "Provider ${api.name} failed", e)
++                        }
++                    }
+                 }
+-            }
+-            .build()
+-        app.baseClient = loggingClient
+-
+-        diagnostics.addStep("Searching for: \"$title\"")
+-        var searchResults = try {
+-            api.search(title, 1)?.items
+-        } catch (e: Exception) {
+-            diagnostics.addStep("search() THREW: ${e.javaClass.simpleName}: ${e.message?.take(120)}")
+-            null
+-        } catch (e: Error) {
+-            val missingCls = extractMissingClass(e)
+-            diagnostics.addStep("search() ERROR: ${missingCls ?: e.message?.take(120)}")
+-            null
+-        } finally {
+-            app.baseClient = originalClient
+-        }
+-
+-        // Show HTTP activity
+-        if (httpLog.isEmpty()) {
+-            diagnostics.addStep("HTTP: no requests made by search()")
+-        } else {
+-            diagnostics.addStep("HTTP: ${httpLog.size / 2} request(s)")
+-            httpLog.take(6).forEach { diagnostics.addStep("  $it") }
+-            if (httpLog.size > 6) diagnostics.addStep("  ... and ${httpLog.size - 6} more")
+-        }
+-
+-        diagnostics.addStep("Search returned: ${if (searchResults == null) "null" else "${searchResults.size} results"}")
+-
+-        // Fallback: if title has special characters, try simplified version
+-        if (searchResults.isNullOrEmpty() && title.contains(Regex("[:\\-–—]"))) {
+-            val simplified = title.replace(Regex("[:\\-–—]"), " ").replace(Regex("\\s+"), " ").trim()
+-            diagnostics.addStep("Retrying with: \"$simplified\"")
+-            searchResults = try {
+-                api.search(simplified, 1)?.items
+-            } catch (e: Exception) {
+-                diagnostics.addStep("search(simplified) THREW: ${e.javaClass.simpleName}: ${e.message?.take(120)}")
+-                null
+-            } catch (e: Error) {
+-                null
+-            }
+-            diagnostics.addStep("Retry returned: ${if (searchResults == null) "null" else "${searchResults.size} results"}")
+-        }
+-
+-        if (searchResults.isNullOrEmpty()) return emptyList()
+-
+-        val bestMatch = findBestMatch(searchResults, listOf(title), year, mediaType)
+-        if (bestMatch == null) {
+-            diagnostics.addStep("No match above similarity threshold ($MIN_TITLE_SIMILARITY)")
+-            searchResults.take(3).forEachIndexed { i, r ->
+-                val sim = calculateSimilarity(r.name, title)
+-                diagnostics.addStep("  [$i] \"${r.name}\" (sim=${String.format("%.2f", sim)})")
+-            }
+-            return emptyList()
+-        }
+-        diagnostics.addStep("Best match: \"${bestMatch.name}\" (${bestMatch.url.take(80)})")
+-
+-        diagnostics.addStep("Loading page...")
+-        val loadResponse = api.load(bestMatch.url)
+-        if (loadResponse == null) {
+-            diagnostics.addStep("load() returned null")
+-            return emptyList()
+-        }
+-        diagnostics.addStep("Loaded: ${loadResponse.javaClass.simpleName}")
+-
+-        val data = extractData(loadResponse, mediaType, season, episode)
+-        if (data == null) {
+-            diagnostics.addStep("No episode data for S${season}E${episode}")
+-            return emptyList()
++            }.awaitAll()
+         }
+-
+-        diagnostics.addStep("Calling loadLinks()...")
+-        val links = mutableListOf<ExtractorLink>()
+-        val subtitles = mutableListOf<SubtitleFile>()
+-
+-        val success = api.loadLinks(
+-            data = data,
+-            isCasting = false,
+-            subtitleCallback = { subtitles.add(it) },
+-            callback = { links.add(it) }
+-        )
+-
+-        diagnostics.addStep("loadLinks returned: success=$success, ${links.size} links, ${subtitles.size} subs")
+-        val domainSubtitles = subtitles.toDomainSubtitles(api.name)
+-        return links.filterValid().map { it.toLocalScraperResult(api.name, domainSubtitles) }
++        // The outer scraper has a 120s deadline. Return completed siblings if another API stalls.
++        val budget = if (apis.size > 1) 90_000L else EXECUTION_TIMEOUT_MS
++        if (withTimeoutOrNull(budget) { searchAll() } == null) diagnostics?.addStep("Search timed out")
++        steps.filterNotNull().forEach { diagnostics?.steps?.addAll(it.steps) }
++        results.flatMap { it }.distinct()
+     }
  
-         if (api == null) {
--            diagnostics.addStep("No MainAPI available after load")
-+            diagnostics.addStep(if (loadedApis.isEmpty()) "No MainAPI available after load" else "No sources match selected languages")
-             return@withContext emptyList()
+     private fun extractMissingClass(e: Error): String? {
+@@ -347,12 +143,14 @@ class ExternalExtensionRunner @Inject constructor(
+         tmdbId: String,
+         mediaType: String,
+         season: Int?,
+-        episode: Int?
++        episode: Int?,
++        diagnostics: TestDiagnostics?,
++        content: StreamContentContext?
+     ): List<LocalScraperResult> {
+-        if (api is TmdbProvider) {
+-            return executeTmdbProvider(api, tmdbId, mediaType, season, episode)
++        if (api is TmdbProvider && tmdbId.toIntOrNull() != null) {
++            return executeTmdbProvider(api, tmdbId, mediaType, season, episode, diagnostics)
+         }
+-        return executeSearchBased(api, tmdbId, mediaType, season, episode)
++        return executeSearchBased(api, tmdbId, mediaType, season, episode, diagnostics, content)
+     }
+ 
+     /**
+@@ -372,7 +170,8 @@ class ExternalExtensionRunner @Inject constructor(
+         tmdbId: String,
+         mediaType: String,
+         season: Int?,
+-        episode: Int?
++        episode: Int?,
++        diagnostics: TestDiagnostics?
+     ): List<LocalScraperResult> {
+         val tmdbIdInt = tmdbId.toIntOrNull()
+         val isMovie = mediaType.lowercase() == "movie"
+@@ -383,6 +182,7 @@ class ExternalExtensionRunner @Inject constructor(
+         val loadJson = """{"id":$tmdbIdInt,"type":"$type"}"""
+ 
+         Log.d(TAG, "TmdbProvider ${api.name}: load($loadJson)")
++        diagnostics?.addStep("Loading TMDB $type $tmdbId")
+         val loadResponse = try {
+             api.load(loadJson)
+         } catch (e: Exception) {
+@@ -411,6 +211,7 @@ class ExternalExtensionRunner @Inject constructor(
+             "https://www.themoviedb.org/tv/$tmdbId"
+         }
+         Log.d(TAG, "TmdbProvider ${api.name}: fallback load($tmdbUrl)")
++        diagnostics?.addStep("Trying provider with TMDB URL")
+         val fallbackResponse = try {
+             api.load(tmdbUrl)
+         } catch (e: Exception) {
+@@ -479,20 +280,29 @@ class ExternalExtensionRunner @Inject constructor(
+         tmdbId: String,
+         mediaType: String,
+         season: Int?,
+-        episode: Int?
++        episode: Int?,
++        diagnostics: TestDiagnostics?,
++        content: StreamContentContext?
+     ): List<LocalScraperResult> {
+         val contentType = when (mediaType.lowercase()) {
+             "movie" -> ContentType.MOVIE
+             else -> ContentType.SERIES
+         }
+-        val enrichment = tmdbMetadataService.fetchEnrichment(tmdbId, contentType)
+-        if (enrichment == null) {
+-            Log.e(TAG, "Failed to fetch TMDB enrichment for $tmdbId")
++        val selectedTitle = content?.title?.trim()?.takeIf { it.isNotEmpty() }
++        val initialSearch = selectedTitle?.let { trySearch(api, it) }
++        val selectedMatch = selectedTitle?.let {
++            findBestMatch(initialSearch?.items.orEmpty(), listOf(it), content?.year, mediaType)
++        }
++        // Keep TMDB aliases for searches that didn't match the selected catalogue title.
++        val enrichment = if (tmdbId.toIntOrNull() != null && selectedMatch == null &&
++            initialSearch?.hostUnreachable != true && initialSearch?.unsupported != true) {
++            tmdbMetadataService.fetchEnrichment(tmdbId, contentType)
++        } else null
++        val title = enrichment?.localizedTitle?.takeIf { it.isNotBlank() } ?: selectedTitle ?: run {
++            diagnostics?.addStep("No catalogue title or TMDB metadata available for $tmdbId")
+             return emptyList()
+         }
+-
+-        val title = enrichment.localizedTitle ?: return emptyList()
+-        val year = enrichment.releaseInfo?.take(4)?.toIntOrNull()
++        val year = content?.year ?: enrichment?.releaseInfo?.take(4)?.toIntOrNull()
+ 
+         // Build candidate titles for multi-language matching: primary localized title,
+         // TMDB original title (often non-English for foreign content), plus alt titles
+@@ -501,10 +311,11 @@ class ExternalExtensionRunner @Inject constructor(
+         // each one against a Spanish/Portuguese/English provider wastes requests.
+         val candidateTitles = buildList {
+             add(title)
+-            enrichment.originalTitle
++            selectedTitle?.takeUnless { equalsIgnoreCase(it, title) }?.let(::add)
++            enrichment?.originalTitle
+                 ?.takeIf { it.isNotBlank() && !equalsIgnoreCase(it, title) }
+                 ?.let(::add)
+-            enrichment.alternativeTitles
++            enrichment?.alternativeTitles.orEmpty()
+                 .asSequence()
+                 .filter { it.isNotBlank() && isLatinScript(it) }
+                 .distinctBy { it.lowercase() }
+@@ -515,7 +326,8 @@ class ExternalExtensionRunner @Inject constructor(
+ 
+         Log.d(TAG, "SearchBased ${api.name}: searching for \"$title\" (${candidateTitles.size} candidates)")
+ 
+-        var outcome = trySearch(api, title)
++        diagnostics?.addStep("Searching for $title ($year)")
++        var outcome = initialSearch?.takeIf { title == selectedTitle } ?: trySearch(api, title)
+         var searchResults = outcome.items
+         var hostDead = outcome.hostUnreachable
+         var unsupported = outcome.unsupported
+@@ -552,6 +364,7 @@ class ExternalExtensionRunner @Inject constructor(
          }
  
+         if (searchResults.isNullOrEmpty()) {
++            diagnostics?.addStep(when { hostDead -> "Provider host unreachable"; unsupported -> "Search unsupported"; else -> "No search results" })
+             when {
+                 hostDead -> Log.w(TAG, "SearchBased ${api.name}: host unreachable, skipping (primary=\"$title\")")
+                 unsupported -> Log.w(TAG, "SearchBased ${api.name}: search() unsupported, skipping (primary=\"$title\")")
+@@ -563,6 +376,7 @@ class ExternalExtensionRunner @Inject constructor(
+ 
+         val bestMatch = findBestMatch(searchResults, candidateTitles, year, mediaType)
+         if (bestMatch == null) {
++            diagnostics?.addStep("No matching title in ${searchResults.size} results")
+             Log.d(TAG, "No suitable match in ${api.name} results for: $title ($year) [candidates=${candidateTitles.size}]")
+             searchResults.take(5).forEachIndexed { i, r ->
+                 val sim = candidateTitles.maxOf { calculateSimilarity(r.name, it) }
+@@ -572,6 +386,7 @@ class ExternalExtensionRunner @Inject constructor(
+         }
+         Log.d(TAG, "Best match from ${api.name}: ${bestMatch.name} (${bestMatch.url})")
+ 
++        diagnostics?.addStep("Loading matched title: ${bestMatch.name}")
+         val loadResponse = try {
+             api.load(bestMatch.url)
+         } catch (e: Exception) {
+@@ -590,6 +405,7 @@ class ExternalExtensionRunner @Inject constructor(
+ 
+         val data = extractData(loadResponse, mediaType, season, episode)
+         if (data == null) {
++            diagnostics?.addStep("No episode data for S${season}E${episode}")
+             Log.d(TAG, "No data extracted from ${api.name} for S${season}E${episode}")
+             return emptyList()
+         }
+@@ -597,6 +413,7 @@ class ExternalExtensionRunner @Inject constructor(
+         val links = java.util.Collections.synchronizedList(mutableListOf<ExtractorLink>())
+         val subtitles = java.util.Collections.synchronizedList(mutableListOf<SubtitleFile>())
+ 
++        diagnostics?.addStep("Resolving playable links")
+         val success = withTimeoutOrNull(LOADLINKS_TIMEOUT_MS) {
+             try {
+                 api.loadLinks(
+diff --git a/app/src/full/java/com/nuvio/tv/core/plugin/cloudstream/ExternalRepoParser.kt b/app/src/full/java/com/nuvio/tv/core/plugin/cloudstream/ExternalRepoParser.kt
+index 647b24585..a8076aa21 100644
+--- a/app/src/full/java/com/nuvio/tv/core/plugin/cloudstream/ExternalRepoParser.kt
++++ b/app/src/full/java/com/nuvio/tv/core/plugin/cloudstream/ExternalRepoParser.kt
+@@ -1,20 +1,25 @@
+ package com.nuvio.tv.core.plugin.cloudstream
+ 
+ import android.util.Log
++import com.nuvio.tv.core.network.IPv4FirstDns
+ import com.nuvio.tv.domain.model.ExternalPluginEntry
+ import com.nuvio.tv.domain.model.ExternalRepoManifest
++import com.squareup.moshi.JsonDataException
++import com.squareup.moshi.JsonReader
+ import com.squareup.moshi.Moshi
+-import com.squareup.moshi.Types
++import javax.inject.Inject
++import javax.inject.Singleton
++import kotlinx.coroutines.CancellationException
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.async
+ import kotlinx.coroutines.awaitAll
+ import kotlinx.coroutines.coroutineScope
+ import kotlinx.coroutines.withContext
+-import com.nuvio.tv.core.network.IPv4FirstDns
++import okhttp3.HttpUrl
++import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+ import okhttp3.OkHttpClient
+ import okhttp3.Request
+-import javax.inject.Inject
+-import javax.inject.Singleton
++import okio.Buffer
+ 
+ private const val TAG = "ExternalRepoParser"
+ 
+@@ -46,104 +51,123 @@ class ExternalRepoParser @Inject constructor(
+         .build()
+ 
+     private val repoManifestAdapter = moshi.adapter(ExternalRepoManifest::class.java)
+-    private val pluginListType = Types.newParameterizedType(List::class.java, ExternalPluginEntry::class.java)
+-    private val pluginListAdapter = moshi.adapter<List<ExternalPluginEntry>>(pluginListType)
++    private val entryAdapter = moshi.adapter(ExternalPluginEntry::class.java)
++
++    private data class Document(val url: HttpUrl, val body: String)
+ 
+-    /**
+-     * Try to parse the given URL as an external repository.
+-     * Returns null if the content doesn't match any known external format.
+-     */
+     suspend fun tryParse(url: String): ExternalRepoParseResult? = withContext(Dispatchers.IO) {
+-        val body = fetchBody(url) ?: return@withContext null
+-        val trimmed = body.trim()
++        val base = cloudStreamManifestUrl(url) ?: return@withContext null
++        fetch(base)?.let { parseDocument(it) }?.let { return@withContext it }
++        // Keep extensionless endpoints working, then try the standard directory layout.
++        if (base.pathSegments.last().contains('.')) return@withContext null
++        fetch(base.newBuilder().addPathSegment("repo.json").build())?.let { parseDocument(it) }
++    }
+ 
+-        // Try as repo manifest (has "pluginLists" key)
+-        if (trimmed.contains("\"pluginLists\"")) {
+-            try {
+-                val manifest = repoManifestAdapter.fromJson(trimmed)
+-                if (manifest != null && manifest.pluginLists.isNotEmpty()) {
+-                    Log.d(TAG, "Parsed as repo manifest: ${manifest.name}, ${manifest.pluginLists.size} plugin lists")
+-                    val allPlugins = coroutineScope {
+-                        manifest.pluginLists.map { listUrl ->
+-                            async {
+-                                val resolvedUrl = resolveUrl(url, listUrl)
+-                                fetchPluginList(resolvedUrl) ?: emptyList()
++    private suspend fun parseDocument(root: Document): ExternalRepoParseResult? {
++        return try {
++            val manifest = if (root.body.trimStart().startsWith("{")) {
++                repoManifestAdapter.fromJson(root.body) ?: return null
++            } else null
++            val entries = if (manifest == null) {
++                parseList(root)
++            } else {
++                coroutineScope {
++                    manifest.pluginLists.mapNotNull { resolve(root.url, it) }.distinct().map { listUrl ->
++                        async {
++                            val list = fetch(listUrl) ?: return@async emptyList()
++                            try {
++                                parseList(list)
++                            } catch (e: Exception) {
++                                if (e is CancellationException) throw e
++                                Log.w(TAG, "Skipping unreadable plugin list on ${list.url.host}")
++                                emptyList()
+                             }
+-                        }.awaitAll().flatten()
+-                    }
+-                    return@withContext ExternalRepoParseResult(
+-                        name = manifest.name,
+-                        description = manifest.description,
+-                        plugins = allPlugins
+-                    )
++                        }
++                    }.awaitAll().flatten()
+                 }
+-            } catch (e: Exception) {
+-                Log.d(TAG, "Not a repo manifest: ${e.message}")
+             }
+-        }
+-
+-        // Try as direct plugins array (has "internalName" or "tvTypes")
+-        if (trimmed.startsWith("[")) {
+-            try {
+-                val plugins = pluginListAdapter.fromJson(trimmed)
+-                if (!plugins.isNullOrEmpty() && plugins.first().internalName.isNotBlank()) {
+-                    Log.d(TAG, "Parsed as direct plugins list: ${plugins.size} plugins")
+-                    val repoName = inferRepoName(url)
+-                    return@withContext ExternalRepoParseResult(
+-                        name = repoName,
+-                        description = null,
+-                        plugins = plugins
+-                    )
+-                }
+-            } catch (e: Exception) {
+-                Log.d(TAG, "Not a direct plugins list: ${e.message}")
++            if (entries.isEmpty()) return null
++            val byName = linkedMapOf<String, ExternalPluginEntry>()
++            for (entry in entries) {
++                val existing = byName[entry.internalName]
++                if (existing == null || entry.version > existing.version) byName[entry.internalName] = entry
+             }
+-        }
+-
+-        null
+-    }
+-
+-    private suspend fun fetchPluginList(url: String): List<ExternalPluginEntry>? = withContext(Dispatchers.IO) {
+-        val body = fetchBody(url) ?: return@withContext null
+-        try {
+-            pluginListAdapter.fromJson(body.trim())
++            ExternalRepoParseResult(
++                name = manifest?.name?.takeIf { it.isNotBlank() }
++                    ?: root.url.pathSegments.last().removeSuffix(".json").ifBlank { root.url.host },
++                description = manifest?.description,
++                plugins = byName.values.toList()
++            )
+         } catch (e: Exception) {
+-            Log.e(TAG, "Failed to parse plugin list from $url: ${e.message}")
++            if (e is CancellationException) throw e
++            Log.d(TAG, "Unrecognized repository on ${root.url.host}")
+             null
+         }
+     }
+ 
+-    private fun fetchBody(url: String): String? {
+-        return try {
+-            val request = Request.Builder()
+-                .url(url)
+-                .header("User-Agent", "NuvioTV/1.0")
+-                .build()
+-            httpClient.newCall(request).execute().use { response ->
+-                if (!response.isSuccessful) {
+-                    Log.e(TAG, "HTTP ${response.code} for $url")
+-                    return null
+-                }
+-                response.body?.string()
++    private fun resolve(base: HttpUrl, candidate: String): HttpUrl? =
++        candidate.trim().takeIf { it.isNotEmpty() }?.let(base::resolve)
++
++    private fun parseList(document: Document): List<ExternalPluginEntry> {
++        val reader = JsonReader.of(Buffer().writeUtf8(document.body))
++        return buildList {
++            reader.beginArray()
++            while (reader.hasNext()) {
++                val fields = reader.readJsonValue() as? Map<*, *> ?: continue
++                val entry = try {
++                    entryAdapter.fromJsonValue(fields.filterValues { it != null })
++                } catch (_: JsonDataException) {
++                    null
++                } ?: continue
++                val id = entry.internalName.trim().takeIf { it.isNotEmpty() } ?: continue
++                val packageUrl = resolve(document.url, entry.url) ?: continue
++                add(entry.copy(
++                    name = entry.name.trim().ifEmpty { id },
++                    internalName = id,
++                    url = packageUrl.toString(),
++                    iconUrl = entry.iconUrl?.let { resolve(document.url, it)?.toString() }
++                ))
+             }
+-        } catch (e: Exception) {
+-            Log.e(TAG, "Failed to fetch $url: ${e.message}")
+-            null
++            reader.endArray()
+         }
+     }
+ 
+-    private fun resolveUrl(baseUrl: String, relativeUrl: String): String {
+-        if (relativeUrl.startsWith("http://") || relativeUrl.startsWith("https://")) {
+-            return relativeUrl
++    private fun fetch(url: HttpUrl): Document? = try {
++        val request = Request.Builder().url(url).header("User-Agent", "NuvioTV/1.0").build()
++        httpClient.newCall(request).execute().use { response ->
++            if (response.isSuccessful) response.body?.let { Document(response.request.url, it.string()) }
++            else null
+         }
+-        val base = baseUrl.substringBeforeLast("/")
+-        return "$base/$relativeUrl"
++    } catch (e: java.io.IOException) {
++        Log.w(TAG, "Could not fetch repository data from ${url.host}")
++        null
+     }
++}
++
++internal fun unwrapCloudStreamUrl(input: String): String {
++    var value = input.trim()
++    val prefixes = listOf("cloudstreamrepo://", "https://cs.repo/?", "http://cs.repo/?")
++    for (prefix in prefixes) {
++        if (value.startsWith(prefix, ignoreCase = true)) {
++            value = value.substring(prefix.length).trim()
++            if (!value.contains("://")) value = "https://$value"
++            break
++        }
++    }
++    return value
++}
+ 
+-    private fun inferRepoName(url: String): String {
+-        // Try to extract a meaningful name from the URL
+-        val path = url.substringAfter("://").substringBefore("?")
+-        val segments = path.split("/").filter { it.isNotBlank() }
+-        return segments.lastOrNull()?.removeSuffix(".json") ?: "External Repository"
++internal fun cloudStreamManifestUrl(input: String): HttpUrl? {
++    val url = unwrapCloudStreamUrl(input).toHttpUrlOrNull() ?: return null
++    if (url.host != "github.com") return url
++    val path = url.pathSegments.filter { it.isNotEmpty() }
++    if (path.size < 2) return url
++    val raw = HttpUrl.Builder().scheme("https").host("raw.githubusercontent.com")
++        .addPathSegment(path[0]).addPathSegment(path[1].removeSuffix(".git"))
++    when {
++        path.size == 2 -> raw.addPathSegments("HEAD/repo.json")
++        path.size >= 5 && path[2] in setOf("blob", "raw") -> path.drop(3).forEach(raw::addPathSegment)
++        else -> return url
+     }
++    return raw.build()
+ }
+diff --git a/app/src/full/java/com/nuvio/tv/core/plugin/cloudstream/TvTypeExtensions.kt b/app/src/full/java/com/nuvio/tv/core/plugin/cloudstream/TvTypeExtensions.kt
+index e8468b06c..93cba590f 100644
+--- a/app/src/full/java/com/nuvio/tv/core/plugin/cloudstream/TvTypeExtensions.kt
++++ b/app/src/full/java/com/nuvio/tv/core/plugin/cloudstream/TvTypeExtensions.kt
+@@ -2,13 +2,13 @@ package com.nuvio.tv.core.plugin.cloudstream
+ 
+ import com.lagradost.cloudstream3.TvType
+ 
+-/** Map CloudStream TvType to NuvioTV content type string ("movie" or "tv"). */
+-fun TvType.toNuvioType(): String = when (this) {
+-    TvType.Movie, TvType.AnimeMovie, TvType.Documentary, TvType.Torrent -> "movie"
+-    else -> "tv"
+-}
+-
+-/** Parse TvType from string name, case-insensitive. */
+-fun tvTypeFromString(value: String): TvType? = TvType.entries.firstOrNull {
+-    it.name.equals(value, ignoreCase = true)
+-}
++internal fun cloudStreamContentTypes(tvTypes: List<String>?): List<String> =
++    tvTypes.orEmpty().mapNotNull { type ->
++        TvType.entries.firstOrNull { it.name.equals(type.trim(), ignoreCase = true) }
++    }.flatMap { type ->
++        when (type) {
++            TvType.Others -> listOf("movie", "tv")
++            TvType.Movie, TvType.AnimeMovie, TvType.Documentary, TvType.Torrent -> listOf("movie")
++            else -> listOf("tv")
++        }
++    }.distinct().ifEmpty { listOf("movie", "tv") }
+diff --git a/app/src/full/java/com/nuvio/tv/core/runtime/ExtensionDns.kt b/app/src/full/java/com/nuvio/tv/core/runtime/ExtensionDns.kt
+new file mode 100644
+index 000000000..1098fb70e
+--- /dev/null
++++ b/app/src/full/java/com/nuvio/tv/core/runtime/ExtensionDns.kt
+@@ -0,0 +1,36 @@
++package com.nuvio.tv.core.runtime
++
++import com.nuvio.tv.core.network.IPv4FirstDns
++import okhttp3.Dns
++import okhttp3.OkHttpClient
++import okhttp3.HttpUrl.Companion.toHttpUrl
++import okhttp3.dnsoverhttps.DnsOverHttps
++import java.net.InetAddress
++import java.util.concurrent.TimeUnit
++
++/** A stable resolver reference also updates clients copied by installed CS3 extensions. */
++object ExtensionDns : Dns {
++    @Volatile internal var selected = "SYSTEM"
++        private set
++    private val resolvers = java.util.concurrent.ConcurrentHashMap<String, Dns>()
++    @Synchronized
++    fun select(mode: String) {
++        if (selected == mode) return
++        selected = mode
++        PluginRuntimeHooks.onExtensionDnsChanged()
++    }
++    override fun lookup(hostname: String): List<InetAddress> = resolver(selected).lookup(hostname)
++
++    internal fun resolver(mode: String): Dns = resolvers.getOrPut(mode) {
++        val (endpoint, addresses) = when (mode) {
++            "CLOUDFLARE" -> "https://cloudflare-dns.com/dns-query" to listOf("1.1.1.1", "1.0.0.1")
++            "GOOGLE" -> "https://dns.google/dns-query" to listOf("8.8.8.8", "8.8.4.4")
++            "QUAD9" -> "https://dns.quad9.net/dns-query" to listOf("9.9.9.9", "149.112.112.112")
++            else -> return@getOrPut IPv4FirstDns()
++        }
++        val bootstrap = OkHttpClient.Builder().dns(Dns.SYSTEM)
++            .callTimeout(15, TimeUnit.SECONDS).build()
++        IPv4FirstDns(DnsOverHttps.Builder().client(bootstrap).url(endpoint.toHttpUrl())
++            .bootstrapDnsHosts(addresses.map(InetAddress::getByName)).build())
++    }
++}
+diff --git a/app/src/full/java/com/nuvio/tv/core/runtime/PluginRuntimeHooks.kt b/app/src/full/java/com/nuvio/tv/core/runtime/PluginRuntimeHooks.kt
+index d8b01ef0d..9a0de76fa 100644
+--- a/app/src/full/java/com/nuvio/tv/core/runtime/PluginRuntimeHooks.kt
++++ b/app/src/full/java/com/nuvio/tv/core/runtime/PluginRuntimeHooks.kt
+@@ -50,7 +50,7 @@ object PluginRuntimeHooks {
+ 
+             try {
+                 app.baseClient = OkHttpClient.Builder()
+-                    .dns(com.nuvio.tv.core.network.IPv4FirstDns())
++                    .dns(ExtensionDns)
+                     .cookieJar(NuvioApplication.extensionCookieJar)
+                     .followRedirects(true)
+                     .followSslRedirects(true)
+@@ -68,6 +68,10 @@ object PluginRuntimeHooks {
+         }
+     }
+ 
++    fun onExtensionDnsChanged() {
++        if (isCloudstreamInitialized) app.baseClient.connectionPool.evictAll()
++    }
++
+     fun onActivityCreate(activity: Activity) {
+         AcraApplication.setActivity(activity)
+     }
 diff --git a/app/src/full/java/com/nuvio/tv/updater/ApkInstaller.kt b/app/src/full/java/com/nuvio/tv/updater/ApkInstaller.kt
 index 175511641..cf71f35eb 100644
 --- a/app/src/full/java/com/nuvio/tv/updater/ApkInstaller.kt
@@ -344471,6 +347114,19 @@ index 57c58ca92..70c10e191 100644
 +        viewModelScope.launch { updatePreferences.setOptimizeDuringInstall(enabled) }
 +    }
  }
+diff --git a/app/src/full/res/values/extension_settings.xml b/app/src/full/res/values/extension_settings.xml
+new file mode 100644
+index 000000000..8bda82499
+--- /dev/null
++++ b/app/src/full/res/values/extension_settings.xml
+@@ -0,0 +1,7 @@
++<resources>
++    <style name="Theme.ReSeq.ExtensionSettings" parent="Theme.Material3.Dark.NoActionBar">
++        <item name="android:windowIsTranslucent">true</item>
++        <item name="android:windowBackground">@android:color/transparent</item>
++    </style>
++    <string name="plugin_extension_settings_failed">This extension could not open its settings.</string>
++</resources>
 diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
 index 2afd07a53..23e156888 100644
 --- a/app/src/main/AndroidManifest.xml
@@ -427014,7 +429670,7 @@ index 000000000..2a9edcd1a
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/core/scout/sync/ScoutRatingSync.kt b/app/src/main/java/com/nuvio/tv/core/scout/sync/ScoutRatingSync.kt
 new file mode 100644
-index 000000000..02c87000e
+index 000000000..a4640c5bc
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/scout/sync/ScoutRatingSync.kt
 @@ -0,0 +1,191 @@
@@ -427055,7 +429711,7 @@ index 000000000..02c87000e
 +    private val polled: List<TrackerRatingClient> = listOf(trakt, mdbList)
 +    private val simklClient = simkl
 +
-+    suspend fun follow() = withContext(Dispatchers.IO) {
++    suspend fun follow(): Unit = withContext(Dispatchers.IO) {
 +        profileManager.activeProfileId.collectLatest { profileId ->
 +            coroutineScope {
 +                launch { followOutbox(profileId) }
@@ -434362,10 +437018,10 @@ index 54df8bee3..7591d2f27 100644
      suspend fun setUseForcedSubtitles(enabled: Boolean) {
          store().edit { prefs ->
 diff --git a/app/src/main/java/com/nuvio/tv/data/local/PluginDataStore.kt b/app/src/main/java/com/nuvio/tv/data/local/PluginDataStore.kt
-index fd5eb7941..161375737 100644
+index fd5eb7941..8f5990841 100644
 --- a/app/src/main/java/com/nuvio/tv/data/local/PluginDataStore.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/local/PluginDataStore.kt
-@@ -4,6 +4,9 @@ import android.content.Context
+@@ -4,12 +4,16 @@ import android.content.Context
  import androidx.datastore.preferences.core.booleanPreferencesKey
  import androidx.datastore.preferences.core.edit
  import androidx.datastore.preferences.core.stringPreferencesKey
@@ -434375,7 +437031,22 @@ index fd5eb7941..161375737 100644
  import com.nuvio.tv.core.profile.ProfileManager
  import com.nuvio.tv.domain.model.PluginRepository
  import com.nuvio.tv.domain.model.ScraperInfo
-@@ -34,6 +37,7 @@ class PluginDataStore @Inject constructor(
+ import com.squareup.moshi.Moshi
+ import com.squareup.moshi.Types
+ import dagger.hilt.android.qualifiers.ApplicationContext
++import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.ExperimentalCoroutinesApi
+ import kotlinx.coroutines.flow.Flow
+ import kotlinx.coroutines.flow.combine
+@@ -18,6 +22,7 @@ import kotlinx.coroutines.flow.emitAll
+ import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.flow.flatMapLatest
+ import kotlinx.coroutines.flow.flow
++import kotlinx.coroutines.flow.flowOn
+ import kotlinx.coroutines.flow.map
+ import java.io.File
+ import javax.inject.Inject
+@@ -34,6 +39,7 @@ class PluginDataStore @Inject constructor(
      companion object {
          internal const val FEATURE = "plugin_settings"
          internal const val GROUP_STREAMS_BY_REPOSITORY = "group_streams_by_repository"
@@ -434383,7 +437054,7 @@ index fd5eb7941..161375737 100644
      }
  
      private fun effectiveProfileId(): Int {
-@@ -76,7 +80,11 @@ class PluginDataStore @Inject constructor(
+@@ -76,7 +82,11 @@ class PluginDataStore @Inject constructor(
      private val scrapersKey = stringPreferencesKey("scrapers")
      private val pluginsEnabledKey = booleanPreferencesKey("plugins_enabled")
      private val groupStreamsByRepositoryKey = booleanPreferencesKey(GROUP_STREAMS_BY_REPOSITORY)
@@ -434395,26 +437066,121 @@ index fd5eb7941..161375737 100644
  
      private val repoListType = Types.newParameterizedType(List::class.java, PluginRepository::class.java)
      private val scraperListType = Types.newParameterizedType(List::class.java, ScraperInfo::class.java)
-@@ -206,6 +214,18 @@ class PluginDataStore @Inject constructor(
+@@ -100,8 +110,10 @@ class PluginDataStore @Inject constructor(
+ 
+     // Repositories
+     val repositories: Flow<List<PluginRepository>> = profileState { pid ->
+-        factory.get(pid, FEATURE).data.map { prefs ->
+-            prefs[repositoriesKey]?.let { json ->
++        factory.get(pid, FEATURE).data
++            .map { it[repositoriesKey] }
++            .distinctUntilChanged()
++            .map { stored -> stored?.let { json ->
+                 try {
+                     moshi.adapter<List<PluginRepository>>(repoListType).fromJson(json) ?: emptyList()
+                 } catch (e: Exception) {
+@@ -109,7 +121,7 @@ class PluginDataStore @Inject constructor(
+                 }
+             } ?: emptyList()
+         }
+-    }
++    }.flowOn(Dispatchers.Default)
+ 
+     suspend fun saveRepositories(repos: List<PluginRepository>) {
+             if (sharedPluginWriteBlocked()) return
+@@ -148,8 +160,10 @@ class PluginDataStore @Inject constructor(
+ 
+     // Scrapers
+     val scrapers: Flow<List<ScraperInfo>> = profileState { pid ->
+-        factory.get(pid, FEATURE).data.map { prefs ->
+-            prefs[scrapersKey]?.let { json ->
++        factory.get(pid, FEATURE).data
++            .map { it[scrapersKey] }
++            .distinctUntilChanged()
++            .map { stored -> stored?.let { json ->
+                 try {
+                     moshi.adapter<List<ScraperInfo>>(scraperListType).fromJson(json) ?: emptyList()
+                 } catch (e: Exception) {
+@@ -157,7 +171,7 @@ class PluginDataStore @Inject constructor(
+                 }
+             } ?: emptyList()
+         }
+-    }
++    }.flowOn(Dispatchers.Default)
+ 
+     suspend fun saveScrapers(scrapers: List<ScraperInfo>) {
+             if (sharedPluginWriteBlocked()) return
+@@ -167,6 +181,42 @@ class PluginDataStore @Inject constructor(
+         }
+     }
+ 
++    /** Capture the writable profile before starting a potentially long repository download. */
++    internal fun writablePluginProfile(): Int? =
++        if (sharedPluginWriteBlocked()) null else effectiveProfileId()
++
++    /** Commit repository metadata and successful downloads together, preserving previous installs and toggles. */
++    internal suspend fun storeExternalDownloads(
++        profileId: Int,
++        repo: PluginRepository,
++        downloads: List<ScraperInfo>,
++        refresh: Boolean
++    ): PluginRepository {
++        val repoAdapter = moshi.adapter<List<PluginRepository>>(repoListType)
++        val scraperAdapter = moshi.adapter<List<ScraperInfo>>(scraperListType)
++        var saved = repo
++        store(profileId).edit { prefs ->
++            val repositories = prefs[repositoriesKey]?.let(repoAdapter::fromJson).orEmpty().toMutableList()
++            val index = repositories.indexOfFirst { it.id == repo.id }
++            check(!refresh || index >= 0) { "Repository was removed during refresh" }
++            val oldScrapers = prefs[scrapersKey]?.let(scraperAdapter::fromJson).orEmpty()
++            val byId = downloads.associateBy { it.id }.toMutableMap()
++            val merged = oldScrapers.map { old ->
++                byId.remove(old.id)?.copy(enabled = old.enabled) ?: old
++            } + byId.values
++            saved = (repositories.getOrNull(index) ?: repo).copy(
++                name = repo.name,
++                description = repo.description,
++                lastUpdated = System.currentTimeMillis(),
++                scraperCount = merged.count { it.repositoryId == repo.id }
++            )
++            if (index >= 0) repositories[index] = saved else repositories.add(saved)
++            prefs[repositoriesKey] = repoAdapter.toJson(repositories)
++            prefs[scrapersKey] = scraperAdapter.toJson(merged)
++        }
++        return saved
++    }
++
+     suspend fun setScraperEnabled(scraperId: String, enabled: Boolean) {
+         val current = scrapers.first().toMutableList()
+         val index = current.indexOfFirst { it.id == scraperId }
+@@ -206,6 +256,26 @@ class PluginDataStore @Inject constructor(
          }
      }
  
 +    private val sourceLanguagesKey = stringSetPreferencesKey("cloudstream_languages")
++    private val extensionDnsKey = stringPreferencesKey("cloudstream_dns")
 +
 +    // An empty selection includes every source, including installations made before this setting existed.
 +    val sourceLanguages: Flow<Set<String>> = profileState { pid ->
 +        factory.get(pid, FEATURE).data.map { it[sourceLanguagesKey] ?: emptySet() }
++    }
++    val extensionDns: Flow<String> = profileState { pid ->
++        factory.get(pid, FEATURE).data.map { it[extensionDnsKey] ?: "SYSTEM" }
 +    }
 +
 +    suspend fun setSourceLanguages(languages: Set<String>) {
 +        if (sharedPluginWriteBlocked()) return
 +        store().edit { it[sourceLanguagesKey] = languages }
 +    }
++    suspend fun setExtensionDns(mode: String) {
++        if (sharedPluginWriteBlocked()) return
++        store().edit { it[extensionDnsKey] = mode }
++    }
 +
      // Scraper code storage
      fun getScraperCodeFile(scraperId: String): File {
          return File(codeDir, "$scraperId.js")
-@@ -272,4 +292,34 @@ class PluginDataStore @Inject constructor(
+@@ -272,4 +342,34 @@ class PluginDataStore @Inject constructor(
              p[scraperSettingsKey] = json
          }
      }
@@ -441033,11 +443799,50 @@ index c23f4146a..68437b9ca 100644
      val voteCount: Int? = null,
      val sourceAddonBaseUrl: String? = null,
 diff --git a/app/src/main/java/com/nuvio/tv/domain/model/Plugin.kt b/app/src/main/java/com/nuvio/tv/domain/model/Plugin.kt
-index 6baa47058..d5d375f05 100644
+index 6baa47058..d6d75c4ea 100644
 --- a/app/src/main/java/com/nuvio/tv/domain/model/Plugin.kt
 +++ b/app/src/main/java/com/nuvio/tv/domain/model/Plugin.kt
-@@ -147,6 +147,169 @@ data class ExternalPluginEntry(
-     val repositoryUrl: String? = null
+@@ -21,6 +21,7 @@ data class RemotePluginInfo(
+ /**
+  * Represents a plugin repository containing scrapers
+  */
++@JsonClass(generateAdapter = true)
+ data class PluginRepository(
+     val id: String,
+     val name: String,
+@@ -69,6 +70,7 @@ data class ScraperManifestInfo(
+ /**
+  * Installed scraper info with runtime state
+  */
++@JsonClass(generateAdapter = true)
+ data class ScraperInfo(
+     val id: String,
+     val name: String,
+@@ -122,7 +124,7 @@ data class LocalScraperResult(
+  */
+ @JsonClass(generateAdapter = true)
+ data class ExternalRepoManifest(
+-    val name: String,
++    val name: String = "",
+     val description: String? = null,
+     val manifestVersion: Int = 1,
+     val pluginLists: List<String>
+@@ -133,7 +135,7 @@ data class ExternalRepoManifest(
+  */
+ @JsonClass(generateAdapter = true)
+ data class ExternalPluginEntry(
+-    val name: String,
++    val name: String = "",
+     val internalName: String,
+     val description: String? = null,
+     val version: Int = 1,
+@@ -144,9 +146,173 @@ data class ExternalPluginEntry(
+     val iconUrl: String? = null,
+     val url: String,
+     val fileSize: Long? = null,
+-    val repositoryUrl: String? = null
++    val repositoryUrl: String? = null,
++    val fileHash: String? = null
  )
  
 +const val PLUGIN_BINGE_GROUP_PREFIX = "local-plugin-"
@@ -441206,7 +444011,7 @@ index 6baa47058..d5d375f05 100644
  /**
   * Convert LocalScraperResult to Stream
   */
-@@ -176,7 +339,14 @@ fun LocalScraperResult.toStream(scraper: ScraperInfo): com.nuvio.tv.domain.model
+@@ -176,7 +342,14 @@ fun LocalScraperResult.toStream(scraper: ScraperInfo): com.nuvio.tv.domain.model
          externalUrl = null,
          behaviorHints = StreamBehaviorHints(
              notWebReady = null,
@@ -441894,6 +444699,22 @@ index 721536401..11853c065 100644
  @Immutable
  @Serializable
  data class StreamBadge(
+diff --git a/app/src/main/java/com/nuvio/tv/domain/model/StreamContentContext.kt b/app/src/main/java/com/nuvio/tv/domain/model/StreamContentContext.kt
+new file mode 100644
+index 000000000..aa708b667
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/domain/model/StreamContentContext.kt
+@@ -0,0 +1,10 @@
++package com.nuvio.tv.domain.model
++
++/** Captured content selection for catalogue sources; never changes an addon's search coordinates. */
++data class StreamContentContext(
++    val contentId: String,
++    val title: String,
++    val year: Int? = null,
++    val episodeTitle: String? = null,
++    val tvdb: TvdbPlaybackContext? = null
++)
 diff --git a/app/src/main/java/com/nuvio/tv/domain/model/TvMix.kt b/app/src/main/java/com/nuvio/tv/domain/model/TvMix.kt
 new file mode 100644
 index 000000000..8f67e4322
@@ -543657,10 +546478,10 @@ index 000000000..a631656b3
 +internal fun pluginFocusedFill(): Color =
 +    if (isV2Settings()) settingsFocusFillColor() else NuvioTheme.colors.FocusBackground
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginScreen.kt
-index 401d25b31..1c1846586 100644
+index 401d25b31..7f2264d48 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginScreen.kt
-@@ -2,6 +2,10 @@
+@@ -2,11 +2,16 @@
  
  package com.nuvio.tv.ui.screens.plugin
  
@@ -543671,7 +546492,13 @@ index 401d25b31..1c1846586 100644
  import com.nuvio.tv.ui.theme.NuvioPrimitives
  import com.nuvio.tv.ui.theme.NuvioTheme
  
-@@ -54,6 +58,7 @@ import androidx.compose.runtime.getValue
+ import android.graphics.Bitmap
+ import androidx.activity.compose.BackHandler
++import androidx.activity.compose.LocalActivity
+ import androidx.compose.animation.AnimatedVisibility
+ import androidx.compose.animation.animateColorAsState
+ import androidx.compose.animation.fadeIn
+@@ -54,6 +59,7 @@ import androidx.compose.runtime.getValue
  import androidx.compose.runtime.mutableStateOf
  import androidx.compose.runtime.remember
  import androidx.compose.runtime.setValue
@@ -543679,7 +546506,7 @@ index 401d25b31..1c1846586 100644
  import androidx.compose.ui.Alignment
  import androidx.compose.ui.Modifier
  import androidx.compose.ui.focus.FocusRequester
-@@ -71,6 +76,7 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+@@ -71,6 +77,7 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
  import androidx.compose.ui.semantics.Role
  import androidx.compose.ui.semantics.contentDescription
  import androidx.compose.ui.semantics.role
@@ -543687,7 +546514,7 @@ index 401d25b31..1c1846586 100644
  import androidx.compose.ui.semantics.semantics
  import androidx.compose.ui.semantics.toggleableState
  import androidx.compose.ui.state.ToggleableState
-@@ -84,6 +90,8 @@ import androidx.compose.ui.unit.dp
+@@ -84,6 +91,8 @@ import androidx.compose.ui.unit.dp
  import androidx.hilt.navigation.compose.hiltViewModel
  import androidx.compose.foundation.lazy.LazyColumn
  import androidx.compose.foundation.lazy.items
@@ -543696,7 +546523,15 @@ index 401d25b31..1c1846586 100644
  import androidx.tv.material3.Border
  import androidx.tv.material3.Button
  import androidx.tv.material3.ButtonDefaults
-@@ -134,11 +142,24 @@ fun PluginScreenContent(
+@@ -96,6 +105,7 @@ import androidx.tv.material3.Switch
+ import androidx.tv.material3.SwitchDefaults
+ import androidx.tv.material3.Text
+ import com.nuvio.tv.domain.model.LocalScraperResult
++import com.nuvio.tv.domain.model.RepositoryType
+ import com.nuvio.tv.domain.model.PluginRepository
+ import com.nuvio.tv.domain.model.ScraperInfo
+ import com.nuvio.tv.ui.components.LoadingIndicator
+@@ -134,11 +144,24 @@ fun PluginScreenContent(
      showHeader: Boolean = true
  ) {
      var repoUrl by remember { mutableStateOf("") }
@@ -543721,7 +546556,7 @@ index 401d25b31..1c1846586 100644
      // Clear messages after delay
      LaunchedEffect(uiState.successMessage) {
          if (uiState.successMessage != null) {
-@@ -165,9 +186,12 @@ fun PluginScreenContent(
+@@ -165,9 +188,12 @@ fun PluginScreenContent(
                  .padding(horizontal = NuvioTheme.spacing.xxxl, vertical = NuvioTheme.spacing.xl)
          ) {
              LazyColumn(
@@ -543735,7 +546570,7 @@ index 401d25b31..1c1846586 100644
              ) {
              if (viewModel.isReadOnly) {
                  item {
-@@ -205,7 +229,10 @@ fun PluginScreenContent(
+@@ -205,7 +231,10 @@ fun PluginScreenContent(
  
                  // Manage from phone card
                  item {
@@ -543747,22 +546582,42 @@ index 401d25b31..1c1846586 100644
                  }
              }
  
-@@ -227,6 +254,14 @@ fun PluginScreenContent(
+@@ -227,6 +256,14 @@ fun PluginScreenContent(
                  )
              }
  
-+            item {
-+                CloudStreamPreferences(
-+                    uiState,
-+                    viewModel.isReadOnly,
-+                    onLanguage = { viewModel.onEvent(PluginUiEvent.ToggleSourceLanguage(it)) }
-+                )
++            if (uiState.scrapers.any { it.type == RepositoryType.EXTERNAL_DEX }) {
++                item {
++                    CloudStreamPreferences(uiState, viewModel.isReadOnly,
++                        onLanguage = { viewModel.onEvent(PluginUiEvent.ToggleSourceLanguage(it)) },
++                        onDns = { viewModel.onEvent(PluginUiEvent.CycleExtensionDns) })
++                }
 +            }
 +
              // Repositories section
              item {
                  Text(
-@@ -337,27 +372,26 @@ private fun PluginStreamGroupingCard(
+@@ -272,8 +309,19 @@ fun PluginScreenContent(
+                 }
+ 
+                 items(uiState.scrapers, key = { it.id }) { scraper ->
++                    val repo = uiState.repositories.find { it.id == scraper.repositoryId }
++                    val canConfigure = uiState.pluginsEnabled && !viewModel.isReadOnly && scraper.enabled &&
++                        scraper.type == RepositoryType.EXTERNAL_DEX && repo?.enabled == true
++                    val activity = LocalActivity.current
++                    var hasSettings by remember(scraper, repo?.lastUpdated, canConfigure) { mutableStateOf(false) }
++                    LaunchedEffect(scraper, repo?.lastUpdated, canConfigure) {
++                        if (canConfigure) hasSettings = viewModel.hasExtensionSettings(scraper.id)
++                    }
+                     ScraperCard(
+                         scraper = scraper,
++                        onSettings = if (hasSettings && activity != null) {
++                            { viewModel.openExtensionSettings(activity, scraper.id) }
++                        } else null,
+                         onToggle = { enabled ->
+                             viewModel.onEvent(PluginUiEvent.ToggleScraper(scraper.id, enabled))
+                         },
+@@ -337,27 +385,26 @@ private fun PluginStreamGroupingCard(
          },
          modifier = Modifier
              .fillMaxWidth()
@@ -543798,7 +546653,7 @@ index 401d25b31..1c1846586 100644
              verticalAlignment = Alignment.CenterVertically,
              horizontalArrangement = Arrangement.SpaceBetween
          ) {
-@@ -403,27 +437,26 @@ private fun PluginsEnabledCard(
+@@ -403,27 +450,26 @@ private fun PluginsEnabledCard(
          },
          modifier = Modifier
              .fillMaxWidth()
@@ -543834,7 +546689,7 @@ index 401d25b31..1c1846586 100644
              verticalAlignment = Alignment.CenterVertically,
              horizontalArrangement = Arrangement.SpaceBetween
          ) {
-@@ -476,11 +509,11 @@ private fun AddRepositoryInline(
+@@ -476,11 +522,11 @@ private fun AddRepositoryInline(
      }
  
      Card(
@@ -543850,7 +546705,7 @@ index 401d25b31..1c1846586 100644
              Text(
                  text = stringResource(R.string.plugin_add_repository),
                  style = MaterialTheme.typography.titleMedium,
-@@ -495,22 +528,19 @@ private fun AddRepositoryInline(
+@@ -495,22 +541,19 @@ private fun AddRepositoryInline(
                  // Surface always stays in the tree for stable D-pad focus
                  Surface(
                      onClick = { isEditing = true },
@@ -543878,7 +546733,7 @@ index 401d25b31..1c1846586 100644
                      scale = ClickableSurfaceDefaults.scale(focusedScale = 1f)
                  ) {
                      Box(modifier = Modifier.padding(NuvioTheme.spacing.md)) {
-@@ -577,10 +607,7 @@ private fun AddRepositoryInline(
+@@ -577,10 +620,7 @@ private fun AddRepositoryInline(
                          focusedContentColor = NuvioTheme.colors.OnSecondaryVariant
                      ),
                      border = ButtonDefaults.border(
@@ -543890,7 +546745,7 @@ index 401d25b31..1c1846586 100644
                      )
                  ) {
                      if (isLoading) {
-@@ -601,32 +628,33 @@ private fun AddRepositoryInline(
+@@ -601,32 +641,33 @@ private fun AddRepositoryInline(
  }
  
  @Composable
@@ -543933,7 +546788,7 @@ index 401d25b31..1c1846586 100644
              horizontalArrangement = Arrangement.SpaceBetween,
              verticalAlignment = Alignment.CenterVertically
          ) {
-@@ -725,13 +753,10 @@ private fun QrCodeOverlay(
+@@ -725,13 +766,10 @@ private fun QrCodeOverlay(
                      .semantics { role = Role.Button },
                  colors = ClickableSurfaceDefaults.colors(
                      containerColor = NuvioTheme.colors.Surface,
@@ -543949,7 +546804,7 @@ index 401d25b31..1c1846586 100644
                  ),
                  shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(50)),
                  scale = ClickableSurfaceDefaults.scale(focusedScale = 1f)
-@@ -897,13 +922,10 @@ private fun ConfirmRepoChangesDialog(
+@@ -897,13 +935,10 @@ private fun ConfirmRepoChangesDialog(
                              modifier = Modifier.semantics { role = Role.Button },
                              colors = ClickableSurfaceDefaults.colors(
                                  containerColor = NuvioTheme.colors.Surface,
@@ -543965,7 +546820,7 @@ index 401d25b31..1c1846586 100644
                              ),
                              shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(50))
                          ) {
-@@ -935,10 +957,7 @@ private fun ConfirmRepoChangesDialog(
+@@ -935,10 +970,7 @@ private fun ConfirmRepoChangesDialog(
                                  focusedContainerColor = NuvioTheme.colors.SecondaryVariant
                              ),
                              border = ClickableSurfaceDefaults.border(
@@ -543977,7 +546832,7 @@ index 401d25b31..1c1846586 100644
                              ),
                              shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(50))
                          ) {
-@@ -1010,13 +1029,10 @@ private fun ConfirmScraperEnableDialog(
+@@ -1010,13 +1042,10 @@ private fun ConfirmScraperEnableDialog(
                          modifier = Modifier.semantics { role = Role.Button },
                          colors = ClickableSurfaceDefaults.colors(
                              containerColor = NuvioTheme.colors.Surface,
@@ -543993,7 +546848,7 @@ index 401d25b31..1c1846586 100644
                          ),
                          shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(50))
                      ) {
-@@ -1048,10 +1064,7 @@ private fun ConfirmScraperEnableDialog(
+@@ -1048,10 +1077,7 @@ private fun ConfirmScraperEnableDialog(
                              focusedContainerColor = NuvioTheme.colors.SecondaryVariant
                          ),
                          border = ClickableSurfaceDefaults.border(
@@ -544005,7 +546860,7 @@ index 401d25b31..1c1846586 100644
                          ),
                          shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(50))
                      ) {
-@@ -1096,11 +1109,11 @@ private fun RepositoryCard(
+@@ -1096,11 +1122,11 @@ private fun RepositoryCard(
      var isRemoveFocused by remember { mutableStateOf(false) }
      val isCardFocused = isToggleFocused || isRefreshFocused || isRemoveFocused
      val cardBorderColor by animateColorAsState(
@@ -544019,7 +546874,7 @@ index 401d25b31..1c1846586 100644
          label = "repositoryCardScale"
      )
  
-@@ -1113,12 +1126,12 @@ private fun RepositoryCard(
+@@ -1113,12 +1139,12 @@ private fun RepositoryCard(
              }
              .background(
                  color = NuvioTheme.colors.BackgroundCard,
@@ -544034,7 +546889,7 @@ index 401d25b31..1c1846586 100644
              )
      ) {
          Row(
-@@ -1155,6 +1168,7 @@ private fun RepositoryCard(
+@@ -1155,6 +1181,7 @@ private fun RepositoryCard(
                      Surface(
                          onClick = { onToggleAll(!anyEnabled) },
                          modifier = Modifier
@@ -544042,7 +546897,7 @@ index 401d25b31..1c1846586 100644
                              .onFocusChanged { isToggleFocused = it.isFocused }
                              .semantics {
                                  role = Role.Switch
-@@ -1162,15 +1176,12 @@ private fun RepositoryCard(
+@@ -1162,15 +1189,12 @@ private fun RepositoryCard(
                              },
                          colors = ClickableSurfaceDefaults.colors(
                              containerColor = NuvioTheme.colors.Surface,
@@ -544061,7 +546916,7 @@ index 401d25b31..1c1846586 100644
                          scale = ClickableSurfaceDefaults.scale(focusedScale = 1f)
                      ) {
                          Row(
-@@ -1199,15 +1210,16 @@ private fun RepositoryCard(
+@@ -1199,15 +1223,16 @@ private fun RepositoryCard(
                      onClick = onRefresh,
                      enabled = !isLoading,
                      modifier = Modifier
@@ -544080,7 +546935,7 @@ index 401d25b31..1c1846586 100644
                  ) {
                      Icon(
                          imageVector = Icons.Default.Refresh,
-@@ -1219,15 +1231,16 @@ private fun RepositoryCard(
+@@ -1219,15 +1244,16 @@ private fun RepositoryCard(
                      onClick = onRemove,
                      enabled = !isLoading,
                      modifier = Modifier
@@ -544099,9 +546954,22 @@ index 401d25b31..1c1846586 100644
                  ) {
                      Icon(
                          imageVector = Icons.Default.Delete,
-@@ -1254,11 +1267,11 @@ private fun ScraperCard(
+@@ -1242,6 +1268,7 @@ private fun RepositoryCard(
+ @Composable
+ private fun ScraperCard(
+     scraper: ScraperInfo,
++    onSettings: (() -> Unit)?,
+     onToggle: (Boolean) -> Unit,
+     onTest: () -> Unit,
+     isTesting: Boolean,
+@@ -1252,13 +1279,15 @@ private fun ScraperCard(
+     var showResults by remember { mutableStateOf(false) }
+     var isTestFocused by remember { mutableStateOf(false) }
      var isToggleFocused by remember { mutableStateOf(false) }
-     val isCardFocused = isTestFocused || isToggleFocused
+-    val isCardFocused = isTestFocused || isToggleFocused
++    val settingsFocus = remember { FocusRequester() }
++    var isSettingsFocused by remember { mutableStateOf(false) }
++    val isCardFocused = isSettingsFocused || isTestFocused || isToggleFocused
      val cardBorderColor by animateColorAsState(
 -        targetValue = if (isCardFocused) NuvioTheme.colors.FocusRing else Color.Transparent,
 +        targetValue = if (isCardFocused && !isV2Settings()) NuvioTheme.colors.FocusRing else Color.Transparent,
@@ -544113,7 +546981,7 @@ index 401d25b31..1c1846586 100644
          label = "scraperCardScale"
      )
  
-@@ -1276,12 +1289,12 @@ private fun ScraperCard(
+@@ -1276,12 +1305,12 @@ private fun ScraperCard(
              }
              .background(
                  color = NuvioTheme.colors.BackgroundCard,
@@ -544128,10 +546996,33 @@ index 401d25b31..1c1846586 100644
              )
      ) {
          Column(
-@@ -1330,15 +1343,16 @@ private fun ScraperCard(
+@@ -1324,21 +1353,38 @@ private fun ScraperCard(
+                     horizontalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.md),
+                     verticalAlignment = Alignment.CenterVertically
+                 ) {
++                    if (onSettings != null) {
++                        Button(
++                            onClick = onSettings,
++                            modifier = Modifier
++                                .focusRequester(settingsFocus)
++                                .onFocusChanged { isSettingsFocused = it.isFocused },
++                            colors = ButtonDefaults.colors(
++                                containerColor = NuvioTheme.colors.Surface,
++                                contentColor = NuvioTheme.colors.TextPrimary,
++                                focusedContainerColor = NuvioTheme.colors.FocusBackground,
++                                focusedContentColor = NuvioTheme.colors.Primary
++                            )
++                        ) {
++                            Text(stringResource(R.string.nav_settings))
++                        }
++                    }
+                     // Test button
+                     Button(
+                         onClick = onTest,
                          enabled = !isTesting && scraper.enabled,
                          modifier = Modifier
-                             .focusProperties { left = FocusRequester.Cancel }
+-                            .focusProperties { left = FocusRequester.Cancel }
++                            .focusProperties { left = if (onSettings != null) settingsFocus else FocusRequester.Cancel }
 +                            .pluginFocus()
                              .onFocusChanged { isTestFocused = it.isFocused }
                              .semantics { role = Role.Button },
@@ -544147,7 +547038,7 @@ index 401d25b31..1c1846586 100644
                      ) {
                          if (isTesting) {
                              LoadingIndicator(modifier = Modifier.size(NuvioTheme.spacing.lg))
-@@ -1361,6 +1375,7 @@ private fun ScraperCard(
+@@ -1361,6 +1407,7 @@ private fun ScraperCard(
                          Surface(
                              onClick = { onToggle(!scraper.enabled) },
                              modifier = Modifier
@@ -544155,7 +547046,7 @@ index 401d25b31..1c1846586 100644
                                  .onFocusChanged { isToggleFocused = it.isFocused }
                                  .semantics {
                                      role = Role.Switch
-@@ -1369,15 +1384,12 @@ private fun ScraperCard(
+@@ -1369,15 +1416,12 @@ private fun ScraperCard(
                                  },
                              colors = ClickableSurfaceDefaults.colors(
                                  containerColor = NuvioTheme.colors.Surface,
@@ -544174,7 +547065,7 @@ index 401d25b31..1c1846586 100644
                              scale = ClickableSurfaceDefaults.scale(focusedScale = 1f)
                          ) {
                              Row(
-@@ -1418,13 +1430,14 @@ private fun ScraperCard(
+@@ -1418,13 +1462,14 @@ private fun ScraperCard(
                              ),
                              shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(6.dp)),
                              border = ClickableSurfaceDefaults.border(
@@ -544190,7 +547081,7 @@ index 401d25b31..1c1846586 100644
                                  .semantics { role = Role.Button }
                          ) {
                              Column(modifier = Modifier.padding(NuvioTheme.spacing.sm)) {
-@@ -1583,7 +1596,7 @@ private fun MessageOverlay(
+@@ -1583,7 +1628,7 @@ private fun MessageOverlay(
                      else
                          NuvioPrimitives.red600.copy(alpha = 0.9f)
                  ),
@@ -544199,7 +547090,7 @@ index 401d25b31..1c1846586 100644
              ) {
                  Row(
                      modifier = Modifier.padding(horizontal = 20.dp, vertical = NuvioTheme.spacing.md),
-@@ -1610,3 +1623,51 @@ private fun formatDate(timestamp: Long): String {
+@@ -1610,3 +1655,62 @@ private fun formatDate(timestamp: Long): String {
      val locale = Locale.getDefault()
      return SimpleDateFormat(android.text.format.DateFormat.getBestDateTimePattern(locale, "dMMMy"), locale).format(Date(timestamp))
  }
@@ -544209,7 +547100,8 @@ index 401d25b31..1c1846586 100644
 +internal fun CloudStreamPreferences(
 +    state: PluginUiState,
 +    readOnly: Boolean,
-+    onLanguage: (String?) -> Unit
++    onLanguage: (String?) -> Unit,
++    onDns: () -> Unit
 +) {
 +    Column(
 +        modifier = Modifier
@@ -544249,34 +547141,53 @@ index 401d25b31..1c1846586 100644
 +                Choice(label, code in state.sourceLanguages) { onLanguage(code) }
 +            }
 +        }
++        val dnsName = when (state.extensionDns) {
++            "CLOUDFLARE" -> "Cloudflare"
++            "GOOGLE" -> "Google"
++            "QUAD9" -> "Quad9"
++            else -> stringResource(R.string.plugin_dns_system)
++        }
++        Text(stringResource(R.string.plugin_dns_description), style = MaterialTheme.typography.bodyMedium)
++        Button(onClick = onDns, enabled = !readOnly) {
++            Text(stringResource(R.string.plugin_dns_choice, dnsName))
++        }
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginUiState.kt b/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginUiState.kt
-index e75186013..ac213a29b 100644
+index e75186013..93064dc44 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginUiState.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginUiState.kt
-@@ -7,6 +7,8 @@ import com.nuvio.tv.domain.model.PluginRepository
+@@ -7,6 +7,9 @@ import com.nuvio.tv.domain.model.PluginRepository
  import com.nuvio.tv.domain.model.ScraperInfo
  
  data class PluginUiState(
 +    val sourceLanguages: Set<String> = emptySet(),
 +    val installedLanguages: Map<String, Int> = emptyMap(),
++    val extensionDns: String = "SYSTEM",
      val pluginsEnabled: Boolean = true,
      val groupStreamsByRepository: Boolean = false,
      val repositories: List<PluginRepository> = emptyList(),
-@@ -43,6 +45,7 @@ data class PendingScraperEnableInfo(
+@@ -43,6 +46,8 @@ data class PendingScraperEnableInfo(
  )
  
  sealed interface PluginUiEvent {
 +    data class ToggleSourceLanguage(val language: String?) : PluginUiEvent
++    object CycleExtensionDns : PluginUiEvent
      data class AddRepository(val url: String) : PluginUiEvent
      data class RemoveRepository(val repoId: String) : PluginUiEvent
      data class RefreshRepository(val repoId: String) : PluginUiEvent
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginViewModel.kt
-index c97a69dd6..4649cf3ef 100644
+index c97a69dd6..5c59fa5e9 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginViewModel.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginViewModel.kt
-@@ -11,12 +11,14 @@ import com.nuvio.tv.core.profile.ProfileManager
+@@ -4,19 +4,20 @@ import android.content.Context
+ import androidx.lifecycle.ViewModel
+ import androidx.lifecycle.viewModelScope
+ import com.nuvio.tv.R
+-import com.nuvio.tv.core.util.readAppLogoBytes
+ import com.nuvio.tv.core.plugin.PluginManager
+ import com.nuvio.tv.core.plugin.PluginSafety
+ import com.nuvio.tv.core.profile.ProfileManager
  import com.nuvio.tv.core.qr.QrCodeGenerator
  import com.nuvio.tv.core.server.DeviceIpAddress
  import com.nuvio.tv.core.server.RepositoryConfigServer
@@ -544291,7 +547202,7 @@ index c97a69dd6..4649cf3ef 100644
  import kotlinx.coroutines.flow.update
  import kotlinx.coroutines.delay
  import kotlinx.coroutines.launch
-@@ -39,15 +41,17 @@ class PluginViewModel @Inject constructor(
+@@ -39,15 +40,20 @@ class PluginViewModel @Inject constructor(
          }
  
      private var repoServer: RepositoryConfigServer? = null
@@ -544308,6 +547219,9 @@ index c97a69dd6..4649cf3ef 100644
 +        viewModelScope.launch { pluginManager.sourceLanguages.collect { languages ->
 +            _uiState.update { it.copy(sourceLanguages = languages) }
 +        } }
++        viewModelScope.launch { pluginManager.extensionDns.collect { mode ->
++            _uiState.update { it.copy(extensionDns = mode) }
++        } }
 +        viewModelScope.launch { pluginManager.scrapers.collectLatest {
 +            val languages = pluginManager.installedSourceLanguages()
 +            _uiState.update { it.copy(installedLanguages = languages) }
@@ -544315,8 +547229,17 @@ index c97a69dd6..4649cf3ef 100644
      }
  
      private fun observePluginData() {
-@@ -84,6 +88,12 @@ class PluginViewModel @Inject constructor(
+@@ -82,8 +88,26 @@ class PluginViewModel @Inject constructor(
+         }
+     }
  
++    suspend fun hasExtensionSettings(scraperId: String): Boolean =
++        !isReadOnly && pluginManager.hasExtensionSettings(scraperId)
++
++    fun openExtensionSettings(activity: android.app.Activity, scraperId: String) {
++        if (!isReadOnly) pluginManager.openExtensionSettings(activity, scraperId)
++    }
++
      fun onEvent(event: PluginUiEvent) {
          when (event) {
 +            is PluginUiEvent.ToggleSourceLanguage -> if (!isReadOnly) viewModelScope.launch {
@@ -544324,6 +547247,11 @@ index c97a69dd6..4649cf3ef 100644
 +                val next = if (event.language == null) emptySet() else
 +                    if (event.language in current) current - event.language else current + event.language
 +                pluginManager.setSourceLanguages(next)
++            }
++            PluginUiEvent.CycleExtensionDns -> if (!isReadOnly) viewModelScope.launch {
++                val options = listOf("SYSTEM", "CLOUDFLARE", "GOOGLE", "QUAD9")
++                val next = (options.indexOf(_uiState.value.extensionDns) + 1) % options.size
++                pluginManager.setExtensionDns(options[next])
 +            }
              is PluginUiEvent.AddRepository -> addRepository(event.url)
              is PluginUiEvent.RemoveRepository -> removeRepository(event.repoId)
@@ -776661,7 +779589,7 @@ index 000000000..824575f29
 +    <string name="scout_menu_visible_sub">Scout\'s Home rows keep their own switches</string>
 +</resources>
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index b4264552c..370270682 100644
+index b4264552c..e9326880d 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
 @@ -343,6 +343,8 @@
@@ -776682,7 +779610,7 @@ index b4264552c..370270682 100644
      <string name="about_update_channel_title">Update channel</string>
      <string name="about_update_channel_subtitle">Choose the type of app updates to receive</string>
      <string name="about_check_updates">Check for updates</string>
-@@ -446,6 +450,18 @@
+@@ -446,6 +450,21 @@
      <string name="update_channel_dialog_subtitle">Choose the type of updates you want to receive</string>
      <string name="update_channel_stable_description">Intended for everyday use.</string>
      <string name="update_channel_beta_description">Early updates that may contain bugs, break features, or behave unexpectedly.</string>
@@ -776698,10 +779626,13 @@ index b4264552c..370270682 100644
 +    <string name="plugin_source_languages_title">Source languages</string>
 +    <string name="plugin_source_languages_description">Choose which languages’ CloudStream sources search for streams. Sources with an unspecified or multilingual language are always included.</string>
 +    <string name="plugin_all_source_languages">All languages</string>
++    <string name="plugin_dns_system">TV system DNS</string>
++    <string name="plugin_dns_choice">CloudStream DNS · %1$s</string>
++    <string name="plugin_dns_description">Choose the resolver used for CloudStream extension requests. Press OK to switch providers.</string>
      <string name="about_privacy_policy">Privacy Policy</string>
      <string name="about_privacy_policy_subtitle">View our privacy policy</string>
      <string name="support_nuvio_name">Support Nuvio</string>
-@@ -803,6 +819,19 @@
+@@ -803,6 +822,19 @@
      <string name="playback_auto_quality_sub">Adapts the video quality of adaptive streams to the measured connection speed, without restarting playback. Picking a quality in the player pauses it until Auto is picked again.</string>
      <string name="playback_fast_start">Fast start</string>
      <string name="playback_fast_start_sub">Starts adaptive streams at the lowest quality and steps up automatically once the first buffering completes and the connection allows it. Requires Auto quality.</string>
@@ -776721,7 +779652,7 @@ index b4264552c..370270682 100644
      <string name="playback_external_forward_subtitles">Forward subtitles to external player</string>
      <string name="playback_external_forward_subtitles_sub">Fetch subtitles in your preferred language from addons and pass them to the external player.</string>
      <string name="playback_external_send_skip_segments">Send intro and outro timestamps</string>
-@@ -835,9 +864,10 @@
+@@ -835,9 +867,10 @@
      <string name="video_section">Video</string>
      <string name="playback_true_black_letterbox">True black bars</string>
      <string name="playback_true_black_letterbox_sub">Leave the bars around the picture unpainted so HDR stays true black. Keep this off if a bright line appears on the bars.</string>
@@ -776735,7 +779666,7 @@ index b4264552c..370270682 100644
      <string name="audio_trailer_section">Trailer</string>
      <string name="audio_autoplay_trailers">Auto-play Trailers</string>
      <string name="audio_autoplay_trailers_sub">Automatically play trailers on detail and post-play screens</string>
-@@ -850,6 +880,17 @@
+@@ -850,6 +883,17 @@
      <string name="audio_preferred_lang">Preferred Audio Language</string>
      <string name="audio_skip_silence">Skip Silence</string>
      <string name="audio_skip_silence_sub">Skip silent portions of audio during playback</string>
@@ -776753,7 +779684,7 @@ index b4264552c..370270682 100644
      <string name="audio_remember_delay_per_device">Remember audio delay per device</string>
      <string name="audio_remember_delay_per_device_sub">Save and restore the in-player audio delay for the current audio output route</string>
      <string name="audio_advanced_section">Advanced Audio</string>
-@@ -940,10 +981,35 @@
+@@ -940,10 +984,35 @@
      <string name="sub_outline">Outline</string>
      <string name="sub_outline_sub">Add outline around subtitle text for better visibility</string>
      <string name="sub_outline_color">Outline Color</string>
@@ -776790,7 +779721,7 @@ index b4264552c..370270682 100644
      <string name="sub_advanced_section">Advanced Subtitle Rendering</string>
      <string name="sub_libass">Use libass for ASS/SSA subtitles</string>
      <string name="sub_libass_sub">Advanced ASS/SSA rendering (styles, positioning, animations)</string>
-@@ -1007,6 +1073,20 @@
+@@ -1007,6 +1076,20 @@
      <string name="autoplay_timeout_sub">Wait time for addons before selecting.</string>
      <string name="autoplay_timeout_instant">Instant</string>
      <string name="autoplay_timeout_unlimited">Unlimited</string>
@@ -776811,7 +779742,7 @@ index b4264552c..370270682 100644
      <string name="autoplay_allowed_addons">Allowed Addons</string>
      <string name="autoplay_all_addons">All installed addons</string>
      <string name="autoplay_allowed_plugins">Allowed Plugins</string>
-@@ -1133,6 +1213,14 @@
+@@ -1133,6 +1216,14 @@
      <string name="layout_cw_sort_streaming_desc">Released items first, upcoming at the end</string>
      <string name="layout_cw_sort_split_upcoming">Separate Upcoming Row</string>
      <string name="layout_cw_sort_split_upcoming_desc">Move unaired episodes to a separate Upcoming row</string>
@@ -776826,7 +779757,7 @@ index b4264552c..370270682 100644
      <string name="upcoming_section_title">Upcoming</string>
      <string name="layout_trailer_button">Show Trailer Button</string>
      <string name="layout_trailer_button_sub">Show trailer button on detail page (only when trailer is available).</string>
-@@ -1235,6 +1323,8 @@
+@@ -1235,6 +1326,8 @@
      <!-- Custom Poster Web Page -->
      <string name="layout_always_show_landscape_clearlogo">Always Backdrop with Logo for Landscape Posters</string>
      <string name="layout_always_show_landscape_clearlogo_sub">Ignore landscape poster from addon and use backdrop with clearlogo overlay instead.</string>
@@ -776835,7 +779766,7 @@ index b4264552c..370270682 100644
      <string name="web_custom_poster_title">Custom Poster Source</string>
      <string name="web_custom_poster_subtitle">Paste a poster URL pattern below and press Save.</string>
      <string name="web_custom_poster_label">URL Pattern</string>
-@@ -1251,6 +1341,13 @@
+@@ -1251,6 +1344,13 @@
      <string name="web_custom_poster_none">No pattern set</string>
      <string name="web_custom_poster_loading">Loading…</string>
      <string name="web_custom_poster_placeholders_info">Placeholders: {id} passes all content IDs. {imdb_id}, {tmdb_id}, {tvdb_id}, {kitsu_id} target a single ID type - if unavailable, the original poster is kept. {imdb_id|tmdb_id|kitsu_id} declares supported ID types - the matching one is used, or the original poster is kept. Add ? to make a placeholder optional, resolving to empty instead of skipping: {imdb_id?}. Other placeholders: {id_type}, {typed_id}, {type}, {shape}.</string>
@@ -776849,7 +779780,7 @@ index b4264552c..370270682 100644
  
  
      <string name="mdblist_name">MDBList</string>
-@@ -1781,6 +1878,13 @@
+@@ -1781,6 +1881,13 @@
      <string name="addon_installing">Installing</string>
      <string name="addon_install_btn">Install</string>
      <string name="addon_install_success">Installed %1$s</string>
@@ -776863,7 +779794,7 @@ index b4264552c..370270682 100644
      <string name="addon_error_invalid_url">Enter a valid addon URL</string>
      <string name="addon_error_invalid_scheme">Addon URL must start with http or https</string>
      <string name="addon_installed_section">Installed</string>
-@@ -2061,6 +2165,12 @@
+@@ -2061,6 +2168,12 @@
      <string name="audio_center_mix_unavailable">Center mix is only available when FFmpeg downmix is active.</string>
      <string name="audio_maintain_original_audio_on_downmix_title">Maintain original audio on downmix</string>
      <string name="audio_maintain_original_audio_on_downmix_subtitle">When disabled, downmix normalization can reduce overall volume.</string>
@@ -776876,7 +779807,7 @@ index b4264552c..370270682 100644
  
      <string name="subtitle_dialog_title">Subtitles</string>
      <string name="subtitle_no_builtin">No built-in subtitles available</string>
-@@ -2254,15 +2364,12 @@
+@@ -2254,15 +2367,12 @@
      <string name="library_status_dropped">Dropped</string>
      <string name="library_syncing_library">Syncing library\u2026</string>
      <string name="library_type_all">All</string>
@@ -776896,7 +779827,7 @@ index b4264552c..370270682 100644
      <string name="library_empty_simkl_not_auth_title">Simkl not connected</string>
      <string name="library_empty_simkl_not_auth_subtitle">Connect your Simkl account in Settings to view your Simkl library</string>
      <string name="library_list_create_dialog_title">Create List</string>
-@@ -2306,6 +2413,7 @@
+@@ -2306,6 +2416,7 @@
      <string name="cloud_library_type_all">All</string>
      <string name="cloud_library_type_torrents">Torrents</string>
      <string name="cloud_library_type_usenet">Usenet</string>
@@ -776904,7 +779835,7 @@ index b4264552c..370270682 100644
      <string name="cloud_library_type_web">Web</string>
      <string name="cloud_library_type_files">Files</string>
  
-@@ -2586,6 +2694,8 @@
+@@ -2586,6 +2697,8 @@
      <string name="update_checking">Checking for updates…</string>
      <string name="update_waiting_for_stable">You’ll receive the next stable release when it becomes available</string>
      <string name="update_download_complete">Download complete. Ready to install.</string>
@@ -776913,7 +779844,7 @@ index b4264552c..370270682 100644
      <string name="update_installed_automatically">Updated automatically while the device was idle</string>
      <string name="update_up_to_date">System is up to date. Latest changes:</string>
      <string name="update_close">Close</string>
-@@ -2678,6 +2788,13 @@
+@@ -2678,6 +2791,13 @@
      <string name="cd_switch_player_engine">Switch player engine</string>
      <string name="cd_episodes">Episodes</string>
      <string name="player_chapter_number">Chapter %1$d</string>
@@ -776927,7 +779858,7 @@ index b4264552c..370270682 100644
      <string name="player_chapters">Chapters</string>
      <string name="player_chapters_title">Chapters (%1$d)</string>
      <string name="player_chapter_remaining">%1$s left</string>
-@@ -3508,17 +3625,17 @@
+@@ -3508,17 +3628,17 @@
      <string name="stream_test_no_stream">No playback recorded. Play a video to run diagnostic tests on its host.</string>
      <string name="stream_test_btn_start">Start Test</string>
      <string name="stream_test_btn_measuring_baseline">Measuring Baseline...</string>
@@ -776953,7 +779884,7 @@ index b4264552c..370270682 100644
      <string name="stream_test_error_prefix">Error: %1$s</string>
      <string name="stream_test_video_bitrate">Average Video Bitrate: %1$s</string>
      <string name="stream_test_error_connection">Connection failed. The last played stream link may have expired or is unreachable. Please play the video again and retry.</string>
-@@ -3585,9 +3702,7 @@
+@@ -3585,9 +3705,7 @@
      <string name="autosync_tolerance_value">%1$d ms</string>
      <string name="autosync_thorough_title">Thorough Auto Sync Search</string>
      <string name="autosync_thorough_description">Keep comparing other subtitles and embedded tracks for a closer match before syncing. When off, the first strong match is used sooner. Only confident matches are ever applied.</string>
@@ -776964,7 +779895,7 @@ index b4264552c..370270682 100644
      <string name="autosync_label_synced">Auto synced</string>
      <string name="stream_resume_from_time">Resume from %1$s</string>
      <string name="stream_resume_from_percent">Resume from %1$d%%</string>
-@@ -3743,4 +3858,16 @@
+@@ -3743,4 +3861,16 @@
      <string name="iptv_free_channel_count">%1$d channels</string>
      <string name="iptv_free_source_summary">Free channels · %1$d countries · %2$d channels</string>
      <string name="iptv_free_source_summary_short">Free channels · %1$d countries</string>
