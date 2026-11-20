@@ -438738,6 +438738,37 @@ index 000000000..8c7841629
 +        val Unchanged = MdbListEpisodeMapping(emptyList(), emptyList())
 +    }
 +}
+diff --git a/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListHistoryService.kt b/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListHistoryService.kt
+index 1527ca572..b1ab70245 100644
+--- a/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListHistoryService.kt
++++ b/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListHistoryService.kt
+@@ -19,6 +19,26 @@ class MdbListHistoryService @Inject constructor(
+     suspend fun remove(scope: MdbListAuthScope, items: Collection<TrackingMediaReference>): TrackingMutationResult =
+         change(scope, items.map { TrackingHistoryItem(it) }, remove = true)
+ 
++    /** Restore the pre-play timestamp only when the current row is this play (dated watch undo). */
++    suspend fun undo(scope: MdbListAuthScope, media: TrackingMediaReference,
++        event: com.nuvio.tv.core.tracking.TrackingWatchEvent): Boolean {
++        sync.refresh(TrackingRefreshIntent.INVALIDATED)
++        return sync.write(scope, setOf(MdbListSyncBucket.WATCHED)) { snapshot ->
++            val target = snapshot.mutationTarget(media) ?: return@write snapshot to false
++            val current = snapshot.watched.singleOrNull(target::matches) ?: return@write snapshot to false
++            if (!event.contains(mdbListTimestamp(current.watchedAt))) return@write snapshot to false
++            check(event.priorKnown) { "The previous MDBList watch is unknown" }
++            val prior = event.priorWatchedAt?.let { Instant.ofEpochMilli(it).toString() }
++            val change = MdbListHistoryChange(target, prior)
++            val response = api.post(if (prior == null) "/sync/watched/remove" else "/sync/watched",
++                mdbListHistoryPayload(listOf(change)), scope)
++            val receipt = decodeMdbListHistoryReceipt(response.body, listOf(change), remove = prior == null)
++            check(receipt.complete)
++            snapshot.copy(watched = snapshot.watched.filterNot(target::matches) +
++                if (prior == null) emptyList() else listOf(current.copy(watchedAt = prior))) to true
++        }
++    }
++
+     private suspend fun change(
+         scope: MdbListAuthScope,
+         items: List<TrackingHistoryItem>,
 diff --git a/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListProgressProjection.kt b/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListProgressProjection.kt
 index ea6bfde4c..3bd7487d2 100644
 --- a/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListProgressProjection.kt
@@ -438762,12 +438793,53 @@ index ea6bfde4c..3bd7487d2 100644
      companion object {
          const val COMPLETION_PERCENT = 80f
          val Empty = MdbListProgressProjection(MdbListSyncSnapshot(0))
+diff --git a/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListScrobbleService.kt b/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListScrobbleService.kt
+index 6f0e35f92..392dec1b0 100644
+--- a/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListScrobbleService.kt
++++ b/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListScrobbleService.kt
+@@ -22,6 +22,29 @@ class MdbListScrobbleService @Inject constructor(
+         }
+     }
+ 
++    /** Clears the one dated playback row this watch created; false when there is none. */
++    suspend fun clearDatedEpisodePause(scope: MdbListAuthScope, media: com.nuvio.tv.core.tracking.TrackingMediaReference,
++        event: com.nuvio.tv.core.tracking.TrackingWatchEvent): Boolean {
++        val episode = requireNotNull(media.episode)
++        val contentId = requireNotNull(media.catalog).contentId
++        val rows = decodeMdbListPlayback(api.get("/sync/playback", scope = scope).body)
++        val matching = rows.filter { it.type == MdbListItemType.EPISODE && contentId in it.media.ids.aliases() &&
++            (if (episode.tmdbId != null && it.episodeTmdbId != null) it.episodeTmdbId == episode.tmdbId
++             else if (episode.tvdbId != null && it.episodeTvdbId != null) it.episodeTvdbId == episode.tvdbId
++             else !episode.usesTvdbSeasonMapping && it.season == episode.season && it.episode == episode.number) &&
++            event.contains(mdbListTimestamp(it.updatedAt)) }
++        if (matching.isEmpty()) return false
++        val row = matching.single()
++        val target = MdbListMutationTarget(row.type, row.media, row.season, row.episode)
++        check(rows.count(target::matches) == 1)
++        sync.write(scope, setOf(MdbListSyncBucket.PLAYBACK)) { snapshot ->
++            val body = mdbListResponseElement(api.post("/scrobble/clear", "{\"id\":${requireNotNull(row.id)}}", scope).body).objectValue()
++            check(body.text("action") == "clear" && body.flag("deleted") != null)
++            snapshot.copy(playback = snapshot.playback.filterNot(target::matches)) to Unit
++        }
++        return true
++    }
++
+     suspend fun clear(scope: MdbListAuthScope, contentId: String, season: Int?, episode: Int?) {
+         sync.ensureLoaded()
+         val sessions = sync.currentSnapshot()?.playback.orEmpty().filter { session ->
 diff --git a/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListTrackingProgressProvider.kt b/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListTrackingProgressProvider.kt
-index 2fb4b8d46..407ee8790 100644
+index 2fb4b8d46..3df5dc18c 100644
 --- a/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListTrackingProgressProvider.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListTrackingProgressProvider.kt
-@@ -6,21 +6,29 @@ import com.nuvio.tv.core.tracking.TrackingProviderId
+@@ -1,26 +1,38 @@
+ package com.nuvio.tv.data.mdblist
+ 
+ import com.nuvio.tv.core.profile.ProfileManager
++import com.nuvio.tv.core.tracking.TrackingMediaReference
+ import com.nuvio.tv.core.tracking.TrackingProgressProvider
+ import com.nuvio.tv.core.tracking.TrackingProviderId
  import com.nuvio.tv.core.tracking.TrackingRefreshIntent
++import com.nuvio.tv.core.tracking.TrackingWatchEvent
  import com.nuvio.tv.core.tracking.parseTrackingExternalIds
  import com.nuvio.tv.data.local.LayoutPreferenceDataStore
 +import com.nuvio.tv.data.repository.EpisodeMappingEntry
@@ -438792,11 +438864,13 @@ index 2fb4b8d46..407ee8790 100644
  class MdbListTrackingProgressProvider @Inject constructor(
      private val sync: MdbListSyncRepository,
      private val scrobbles: MdbListScrobbleService,
++    private val history: MdbListHistoryService,
 +    private val episodeMappings: MdbListEpisodeMappingService,
++    private val authStore: MdbListAuthStore,
      auth: MdbListAuthStore,
      profiles: ProfileManager,
      layout: LayoutPreferenceDataStore
-@@ -33,7 +41,7 @@ class MdbListTrackingProgressProvider @Inject constructor(
+@@ -33,7 +45,7 @@ class MdbListTrackingProgressProvider @Inject constructor(
          if (authorization.isAuthenticated && authorization.scope.profileId == profileId &&
              state.scope == authorization.scope) state.projection else MdbListProgressProjection.Empty
      }.distinctUntilChanged()
@@ -438805,7 +438879,7 @@ index 2fb4b8d46..407ee8790 100644
      override val watchedItems = projection.map { it.watchedItems }.loadOnStart()
      override val watchedMovieIds = projection.map { it.watchedMovieIds }.loadOnStart()
      override val nextUpSeeds = combine(projection, layout.nextUpFromFurthestEpisode) { projection, furthest ->
-@@ -44,12 +52,28 @@ class MdbListTrackingProgressProvider @Inject constructor(
+@@ -44,12 +56,28 @@ class MdbListTrackingProgressProvider @Inject constructor(
      }.distinctUntilChanged()
  
      override fun episodeProgress(contentId: String): Flow<Map<Pair<Int, Int>, WatchProgress>> =
@@ -438836,7 +438910,7 @@ index 2fb4b8d46..407ee8790 100644
  
      override suspend fun watchedShowEpisodes(): Map<String, Set<Pair<Int, Int>>> {
          sync.refresh(TrackingRefreshIntent.AUTOMATIC)
-@@ -67,25 +91,102 @@ class MdbListTrackingProgressProvider @Inject constructor(
+@@ -67,25 +95,115 @@ class MdbListTrackingProgressProvider @Inject constructor(
          val season = parts[parts.lastIndex - 1].toIntOrNull() ?: return null
          val parent = parts.dropLast(2).joinToString(":")
          if (retainsLocalProgress(parent)) return null
@@ -438878,6 +438952,19 @@ index 2fb4b8d46..407ee8790 100644
      private fun currentProjection(): MdbListProgressProjection =
          sync.currentProjection()
  
++    /** Dated undo: clears the play's own pause row, then restores the prior watch timestamp. */
++    override suspend fun removeWatchEvent(target: TrackingMediaReference, event: TrackingWatchEvent): Boolean {
++        val scope = authStore.scope()
++        check(event.profileId == null || scope.profileId == event.profileId)
++        val mapping = if (target.catalog?.providerDefault == true) null else episodeMapping(requireNotNull(target.catalog).contentId, currentProjection())
++        val episode = requireNotNull(target.episode)
++        val mapped = mapping?.takeIf { it.remaps }?.toTmdb(requireNotNull(episode.season), episode.number)
++        val native = if (mapped == null) target else target.copy(episode = episode.copy(season = mapped.season, number = mapped.episode))
++        val pause = scrobbles.clearDatedEpisodePause(scope, native, event)
++        val watch = event.completionExpected && history.undo(scope, native, event)
++        return if (event.completionExpected) watch else pause
++    }
++
 +    private suspend fun episodeMapping(
 +        contentId: String,
 +        projection: MdbListProgressProjection
@@ -439311,7 +439398,7 @@ index c057d17d3..4dd4ac18e 100644
  
  @JsonClass(generateAdapter = true)
 diff --git a/app/src/main/java/com/nuvio/tv/data/remote/api/TraktApi.kt b/app/src/main/java/com/nuvio/tv/data/remote/api/TraktApi.kt
-index b01b4dd91..e24621c24 100644
+index b01b4dd91..5e8132554 100644
 --- a/app/src/main/java/com/nuvio/tv/data/remote/api/TraktApi.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/remote/api/TraktApi.kt
 @@ -1,6 +1,8 @@
@@ -439323,7 +439410,15 @@ index b01b4dd91..e24621c24 100644
  import com.nuvio.tv.data.remote.dto.trakt.TraktDeviceCodeResponseDto
  import com.nuvio.tv.data.remote.dto.trakt.TraktDeviceTokenRequestDto
  import com.nuvio.tv.data.remote.dto.trakt.TraktLastActivitiesResponseDto
-@@ -220,7 +222,8 @@ interface TraktApi {
+@@ -16,6 +18,7 @@ import com.nuvio.tv.data.remote.dto.trakt.TraktListItemsMutationRequestDto
+ import com.nuvio.tv.data.remote.dto.trakt.TraktListItemsMutationResponseDto
+ import com.nuvio.tv.data.remote.dto.trakt.TraktListSummaryDto
+ import com.nuvio.tv.data.remote.dto.trakt.TraktMovieDto
++import com.nuvio.tv.data.remote.dto.trakt.TraktHistoryPlayRemoval
+ import com.nuvio.tv.data.remote.dto.trakt.TraktPlaybackItemDto
+ import com.nuvio.tv.data.remote.dto.trakt.TraktProminentListDto
+ import com.nuvio.tv.data.remote.dto.trakt.TraktReorderListsRequestDto
+@@ -220,7 +223,8 @@ interface TraktApi {
          @Header("Authorization") authorization: String,
          @Path("id_type") idType: String,
          @Path("id") id: String,
@@ -439333,7 +439428,20 @@ index b01b4dd91..e24621c24 100644
      ): Response<List<TraktSearchResultDto>>
  
      @GET("search/list")
-@@ -391,4 +394,22 @@ interface TraktApi {
+@@ -279,6 +283,12 @@ interface TraktApi {
+         @Body body: TraktHistoryRemoveRequestDto
+     ): Response<TraktHistoryRemoveResponseDto>
+ 
++    @HTTP(method = "POST", path = "sync/history/remove", hasBody = true)
++    suspend fun removeHistoryPlay(
++        @Header("Authorization") authorization: String,
++        @Body body: TraktHistoryPlayRemoval
++    ): Response<TraktHistoryRemoveResponseDto>
++
+     @GET("users/{id}/lists")
+     suspend fun getUserLists(
+         @Header("Authorization") authorization: String,
+@@ -391,4 +401,22 @@ interface TraktApi {
          @Header("Authorization") authorization: String,
          @Body body: okhttp3.RequestBody
      ): Response<okhttp3.ResponseBody>
@@ -439408,10 +439516,22 @@ index e4dfb4836..d04ce9684 100644
 +    @Json(name = "first_aired") val firstAired: String? = null
  )
 diff --git a/app/src/main/java/com/nuvio/tv/data/remote/dto/trakt/TraktSyncDtos.kt b/app/src/main/java/com/nuvio/tv/data/remote/dto/trakt/TraktSyncDtos.kt
-index 3cf89e0dc..d4ec24b46 100644
+index 3cf89e0dc..295b1badf 100644
 --- a/app/src/main/java/com/nuvio/tv/data/remote/dto/trakt/TraktSyncDtos.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/remote/dto/trakt/TraktSyncDtos.kt
-@@ -204,3 +204,25 @@ data class TraktHiddenItemDto(
+@@ -110,6 +110,11 @@ data class TraktHistoryEpisodeRemoveDto(
+     @Json(name = "number") val number: Int
+ )
+ 
++@JsonClass(generateAdapter = true)
++data class TraktHistoryPlayRemoval(
++    @Json(name = "ids") val ids: List<Long>
++)
++
+ @JsonClass(generateAdapter = true)
+ data class TraktHistoryRemoveResponseDto(
+     @Json(name = "deleted") val deleted: TraktHistoryRemoveCountDto? = null,
+@@ -204,3 +209,25 @@ data class TraktHiddenItemDto(
      @Json(name = "show") val show: TraktShowDto? = null,
      @Json(name = "movie") val movie: TraktMovieDto? = null
  )
@@ -441498,7 +441618,7 @@ index db909ab60..2a48ca0b0 100644
 -    }
  }
 diff --git a/app/src/main/java/com/nuvio/tv/data/repository/TraktProgressService.kt b/app/src/main/java/com/nuvio/tv/data/repository/TraktProgressService.kt
-index 97e80229b..c7ecc65fb 100644
+index 97e80229b..1047430c7 100644
 --- a/app/src/main/java/com/nuvio/tv/data/repository/TraktProgressService.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/repository/TraktProgressService.kt
 @@ -29,6 +29,7 @@ import com.nuvio.tv.data.remote.dto.trakt.TraktWatchedShowItemDto
@@ -441545,8 +441665,81 @@ index 97e80229b..c7ecc65fb 100644
      suspend fun markAsWatched(
          progress: WatchProgress,
          title: String?,
+@@ -883,6 +899,72 @@ class TraktProgressService @Inject constructor(
+             || (videoCanonicalKey != null && watchedMovies.contains(videoCanonicalKey))
+     }
+ 
++    /** Dated undo: removes exactly this play (its pause rows and its history row), nothing older. */
++    internal suspend fun removeDatedWatchEvent(target: com.nuvio.tv.core.tracking.TrackingMediaReference,
++        event: com.nuvio.tv.core.tracking.TrackingWatchEvent): Boolean {
++        val profile = event.profileId ?: profileManager.activeProfileId.value
++        check(profileManager.activeProfileId.value == profile)
++        val parent = requireNotNull(target.catalog)
++        val episode = requireNotNull(target.episode)
++        fun parentMatches(ids: TraktIdsDto?) = normalizeContentId(ids) == parent.contentId ||
++            target.ids.trakt != null && ids?.trakt?.toLong() == target.ids.trakt
++        fun episodeMatches(row: TraktEpisodeDto?) = row != null && when {
++            episode.traktId != null -> row.ids?.trakt?.toLong() == episode.traktId.toLong()
++            else -> row.season == episode.season && row.number == episode.number
++        }
++        val playbackEpisodes = getPlayback("episodes", force = true).orEmpty()
++        val pauses = playbackEpisodes.filter { parentMatches(it.show?.ids) && episodeMatches(it.episode) &&
++            exactWatchTime(it.pausedAt)?.let(event::contains) == true &&
++            (event.progress.traktPlaybackId == null || it.id == event.progress.traktPlaybackId) }
++        check(pauses.size <= 1) { "Ambiguous playback event" }
++        val plays = mutableListOf<TraktUserEpisodeHistoryItemDto>()
++        var page = 1
++        do {
++            val response = requireNotNull(traktAuthService.executeAuthorizedRequest {
++                traktApi.getEpisodeHistory(it, page = page, limit = 1000,
++                    startAt = java.time.Instant.ofEpochMilli(event.from).toString(),
++                    endAt = java.time.Instant.ofEpochMilli(event.through).toString())
++            })
++            check(response.isSuccessful)
++            plays += requireNotNull(response.body())
++            page++
++        } while (page <= (response.headers()["X-Pagination-Page-Count"]?.toIntOrNull() ?: 1))
++        val completed = event.completionExpected || event.progress.source in setOf(WatchProgress.SOURCE_TRAKT_HISTORY, WatchProgress.SOURCE_TRAKT_SHOW_PROGRESS)
++        val matching = plays.filter { completed && parentMatches(it.show?.ids) && episodeMatches(it.episode) &&
++            exactWatchTime(it.watchedAt)?.let(event::contains) == true &&
++            (event.progress.source !in setOf(WatchProgress.SOURCE_TRAKT_HISTORY, WatchProgress.SOURCE_TRAKT_SHOW_PROGRESS) ||
++                exactWatchTime(it.watchedAt) == event.progress.lastWatched) }
++        check(matching.size <= 1) { "Ambiguous history event" }
++        check(profileManager.activeProfileId.value == profile)
++        for (pause in pauses) {
++            val result = traktAuthService.executeAuthorizedWriteRequest { traktApi.deletePlayback(it, requireNotNull(pause.id)) }
++            check(result?.isSuccessful == true || result?.code() == 404)
++        }
++        for (play in matching) {
++            val result = traktAuthService.executeAuthorizedWriteRequest { traktApi.removeHistoryPlay(it,
++                com.nuvio.tv.data.remote.dto.trakt.TraktHistoryPlayRemoval(listOf(requireNotNull(play.id)))) }
++            check(result?.isSuccessful == true && result.body()?.deleted?.episodes == 1)
++        }
++        val removed = pauses.isNotEmpty() || matching.isNotEmpty()
++        if (removed) {
++            remoteProgress.update { rows -> rows.filterNot { row -> event.contains(row.lastWatched) &&
++                row.contentId == parent.contentId && (row.traktPlaybackId in pauses.map { it.id } ||
++                    row.season == episode.season && row.episode == episode.number) } }
++            optimisticProgress.update { rows -> rows.filterValues { value -> !(value.progress.contentId == parent.contentId &&
++                value.progress.season == episode.season && value.progress.episode == episode.number && event.contains(value.progress.lastWatched)) } }
++            cacheMutex.withLock { cachedEpisodesPlayback = null }
++            episodeProgressActivityVersion.incrementAndGet()
++            watchedShowSeedsStale = true
++            ensureEpisodeProgressSnapshot(parent.contentId, forceRefresh = true)
++        }
++        return if (completed) matching.isNotEmpty() || event.progress.source == WatchProgress.SOURCE_TRAKT_HISTORY
++            else pauses.isNotEmpty() || event.progress.traktPlaybackId != null
++    }
++
++    private fun exactWatchTime(timestamp: String?): Long? = timestamp?.let {
++        runCatching { java.time.Instant.parse(it).toEpochMilli() }.getOrNull()
++    }
++
+     suspend fun removeProgress(contentId: String, season: Int?, episode: Int?) {
+         Log.d(
+             TAG,
 diff --git a/app/src/main/java/com/nuvio/tv/data/repository/TraktTrackingProgressProvider.kt b/app/src/main/java/com/nuvio/tv/data/repository/TraktTrackingProgressProvider.kt
-index 310ec9294..66d7862ab 100644
+index 310ec9294..0bc9356e3 100644
 --- a/app/src/main/java/com/nuvio/tv/data/repository/TraktTrackingProgressProvider.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/repository/TraktTrackingProgressProvider.kt
 @@ -27,6 +27,7 @@ class TraktTrackingProgressProvider @Inject constructor(
@@ -441566,6 +441759,17 @@ index 310ec9294..66d7862ab 100644
      override fun airedEpisodeOrder(contentId: String) = service.observeAiredEpisodes(contentId)
  
      override fun isWatched(
+@@ -69,6 +68,10 @@ class TraktTrackingProgressProvider @Inject constructor(
+     override suspend fun removeProgress(contentId: String, season: Int?, episode: Int?) =
+         service.removeProgress(contentId, season, episode)
+ 
++    override suspend fun removeWatchEvent(target: com.nuvio.tv.core.tracking.TrackingMediaReference,
++        event: com.nuvio.tv.core.tracking.TrackingWatchEvent) =
++        service.removeDatedWatchEvent(target, event)
++
+     override fun applyOptimisticProgress(progress: WatchProgress, quiet: Boolean) {
+         if (quiet) service.updateOptimisticProgressQuietly(progress) else service.applyOptimisticProgress(progress)
+     }
 diff --git a/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
 index ba9b59305..462a7100d 100644
 --- a/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
@@ -442475,6 +442679,81 @@ index 000000000..89c6a3b0f
 +        const val REFRESH_EARLY_MS = 24L * 60 * 60 * 1000
 +    }
 +}
+diff --git a/app/src/main/java/com/nuvio/tv/data/simkl/SimklTrackingProgressProvider.kt b/app/src/main/java/com/nuvio/tv/data/simkl/SimklTrackingProgressProvider.kt
+index 71951c9d1..2f0c1c068 100644
+--- a/app/src/main/java/com/nuvio/tv/data/simkl/SimklTrackingProgressProvider.kt
++++ b/app/src/main/java/com/nuvio/tv/data/simkl/SimklTrackingProgressProvider.kt
+@@ -1,8 +1,10 @@
+ package com.nuvio.tv.data.simkl
+ 
++import com.nuvio.tv.core.tracking.TrackingMediaReference
+ import com.nuvio.tv.core.tracking.TrackingProgressProvider
+ import com.nuvio.tv.core.tracking.TrackingProviderId
+ import com.nuvio.tv.core.tracking.TrackingRefreshIntent
++import com.nuvio.tv.core.tracking.TrackingWatchEvent
+ import com.nuvio.tv.data.local.LayoutPreferenceDataStore
+ import com.nuvio.tv.domain.model.WatchProgress
+ import javax.inject.Inject
+@@ -11,6 +13,7 @@ import kotlinx.coroutines.CancellationException
+ import kotlinx.coroutines.flow.Flow
+ import kotlinx.coroutines.flow.combine
+ import kotlinx.coroutines.flow.distinctUntilChanged
++import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.flow.flowOf
+ import kotlinx.coroutines.flow.map
+ import kotlinx.coroutines.flow.onStart
+@@ -76,6 +79,51 @@ class SimklTrackingProgressProvider @Inject constructor(
+ 
+     override suspend fun refresh(intent: TrackingRefreshIntent) = syncRepository.refresh(intent)
+ 
++    /** Dated undo: deletes this play's paused sessions, then this play's history row only. */
++    override suspend fun removeWatchEvent(target: TrackingMediaReference, event: TrackingWatchEvent): Boolean {
++        val scope = authStorage.currentScope()
++        fun checkScope() = check(authStorage.isCurrent(scope) && (event.profileId == null || scope.profileId == event.profileId))
++        checkScope()
++        val episode = requireNotNull(target.episode)
++        val parent = requireNotNull(target.catalog)
++        syncRepository.ensureLoaded()
++        val snapshot = syncRepository.state.value.snapshot
++        val entries = snapshot.entries.filter { it.matchesSimklContentId(parent.contentId) }
++        val sessions = snapshot.playback.filter { row ->
++            val media = row.media ?: return@filter false
++            val ep = row.episode ?: return@filter false
++            (media.canonicalContentId() == parent.contentId || entries.any { it.media == media }) &&
++                (ep.tvdbSeason ?: ep.season) == episode.season && (ep.tvdbNumber ?: ep.number) == episode.number &&
++                (parseSimklUtcEpochMs(row.pausedAt) ?: parseSimklUtcEpochMs(row.watchedAt))?.let(event::contains) == true
++        }
++        check(sessions.size <= 1) { "Ambiguous Simkl playback event" }
++        for (row in sessions) {
++            checkScope()
++            val id = requireNotNull(row.id)
++            apiClient.execute(SimklApiRequest(SimklHttpMethod.DELETE, "/sync/playback/$id"))
++            checkScope()
++            syncRepository.removePlaybackSessions(setOf(id))
++        }
++        // The unchanged 9.8 output does not opt into Simkl rewatch sessions.
++        // Preserve an older canonical completion instead of unwatching the episode.
++        checkScope()
++        syncRepository.refresh(TrackingRefreshIntent.INVALIDATED)
++        val current = watchedItems.first().filter { it.contentId == parent.contentId && it.season == episode.season && it.episode == episode.number }
++            .maxByOrNull { it.watchedAt }
++        if (event.completionExpected && current != null && event.contains(current.watchedAt)) {
++            checkScope()
++            check(event.priorKnown && event.priorWatchedAt == null) { "Cannot erase earlier Simkl history" }
++            val body = buildSimklHistoryRemovalBody(listOf(target), kotlinx.serialization.json.Json { explicitNulls = false })
++            val response = apiClient.execute(SimklApiRequest(SimklHttpMethod.POST, "/sync/history/remove", body = body,
++                retryPolicy = SimklRetryPolicy.SYNC_WRITE))
++            check(response.status in 200..299)
++            syncRepository.refresh(TrackingRefreshIntent.INVALIDATED)
++            return true
++        }
++        return if (event.completionExpected) event.priorKnown && current?.watchedAt == event.priorWatchedAt && current != null
++            else sessions.isNotEmpty()
++    }
++
+     override suspend fun removeProgress(contentId: String, season: Int?, episode: Int?) {
+         syncRepository.ensureLoaded()
+         val snapshot = syncRepository.state.value.snapshot
 diff --git a/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbClient.kt b/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbClient.kt
 index 84397d341..d5e9e07e6 100644
 --- a/app/src/main/java/com/nuvio/tv/data/tvdb/TvdbClient.kt
@@ -468298,6 +468577,51 @@ index 000000000..ecc4bcd6c
 +    }
 +
 +}
+diff --git a/app/src/main/java/com/nuvio/tv/livetv/multiview/MultiviewConnectionPolicy.kt b/app/src/main/java/com/nuvio/tv/livetv/multiview/MultiviewConnectionPolicy.kt
+new file mode 100644
+index 000000000..785f30f29
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/livetv/multiview/MultiviewConnectionPolicy.kt
+@@ -0,0 +1,39 @@
++package com.nuvio.tv.livetv.multiview
++
++import com.nuvio.tv.livetv.model.LiveChannel
++import com.nuvio.tv.livetv.model.PlaylistAccount
++import com.nuvio.tv.livetv.model.PlaylistSource
++
++/** Called synchronously before allocating a player or resolving a portal link, including retries. */
++internal object MultiviewConnectionPolicy {
++    private fun m3uLogin(source: PlaylistSource): List<String>? = runCatching {
++        val uri = java.net.URI(PlaylistSource.tidyLink(source.url))
++        if (!uri.path.orEmpty().endsWith("get.php", true)) return@runCatching null
++        val (user, pass) = PlaylistSource.credentialsFromLink(source.url) ?: return@runCatching null
++        listOf("xtream", PlaylistSource.cleanXtreamServer(source.url).lowercase(), user, pass)
++    }.getOrNull()
++
++    private fun identity(source: PlaylistSource): List<String> = when {
++        source.isStalker -> listOf("portal", source.stalkerConfig?.portalUrl.orEmpty()
++            .trim().trimEnd('/').removeSuffix("/server/load.php").removeSuffix("/portal.php"))
++        source.isXtream -> listOf("xtream", source.xtreamBase().lowercase(), source.xtreamUsername.trim(), source.xtreamPassword.trim())
++        else -> m3uLogin(source) ?: listOf("m3u", source.id)
++    }
++
++    fun denial(channel: LiveChannel, active: List<LiveChannel>, sources: List<PlaylistSource>,
++        accounts: Map<String, PlaylistAccount>): String? {
++        val source = sources.firstOrNull { it.id == channel.sourceId && it.liveEnabled }
++            ?: return "This playlist is no longer available. Choose another channel."
++        val same = sources.filter { identity(it) == identity(source) }
++        val ids = same.mapTo(HashSet()) { it.id }
++        val maximum = if (source.isStalker) 1 else same.mapNotNull { accounts[it.id]?.maxConnections?.takeIf { n -> n > 0 } }.minOrNull()
++            ?: return null
++        // activeConnections is a saved refresh snapshot, not a current reservation. It can
++        // include the just-released guide preview or these very panes. Adding it double-counts
++        // our connections and can block the first pane forever on a one-stream account.
++        // Reserve against the real account maximum here; live provider rejections still handle
++        // capacity consumed elsewhere after the snapshot was taken.
++        return if (active.count { it.sourceId in ids } >= maximum)
++            "Your provider allows $maximum streams at once" else null
++    }
++}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/multiview/MultiviewDesign.kt b/app/src/main/java/com/nuvio/tv/livetv/multiview/MultiviewDesign.kt
 new file mode 100644
 index 000000000..04d4484ef
@@ -468644,12 +468968,62 @@ index 000000000..04d4484ef
 +        Icon(Icons.Default.KeyboardArrowDown, contentDescription = null, tint = NuvioTheme.colors.TextSecondary, modifier = Modifier.size(14.dp))
 +    }
 +}
+diff --git a/app/src/main/java/com/nuvio/tv/livetv/multiview/MultiviewDevicePolicy.kt b/app/src/main/java/com/nuvio/tv/livetv/multiview/MultiviewDevicePolicy.kt
+new file mode 100644
+index 000000000..832836687
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/livetv/multiview/MultiviewDevicePolicy.kt
+@@ -0,0 +1,44 @@
++package com.nuvio.tv.livetv.multiview
++
++import androidx.annotation.OptIn
++import androidx.media3.common.util.UnstableApi
++import android.app.ActivityManager
++import android.content.Context
++import android.media.MediaCodecList
++import com.nuvio.tv.ui.screens.settings.MemoryBudget
++
++/** Reserve one decoder for system/UI work. A failed capability query assumes two instances. */
++internal object MultiviewDevicePolicy {
++    fun limit(avc: Int?, hevc: Int?, heapMb: Long, lowRam: Boolean, physicalRamMb: Long = 0): Int {
++        val decoders = minOf(avc?.takeIf { it > 0 } ?: 2, hevc?.takeIf { it > 0 } ?: 2)
++        val memory = when {
++            lowRam || heapMb < 384 || physicalRamMb in 1..2304 -> 2
++            // The 3 GB Onn has a 384 MB app heap. Keep the shared buffer budget
++            // heap-based, but do not classify this mid-range TV as a 2 GB stick.
++            heapMb < 512 && physicalRamMb !in 2305..Long.MAX_VALUE -> 2
++            heapMb < 1024 || physicalRamMb in 2305..3584 -> 3
++            else -> 4
++        }
++        return minOf(4, (decoders - 1).coerceAtLeast(0), memory)
++    }
++
++    @OptIn(UnstableApi::class)
++    fun read(context: Context): Int {
++        val am = context.getSystemService(ActivityManager::class.java)
++        val ram = ActivityManager.MemoryInfo().also(am::getMemoryInfo).totalMem / (1024 * 1024)
++        fun instances(mime: String): Int? = runCatching {
++            val candidates = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.asSequence()
++                .filter { !it.isEncoder && it.supportedTypes.any { type -> type.equals(mime, true) } }
++                .toList()
++            // Match the preferred decoder class. A software fallback's advertised count must
++            // never inflate a TV's hardware budget; emulators use software when that is all they have.
++            fun software(name: String) = name.startsWith("OMX.google.", true) || name.startsWith("c2.android.", true)
++            val preferred = candidates.firstOrNull {
++                if (android.os.Build.VERSION.SDK_INT >= 29) !it.isSoftwareOnly else !software(it.name)
++            } ?: candidates.firstOrNull()
++            preferred?.getCapabilitiesForType(mime)?.maxSupportedInstances
++        }.getOrNull()
++        return limit(instances("video/avc"), instances("video/hevc"), MemoryBudget.heapMb,
++            am.isLowRamDevice, ram)
++    }
++}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/multiview/MultiviewPicker.kt b/app/src/main/java/com/nuvio/tv/livetv/multiview/MultiviewPicker.kt
 new file mode 100644
-index 000000000..d4888bfb7
+index 000000000..f51654525
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/multiview/MultiviewPicker.kt
-@@ -0,0 +1,961 @@
+@@ -0,0 +1,963 @@
 +package com.nuvio.tv.livetv.multiview
 +
 +import androidx.compose.foundation.background
@@ -469149,6 +469523,8 @@ index 000000000..d4888bfb7
 +                                )
 +                            }
 +                            if (failed) MultiviewChip("Retry", icon = Icons.Default.Refresh, onClick = onRetry)
++                            if (selectedPane?.player != null) MultiviewChip("Report a problem with this video",
++                                onClick = { com.nuvio.tv.core.report.ProblemReportActivity.open(context, selectedPane.player) })
 +                        }
 +                    }
 +                }
@@ -469613,10 +469989,10 @@ index 000000000..d4888bfb7
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/multiview/MultiviewPlaybackSession.kt b/app/src/main/java/com/nuvio/tv/livetv/multiview/MultiviewPlaybackSession.kt
 new file mode 100644
-index 000000000..1118c52b0
+index 000000000..360fa0809
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/multiview/MultiviewPlaybackSession.kt
-@@ -0,0 +1,713 @@
+@@ -0,0 +1,719 @@
 +package com.nuvio.tv.livetv.multiview
 +
 +import android.os.SystemClock
@@ -469704,6 +470080,10 @@ index 000000000..1118c52b0
 +     * another playlist, or another stream of the same game. [tried] holds keys already tried.
 +     */
 +    private val findBackup: (paneId: Int, failed: LiveChannel, tried: Set<String>) -> LiveChannel? = { _, _, _ -> null },
++    /** Asked before a pane starts: the provider's saved connection maximum, as a message or null. */
++    private val startFailure: (LiveChannel, List<LiveChannel>) -> String? = { _, _ -> null },
++    /** The device's pane budget (decoders, memory); layouts with more panes are refused. */
++    val maxPanes: Int = MultiviewDevicePolicy.read(context),
 +) {
 +    private val appContext = context.applicationContext
 +    private val mainHandler = Handler(Looper.getMainLooper())
@@ -469727,6 +470107,8 @@ index 000000000..1118c52b0
 +        onChanged = ::publishState,
 +        mayPlayChannel = mayPlayChannel,
 +        onSetupFailed = ::reportSetupFailure,
++        startFailure = startFailure,
++        maxPanes = maxPanes,
 +    )
 +
 +    /**
@@ -470374,10 +470756,10 @@ index 000000000..d38ee509f
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/multiview/MultiviewScreen.kt b/app/src/main/java/com/nuvio/tv/livetv/multiview/MultiviewScreen.kt
 new file mode 100644
-index 000000000..89cafa68b
+index 000000000..011986e35
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/multiview/MultiviewScreen.kt
-@@ -0,0 +1,682 @@
+@@ -0,0 +1,696 @@
 +package com.nuvio.tv.livetv.multiview
 +
 +import androidx.activity.compose.BackHandler
@@ -470515,21 +470897,35 @@ index 000000000..89cafa68b
 +    val request = remember { if (startOnSports) SportsWatchLaunch.take() else null }
 +    // Kept current every composition: the session asks it when a pane's channel won't play.
 +    val backupRef = remember { arrayOfNulls<(Int, LiveChannel, Set<String>) -> LiveChannel?>(1) }
++    // This device's pane budget (spare decoders, memory). No spare decoder: a clear message.
++    val deviceLimit = remember { MultiviewDevicePolicy.read(context) }
++    if (deviceLimit == 0) {
++        Column(Modifier.fillMaxSize().background(NuvioTheme.colors.Background).padding(24.dp)) {
++            androidx.compose.material3.Text("This device has no spare video decoder for Multiview.",
++                color = NuvioTheme.colors.TextPrimary)
++            MultiviewChip("Back", onClick = onBack)
++        }
++        return
++    }
 +    val session = remember {
 +        // The guide and Sports share one player. Multiview owns independent players and audio.
 +        viewModel.playback.stop()
 +        viewModel.playback.releaseNow()
++        val layout = (request?.let { r -> MultiviewLayout.entries.first { it.paneCount == r.panes.coerceIn(1, 4) } }
++            ?: restore?.layout
++            ?: MultiviewLayoutMemory.load(context.applicationContext)
++            ?: MultiviewLayout.TWO).takeIf { it.paneCount <= deviceLimit }
++            ?: MultiviewLayout.entries.first { it.paneCount == deviceLimit.coerceAtLeast(1) }
 +        MultiviewPlaybackSession(
 +            context.applicationContext,
-+            initialLayout = request?.let { r -> MultiviewLayout.entries.first { it.paneCount == r.panes.coerceIn(1, 4) } }
-+                ?: restore?.layout
-+                ?: MultiviewLayoutMemory.load(context.applicationContext)
-+                ?: MultiviewLayout.TWO,
++            initialLayout = layout,
++            maxPanes = deviceLimit,
 +            mayPlayChannel = { channel ->
 +                viewModel.activeProfileId.value == openingProfile &&
 +                    (viewModel.allowedChannels.value.any { it == channel } || sportsRef[0]?.mayPlay(channel) == true)
 +            },
 +            autoReconnect = { viewModel.autoReconnect.value },
++            startFailure = viewModel::startFailure,
 +            findBackup = { paneId, failed, tried -> backupRef[0]?.invoke(paneId, failed, tried) })
 +    }
 +    val state by session.state.collectAsStateWithLifecycle()
@@ -471062,10 +471458,10 @@ index 000000000..89cafa68b
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/multiview/MultiviewSessionCore.kt b/app/src/main/java/com/nuvio/tv/livetv/multiview/MultiviewSessionCore.kt
 new file mode 100644
-index 000000000..89f1dacb1
+index 000000000..8b68a50c7
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/multiview/MultiviewSessionCore.kt
-@@ -0,0 +1,343 @@
+@@ -0,0 +1,352 @@
 +package com.nuvio.tv.livetv.multiview
 +
 +import com.nuvio.tv.livetv.model.LiveChannel
@@ -471123,7 +471519,13 @@ index 000000000..89f1dacb1
 +    private val mayPlayChannel: (LiveChannel) -> Boolean = { true },
 +    /** A pane that couldn't even be set up: the reason goes to the report instead of being lost. */
 +    private val onSetupFailed: (Int, LiveChannel, Exception) -> Unit = { _, _, _ -> },
++    /** Asked before a pane starts: a provider's saved connection maximum, as a message or null. */
++    private val startFailure: (LiveChannel, List<LiveChannel>) -> String? = { _, _ -> null },
++    /** The device's pane budget (decoders, memory); layouts with more panes are refused. */
++    private val maxPanes: Int = MultiviewBufferBudget.MAX_PANES,
 +) {
++    init { require(initialLayout.paneCount <= maxPanes) }
++
 +    var layout: MultiviewLayout = initialLayout
 +        private set
 +    var focusedPane: Int = 0
@@ -471147,7 +471549,7 @@ index 000000000..89f1dacb1
 +            ?: MultiviewPanePlayback(error = setupErrors.getOrNull(paneId))
 +
 +    fun setLayout(value: MultiviewLayout) {
-+        if (released || layout == value) return
++        if (released || layout == value || value.paneCount > maxPanes) return
 +        muteAll()
 +        if (value.paneCount < layout.paneCount) {
 +            for (id in value.paneCount until layout.paneCount) {
@@ -471166,6 +471568,9 @@ index 000000000..89f1dacb1
 +    fun assignChannel(paneId: Int, channel: LiveChannel) {
 +        if (!isVisible(paneId) || released) return
 +        if (channels[paneId] == channel && players[paneId] != null) return
++        // The provider's own rejections still apply after this; this only reads saved counters.
++        runCatching { startFailure(channel, channels.filterNotNull().filter { it != channel }) }.getOrNull()
++            ?.let { message -> setupErrors[paneId] = message; onChanged(); return }
 +        muteAll()
 +        releasePane(paneId)
 +        channels[paneId] = channel
@@ -471646,10 +472051,10 @@ index 000000000..1594d55af
 +)
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/multiview/MultiviewViewModel.kt b/app/src/main/java/com/nuvio/tv/livetv/multiview/MultiviewViewModel.kt
 new file mode 100644
-index 000000000..c4ed6dadf
+index 000000000..da3f7fbbb
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/multiview/MultiviewViewModel.kt
-@@ -0,0 +1,159 @@
+@@ -0,0 +1,177 @@
 +package com.nuvio.tv.livetv.multiview
 +
 +import androidx.lifecycle.ViewModel
@@ -471708,6 +472113,24 @@ index 000000000..c4ed6dadf
 +    val allowedChannels: StateFlow<List<LiveChannel>> = allowedLiveTvChannelsFlow(
 +        channelStore.displayChannels, preferences.userState, preferences.settings,
 +    ).flowOn(Dispatchers.Default).stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
++
++    private val playlists: StateFlow<List<com.nuvio.tv.livetv.model.PlaylistSource>?> =
++        preferences.playlists.map { list -> list.toList() }
++            .stateIn(viewModelScope, SharingStarted.Eagerly, null)
++    private val accounts: StateFlow<Map<String, com.nuvio.tv.livetv.model.PlaylistAccount>?> =
++        preferences.playlistAccounts.map { it.toMap() }
++            .stateIn(viewModelScope, SharingStarted.Eagerly, null)
++
++    /** Refuses a pane up front when the provider's saved connection maximum is already used. */
++    fun startFailure(channel: LiveChannel, active: List<LiveChannel>): String? {
++        val sources = playlists.value ?: return "Playlist information is still loading. Retry shortly."
++        val limits = accounts.value ?: return "Provider information is still loading. Retry shortly."
++        // Safe support evidence: account counters only, never a login, channel key or stream URL.
++        val account = limits[channel.sourceId]
++        android.util.Log.i("Multiview", "Provider preflight: ${channel.sourceName}, maximum=${account?.maxConnections ?: 0}, " +
++            "reportedActive=${account?.activeConnections ?: 0}, ownedPanes=${active.count { it.sourceId == channel.sourceId }}")
++        return MultiviewConnectionPolicy.denial(channel, active, sources, limits)
++    }
 +
 +    /** The guide's chosen backdrop (Settings → Live TV), so Multiview matches the Guide and Sports. */
 +    val backdrop: StateFlow<String> = preferences.settings.map { it.guideBackdrop }
@@ -488926,10 +489349,10 @@ index 000000000..f92fafbe8
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/sports/SportsCatalog.kt b/app/src/main/java/com/nuvio/tv/livetv/sports/SportsCatalog.kt
 new file mode 100644
-index 000000000..1d659567b
+index 000000000..2f93ddafe
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/sports/SportsCatalog.kt
-@@ -0,0 +1,771 @@
+@@ -0,0 +1,773 @@
 +package com.nuvio.tv.livetv.sports
 +
 +import java.text.Normalizer
@@ -489066,6 +489489,8 @@ index 000000000..1d659567b
 +        League("cricket/panel", Sport.CRICKET, "International Cricket", "INTL", "cricket/panel",
 +            guideWords = listOf("Test Match", "ODI", "One Day International", "T20 International", "The Ashes"),
 +            regions = setOf("UK", "IE", "AU", "OTHER"), minutes = 480, color = 0xFF0E5A3A),
++        // Cricket Australia's own fixtures feed (no ESPN coverage of these competitions).
++        *CricketAustralia.leagues.toTypedArray(),
 +        // ---- Aussie rules
 +        League("australian-football/afl", Sport.AUSSIE_RULES, "AFL", "AFL", "australian-football/afl", guideWords = listOf("AFL", "Aussie Rules"),
 +            regions = setOf("AU"), minutes = 150, color = 0xFF01285E),
@@ -500432,10 +500857,10 @@ index 000000000..c55b8a501
 +internal fun RecBadge() = SportsBadge("● REC", Color(0xFFE53935), Color.White)
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/sports/SportsRepository.kt b/app/src/main/java/com/nuvio/tv/livetv/sports/SportsRepository.kt
 new file mode 100644
-index 000000000..41cc64db3
+index 000000000..59663439e
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/sports/SportsRepository.kt
-@@ -0,0 +1,2879 @@
+@@ -0,0 +1,2953 @@
 +package com.nuvio.tv.livetv.sports
 +
 +import android.content.Context
@@ -500456,6 +500881,8 @@ index 000000000..41cc64db3
 +import kotlinx.coroutines.async
 +import kotlinx.coroutines.awaitAll
 +import kotlinx.coroutines.delay
++import kotlinx.coroutines.ensureActive
++import kotlin.coroutines.coroutineContext
 +import kotlinx.coroutines.flow.MutableStateFlow
 +import kotlinx.coroutines.flow.SharingStarted
 +import kotlinx.coroutines.flow.StateFlow
@@ -500543,6 +500970,23 @@ index 000000000..41cc64db3
 +        return snapshot
 +    }
 +
++    /**
++     * The shared base feed's cached payloads for one provider ("tsdb"/"espn"/"calendar"): league
++     * id -> (raw JSON, when the shared job fetched it). Read in ONE pass (the snapshot is one
++     * file) and filtered to [wanted]; empty when no snapshot or the feed is off. Callers then
++     * fetch the provider themselves for anything missing.
++     */
++    internal suspend fun baseFeedPayloads(provider: String, wanted: Set<String>): Map<String, Pair<String, Long>> {
++        val snapshot = _baseFeedSnapshot.value ?: return emptyMap()
++        val out = HashMap<String, Pair<String, Long>>()
++        runCatching {
++            readBaseFeedEntries(snapshot) { entry ->
++                if (entry.provider == provider && entry.leagueId in wanted) out[entry.leagueId] = entry.payload to entry.fetchedAt
++            }
++        }
++        return out
++    }
++
 +    private suspend fun baseFeedLoop() {
 +        if (!baseFeed.enabled) return
 +        while (true) {
@@ -500614,6 +501058,10 @@ index 000000000..41cc64db3
 +    private val scheduleData = MutableStateFlow<Map<String, LeagueData>>(emptyMap())
 +    /** Non-league football (nuvio-data files): whole seasons, by league id. */
 +    private val tsdbData = MutableStateFlow<Map<String, LeagueData>>(emptyMap())
++    /** Cricket Australia's own fixtures feed, by format (1 Test, 2 ODI, 3 T20I, 4 Shield, 5 One-Day Cup). */
++    private val cricketData = MutableStateFlow<Map<Int, List<SportsEvent>>>(emptyMap())
++    private val cricketAttempts = java.util.concurrent.ConcurrentHashMap<Int, Long>()
++    private val cricketAustralia by lazy { CricketAustralia() }
 +    private val tsdbTeams = java.util.concurrent.ConcurrentHashMap<String, List<TeamInfo>>()
 +    /** The app's own leagues filled from the nuvio-data files (WWE, MotoGP…): league id -> TheSportsDB id. */
 +    @Volatile private var tsdbAlias: Map<String, String> = emptyMap()
@@ -500657,7 +501105,8 @@ index 000000000..41cc64db3
 +
 +    private data class EventInputs(
 +        val l: Map<String, LeagueData>, val w: Map<String, LeagueData>, val f: Map<String, LeagueData>,
-+        val g: Map<Long, List<SportsEvent>>, val t: Map<String, LeagueData>
++        val g: Map<Long, List<SportsEvent>>, val t: Map<String, LeagueData>,
++        val c: Map<Int, List<SportsEvent>> = emptyMap()
 +    )
 +
 +    /**
@@ -500666,9 +501115,11 @@ index 000000000..41cc64db3
 +     * comes in: on slower boxes that alone kept the processor busy through a whole update round.
 +     */
 +    @OptIn(FlowPreview::class)
-+    private fun plainEvents(): StateFlow<List<SportsEvent>> = combine(leagueData, weekData, fixtureData, guideData, tsdbData) { l, w, f, g, t ->
-+        EventInputs(l, w, f, g, t)
-+    }.debounce(400).map { (l, w, f, g, t) ->
++    private fun plainEvents(): StateFlow<List<SportsEvent>> = combine(
++        combine(leagueData, weekData, fixtureData, guideData, tsdbData) { l, w, f, g, t ->
++            EventInputs(l, w, f, g, t)
++        }, cricketData) { inputs, cricket -> inputs.copy(c = cricket) }
++    .debounce(400).map { (l, w, f, g, t, c) ->
 +        val now = System.currentTimeMillis()
 +        val copies = java.util.IdentityHashMap<SportsEvent, SportsEvent>()
 +        val guide = mergeWrestlingAirings(g.values.flatten()).map { timed(it, now, copies) }
@@ -500742,7 +501193,10 @@ index 000000000..41cc64db3
 +            return false
 +        }
 +        timedCopies = copies
-+        (espn + (fixtures + guide.filterNot { it.id in replacedGuide }).filterNot(::coveredByEspn) + tsdb).distinctBy { it.id }
++        // Cricket Australia's fixtures join last, reconciled with anything already known by id.
++        val plain = (espn + (fixtures + guide.filterNot { it.id in replacedGuide }).filterNot(::coveredByEspn) + tsdb).distinctBy { it.id }
++        val cricket = c.values.flatten().filter { it.startMs in from until to }
++        if (cricket.isEmpty()) plain else CricketAustralia.merge(plain, cricket.map { timed(it, now, copies) })
 +    }.flowOn(Dispatchers.Default).stateIn(scope, SharingStarted.Eagerly, emptyList())
 +
 +    /**
@@ -501243,6 +501697,7 @@ index 000000000..41cc64db3
 +            if (active) sportsCatching { updateOnce(System.currentTimeMillis()) }.onFailure { Log.w(TAG, "Sports update failed", it) }
 +            // Requested scoreboards and notifications keep their feeds. The catalogue that
 +            // only helps future browsing waits until the movie or episode closes.
++            sportsCatching { updateCricket() }.onFailure { Log.w(TAG, "Cricket update failed", it) }
 +            if (active && com.nuvio.tv.livetv.data.BackgroundWork.onDemandPlaying.value && requiredDuringPlayback().isNotEmpty()) {
 +                sportsCatching { updateTsdb(System.currentTimeMillis(), false, requiredOnly = true) }
 +                    .onFailure { Log.w(TAG, "Required sports update failed", it) }
@@ -501841,6 +502296,10 @@ index 000000000..41cc64db3
 +        // against TheSportsDB itself — the region gate here was only ever about tidiness.
 +        val wanted = (followedLeagueIds(f) + SportsCatalog.all.map { it.id }).distinct().filter { fromTsdb(it) }
 +        val required = if (requiredOnly) requiredDuringPlayback() else emptySet()
++        // The shared base feed already fetched these leagues' payloads (its own job): read the
++        // cached snapshot once, and use each league's entry before asking TheSportsDB again.
++        val baseCache = if (requiredOnly) emptyMap() else
++            runCatching { baseFeedPayloads("tsdb", wanted.map { tsdbFileId(it) }.toSet()) }.getOrDefault(emptyMap())
 +        for (id in wanted) {
 +            if (requiredOnly && id !in required) continue
 +            if (!requiredOnly) com.nuvio.tv.livetv.data.BackgroundWork.awaitOnDemandIdle()
@@ -501855,8 +502314,9 @@ index 000000000..41cc64db3
 +            }
 +            if (cur != null && now - cur.fetchedAt < maxAge) continue
 +            val tid = tsdbFileId(id)
-+            val raw = sportsCatching { feeds.footballLeagueRaw(tid) }.getOrNull()
-+            val at = System.currentTimeMillis()
++            val baseRaw = baseCache[tid]
++            val raw = baseRaw?.first ?: sportsCatching { feeds.footballLeagueRaw(tid) }.getOrNull()
++            val at = baseRaw?.second ?: System.currentTimeMillis()
 +            if (raw == null) {
 +                tsdbData.update { m -> m + (id to LeagueData(m[id]?.events.orEmpty(), at - maxAge + 5 * MINUTE, "failed")) }
 +                continue
@@ -501867,6 +502327,45 @@ index 000000000..41cc64db3
 +            sportsCatching { File(dir, "tsdb_$tid.json").writeText(raw) }
 +        }
 +        if (!requiredOnly && tsdbData.value.keys.any { it !in wanted }) tsdbData.update { m -> m.filterKeys { it in wanted } }
++    }
++
++    /** Cricket Australia's own fixtures feed: formats refresh at their own cadence, cached per format. */
++    private suspend fun updateCricket() {
++        val now = System.currentTimeMillis()
++        for (format in CricketAustralia.formats) {
++            val interval = CricketAustralia.interval(format)
++            if (now - (cricketAttempts[format] ?: 0L) < interval) continue
++            cricketAttempts[format] = now
++            try {
++                sportsCatching {
++                    val file = File(dir, "cricket_au_$format.json")
++                    val saved = sportsCatching { file.readText().let {
++                        it.substringBefore('\n').toLong() to it.substringAfter('\n')
++                    } }.getOrNull()
++                    if (cricketData.value[format] == null && saved != null) {
++                        cricketData.update { it + (format to CricketAustralia.parse(saved.second, saved.first).map { e ->
++                            if (now - saved.first > interval && e.state == GameState.LIVE)
++                                e.copy(state = GameState.OFF, status = "Awaiting update") else e
++                        }) }
++                    }
++                    val fresh = if (saved != null && now - saved.first < interval) saved else
++                        now to cricketAustralia.fixtures(format, now)
++                    val parsed = CricketAustralia.parse(fresh.second, fresh.first)
++                    cricketAttempts[format] = fresh.first
++                    cricketData.update { it + (format to parsed) }
++                    if (fresh !== saved) file.writeText("${fresh.first}\n${fresh.second}")
++                }.onFailure {
++                    coroutineContext.ensureActive()
++                    cricketData.update { data -> data + (format to data[format].orEmpty().map { e ->
++                        if (e.state == GameState.LIVE) e.copy(state = GameState.OFF, status = "Awaiting update") else e
++                    }) }
++                    Log.w(TAG, "Cricket Australia update failed", it)
++                }
++            } catch (cancelled: kotlinx.coroutines.CancellationException) {
++                cricketAttempts.remove(format)
++                throw cancelled
++            }
++        }
 +    }
 +
 +    /** The non-league leagues and their teams, from the list file. False if it couldn't be read. */
