@@ -437868,7 +437868,7 @@ index 09035a442..08d6d3c03 100644
  
      private companion object {
 diff --git a/app/src/main/java/com/nuvio/tv/data/local/StreamLinkCacheDataStore.kt b/app/src/main/java/com/nuvio/tv/data/local/StreamLinkCacheDataStore.kt
-index 2ee123c8a..0cc8810a1 100644
+index 2ee123c8a..e7bbb3671 100644
 --- a/app/src/main/java/com/nuvio/tv/data/local/StreamLinkCacheDataStore.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/local/StreamLinkCacheDataStore.kt
 @@ -26,7 +26,10 @@ data class CachedStreamLink(
@@ -437905,7 +437905,7 @@ index 2ee123c8a..0cc8810a1 100644
          }.toString()
  
          store().edit { prefs ->
-@@ -81,6 +90,12 @@ class StreamLinkCacheDataStore @Inject constructor(
+@@ -81,6 +90,26 @@ class StreamLinkCacheDataStore @Inject constructor(
          }
      }
  
@@ -437915,10 +437915,24 @@ index 2ee123c8a..0cc8810a1 100644
 +        }
 +    }
 +
++    /** Drops entries older than 30 days across every profile, for the settings' storage cleanup. */
++    suspend fun pruneAllProfiles() {
++        val cutoff = System.currentTimeMillis() - 30L * 24 * 60 * 60_000L
++        (profileManager.profiles.value.map { it.id } + profileManager.activeProfileId.value).distinct().forEach { id ->
++            factory.get(id, FEATURE).edit { prefs ->
++                prefs.asMap().forEach { (key, value) ->
++                    if (key.name.startsWith("stream_link_") &&
++                        runCatching { JSONObject(value as String).optLong("cachedAtMs", 0L) }.getOrDefault(0L) < cutoff
++                    ) prefs.remove(key)
++                }
++            }
++        }
++    }
++
      suspend fun getValid(contentKey: String, maxAgeMs: Long): CachedStreamLink? {
          if (maxAgeMs <= 0L) return null
  
-@@ -129,7 +144,10 @@ class StreamLinkCacheDataStore @Inject constructor(
+@@ -129,7 +158,10 @@ class StreamLinkCacheDataStore @Inject constructor(
                  contentLanguage = json.optString("contentLanguage", "").ifBlank { null },
                  year = json.optString("year", "").ifBlank { null },
                  audioDelayMs = if (json.has("audioDelayMs")) json.optInt("audioDelayMs") else null,
@@ -457593,10 +457607,10 @@ index 000000000..cf695ae63
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/data/LiveTvPosterStore.kt b/app/src/main/java/com/nuvio/tv/livetv/data/LiveTvPosterStore.kt
 new file mode 100644
-index 000000000..745796306
+index 000000000..ccab2d18e
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/data/LiveTvPosterStore.kt
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,72 @@
 +package com.nuvio.tv.livetv.data
 +
 +import android.content.ContentValues
@@ -457644,6 +457658,18 @@ index 000000000..745796306
 +    /** Forgets everything (Settings: clear poster & show info). */
 +    fun clear() { runCatching { writableDatabase.delete("posters", null, null) } }
 +
++    /** Drops stale lookups and keeps the newest 5,000, for the settings' storage cleanup. */
++    fun prune() {
++        runCatching {
++            val db = writableDatabase
++            val now = System.currentTimeMillis()
++            db.delete("posters", "checked < ? OR ((poster IS NULL OR poster='') AND checked < ?)",
++                arrayOf((now - FOUND_MS).toString(), (now - MISS_MS).toString()))
++            db.execSQL("DELETE FROM posters WHERE k IN (SELECT k FROM posters ORDER BY checked DESC LIMIT -1 OFFSET 5000)")
++            SqliteCompact.compactIfWasteful(db, "poster lookup")
++        }
++    }
++
 +    fun put(key: String, poster: String?) {
 +        runCatching {
 +            writableDatabase.insertWithOnConflict("posters", null, ContentValues().apply {
@@ -457659,10 +457685,10 @@ index 000000000..745796306
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/data/LiveTvPreferences.kt b/app/src/main/java/com/nuvio/tv/livetv/data/LiveTvPreferences.kt
 new file mode 100644
-index 000000000..820df52b3
+index 000000000..fe11d914e
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/data/LiveTvPreferences.kt
-@@ -0,0 +1,1939 @@
+@@ -0,0 +1,1948 @@
 +package com.nuvio.tv.livetv.data
 +
 +import android.content.Context
@@ -457716,7 +457742,8 @@ index 000000000..820df52b3
 +        if (latest == null || !latest.isStalker || latest.stalkerConfig != source.stalkerConfig ||
 +            latest.enabled != source.enabled || latest.importLive != source.importLive ||
 +            latest.importVod != source.importVod || latest.useEmbeddedEpg != source.useEmbeddedEpg ||
-+            latest.guideShiftMinutes != source.guideShiftMinutes || latest.catchupShiftMinutes != source.catchupShiftMinutes
++            latest.guideShiftMinutes != source.guideShiftMinutes || latest.catchupShiftMinutes != source.catchupShiftMinutes ||
++            latest.vodImportPolicy() != source.vodImportPolicy()
 +        ) throw com.nuvio.stalker.StalkerException(com.nuvio.stalker.StalkerError.STALE_SESSION)
 +        publish()
 +    }
@@ -459432,7 +459459,12 @@ index 000000000..820df52b3
 +                    linkServer = o.optString("linkServer"),
 +                    linkUsername = o.optString("linkUsername"),
 +                    linkPassword = o.optString("linkPassword"),
-+                    vodInPlaylist = o.optBoolean("vodInPlaylist", false)
++                    vodInPlaylist = o.optBoolean("vodInPlaylist", false),
++                    vodMovies = o.optBoolean("vodMovies", true),
++                    vodSeries = o.optBoolean("vodSeries", true),
++                    vodSourceOnly = o.optBoolean("vodSourceOnly", false),
++                    vodMovieCategories = o.optJSONArray("vodMovieCategories")?.let { a -> (0 until a.length()).map { a.getString(it) }.toSet() },
++                    vodSeriesCategories = o.optJSONArray("vodSeriesCategories")?.let { a -> (0 until a.length()).map { a.getString(it) }.toSet() }
 +                )
 +            }
 +        }.getOrDefault(emptyList())
@@ -459454,6 +459486,9 @@ index 000000000..820df52b3
 +                    .put("lastUpdatedMs", s.lastUpdatedMs).put("lastError", s.lastError ?: "")
 +                    .put("channelCount", s.channelCount)
 +                    .put("importVod", s.importVod)
++                    .put("vodMovies", s.vodMovies).put("vodSeries", s.vodSeries).put("vodSourceOnly", s.vodSourceOnly)
++                    .put("vodMovieCategories", s.vodMovieCategories?.let { JSONArray(it.sorted()) })
++                    .put("vodSeriesCategories", s.vodSeriesCategories?.let { JSONArray(it.sorted()) })
 +                    .put("importLive", s.importLive)
 +                    .put("streamFormat", s.streamFormat)
 +                    .put("serverTimezone", s.serverTimezone)
@@ -459604,10 +459639,10 @@ index 000000000..820df52b3
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/data/LiveTvRepository.kt b/app/src/main/java/com/nuvio/tv/livetv/data/LiveTvRepository.kt
 new file mode 100644
-index 000000000..329c24693
+index 000000000..3bf122f5a
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/data/LiveTvRepository.kt
-@@ -0,0 +1,3970 @@
+@@ -0,0 +1,3976 @@
 +package com.nuvio.tv.livetv.data
 +
 +import io.ktor.http.encodeURLParameter
@@ -460805,6 +460840,12 @@ index 000000000..329c24693
 +            BackgroundWork.awaitIdle()
 +            mutex.withLock { withContext(Dispatchers.IO) { guideDb.compact() } }
 +        }
++    }
++
++    /** Reclaims the guide database's free space for the settings' storage cleanup. */
++    suspend fun maintainStorage() = withContext(Dispatchers.IO) {
++        BackgroundWork.awaitIdle()
++        mutex.withLock { guideDb.compact() }
 +    }
 +
 +    /**
@@ -466938,10 +466979,10 @@ index 000000000..f2ffa4a64
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/model/LiveTvModels.kt b/app/src/main/java/com/nuvio/tv/livetv/model/LiveTvModels.kt
 new file mode 100644
-index 000000000..d7497bdb2
+index 000000000..49aabe7ac
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/model/LiveTvModels.kt
-@@ -0,0 +1,1044 @@
+@@ -0,0 +1,1065 @@
 +package com.nuvio.tv.livetv.model
 +
 +import com.nuvio.stalker.StalkerConfig
@@ -467030,13 +467071,34 @@ index 000000000..d7497bdb2
 +    val linkUsername: String = "",
 +    val linkPassword: String = "",
 +    /** M3U links: the playlist also lists movies or episodes (found when it's read). */
-+    val vodInPlaylist: Boolean = false
++    val vodInPlaylist: Boolean = false,
++    /**
++     * On Demand import policy (device-wide, like [importVod]): which kinds this source
++     * imports, and whether only stream sources are kept ("source matching only": artwork
++     * is left out of the import and fetched as you browse instead).
++     */
++    val vodMovies: Boolean = true,
++    val vodSeries: Boolean = true,
++    val vodSourceOnly: Boolean = false,
++    /** Only these categories import (and can match as sources); null = every category. */
++    val vodMovieCategories: Set<String>? = null,
++    val vodSeriesCategories: Set<String>? = null
 +) {
 +    /** The user agent requests for this playlist go out with ("" = the app default). */
 +    val effectiveUserAgent: String get() = userAgent.ifBlank { fallbackUserAgent }
 +    val isStalker: Boolean get() = sourceType == "stalker" || stalkerConfig != null
 +    val isXtream: Boolean get() = !isStalker && xtreamServer.isNotBlank()
 +    val hasCatalog: Boolean get() = isXtream || isStalker
++
++    /** The category ids chosen for this kind in its import options (null = all categories). */
++    fun vodCategories(series: Boolean): Set<String>? = if (series) vodSeriesCategories else vodMovieCategories
++
++    /** What the On Demand import depends on, for noticing policy changes without a re-import. */
++    fun vodImportPolicy(): String = listOf(vodMovies, vodSeries, vodSourceOnly,
++        vodMovieCategories?.sorted(), vodSeriesCategories?.sorted()).joinToString("|")
++
++    /** Movies and series can be searched as sources: any source On Demand can import. */
++    val supportsVod: Boolean get() = hasVod
 +
 +    /**
 +     * An M3U playlist that is really an Xtream login: the server, username and password, from
@@ -472370,10 +472432,10 @@ index 000000000..b4006886b
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandDatabase.kt b/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandDatabase.kt
 new file mode 100644
-index 000000000..c83a156f4
+index 000000000..8b9cee291
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandDatabase.kt
-@@ -0,0 +1,960 @@
+@@ -0,0 +1,1003 @@
 +package com.nuvio.tv.livetv.ondemand
 +
 +import android.content.ContentValues
@@ -472895,6 +472957,15 @@ index 000000000..c83a156f4
 +        )
 +    }
 +
++    /** Artwork found while browsing a "source matching only" import is kept for next time. */
++    fun setIcon(item: VodItem, icon: String?) {
++        if (icon.isNullOrBlank()) return
++        writableDatabase.execSQL(
++            "UPDATE items SET icon = ? WHERE pl = ? AND kind = ? AND id = ? AND (icon IS NULL OR icon = '')",
++            arrayOf(icon, item.playlistId, item.kind.key, item.id)
++        )
++    }
++
 +    /** Fills in genres from your addons' match, when the provider didn't send any. */
 +    fun fillGenre(item: VodItem, genres: String) {
 +        writableDatabase.execSQL(
@@ -473086,6 +473157,40 @@ index 000000000..c83a156f4
 +        return query("SELECT *$copies FROM items WHERE $where$group ORDER BY ${sort.orderBy("length(name)")} LIMIT $limit", args)
 +            .filter { "${it.kind.key}:${it.playlistId}:${it.categoryId}" !in excludeCategories }
 +    }
++
++    /**
++     * One playlist's slice of the library search: kind optional (both), a page at a time so a
++     * huge provider never loads more than what is on screen. Same matching rules as [search].
++     */
++    fun searchLibrary(
++        playlistId: String, kind: VodKind?, text: String, excludeCategories: Set<String>,
++        limit: Int, offset: Int, merge: Boolean = true
++    ): List<VodItem> {
++        val words = normalizeWords(text)
++        if (words.isEmpty()) return emptyList()
++        val kinds = if (kind == null) listOf(VodKind.MOVIE, VodKind.SERIES) else listOf(kind)
++        val ids = LinkedHashSet<Long>()
++        for (k in kinds) {
++            val joined = words.joinToString("")
++            ids.addAll(rowids(
++                "SELECT rowid FROM items WHERE pl = ? AND kind = ? AND norm >= ? AND norm < ? LIMIT 1500",
++                listOf(playlistId, k.key, joined, joined + "\uFFFF"), null
++            ))
++            ids.addAll(rowids(
++                "SELECT rowid FROM items WHERE pl = ? AND kind = ? AND " + words.joinToString(" AND ") { "instr(norm, ?) > 0" } + " LIMIT 4000",
++                listOf(playlistId, k.key) + words, null
++            ))
++        }
++        if (ids.isEmpty()) return emptyList()
++        val group = if (merge) " GROUP BY $DUP_KEY" else ""
++        return query(
++            "SELECT * FROM items WHERE rowid IN (${ids.joinToString(",")})$group ORDER BY length(name) LIMIT $limit OFFSET $offset",
++            emptyList()
++        ).filter { "${it.kind.key}:${it.playlistId}:${it.categoryId}" !in excludeCategories }
++    }
++
++    /** Kept for the storage dialog's wording: this database has no pending schema shrink to wait for. */
++    fun shrinkingNeedsSpace(): Boolean = false
 +
 +    /** Every copy of a title: same TMDB id, or same name and year (other quality, other provider). */
 +    fun versions(item: VodItem): List<VodItem> =
@@ -473440,10 +473545,10 @@ index 000000000..6433a1470
 +)
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandHomeScreen.kt b/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandHomeScreen.kt
 new file mode 100644
-index 000000000..ceb07eec4
+index 000000000..1aad81fb6
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandHomeScreen.kt
-@@ -0,0 +1,625 @@
+@@ -0,0 +1,629 @@
 +package com.nuvio.tv.livetv.ondemand
 +
 +import androidx.compose.foundation.background
@@ -473461,6 +473566,7 @@ index 000000000..ceb07eec4
 +import androidx.compose.foundation.layout.size
 +import androidx.compose.foundation.shape.RoundedCornerShape
 +import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.ManageSearch
 +import androidx.compose.material.icons.filled.Search
 +import androidx.compose.material.icons.filled.Tune
 +import androidx.compose.runtime.Composable
@@ -473528,6 +473634,8 @@ index 000000000..ceb07eec4
 +    onPlay: (url: String, title: String, type: String, poster: String?, contentId: String, contentName: String, season: Int?, episode: Int?, episodeName: String?, headers: Map<String, String>) -> Unit,
 +    /** The search button: Nuvio's own search. */
 +    onOpenSearch: () -> Unit,
++    /** The library search button: titles already imported from the playlists, per provider. */
++    onOpenLibrarySearch: () -> Unit = {},
 +    /** Home's own trailer lookup and results (trailers follow Nuvio's trailer settings). */
 +    trailers: OnDemandTrailers? = null,
 +    viewModel: OnDemandViewModel = hiltViewModel()
@@ -473887,6 +473995,7 @@ index 000000000..ceb07eec4
 +                Spacer(Modifier.size(6.dp))
 +            }
 +            TopButton(Icons.Default.Search, onClick = onOpenSearch)
++            TopButton(Icons.Default.ManageSearch, onClick = onOpenLibrarySearch)
 +            TopButton(Icons.Default.Tune, onClick = { showManage = true })
 +        }
 +    }
@@ -474069,6 +474178,389 @@ index 000000000..ceb07eec4
 +}
 +
 +private val FIX_YEAR = Regex("\\s*\\(?((?:19|20)\\d{2})\\)?\\s*$")
+diff --git a/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandLibrarySearch.kt b/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandLibrarySearch.kt
+new file mode 100644
+index 000000000..003c51800
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandLibrarySearch.kt
+@@ -0,0 +1,177 @@
++package com.nuvio.tv.livetv.ondemand
++
++import androidx.lifecycle.ViewModel
++import androidx.lifecycle.viewModelScope
++import com.nuvio.tv.livetv.data.LiveTvPreferences
++import com.nuvio.tv.livetv.parental.ParentalControls
++import dagger.hilt.android.lifecycle.HiltViewModel
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.coroutineScope
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.flow.combine
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.flow.update
++import kotlinx.coroutines.joinAll
++import kotlinx.coroutines.launch
++import javax.inject.Inject
++
++internal const val VOD_SEARCH_PAGE_SIZE = 50
++
++data class VodSearchPlaylist(val id: String, val name: String)
++data class VodSearchRequest(
++    val query: String,
++    val kind: VodKind?,
++    val playlists: List<VodSearchPlaylist>,
++    val hidden: Set<String>,
++    val merge: Boolean
++)
++data class VodSearchRow(
++    val playlist: VodSearchPlaylist,
++    val items: List<VodItem> = emptyList(),
++    val hasMore: Boolean = false,
++    val loading: Boolean = false
++)
++data class VodLibrarySearchState(
++    val query: String = "",
++    val kind: VodKind? = null,
++    val rows: List<VodSearchRow> = emptyList(),
++    val loading: Boolean = false,
++    val error: Boolean = false
++)
++
++/** Local catalogue search: never depends on an addon recognizing a provider's title. */
++class OnDemandLibrarySearch @Inject constructor(
++    private val repository: OnDemandRepository,
++    private val preferences: LiveTvPreferences
++) {
++    suspend fun request(query: String, kind: VodKind?): VodSearchRequest {
++        val playlists = preferences.playlists.first().filter { it.enabled && it.importVod && it.supportsVod }
++        val user = preferences.userState.first()
++        val settings = preferences.settings.first()
++        val categories = repository.categories(VodKind.MOVIE) + repository.categories(VodKind.SERIES)
++        val hidden = user.vodHiddenCategories + categories.filter {
++            ParentalControls.isLocked("vod:${it.uid}", it.name, settings, user.lockedGroups)
++        }.map { it.uid }
++        return VodSearchRequest(query.trim(), kind, playlists.map { VodSearchPlaylist(it.id, it.name) }, hidden, settings.vodMergeDuplicates)
++    }
++
++    suspend fun page(request: VodSearchRequest, playlist: VodSearchPlaylist, offset: Int): VodSearchRow {
++        val items = repository.searchPlaylist(playlist.id, request.kind, request.query, request.hidden,
++            request.merge, VOD_SEARCH_PAGE_SIZE + 1, offset)
++        return VodSearchRow(playlist, items.take(VOD_SEARCH_PAGE_SIZE), items.size > VOD_SEARCH_PAGE_SIZE)
++    }
++}
++
++@HiltViewModel
++class OnDemandLibrarySearchViewModel @Inject constructor(
++    private val search: OnDemandLibrarySearch,
++    private val repository: OnDemandRepository,
++    private val preferences: LiveTvPreferences
++) : ViewModel() {
++    private val _ui = MutableStateFlow(VodLibrarySearchState())
++    val ui = _ui.asStateFlow()
++    private var searchJob: Job? = null
++    private val pageJobs = mutableMapOf<String, Job>()
++    private var generation = 0L
++    private var request: VodSearchRequest? = null
++
++    init {
++        repository.start()
++        viewModelScope.launch {
++            repository.artworkUpdates.collect { urls ->
++                _ui.update { state -> state.copy(rows = state.rows.map { row -> row.copy(items = row.items.map { item ->
++                    if (urls.containsKey(item.uid)) item.copy(icon = urls[item.uid]) else item
++                }) }) }
++            }
++        }
++        viewModelScope.launch {
++            // Re-run when imports, playlist eligibility, visibility or PIN access change.
++            combine(repository.version, preferences.playlists, preferences.settings, preferences.userState,
++                ParentalControls.unlocked) { _, _, _, _, _ -> Unit }.collect { restart() }
++        }
++    }
++
++    fun queryChanged(query: String) {
++        if (query == _ui.value.query) return
++        _ui.update { it.copy(query = query) }
++        restart(debounce = true)
++    }
++
++    fun selectKind(kind: VodKind?) {
++        if (kind == _ui.value.kind) return
++        _ui.update { it.copy(kind = kind) }
++        restart()
++    }
++
++    fun submit() = restart()
++
++    private fun restart(debounce: Boolean = false) {
++        val run = ++generation
++        searchJob?.cancel()
++        pageJobs.values.forEach { it.cancel() }
++        pageJobs.clear()
++        request = null
++        val state = _ui.value
++        val query = state.query.trim()
++        _ui.update { it.copy(rows = emptyList(), loading = query.length >= 2, error = false) }
++        if (query.length < 2) return
++        searchJob = viewModelScope.launch {
++            try {
++                if (debounce) delay(300)
++                val captured = search.request(query, state.kind)
++                if (run != generation) return@launch
++                request = captured
++                _ui.update { it.copy(rows = captured.playlists.map { playlist -> VodSearchRow(playlist, loading = true) }) }
++                coroutineScope {
++                    captured.playlists.map { playlist -> launch {
++                        try {
++                            val page = search.page(captured, playlist, 0)
++                            if (run == generation) replaceRow(page)
++                        } catch (cancelled: CancellationException) {
++                            throw cancelled
++                        } catch (_: Exception) {
++                            if (run == generation) {
++                                replaceRow(VodSearchRow(playlist))
++                                _ui.update { it.copy(error = true) }
++                            }
++                        }
++                    } }.joinAll()
++                }
++            } catch (cancelled: CancellationException) {
++                throw cancelled
++            } catch (_: Exception) {
++                if (run == generation) _ui.update { it.copy(error = true) }
++            } finally {
++                if (run == generation) _ui.update { it.copy(loading = false) }
++            }
++        }
++    }
++
++    fun loadMore(playlistId: String) {
++        val captured = request ?: return
++        val row = _ui.value.rows.firstOrNull { it.playlist.id == playlistId } ?: return
++        if (row.loading || !row.hasMore) return
++        val run = generation
++        replaceRow(row.copy(loading = true))
++        pageJobs[playlistId] = viewModelScope.launch {
++            try {
++                val page = search.page(captured, row.playlist, row.items.size)
++                if (run == generation) replaceRow(page.copy(items = row.items + page.items))
++            } catch (cancelled: CancellationException) {
++                throw cancelled
++            } catch (_: Exception) {
++                if (run == generation) {
++                    replaceRow(row.copy(loading = false, hasMore = false))
++                    _ui.update { it.copy(error = true) }
++                }
++            }
++        }
++    }
++
++    private fun replaceRow(row: VodSearchRow) {
++        _ui.update { state -> state.copy(rows = state.rows.map { if (it.playlist.id == row.playlist.id) row else it }) }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandLibrarySearchScreen.kt b/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandLibrarySearchScreen.kt
+new file mode 100644
+index 000000000..0d54a9283
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandLibrarySearchScreen.kt
+@@ -0,0 +1,194 @@
++package com.nuvio.tv.livetv.ondemand
++
++import androidx.activity.compose.BackHandler
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.itemsIndexed
++import androidx.compose.foundation.lazy.rememberLazyListState
++import androidx.compose.foundation.text.KeyboardActions
++import androidx.compose.foundation.text.KeyboardOptions
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.Search
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.OutlinedTextFieldDefaults
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.runtime.snapshotFlow
++import androidx.compose.runtime.withFrameNanos
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusProperties
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.input.key.Key
++import androidx.compose.ui.input.key.KeyEventType
++import androidx.compose.ui.input.key.key
++import androidx.compose.ui.input.key.onPreviewKeyEvent
++import androidx.compose.ui.input.key.type
++import androidx.compose.ui.platform.LocalSoftwareKeyboardController
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.text.input.ImeAction
++import androidx.compose.ui.unit.dp
++import androidx.hilt.navigation.compose.hiltViewModel
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import androidx.tv.material3.Button
++import androidx.tv.material3.ButtonDefaults
++import androidx.tv.material3.Icon
++import androidx.tv.material3.MaterialTheme
++import androidx.tv.material3.Text
++import com.nuvio.tv.R
++import com.nuvio.tv.livetv.ui.SearchResultCard
++import com.nuvio.tv.livetv.ui.SearchResultsRow
++import com.nuvio.tv.ui.components.EmptyScreenState
++import com.nuvio.tv.ui.components.LoadingIndicator
++import com.nuvio.tv.ui.theme.NuvioTheme
++import kotlinx.coroutines.flow.distinctUntilChanged
++
++/** Searches only the imported IPTV library; selecting a result opens its provider details. */
++@Composable
++fun OnDemandLibrarySearchScreen(
++    onBack: () -> Unit,
++    onPlay: (url: String, title: String, type: String, poster: String?) -> Unit,
++    viewModel: OnDemandLibrarySearchViewModel = hiltViewModel()
++) {
++    val state by viewModel.ui.collectAsStateWithLifecycle()
++    val colors = NuvioTheme.colors
++    val keyboard = LocalSoftwareKeyboardController.current
++    val inputFocus = remember { FocusRequester() }
++    val firstResultFocus = remember { FocusRequester() }
++    val filterFocus = remember { FocusRequester() }
++    var moveToResults by remember { mutableStateOf(false) }
++    var providerItem by remember { mutableStateOf<VodItem?>(null) }
++    val visibleRows = state.rows.filter { it.items.isNotEmpty() }
++
++    BackHandler { onBack() }
++    LaunchedEffect(Unit) {
++        withFrameNanos { }
++        inputFocus.requestFocus()
++    }
++    LaunchedEffect(moveToResults, visibleRows.firstOrNull()?.items?.firstOrNull()?.uid) {
++        if (moveToResults && visibleRows.isNotEmpty()) {
++            withFrameNanos { }
++            firstResultFocus.requestFocus()
++            moveToResults = false
++        }
++    }
++
++    Column(Modifier.fillMaxSize().background(colors.Background).padding(top = 28.dp)) {
++        Row(Modifier.fillMaxWidth().padding(horizontal = 52.dp), verticalAlignment = Alignment.CenterVertically) {
++            Text(stringResource(R.string.vod_search_title), style = MaterialTheme.typography.headlineLarge,
++                color = colors.TextPrimary, modifier = Modifier.weight(1f))
++            Button(onClick = onBack) { Text(stringResource(R.string.action_back)) }
++        }
++        Spacer(Modifier.height(16.dp))
++        OutlinedTextField(
++            value = state.query,
++            onValueChange = { moveToResults = false; viewModel.queryChanged(it) },
++            label = { Text(stringResource(R.string.vod_search_hint), color = colors.TextPrimary) },
++            leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, tint = colors.TextPrimary) },
++            singleLine = true,
++            colors = OutlinedTextFieldDefaults.colors(focusedTextColor = colors.TextPrimary,
++                unfocusedTextColor = colors.TextPrimary, focusedBorderColor = colors.FocusRing),
++            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
++            keyboardActions = KeyboardActions(onSearch = {
++                keyboard?.hide()
++                moveToResults = true
++                viewModel.submit()
++            }),
++            modifier = Modifier.fillMaxWidth().padding(horizontal = 52.dp).focusRequester(inputFocus)
++                .onPreviewKeyEvent { event ->
++                    if (event.type == KeyEventType.KeyDown && event.key == Key.DirectionDown) {
++                        keyboard?.hide()
++                        filterFocus.requestFocus()
++                        true
++                    } else false
++                }
++        )
++        Row(Modifier.padding(horizontal = 52.dp, vertical = 16.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
++            listOf(null to R.string.stream_filter_all, VodKind.MOVIE to R.string.type_movies, VodKind.SERIES to R.string.type_series)
++                .forEach { (kind, label) ->
++                    Button(onClick = { moveToResults = false; viewModel.selectKind(kind) },
++                        modifier = Modifier.then(if (kind == null) Modifier.focusRequester(filterFocus) else Modifier)
++                            .focusProperties { up = inputFocus; if (visibleRows.isNotEmpty()) down = firstResultFocus },
++                        colors = ButtonDefaults.colors(containerColor = if (state.kind == kind) colors.Secondary else colors.Background)) {
++                        Text(stringResource(label))
++                    }
++                }
++        }
++        when {
++            state.query.trim().length < 2 -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
++                Text(stringResource(R.string.vod_search_start), color = colors.TextPrimary)
++            }
++            state.loading && visibleRows.isEmpty() -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { LoadingIndicator() }
++            visibleRows.isEmpty() -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
++                if (state.error) Button(onClick = viewModel::submit) { Text(stringResource(R.string.action_retry)) }
++                else EmptyScreenState(title = stringResource(R.string.search_no_results_title),
++                    subtitle = stringResource(R.string.vod_search_no_results), icon = Icons.Default.Search)
++            }
++            else -> LazyColumn(verticalArrangement = Arrangement.spacedBy(24.dp)) {
++                itemsIndexed(visibleRows, key = { _, row -> "${state.query}:${state.kind}:${row.playlist.id}" }) { index, row ->
++                    LibrarySearchRow(row, if (index == 0) firstResultFocus else null, filterFocus,
++                        onLoadMore = { viewModel.loadMore(row.playlist.id) }, onOpen = { providerItem = it })
++                }
++                if (state.loading) item(key = "search_loading") { LoadingIndicator() }
++                if (state.error) item(key = "search_retry") {
++                    Button(onClick = viewModel::submit, modifier = Modifier.padding(horizontal = 52.dp)) {
++                        Text(stringResource(R.string.action_retry))
++                    }
++                }
++                item(key = "search_bottom") { Spacer(Modifier.height(32.dp)) }
++            }
++        }
++    }
++    providerItem?.let { item ->
++        ProviderDetailDialog(item = item, viewModel = hiltViewModel(), onDismiss = { providerItem = null },
++            onPlay = { url, title, poster, _, _, _, _ ->
++                providerItem = null
++                onPlay(url, title, item.kind.key, poster)
++            })
++    }
++}
++
++@Composable
++private fun LibrarySearchRow(
++    row: VodSearchRow,
++    entryFocus: FocusRequester?,
++    inputFocus: FocusRequester,
++    onLoadMore: () -> Unit,
++    onOpen: (VodItem) -> Unit
++) {
++    val scroll = rememberLazyListState()
++    LaunchedEffect(scroll, row.items.size, row.hasMore, row.loading) {
++        snapshotFlow { scroll.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1 }
++            .distinctUntilChanged().collect { last ->
++                if (!row.loading && row.hasMore && last >= row.items.size - 8) onLoadMore()
++            }
++    }
++    SearchResultsRow(title = stringResource(R.string.vod_search_playlist, row.playlist.name), listState = scroll) {
++        itemsIndexed(row.items, key = { _, item -> item.uid }) { index, item ->
++            SearchResultCard(
++                title = OnDemandDatabase.displayTitle(item.name),
++                lines = listOf(listOfNotNull(stringResource(if (item.kind == VodKind.SERIES) R.string.type_series else R.string.type_movies),
++                    item.year?.toString()).joinToString(" · ")),
++                poster = item.icon, logo = null,
++                modifier = Modifier.then(if (index == 0 && entryFocus != null) Modifier.focusRequester(entryFocus) else Modifier)
++                    .focusProperties { if (entryFocus != null) up = inputFocus },
++                onClick = { onOpen(item) }
++            )
++        }
++        if (row.loading) item(key = "loading_more") { LoadingIndicator() }
++    }
++}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandPlay.kt b/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandPlay.kt
 new file mode 100644
 index 000000000..589c65919
@@ -474427,10 +474919,10 @@ index 000000000..bbce5725d
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandRepository.kt b/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandRepository.kt
 new file mode 100644
-index 000000000..51429eca1
+index 000000000..cf5e5d8e9
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/ondemand/OnDemandRepository.kt
-@@ -0,0 +1,1480 @@
+@@ -0,0 +1,1613 @@
 +package com.nuvio.tv.livetv.ondemand
 +
 +import android.content.Context
@@ -474449,8 +474941,10 @@ index 000000000..51429eca1
 +import kotlinx.coroutines.SupervisorJob
 +import kotlinx.coroutines.async
 +import kotlinx.coroutines.awaitAll
++import kotlinx.coroutines.flow.MutableSharedFlow
 +import kotlinx.coroutines.flow.MutableStateFlow
 +import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asSharedFlow
 +import kotlinx.coroutines.flow.asStateFlow
 +import kotlinx.coroutines.flow.distinctUntilChanged
 +import kotlinx.coroutines.flow.drop
@@ -474458,7 +474952,9 @@ index 000000000..51429eca1
 +import kotlinx.coroutines.flow.map
 +import kotlinx.coroutines.launch
 +import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.Semaphore
 +import kotlinx.coroutines.sync.withLock
++import kotlinx.coroutines.sync.withPermit
 +import kotlinx.coroutines.withContext
 +import okhttp3.Request
 +import org.json.JSONObject
@@ -474597,6 +475093,13 @@ index 000000000..51429eca1
 +    private val _version = MutableStateFlow(0)
 +    /** Goes up after every import, so screens reload. */
 +    val version: StateFlow<Int> = _version.asStateFlow()
++
++    /** Artwork fetched while browsing a "source matching only" import, as uid -> icon. */
++    private val _artworkUpdates = MutableSharedFlow<Map<String, String?>>(extraBufferCapacity = 8)
++    val artworkUpdates: kotlinx.coroutines.flow.SharedFlow<Map<String, String?>> = _artworkUpdates.asSharedFlow()
++    private val artworkInFlight = java.util.Collections.newSetFromMap<Triple<String, VodKind, String>>(java.util.concurrent.ConcurrentHashMap())
++    private val artworkAttempts = java.util.concurrent.ConcurrentHashMap<String, Long>()
++    private val artworkGate = kotlinx.coroutines.sync.Semaphore(2)
 +
 +    private val _genreUpdates = MutableStateFlow(0)
 +    /** Goes up as background genre lookups add genres (the genre list refreshes, nothing else). */
@@ -474765,12 +475268,15 @@ index 000000000..51429eca1
 +            _status.value = OnDemandStatus(true, text(R.string.iptv_status_importing_movies_series, pl.name), silent = quietImport)
 +            lastProblem = null
 +            // Movies and series import separately, so a problem with one keeps the other.
-+            val movies = runCatching { importKind(pl, VodKind.MOVIE) }
++            // The import options can leave one kind out entirely (movies, series or both).
++            val movies = if (pl.vodMovies) runCatching { importKind(pl, VodKind.MOVIE) }
 +                .onFailure { if (pl.isStalker) Log.w(TAG, "Movies for ${pl.name} failed: ${problemText(pl, it)}") else Log.w(TAG, "Movies for ${pl.name} failed", it); lastProblem = text(R.string.iptv_status_import_movies_failed, pl.name, problemText(pl, it)) }
++                else Result.success(Unit)
 +            if (!force) com.nuvio.tv.livetv.data.BackgroundWork.awaitIdle()
 +            if (!force) com.nuvio.tv.livetv.data.BackgroundWork.awaitNoHeavy()
-+            val series = runCatching { importKind(pl, VodKind.SERIES) }
++            val series = if (pl.vodSeries) runCatching { importKind(pl, VodKind.SERIES) }
 +                .onFailure { if (pl.isStalker) Log.w(TAG, "Series for ${pl.name} failed: ${problemText(pl, it)}") else Log.w(TAG, "Series for ${pl.name} failed", it); lastProblem = text(R.string.iptv_status_import_series_failed, pl.name, problemText(pl, it)) }
++                else Result.success(Unit)
 +            val ok = movies.isSuccess && series.isSuccess && lastProblem == null
 +            lastProblem?.let { problemByPlaylist[pl.id] = it } ?: problemByPlaylist.remove(pl.id)
 +            // Success: next import in a day. Failure: try again in an hour, not on every start.
@@ -475105,17 +475611,24 @@ index 000000000..51429eca1
 +    private suspend fun importStalkerKind(pl: PlaylistSource, kind: VodKind) {
 +        val client = stalker.client(pl)
 +        val identity = com.nuvio.tv.livetv.stalker.StalkerGateway.identity(pl)
++        // Import options: only the chosen categories import (null = every category); with
++        // "source matching only" the import keeps the sources without artwork.
++        val allowed = pl.vodCategories(kind == VodKind.SERIES)
++        val sourceOnly = pl.vodSourceOnly
 +        // Fetch every page successfully before replacing anything; a truncated import keeps the old catalogue.
 +        if (kind == VodKind.MOVIE) {
 +            val categories = client.vodCategories().associate { it.id to it.name }.toMutableMap()
 +            val movies = client.movies()
 +            movies.forEach { if (!it.isSeries) categories.putIfAbsent(it.categoryId.orEmpty(), "Uncategorized") }
++            if (allowed != null) categories.keys.retainAll(allowed)
 +            ensureCurrentStalker(pl)
-+            prefs.withCurrentPlaylist(pl) { db.replace(pl.id, kind, categories.toList(), movies.asSequence().filterNot { it.isSeries }.map { movie ->
-+                VodItem(pl.id, kind, movie.id, movie.title, movie.poster, movie.categoryId.orEmpty(),
-+                    null, null, movie.year?.take(4)?.toIntOrNull(), movie.rating, 0L, genre = movie.genre,
-+                    stalkerRef = movie.stream.copy(sourceIdentity = identity), providerPlot = movie.plot, providerDurationSeconds = movie.durationSeconds)
-+            }) }
++            prefs.withCurrentPlaylist(pl) { db.replace(pl.id, kind, categories.toList(), movies.asSequence().filterNot { it.isSeries }
++                .filter { allowed == null || it.categoryId.orEmpty() in allowed }
++                .map { movie ->
++                    VodItem(pl.id, kind, movie.id, movie.title, if (sourceOnly) null else movie.poster, movie.categoryId.orEmpty(),
++                        null, null, movie.year?.take(4)?.toIntOrNull(), movie.rating, 0L, genre = movie.genre,
++                        stalkerRef = movie.stream.copy(sourceIdentity = identity), providerPlot = movie.plot, providerDurationSeconds = movie.durationSeconds)
++                }) }
 +        } else {
 +            val nativeCategories = try { client.seriesCategories() } catch (e: com.nuvio.stalker.StalkerException) {
 +                if (e.error == com.nuvio.stalker.StalkerError.UNSUPPORTED) emptyList() else throw e
@@ -475126,12 +475639,15 @@ index 000000000..51429eca1
 +            val categories = (nativeCategories.map { "CLASSIC:${it.id}" to it.name } + vodCategories.map { "VOD:${it.id}" to it.name }).toMap().toMutableMap()
 +            val series = client.series()
 +            series.forEach { categories.putIfAbsent("${it.variant.name}:${it.categoryId.orEmpty()}", "Uncategorized") }
++            if (allowed != null) categories.keys.retainAll(allowed)
 +            ensureCurrentStalker(pl)
-+            prefs.withCurrentPlaylist(pl) { db.replace(pl.id, kind, categories.toList(), series.asSequence().map { show ->
-+                VodItem(pl.id, kind, "${show.variant.name}:${show.id}", show.title, show.poster, "${show.variant.name}:${show.categoryId.orEmpty()}",
-+                    null, null, show.year?.take(4)?.toIntOrNull(), show.rating, 0L, genre = show.genre,
-+                    stalkerRef = show.stream.copy(sourceIdentity = identity), stalkerSeriesVariant = show.variant.name, providerPlot = show.plot)
-+            }) }
++            prefs.withCurrentPlaylist(pl) { db.replace(pl.id, kind, categories.toList(), series.asSequence()
++                .filter { allowed == null || "${it.variant.name}:${it.categoryId.orEmpty()}" in allowed }
++                .map { show ->
++                    VodItem(pl.id, kind, "${show.variant.name}:${show.id}", show.title, if (sourceOnly) null else show.poster, "${show.variant.name}:${show.categoryId.orEmpty()}",
++                        null, null, show.year?.take(4)?.toIntOrNull(), show.rating, 0L, genre = show.genre,
++                        stalkerRef = show.stream.copy(sourceIdentity = identity), stalkerSeriesVariant = show.variant.name, providerPlot = show.plot)
++                }) }
 +        }
 +    }
 +
@@ -475148,6 +475664,17 @@ index 000000000..51429eca1
 +                categories += c.optString("category_id") to c.optString("category_name").ifBlank { "Other" }
 +            }
 +        }
++        // Import options: only the chosen categories import (null = every category), and
++        // "source matching only" keeps the sources without artwork (fetched as you browse).
++        val allowed = pl.vodCategories(kind == VodKind.SERIES)
++        if (allowed != null) categories.removeAll { it.first !in allowed }
++        val sourceOnly = pl.vodSourceOnly
++        fun scoped(s: Sequence<VodItem>): Sequence<VodItem> = sequence {
++            for (item in s) {
++                if (allowed != null && item.categoryId !in allowed) continue
++                yield(if (sourceOnly) item.copy(icon = null) else item)
++            }
++        }
 +        _status.value = OnDemandStatus(true, text(if (kind == VodKind.MOVIE) R.string.iptv_status_importing_movies else R.string.iptv_status_importing_series, pl.name), silent = quietImport)
 +        var n = 0
 +        fun progress() {
@@ -475158,7 +475685,7 @@ index 000000000..51429eca1
 +        var stoppedEarly: Throwable? = null
 +        val saved = db.replace(
 +            pl.id, kind, categories,
-+            streamItems(pl, kind, "$api&action=$listAction", onStop = { stoppedEarly = it }, onItem = ::progress)
++            scoped(streamItems(pl, kind, "$api&action=$listAction", onStop = { stoppedEarly = it }, onItem = ::progress))
 +        )
 +        com.nuvio.tv.livetv.model.LiveTvLoadReport.add(
 +            "On Demand \"${pl.name}\": ${"%,d".format(saved)} $what, ${categories.size} categories; " +
@@ -475192,10 +475719,10 @@ index 000000000..51429eca1
 +                if (problem?.message?.contains("429") == true) break
 +            }
 +        }
-+        val total = db.replace(pl.id, kind, categories, byCategory)
++        val total = db.replace(pl.id, kind, categories, scoped(byCategory))
 +        if (total < saved) {
 +            // Category by category did worse: go back to what the full list gave.
-+            db.replace(pl.id, kind, categories, streamItems(pl, kind, "$api&action=$listAction", onStop = {}, onItem = {}))
++            db.replace(pl.id, kind, categories, scoped(streamItems(pl, kind, "$api&action=$listAction", onStop = {}, onItem = {})))
 +            reportStop(pl, kind, saved, firstProblem)
 +        } else if (failedCategories > 0) {
 +            lastProblem = text(
@@ -475372,6 +475899,104 @@ index 000000000..51429eca1
 +            runCatching { db.search(kind, text, hidden, sort = sort, merge = merge, signal = signal) }.getOrDefault(emptyList())
 +        } finally {
 +            stop?.dispose()
++        }
++    }
++
++    /** Searches the full imported library for one playlist, a page at a time (never depends on an addon matching a title). */
++    suspend fun searchPlaylist(playlistId: String, kind: VodKind?, text: String, hidden: Set<String>,
++        merge: Boolean, limit: Int, offset: Int): List<VodItem> = withContext(Dispatchers.IO) {
++        runCatching { db.searchLibrary(playlistId, kind, text, hidden, limit, offset, merge) }.getOrDefault(emptyList())
++            .also { queueArtwork(it) }
++    }
++
++    /** A provider's movie or series categories, for the per-playlist import options. */
++    suspend fun importCategories(playlistId: String, kind: VodKind): List<Pair<String, String>> = withContext(Dispatchers.IO) {
++        val stored = prefs.playlists.first().firstOrNull { it.id == playlistId } ?: return@withContext emptyList()
++        when {
++            stored.isStalker -> {
++                val client = stalker.client(stored)
++                val out = ArrayList<Pair<String, String>>()
++                runCatching { client.vodCategories().forEach { out += it.id to it.name } }
++                if (kind == VodKind.SERIES) runCatching { client.seriesCategories().forEach { out += "CLASSIC:${it.id}" to it.name } }
++                out.distinctBy { it.first }
++            }
++            stored.hasCatalog || stored.m3uLogin != null -> {
++                val pl = stored.withVodLogin()
++                val api = pl.xtreamApiUrl()
++                val action = if (kind == VodKind.MOVIE) "get_vod_categories" else "get_series_categories"
++                val result = ArrayList<Pair<String, String>>()
++                runCatching {
++                    val arr = org.json.JSONArray(getText("$api&action=$action", pl.userAgent))
++                    for (i in 0 until arr.length()) {
++                        val c = arr.optJSONObject(i) ?: continue
++                        result += c.optString("category_id") to c.optString("category_name").ifBlank { "Other" }
++                    }
++                }
++                result.distinctBy { it.first }
++            }
++            else -> emptyList()
++        }
++    }
++
++    /** Reclaims free database space after cleanup (the guide and On Demand catalogues). */
++    suspend fun maintainStorage(): Long = withContext(Dispatchers.IO) {
++        mutex.withLock {
++            com.nuvio.tv.livetv.data.BackgroundWork.awaitIdle()
++            db.compact()
++        }
++    }
++
++    suspend fun shrinkingNeedsSpace(): Boolean = withContext(Dispatchers.IO) { db.shrinkingNeedsSpace() }
++
++    /**
++     * "Source matching only" imports keep the sources without artwork; as pages are browsed or
++     * searched, the provider's category lists are read again (quietly) and the artwork addresses
++     * found that way are saved and announced. Xtream-style providers only: a Stalker portal's
++     * and a plain M3U playlist's titles carry their artwork in the import itself.
++     */
++    private fun queueArtwork(items: List<VodItem>) {
++        if (items.isEmpty()) return
++        scope.launch(com.nuvio.tv.livetv.data.BackgroundWork.quiet) {
++            val sources = prefs.playlists.first().associateBy { it.id }
++            items.filter { it.icon == null }
++                .groupBy { Triple(it.playlistId, it.kind, it.categoryId) }.forEach { (group, page) ->
++                    val source = sources[group.first]?.takeIf { it.enabled && it.importVod && it.vodSourceOnly } ?: return@forEach
++                    if (source.isStalker || source.m3uLogin != null || isAddonPlaylist(source.id)) return@forEach
++                    if (!artworkInFlight.add(group)) return@forEach
++                    try {
++                        val requestKey = group.toString() + page.map { it.id }.sorted().joinToString("\u0000")
++                        val now = System.currentTimeMillis()
++                        val previous = artworkAttempts[requestKey]
++                        if (previous != null && now - previous < 5 * 60_000L) return@forEach
++                        artworkAttempts[requestKey] = now
++                        if (artworkAttempts.size > 500) artworkAttempts.keys.take(100).forEach { artworkAttempts.remove(it) }
++                        artworkGate.withPermit {
++                            val wanted = page.mapTo(HashSet()) { it.id }
++                            val urls = page.associate { it.id to null as String? }.toMutableMap()
++                            val action = if (group.second == VodKind.MOVIE) "get_vod_streams" else "get_series"
++                            val pl = source.withVodLogin()
++                            val api = pl.xtreamApiUrl()
++                            streamItems(pl, group.second, "$api&action=$action&category_id=${enc(group.third)}", onStop = {}, onItem = {})
++                                .toList().forEach { item -> if (item.id in wanted) urls[item.id] = item.icon }
++                            val current = prefs.playlists.first().firstOrNull { it.id == source.id }
++                            if (current?.vodSourceOnly == true && current.enabled && current.importVod &&
++                                current.vodImportPolicy() == source.vodImportPolicy() &&
++                                current.xtreamServer == source.xtreamServer && current.xtreamUsername == source.xtreamUsername &&
++                                current.xtreamPassword == source.xtreamPassword) {
++                                page.forEach { item ->
++                                    val icon = urls[item.id] ?: return@forEach
++                                    runCatching { db.setIcon(item, icon) }
++                                }
++                                _artworkUpdates.emit(urls.mapKeys { "${group.second.key}:${source.id}:${it.key}" })
++                            }
++                        }
++                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
++                        throw cancelled
++                    } catch (error: Exception) {
++                        // Artwork is disposable. A full disk or provider error must not break playback.
++                        Log.w(TAG, "Could not cache catalogue artwork: ${error.javaClass.simpleName}")
++                    } finally { artworkInFlight.remove(group) }
++                }
 +        }
 +    }
 +
@@ -477545,6 +478170,90 @@ index 000000000..5f6f325aa
 +    val out = ArrayList<VodItem>(items.size)
 +    while (out.size < items.size) for (g in groups) if (g.hasNext()) out += g.next()
 +    return out
++}
+diff --git a/app/src/main/java/com/nuvio/tv/livetv/ondemand/VodImportSettingsDialog.kt b/app/src/main/java/com/nuvio/tv/livetv/ondemand/VodImportSettingsDialog.kt
+new file mode 100644
+index 000000000..ea19f7080
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/livetv/ondemand/VodImportSettingsDialog.kt
+@@ -0,0 +1,78 @@
++package com.nuvio.tv.livetv.ondemand
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.items
++import androidx.compose.material3.Text
++import androidx.compose.runtime.*
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.unit.dp
++import com.nuvio.tv.livetv.model.PlaylistSource
++import com.nuvio.tv.ui.theme.NuvioTheme
++import com.nuvio.tv.ui.components.NuvioDialog
++import com.nuvio.tv.ui.screens.settings.SettingsActionRow
++import com.nuvio.tv.ui.screens.settings.SettingsToggleRow
++
++/** Device-wide import choices, deliberately separate from a profile's hidden groups. */
++@Composable
++fun VodImportSettingsDialog(
++    source: PlaylistSource,
++    repository: OnDemandRepository,
++    onSave: (PlaylistSource) -> Unit,
++    onDismiss: () -> Unit
++) {
++    var draft by remember(source) { mutableStateOf(source) }
++    var choosing by remember { mutableStateOf<VodKind?>(null) }
++    val first = remember { FocusRequester() }
++    LaunchedEffect(choosing) { kotlinx.coroutines.delay(80); runCatching { first.requestFocus() } }
++    val kind = choosing
++    if (kind != null) {
++        var choices by remember(kind) { mutableStateOf<List<Pair<String, String>>?>(null) }
++        var failed by remember(kind) { mutableStateOf(false) }
++        var selected by remember(kind) { mutableStateOf(draft.vodCategories(kind == VodKind.SERIES)) }
++        LaunchedEffect(kind) {
++            runCatching { repository.importCategories(source.id, kind) }
++                .onSuccess { choices = it }.onFailure { failed = true }
++        }
++        NuvioDialog(title = if (kind == VodKind.MOVIE) "Movie categories to import" else "Series categories to import",
++            onDismiss = { choosing = null }, width = 640.dp) {
++            LazyColumn(Modifier.heightIn(max = 450.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
++                item { Text("Only selected categories are imported or offered as sources. These choices apply to all profiles.", color = NuvioTheme.colors.TextPrimary) }
++                item { SettingsToggleRow("All categories", "Includes new categories your provider adds", selected == null,
++                    { selected = if (selected == null) emptySet() else null }, modifier = Modifier.focusRequester(first)) }
++                if (choices == null) item { Text(if (failed) "Couldn't load categories. Your saved selection is unchanged." else "Loading categories…", color = NuvioTheme.colors.TextPrimary) }
++                items(choices.orEmpty(), key = { it.first }) { (id, name) ->
++                    SettingsToggleRow(name, "", selected == null || id in selected.orEmpty(), {
++                        val previous = selected ?: choices.orEmpty().mapTo(mutableSetOf()) { it.first }
++                        selected = if (id in previous) previous - id else previous + id
++                    })
++                }
++                item { SettingsActionRow("Apply categories", subtitle = "", onClick = {
++                    draft = if (kind == VodKind.MOVIE) draft.copy(vodMovieCategories = selected)
++                        else draft.copy(vodSeriesCategories = selected)
++                    choosing = null
++                }) }
++                item { SettingsActionRow("Cancel", subtitle = "", onClick = { choosing = null }) }
++            }
++        }
++        return
++    }
++    NuvioDialog(title = "On Demand imports", onDismiss = onDismiss, width = 640.dp) {
++        LazyColumn(Modifier.heightIn(max = 480.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
++            item { Text("${source.name}: keep every source by default, or choose what this device imports.", color = NuvioTheme.colors.TextPrimary) }
++            item { SettingsToggleRow("Import movies", "", draft.vodMovies, { draft = draft.copy(vodMovies = !draft.vodMovies) }, modifier = Modifier.focusRequester(first)) }
++            item { SettingsToggleRow("Import series", "", draft.vodSeries, { draft = draft.copy(vodSeries = !draft.vodSeries) }) }
++            item { SettingsToggleRow("Source matching only", "Keeps every imported source. Artwork addresses are fetched as you browse and kept in a small cache.",
++                draft.vodSourceOnly, { draft = draft.copy(vodSourceOnly = !draft.vodSourceOnly) }) }
++            item { SettingsActionRow("Movie categories", subtitle = "Only these categories can match as sources", value = draft.vodMovieCategories?.size?.let { "$it selected" } ?: "All",
++                onClick = { choosing = VodKind.MOVIE }) }
++            item { SettingsActionRow("Series categories", subtitle = "Only these categories can match as sources", value = draft.vodSeriesCategories?.size?.let { "$it selected" } ?: "All",
++                onClick = { choosing = VodKind.SERIES }) }
++            item { SettingsActionRow("Save and update imports", subtitle = "Applies to every profile on this device", onClick = { onSave(draft); onDismiss() }) }
++            item { SettingsActionRow("Cancel", subtitle = "", onClick = onDismiss) }
++        }
++    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/ondemand/VodLanguagePreference.kt b/app/src/main/java/com/nuvio/tv/livetv/ondemand/VodLanguagePreference.kt
 new file mode 100644
@@ -524999,10 +525708,10 @@ index 000000000..1cd69b0b2
 +// see com.nuvio.tv.ui.screens.settings.LiveTvSettingsContent. This file can be deleted.
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/ui/LiveTvSettingsViewModel.kt b/app/src/main/java/com/nuvio/tv/livetv/ui/LiveTvSettingsViewModel.kt
 new file mode 100644
-index 000000000..d87d48d55
+index 000000000..d13a9cfe8
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/ui/LiveTvSettingsViewModel.kt
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,240 @@
 +package com.nuvio.tv.livetv.ui
 +
 +import android.content.Context
@@ -525034,8 +525743,38 @@ index 000000000..d87d48d55
 +    val cloudSync: com.nuvio.tv.livetv.sync.LiveTvCloudSync,
 +    val onDemand: com.nuvio.tv.livetv.ondemand.OnDemandRepository,
 +    private val posterResolver: com.nuvio.tv.livetv.data.LiveTvPosterResolver,
-+    private val matcher247: com.nuvio.tv.livetv.data.LiveTv247Matcher
++    private val matcher247: com.nuvio.tv.livetv.data.LiveTv247Matcher,
++    private val posterStore: com.nuvio.tv.livetv.data.LiveTvPosterStore,
++    private val streamLinks: com.nuvio.tv.data.local.StreamLinkCacheDataStore
 +) : ViewModel() {
++
++    /** Measured sizes for the IPTV storage dialog (sizes only, never file contents). */
++    val storage = kotlinx.coroutines.flow.MutableStateFlow<com.nuvio.tv.livetv.data.IptvStorageSnapshot?>(null)
++    val storageBusy = kotlinx.coroutines.flow.MutableStateFlow(false)
++    val storageMessage = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
++
++    fun measureStorage(clean: Boolean = false) {
++        if (storageBusy.value) return
++        storageBusy.value = true
++        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
++            try {
++                val before = com.nuvio.tv.livetv.data.IptvStorageReport.scan(context)
++                if (clean) {
++                    repository.maintainStorage()
++                    onDemand.maintainStorage()
++                    posterStore.prune()
++                    streamLinks.pruneAllProfiles()
++                }
++                val after = com.nuvio.tv.livetv.data.IptvStorageReport.scan(context)
++                storage.value = after
++                storageMessage.value = if (clean) "${com.nuvio.tv.livetv.data.IptvStorageSnapshot.size((before.totalBytes - after.totalBytes).coerceAtLeast(0))} reclaimed. Recordings and source selections kept."
++                    else "Includes database journals. Recordings are never removed by cleanup."
++                if (clean && onDemand.shrinkingNeedsSpace()) storageMessage.value += " More free space is needed to finish shrinking the catalogue."
++            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
++            catch (_: Exception) { storageMessage.value = "Couldn't complete storage maintenance. Try again when imports and playback finish." }
++            finally { storageBusy.value = false }
++        }
++    }
 +
 +    val playlists: StateFlow<List<PlaylistSource>> =
 +        prefs.playlists.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
@@ -527462,10 +528201,10 @@ index 000000000..662fc2d90
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/ui/SearchResultCard.kt b/app/src/main/java/com/nuvio/tv/livetv/ui/SearchResultCard.kt
 new file mode 100644
-index 000000000..06c991d12
+index 000000000..c9d976e61
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/ui/SearchResultCard.kt
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,171 @@
 +package com.nuvio.tv.livetv.ui
 +
 +import androidx.compose.foundation.background
@@ -527521,6 +528260,8 @@ index 000000000..06c991d12
 +internal fun SearchResultsRow(
 +    title: String,
 +    modifier: Modifier = Modifier,
++    /** Owned by the caller so it can watch the scroll (load-more pages) while the row shows it. */
++    listState: androidx.compose.foundation.lazy.LazyListState = androidx.compose.runtime.remember { androidx.compose.foundation.lazy.LazyListState() },
 +    content: LazyListScope.() -> Unit
 +) {
 +    Column(modifier = modifier.fillMaxWidth()) {
@@ -527538,6 +528279,7 @@ index 000000000..06c991d12
 +            )
 +        }
 +        LazyRow(
++            state = listState,
 +            contentPadding = PaddingValues(start = NuvioTheme.spacing.xxxl, end = 200.dp),
 +            horizontalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.lg),
 +            content = content
@@ -530410,7 +531152,7 @@ index 000000000..110d484a3
 +fun isDetailPageLeaving(currentRoute: String?, visibleRoutes: List<String?>): Boolean =
 +    currentRoute?.startsWith("detail/") != true && visibleRoutes.any { it?.startsWith("detail/") == true }
 diff --git a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
-index 0133c760c..602f26a5c 100644
+index 0133c760c..4f08a1048 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
 @@ -1,11 +1,22 @@
@@ -530848,7 +531590,7 @@ index 0133c760c..602f26a5c 100644
          // Nuvio fork: Genres — browse the library by genre, derived locally from Home's catalogs.
          // Genres fork: opened from Home's Genres row with the picked bucket preselected.
          composable(
-@@ -1632,30 +1873,322 @@ private fun PlaybackNavHost(
+@@ -1632,30 +1873,337 @@ private fun PlaybackNavHost(
              )
          }
  
@@ -531123,6 +531865,21 @@ index 0133c760c..602f26a5c 100644
 +                    // What this search shows is set for On Demand in Live TV settings.
 +                    com.nuvio.tv.livetv.ui.LiveTvSearchBridge.origin.value = com.nuvio.tv.livetv.ui.LiveTvSearchBridge.ON_DEMAND
 +                    navController.navigate(Screen.Search.route) { launchSingleTop = true }
++                },
++                // The library search only looks at what the playlists imported, one row per provider.
++                onOpenLibrarySearch = {
++                    navController.navigate(Screen.OnDemandLibrarySearch.route) { launchSingleTop = true }
++                }
++            )
++        }
++
++        composable(Screen.OnDemandLibrarySearch.route) {
++            com.nuvio.tv.livetv.ondemand.OnDemandLibrarySearchScreen(
++                onBack = { navController.popBackStack() },
++                onPlay = { url, title, type, poster ->
++                    navController.navigate(Screen.Player.createRoute(streamUrl = url, title = title,
++                        contentType = type, contentName = title, poster = poster,
++                        addonName = com.nuvio.tv.livetv.ondemand.OnDemandStreams.GROUP_NAME))
 +                }
 +            )
 +        }
@@ -531189,7 +531946,7 @@ index 0133c760c..602f26a5c 100644
              )
          }
  
-@@ -1702,6 +2235,114 @@ private fun PlaybackNavHost(
+@@ -1702,6 +2250,114 @@ private fun PlaybackNavHost(
              )
          }
  
@@ -531304,7 +532061,7 @@ index 0133c760c..602f26a5c 100644
          composable(Screen.Settings.route) {
              SettingsScreen(
                  showBuiltInHeader = !hideBuiltInHeaders,
-@@ -1718,7 +2359,9 @@ private fun PlaybackNavHost(
+@@ -1718,7 +2374,9 @@ private fun PlaybackNavHost(
                  onNavigateToLicensesAttributions = {
                      navController.navigate(Screen.LicensesAttributions.route)
                  },
@@ -531315,7 +532072,7 @@ index 0133c760c..602f26a5c 100644
              )
          }
  
-@@ -1978,3 +2621,25 @@ private fun PlaybackNavHost(
+@@ -1978,3 +2636,25 @@ private fun PlaybackNavHost(
          }
      }
  }
@@ -531342,7 +532099,7 @@ index 0133c760c..602f26a5c 100644
 +    )
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/navigation/Screen.kt b/app/src/main/java/com/nuvio/tv/ui/navigation/Screen.kt
-index 8513ce36c..dbafd4422 100644
+index 8513ce36c..7c4f8e7ce 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/navigation/Screen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/navigation/Screen.kt
 @@ -68,7 +68,7 @@ sealed class Screen(val route: String) {
@@ -531378,7 +532135,7 @@ index 8513ce36c..dbafd4422 100644
      data object TvChannels : Screen("tv_channels")
      data object Jellyfin : Screen("jellyfin")
      data object JellyfinDetail : Screen("jellyfin_detail/{itemId}") {
-@@ -157,7 +159,46 @@ sealed class Screen(val route: String) {
+@@ -157,7 +159,48 @@ sealed class Screen(val route: String) {
      }
      /** YouTube fork: its own section, kept off Home. */
      data object YouTube : Screen("youtube")
@@ -531414,6 +532171,8 @@ index 8513ce36c..dbafd4422 100644
 +    data object SportsMultiview : Screen("sports_multiview")
 +    data object LiveTvSettings : Screen("live_tv_settings")
 +    data object OnDemand : Screen("on_demand")
++    /** The imported IPTV library's own search, one result row per playlist. */
++    data object OnDemandLibrarySearch : Screen("on_demand/library_search")
 +    /** Live TV fork: recorded shows. */
 +    data object Recordings : Screen("recordings")
 +    /** Live TV fork: release dates of your shows and movies. */
@@ -559151,6 +559910,52 @@ index a1120b4e7..624147326 100644
  @Composable
  internal fun forkImmersiveHomeRow() = forkTvToggleRow(
      title = "Immersive home hero",
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/IptvStorageDialog.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/IptvStorageDialog.kt
+new file mode 100644
+index 000000000..b722a6d0e
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/IptvStorageDialog.kt
+@@ -0,0 +1,40 @@
++package com.nuvio.tv.ui.screens.settings
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.items
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.focus.FocusRequester
++import androidx.compose.ui.focus.focusRequester
++import androidx.compose.ui.unit.dp
++import com.nuvio.tv.livetv.data.IptvStorageSnapshot
++import com.nuvio.tv.ui.theme.NuvioTheme
++import com.nuvio.tv.ui.components.NuvioDialog
++
++@Composable
++internal fun IptvStorageDialog(
++    snapshot: IptvStorageSnapshot?, busy: Boolean, message: String?,
++    onMeasure: () -> Unit, onClean: () -> Unit, onDismiss: () -> Unit
++) {
++    val first = remember { FocusRequester() }
++    LaunchedEffect(busy) { if (!busy) { kotlinx.coroutines.delay(80); runCatching { first.requestFocus() } } }
++    NuvioDialog(title = "IPTV storage", onDismiss = onDismiss, width = 680.dp) {
++        LazyColumn(Modifier.heightIn(max = 480.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
++            item { Text(if (busy) "Measuring or cleaning storage…" else message ?: "Measure the catalogue, guide and downloaded files separately.", color = NuvioTheme.colors.TextPrimary) }
++            item { SettingsActionRow("Refresh sizes", subtitle = "Reports sizes without exporting file contents", enabled = !busy,
++                modifier = Modifier.focusRequester(first), onClick = onMeasure) }
++            item { SettingsActionRow("Clean up unused data", subtitle = "Removes abandoned imports and expired files, then reclaims free database space when possible",
++                enabled = !busy, onClick = onClean) }
++            items(snapshot?.categories.orEmpty(), key = { it.label }) { category ->
++                Text("${category.label}: ${IptvStorageSnapshot.size(category.bytes)}", color = NuvioTheme.colors.TextPrimary)
++            }
++            item { Text("Artwork and update installers are shared app storage. Cleanup keeps recordings, provider logins, selections and valid catalogue entries.", color = NuvioTheme.colors.TextPrimary) }
++            item { SettingsActionRow("Close", subtitle = "", onClick = onDismiss) }
++        }
++    }
++}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutCardSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutCardSettings.kt
 index d1879f49d..180f57650 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LayoutCardSettings.kt
@@ -559419,10 +560224,10 @@ index 86279a489..beabb6c3d 100644
          }
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LiveTvSettingsContent.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LiveTvSettingsContent.kt
 new file mode 100644
-index 000000000..10fbba8a4
+index 000000000..ad47c02b1
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LiveTvSettingsContent.kt
-@@ -0,0 +1,3143 @@
+@@ -0,0 +1,3157 @@
 +package com.nuvio.tv.ui.screens.settings
 +
 +import android.content.Context
@@ -559775,6 +560580,13 @@ index 000000000..10fbba8a4
 +    val developerToolsOn by com.nuvio.tv.livetv.model.DeveloperTools.enabled.collectAsStateWithLifecycle()
 +    val onDemandHas by viewModel.onDemand.hasContent.collectAsStateWithLifecycle()
 +    val onDemandStatus by viewModel.onDemand.status.collectAsStateWithLifecycle()
++    val storageSnapshot by viewModel.storage.collectAsStateWithLifecycle()
++    val storageBusy by viewModel.storageBusy.collectAsStateWithLifecycle()
++    val storageMessage by viewModel.storageMessage.collectAsStateWithLifecycle()
++    var showStorage by remember { mutableStateOf(false) }
++    if (showStorage) IptvStorageDialog(storageSnapshot, storageBusy, storageMessage,
++        onMeasure = { viewModel.measureStorage() }, onClean = { viewModel.measureStorage(clean = true) },
++        onDismiss = { showStorage = false })
 +    var pinWrong by remember { mutableStateOf(false) }
 +
 +    fun update(t: (LiveTvSettings) -> LiveTvSettings) = viewModel.update(t)
@@ -560177,13 +560989,20 @@ index 000000000..10fbba8a4
 +                    )
 +                    // One switch per Xtream login (logins added before On Demand start switched off).
 +                    playlists.filter { it.hasVod }.forEach { pl ->
++                        var importSettings by remember(pl.id) { mutableStateOf(false) }
 +                        SettingsToggleRow(
 +                            context.getString(R.string.iptv_settings_movies_series_from_1_s, pl.name),
 +                            if (pl.importVod) context.getString(R.string.iptv_settings_included) else context.getString(R.string.iptv_settings_not_included_switch_on_to_import_this_provider),
 +                            pl.importVod,
 +                            { viewModel.savePlaylist(pl.copy(importVod = !pl.importVod)) }
 +                        )
++                        if (pl.importVod) SettingsActionRow("Import and storage options for ${pl.name}",
++                            subtitle = "Movies, series, categories and source matching mode", onClick = { importSettings = true })
++                        if (importSettings) com.nuvio.tv.livetv.ondemand.VodImportSettingsDialog(pl, viewModel.onDemand,
++                            onSave = viewModel::savePlaylist, onDismiss = { importSettings = false })
 +                    }
++                    SettingsActionRow("IPTV storage and cleanup",
++                        subtitle = "Catalogue, guide, artwork and installer sizes", onClick = { showStorage = true; viewModel.measureStorage() })
 +                    SubHeading(context.getString(R.string.iptv_settings_browsing))
 +                    var pickingSort by remember { mutableStateOf(false) }
 +                    val defaultSort = com.nuvio.tv.livetv.ondemand.VodSort.parse(s.vodDefaultSort)?.first
@@ -779589,7 +780408,7 @@ index 000000000..824575f29
 +    <string name="scout_menu_visible_sub">Scout\'s Home rows keep their own switches</string>
 +</resources>
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index b4264552c..e9326880d 100644
+index b4264552c..9c6851c4f 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
 @@ -343,6 +343,8 @@
@@ -779895,7 +780714,7 @@ index b4264552c..e9326880d 100644
      <string name="autosync_label_synced">Auto synced</string>
      <string name="stream_resume_from_time">Resume from %1$s</string>
      <string name="stream_resume_from_percent">Resume from %1$d%%</string>
-@@ -3743,4 +3861,16 @@
+@@ -3743,4 +3861,21 @@
      <string name="iptv_free_channel_count">%1$d channels</string>
      <string name="iptv_free_source_summary">Free channels · %1$d countries · %2$d channels</string>
      <string name="iptv_free_source_summary_short">Free channels · %1$d countries</string>
@@ -779910,6 +780729,11 @@ index b4264552c..e9326880d 100644
 +<string name="library_empty_trakt_title">No %1$s in this list</string>
 +<string name="library_type_items">items</string>
 +<string name="playback_chapters_label">Chapters</string>
++<string name="vod_search_title">Search On Demand</string>
++<string name="vod_search_hint">Search IPTV movies and series</string>
++<string name="vod_search_start">Enter at least 2 characters to search your On Demand playlists.</string>
++<string name="vod_search_no_results">Try another title or switch between All, Movies and Series.</string>
++<string name="vod_search_playlist">IPTV · %1$s</string>
 +
  </resources>
 diff --git a/app/src/main/res/values/strings_discovery.xml b/app/src/main/res/values/strings_discovery.xml
