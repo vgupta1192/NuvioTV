@@ -1,5 +1,5 @@
 diff --git a/app/build.gradle.kts b/app/build.gradle.kts
-index d2ff9910e..267303eea 100644
+index d2ff9910e..7bfa58b9c 100644
 --- a/app/build.gradle.kts
 +++ b/app/build.gradle.kts
 @@ -145,6 +145,7 @@ android {
@@ -97,7 +97,18 @@ index d2ff9910e..267303eea 100644
      implementation("dev.chrisbanes.haze:haze-android:1.7.2") {
          exclude(group = "org.jetbrains.compose.ui")
          exclude(group = "org.jetbrains.compose.foundation")
-@@ -688,6 +720,9 @@ dependencies {
+@@ -664,6 +696,10 @@ dependencies {
+     implementation(libs.nanohttpd)
+     implementation(libs.zxing.core)
+ 
++    // Usenet playback (NZB streaming)
++    implementation(libs.re2j)
++    implementation(libs.xz)
++
+ 
+     // Supabase
+     implementation(platform(libs.supabase.bom))
+@@ -688,6 +724,9 @@ dependencies {
      androidTestImplementation(libs.androidx.test.ext.junit)
      androidTestImplementation(libs.androidx.test.runner)
      testImplementation("junit:junit:4.13.2")
@@ -416340,7 +416351,7 @@ index d348aabef..30b2ce03f 100644
          Row(
              modifier = Modifier
 diff --git a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
-index 456774cca..4818c0063 100644
+index 456774cca..5f1987f7a 100644
 --- a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
 +++ b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
 @@ -8,6 +8,7 @@ import android.os.StrictMode
@@ -416364,7 +416375,7 @@ index 456774cca..4818c0063 100644
  import dagger.hilt.android.HiltAndroidApp
  import okhttp3.Cookie
  import okhttp3.CookieJar
-@@ -92,7 +95,10 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+@@ -92,7 +95,11 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
          }
      }
  
@@ -416372,10 +416383,11 @@ index 456774cca..4818c0063 100644
      override fun onCreate() {
 +        // Before super.onCreate(): Hilt creates injected services there, and the budget is read once.
 +        MemoryBudget.init(this)
++        com.nuvio.tv.core.usenet.UsenetMemoryProfile.init(this)
          super.onCreate()
          // Nuvio-KE port: hydrate the AFR fps cache from disk (background load) so cold
          // rewatches take the preflight hit path — the switch happens before prepare and the
-@@ -108,6 +114,9 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+@@ -108,6 +115,9 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
          PluginRuntimeHooks.onApplicationCreate(this)
          com.nuvio.tv.reshaped.subtitlefont.SubtitleFontStore.warmUp(this) // Nuvio fork: custom subtitle font, loaded off the main thread
          com.nuvio.tv.ui.screens.player.PlayerEffects.ensureLoaded(this) // Nuvio fork: picture and sound effects, read by stream auto-play
@@ -416385,7 +416397,7 @@ index 456774cca..4818c0063 100644
          androidTvChannelSyncService.start()
          serverUserStateProjection.start()
          releaseReminderCoordinator.start() // Nuvio fork: deliver + schedule "Remind me" notifications
-@@ -118,6 +127,7 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+@@ -118,6 +128,7 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
          LocaleCache.localeTag = tag ?: ""
      }
  
@@ -416393,7 +416405,7 @@ index 456774cca..4818c0063 100644
      override fun newImageLoader(context: android.content.Context): ImageLoader {
          val imageOkHttpClient by lazy {
              val imageDispatcher = okhttp3.Dispatcher().apply {
-@@ -149,6 +159,7 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+@@ -149,6 +160,7 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
  
          return ImageLoader.Builder(this)
              .components {
@@ -416401,7 +416413,7 @@ index 456774cca..4818c0063 100644
                  add(CustomPosterFallbackInterceptor())
                  if (Build.VERSION.SDK_INT >= 28) {
                      add(AnimatedImageDecoder.Factory())
-@@ -157,7 +168,7 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+@@ -157,7 +169,7 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
                  }
                  add(SvgDecoder.Factory())
                  add(
@@ -416410,7 +416422,7 @@ index 456774cca..4818c0063 100644
                          callFactory = { imageOkHttpClient },
                          cacheStrategy = {
                              StaleWhileRevalidateCacheStrategy(
-@@ -179,18 +190,28 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+@@ -179,18 +191,28 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
                  // Normal devices (>3GB): use 0.25 for snappy image loading.
                  // - allowHardware(false) keeps bitmaps on heap instead of GPU memory
                  val cachePercent = when {
@@ -418166,6 +418178,19 @@ index 000000000..c9dbb9692
 +internal fun redactStalkerPlaybackDetails(value: String): String =
 +    if (value.contains("stalker:", ignoreCase = true) || value.contains("stalker%3a", ignoreCase = true))
 +        "[Stalker playback details redacted]" else value
+diff --git a/app/src/main/java/com/nuvio/tv/core/player/StreamAutoPlaySelector.kt b/app/src/main/java/com/nuvio/tv/core/player/StreamAutoPlaySelector.kt
+index e91bd181a..287d6f749 100644
+--- a/app/src/main/java/com/nuvio/tv/core/player/StreamAutoPlaySelector.kt
++++ b/app/src/main/java/com/nuvio/tv/core/player/StreamAutoPlaySelector.kt
+@@ -44,7 +44,7 @@ object StreamAutoPlaySelector {
+     private fun isPlayable(stream: Stream): Boolean {
+         // External URL streams (e.g. error pages, web links) are not playable.
+         if (stream.isExternal()) return false
+-        if (stream.serverTarget != null) return true
++        if (stream.serverTarget != null || stream.usenet?.servers?.isNotEmpty() == true) return true
+         // Streams with a direct URL are always playable regardless of debrid cache status.
+         if (stream.getStreamUrl() != null) return true
+         when (stream.debridCacheStatus?.state) {
 diff --git a/app/src/main/java/com/nuvio/tv/core/player/SubtitleFonts.kt b/app/src/main/java/com/nuvio/tv/core/player/SubtitleFonts.kt
 new file mode 100644
 index 000000000..dd3eb2763
@@ -427618,6 +427643,2803 @@ index fdbefb0da..9ec992355 100644
              watchedSeriesStateHolder.update(emptySet())
              refreshAfterSwitch { provider.refresh(TrackingRefreshIntent.USER_INITIATED) }
          } else if (source == WatchProgressSource.NUVIO_SYNC) {
+diff --git a/app/src/main/java/com/nuvio/tv/core/usenet/LazyRar.kt b/app/src/main/java/com/nuvio/tv/core/usenet/LazyRar.kt
+new file mode 100644
+index 000000000..bb4f033c6
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/usenet/LazyRar.kt
+@@ -0,0 +1,198 @@
++/*
++ * Behaviour adapted from haaihond/NuvioTV, GPL-3.0:
++ * native/usenet/internal/engine/rar.go and select.go
++ * commit bc6decd434c5718d4cb98e1ffddd9f1708bdd8b6.
++ * Kotlin implementation; uncertain layouts use verified header discovery.
++ */
++package com.nuvio.tv.core.usenet
++
++internal data class RarLayout(
++    val version: Int, val number: Long = 0, val numberWidth: Int = 0,
++    val mainSize: Long = 0, val sizeWidth: Int = 0, val packedWidth: Int = 0
++) {
++    private fun width(value: Long): Int {
++        var n = value
++        var result = 1
++        while (n >= 128) { n = n ushr 7; result++ }
++        return result
++    }
++    fun shift(relative: Int, packed: Long): Long? {
++        if (version == 4) return 0
++        var delta = (maxOf(numberWidth, width(number + relative)) - numberWidth).toLong()
++        delta += maxOf(sizeWidth, width(mainSize + delta)) - sizeWidth
++        val length = packed - delta
++        return delta.takeIf { length > 0 && (packedWidth != width(packed) || width(length) == packedWidth) }
++    }
++}
++
++/** Publication of a new layout never holds up reads of already verified extents. */
++private class PredictedRarFile(
++    override val name: String, override val size: Long, initial: List<RarPart>,
++    private val verify: (Int) -> RarPart, private val rebuild: () -> List<RarPart>
++) : UsenetFile {
++    private data class Layout(val parts: List<RarPart>, val ends: LongArray, val verified: Set<Int>)
++    private fun layout(parts: List<RarPart>, verified: Set<Int>): Layout {
++        var sum = 0L
++        val ends = LongArray(parts.size) { i ->
++            ensureUsenet(parts[i].extent.length in 1..(size - sum), "Incomplete multipart RAR file.")
++            sum += parts[i].extent.length
++            sum
++        }
++        ensureUsenet(sum == size, "Incomplete multipart RAR file.")
++        return Layout(parts, ends, verified)
++    }
++    @Volatile private var current = layout(initial, setOf(0, 1, initial.lastIndex))
++    private val layoutGate = Any()
++
++    override fun read(position: Long, buffer: ByteArray, offset: Int, length: Int): Int {
++        if (length == 0) return 0
++        if (position >= size) return -1
++        while (true) {
++            val snapshot = current
++            val i = snapshot.ends.binarySearch(position + 1).let { if (it < 0) -it - 1 else it }
++            if (i !in snapshot.verified) {
++                synchronized(layoutGate) {
++                    if (current === snapshot) {
++                        val expected = snapshot.parts[i]
++                        val actual = verify(i)
++                        current = if (actual.name == expected.name && actual.continues == expected.continues &&
++                            actual.more == expected.more && actual.stored == expected.stored &&
++                            actual.encrypted == expected.encrypted && actual.unpacked == expected.unpacked &&
++                            actual.extent.offset == expected.extent.offset && actual.extent.length == expected.extent.length &&
++                            actual.extent.volume.size == expected.extent.volume.size &&
++                            (actual.encryption == null && expected.encryption == null ||
++                                actual.encryption?.sameCipher(expected.encryption) == true)) {
++                            snapshot.copy(parts = snapshot.parts.toMutableList().apply { set(i, actual) },
++                                verified = snapshot.verified + i)
++                        } else {
++                            val parts = rebuild()
++                            layout(parts, parts.indices.toSet())
++                        }
++                    }
++                }
++                continue
++            }
++            val extent = snapshot.parts[i].extent
++            val within = position - (snapshot.ends[i] - extent.length)
++            if (within + length >= extent.length) snapshot.parts.getOrNull(i + 1)?.extent?.let { it.volume.prefetch(it.offset) }
++            return extent.volume.read(extent.offset + within, buffer, offset,
++                minOf(length.toLong(), extent.length - within).toInt())
++        }
++    }
++}
++
++internal class RarWalker(
++    private val volumes: List<() -> UsenetFile>, private val passwords: RarPasswords,
++    private val checkActive: () -> Unit, private val lazyVolume: ((Int, Long) -> UsenetFile)? = null
++) {
++    private inner class Cursor(var volume: Int) {
++        var parts = emptyList<RarPart>().iterator()
++        fun next(): RarPart? {
++            while (!parts.hasNext()) {
++                if (volume >= volumes.size) return null
++                checkActive()
++                parts = StoredRar.parts(volumes[volume++](), passwords).iterator()
++            }
++            return parts.next()
++        }
++    }
++    private fun continuation(first: RarPart, part: RarPart) {
++        ensureUsenet(part.continues && part.name == first.name && part.unpacked == first.unpacked,
++            "Incomplete multipart RAR file.")
++    }
++    private fun scan(base: Int, first: RarPart): List<RarPart> {
++        val result = mutableListOf(first)
++        val cursor = Cursor(base + 1)
++        while (result.last().more) {
++            val part = cursor.next() ?: throw UsenetFailure("NZB is missing the final RAR volume.")
++            continuation(first, part)
++            result += part
++        }
++        validate(result)
++        return result
++    }
++    private fun validate(parts: List<RarPart>) {
++        ensureUsenet(parts.all { it.stored }, "This RAR video uses compression and cannot be streamed.")
++        val first = parts.first()
++        val size = first.unpacked
++        if (first.encrypted) {
++            val encryption = first.encryption ?: throw UsenetFailure("Unsupported encrypted RAR layout.")
++            ensureUsenet(parts.all { encryption.sameCipher(it.encryption) && it.unpacked == size },
++                "Inconsistent encrypted RAR volumes.")
++        } else ensureUsenet(parts.none { it.encrypted }, "Inconsistent encrypted RAR volumes.")
++        if (size != null && size > 0) {
++            val payload = payload(first) ?: throw UsenetFailure("Invalid RAR file size.")
++            ensureUsenet(parts.sumOf { it.extent.length } == payload, "Incomplete multipart RAR file.")
++        }
++    }
++    private fun payload(first: RarPart): Long? = first.unpacked?.takeIf { it > 0 && it <= Long.MAX_VALUE - 15 }
++        ?.let { if (first.encrypted) (it + 15) and -16L else it }
++
++    private fun open(base: Int, first: RarPart): UsenetFile {
++        val predicted = try { predict(base, first) } catch (_: UsenetFailure) { checkActive(); null }
++        val packed = predicted ?: scan(base, first).let { StoredFile(first.name, it.map(RarPart::extent)) }
++        if (!first.encrypted) return packed
++        val encryption = first.encryption ?: throw UsenetFailure("Unsupported encrypted RAR layout.")
++        val size = first.unpacked ?: throw UsenetFailure("Encrypted RAR file size is unknown.")
++        ensureUsenet(size in 1..packed.size && packed.size - size < 16 && packed.size % 16 == 0L,
++            "Inconsistent encrypted RAR volumes.")
++        return RarPlaintext(packed, 0, size, passwords.key(encryption), encryption.iv)
++    }
++    private fun predict(base: Int, first: RarPart): UsenetFile? {
++        val lazy = lazyVolume ?: return null
++        val size = payload(first) ?: return null
++        if (!first.more || !first.stored || volumes.size - base < 4) return null
++        val second = StoredRar.parts(volumes[base + 1](), passwords).firstOrNull() ?: return null
++        if (!second.continues || !second.more || second.name != first.name || second.unpacked != first.unpacked ||
++            second.extent.volume.size != first.extent.volume.size || !second.stored) return null
++        val template = second.layout ?: return null
++        val parts = mutableListOf(first, second)
++        var remaining = size - first.extent.length - second.extent.length
++        if (remaining <= 0) return null
++        for (i in base + 2 until volumes.size) {
++            val shift = template.shift(i - base - 1, second.extent.length) ?: return null
++            val length = second.extent.length - shift
++            if (remaining <= length) {
++                val last = StoredRar.parts(volumes[i](), passwords).firstOrNull() ?: return null
++                if (!last.continues || last.more || last.name != first.name || last.unpacked != first.unpacked ||
++                    last.extent.length != remaining) return null
++                parts += last
++                validate(parts)
++                return PredictedRarFile(first.name, size, parts,
++                    verify = { n -> StoredRar.parts(volumes[base + n](), passwords).firstOrNull()
++                        ?: throw UsenetFailure("Incomplete multipart RAR file.") },
++                    rebuild = { scan(base, first) })
++            }
++            parts += second.copy(extent = FileExtent(lazy(i, second.extent.volume.size),
++                second.extent.offset + shift, length))
++            remaining -= length
++        }
++        return null
++    }
++
++    fun candidates(): Sequence<UsenetCandidate> = sequence {
++        val cursor = Cursor(0)
++        var count = 0
++        while (true) {
++            val first = cursor.next() ?: break
++            ensureUsenet(!first.continues, "Incomplete multipart RAR file.")
++            ensureUsenet(++count <= 8192, "Too many archived files.")
++            val base = cursor.volume - 1
++            yield(UsenetCandidate(first.name, first.unpacked ?: first.extent.length) { open(base, first) })
++            if (!first.more) continue
++            // Prove that an unselected split entry occupies the entire middle of the set.
++            val tail = Cursor(volumes.lastIndex)
++            val last = if (base < volumes.lastIndex) tail.next() else null
++            if (last != null && last.continues && !last.more && last.name == first.name && last.unpacked == first.unpacked) {
++                cursor.volume = tail.volume
++                cursor.parts = tail.parts
++            } else {
++                var part = first
++                while (part.more) {
++                    part = cursor.next() ?: throw UsenetFailure("NZB is missing the final RAR volume.")
++                    continuation(first, part)
++                }
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/usenet/NewsArticles.kt b/app/src/main/java/com/nuvio/tv/core/usenet/NewsArticles.kt
+new file mode 100644
+index 000000000..b5c2b2298
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/usenet/NewsArticles.kt
+@@ -0,0 +1,507 @@
++package com.nuvio.tv.core.usenet
++
++import java.io.InputStream
++import java.io.Closeable
++import java.io.IOException
++import java.net.ConnectException
++import java.net.InetAddress
++import java.net.SocketTimeoutException
++import java.net.UnknownHostException
++import java.net.InetSocketAddress
++import java.net.Socket
++import java.net.URI
++import java.net.URLDecoder
++import java.util.zip.CRC32
++import javax.net.ssl.SSLException
++import javax.net.ssl.SSLSocket
++import javax.net.ssl.SSLSocketFactory
++
++internal data class Article(val start: Long, val total: Long, val bytes: ByteArray, val filename: String? = null) {
++    val end get() = start + bytes.size
++}
++
++private const val MAX_PART = 4 * 1024 * 1024
++/** One reader owns all read-ahead, including status lines between pipelined articles. */
++internal class NewsWireReader(private val input: InputStream) {
++    private val block = ByteArray(64 * 1024)
++    private var position = 0
++    private var end = 0
++    val line = ByteArray(8192)
++
++    fun readLine(limit: Int = line.size): Int {
++        var length = 0
++        while (true) {
++            if (position == end) {
++                end = input.read(block)
++                if (end < 0) throw UsenetFailure("Usenet connection ended early.")
++                position = 0
++            }
++            val start = position
++            while (position < end && block[position] != 10.toByte()) position++
++            val count = position - start
++            ensureUsenet(count <= limit - length, "Invalid Usenet article line.")
++            block.copyInto(line, length, start, position)
++            length += count
++            if (position < end) {
++                position++
++                return length
++            }
++        }
++    }
++
++    fun statusCode(): Int? {
++        val length = readLine(line.size - 1)
++        return String(line, 0, length, Charsets.ISO_8859_1).removeSuffix("\r").take(3).toIntOrNull()
++    }
++}
++
++internal fun decodeArticle(input: NewsWireReader): Article {
++    var total = 0L
++    var start = 0L
++    var multipart = false
++    var payload: ByteArray? = null
++    var written = 0
++    var finished = false
++    var filename: String? = null
++    val line = input.line
++    var wireBytes = 0
++    fun String.field(name: String) = split(' ').firstOrNull { it.startsWith("$name=") }?.substringAfter('=')
++    fun buffer(size: Long): ByteArray {
++        ensureUsenet(size in 1..MAX_PART.toLong(), "Usenet article exceeds the size limit.")
++        return ByteArray(size.toInt())
++    }
++    while (true) {
++        var length = input.readLine()
++        wireBytes += length + 1
++        ensureUsenet(wireBytes <= MAX_PART * 3, "Usenet article exceeds the size limit.")
++        if (length > 0 && line[length - 1] == 13.toByte()) length--
++        if (length == 1 && line[0] == 46.toByte()) break
++        if (finished) continue
++        if (payload == null) {
++            val header = String(line, 0, length, Charsets.ISO_8859_1)
++            if (total == 0L) {
++                if (!header.startsWith("=ybegin ")) continue
++                val fields = header.substringBefore(" name=")
++                filename = header.substringAfter(" name=", "").trim().take(2048).ifEmpty { null }
++                total = fields.field("size")?.toLongOrNull() ?: 0L
++                ensureUsenet(total > 0, "Invalid yEnc file size.")
++                multipart = fields.field("part") != null
++                if (!multipart) payload = buffer(total)
++            } else {
++                ensureUsenet(header.startsWith("=ypart "), "Missing yEnc part range.")
++                val first = header.field("begin")?.toLongOrNull() ?: 0
++                val end = header.field("end")?.toLongOrNull() ?: 0
++                ensureUsenet(first in 1..end && end <= total, "Invalid yEnc part range.")
++                start = first - 1
++                payload = buffer(end - start)
++            }
++            continue
++        }
++        if (length >= 6 && line[0] == 61.toByte() && line[1] == 121.toByte() &&
++            String(line, 0, 6, Charsets.US_ASCII) == "=yend ") {
++            val trailer = String(line, 0, length, Charsets.US_ASCII)
++            ensureUsenet(written == payload.size && trailer.field("size")?.toLongOrNull() == written.toLong(),
++                "Incomplete Usenet article.")
++            val crc = trailer.field(if (multipart) "pcrc32" else "crc32")
++            ensureUsenet(crc == null || crc.toLongOrNull(16) == CRC32().apply { update(payload) }.value,
++                "Usenet article failed its checksum.")
++            finished = true
++            continue
++        }
++        var index = if (length >= 2 && line[0] == 46.toByte() && line[1] == 46.toByte()) 1 else 0
++        while (index < length) {
++            var value = line[index++].toInt()
++            if (value == 61) {
++                ensureUsenet(index < length, "Invalid yEnc escape.")
++                value = line[index++].toInt() - 64
++            }
++            ensureUsenet(written < payload.size, "Usenet article exceeds its declared size.")
++            payload[written++] = (value - 42).toByte()
++        }
++    }
++    if (!finished || payload == null) throw UsenetFailure("Missing or incomplete yEnc article.")
++    return Article(start, total, payload, filename)
++}
++
++private class NewsServer(val host: String, val port: Int, val tls: Boolean, val user: String?, val pass: String?,
++                         val limit: Int, val limitFromAddon: Boolean) {
++    fun sameAccount(other: NewsServer) = host.equals(other.host, true) && user == other.user
++    fun sameLogin(other: NewsServer) = sameAccount(other) && port == other.port && tls == other.tls && pass == other.pass
++
++    companion object {
++        fun parse(value: String): NewsServer? = runCatching {
++            val uri = URI(value)
++            val tls = uri.scheme.equals("nntps", true)
++            require(tls || uri.scheme.equals("nntp", true))
++            val host = requireNotNull(uri.host)
++            val port = if (uri.port == -1) (if (tls) 563 else 119) else uri.port
++            require(port in 1..65535 && uri.query == null && uri.fragment == null)
++            fun decode(part: String) = URLDecoder.decode(part.replace("+", "%2B"), "UTF-8").also {
++                require(it.length <= 512 && it.none { c -> c.isISOControl() })
++            }
++            val auth = uri.rawUserInfo?.split(':', limit = 2)
++            val addonLimit = uri.path.orEmpty().trim('/').toIntOrNull()
++            val limit = addonLimit?.coerceIn(1, 12) ?: 2
++            NewsServer(host, port, tls, auth?.first()?.let(::decode), auth?.getOrNull(1)?.let(::decode),
++                limit, limitFromAddon = addonLimit != null)
++        }.getOrNull()
++    }
++}
++
++private class NewsConnection(server: NewsServer, tlsFactory: SSLSocketFactory, private var deadline: Long,
++                             trace: UsenetStartupTrace?, register: (Socket) -> Unit) : Closeable {
++    private val connectStarted = System.nanoTime()
++    private var socket = connect(server, register)
++    private val input: NewsWireReader
++    private val pending = java.util.ArrayDeque<String>(3)
++    init {
++        try {
++            socket.soTimeout = 12_000
++            if (server.tls) {
++                val secure = tlsFactory.createSocket(socket, server.host, server.port, true) as SSLSocket
++                socket = secure
++                register(secure)
++                secure.sslParameters = secure.sslParameters.apply { endpointIdentificationAlgorithm = "HTTPS" }
++                secure.startHandshake()
++            }
++            // A socket idle timeout alone can be kept alive indefinitely by trickled bytes.
++            val raw = socket.getInputStream()
++            input = NewsWireReader(object : InputStream() {
++                var timeout = 12_000
++                private fun updateTimeout() {
++                    val remaining = deadline - System.nanoTime()
++                    if (remaining <= 0) throw SocketTimeoutException()
++                    val ms = ((remaining / 1_000_000) + 1).coerceAtMost(12_000).toInt()
++                    if (ms != timeout) {
++                        socket.soTimeout = ms
++                        timeout = ms
++                    }
++                }
++                override fun read(): Int {
++                    updateTimeout()
++                    return raw.read()
++                }
++                override fun read(buffer: ByteArray, off: Int, len: Int): Int {
++                    updateTimeout()
++                    return raw.read(buffer, off, len)
++                }
++            })
++            ensureUsenet(status() in setOf(200, 201), "Usenet provider refused the connection.")
++            if (server.user != null) {
++                var auth = command("AUTHINFO USER " + server.user)
++                if (auth == 381) auth = command("AUTHINFO PASS " + server.pass.orEmpty())
++                ensureUsenet(auth == 281, "Usenet provider rejected sign-in.")
++            }
++            trace?.mark("first_login")
++        } catch (e: Exception) {
++            close()
++            throw e
++        }
++    }
++    private companion object {
++        fun connect(server: NewsServer, register: (Socket) -> Unit): Socket {
++            val addresses = InetAddress.getAllByName(server.host)
++            var failure: IOException? = null
++            for (address in addresses.take(4)) {
++                val candidate = Socket()
++                try {
++                    register(candidate)
++                    candidate.connect(InetSocketAddress(address, server.port), 4_000)
++                    return candidate
++                } catch (error: IOException) {
++                    candidate.close()
++                    failure = error
++                }
++            }
++            throw failure ?: UnknownHostException()
++        }
++    }
++    // Includes TCP, TLS and authentication. Compare this connection's observed costs.
++    private val setupNanos = System.nanoTime() - connectStarted
++    private var transferNanos = 0L
++    var transferLimited: Boolean? = null
++        private set
++    // The queued BODY commands already shared the preceding request's round trip.
++    fun economicalDrain(): Boolean = pending.isNotEmpty() && transferNanos > 0 &&
++        transferNanos * pending.size < setupNanos
++
++    private fun status() = input.statusCode()
++    private fun send(value: String) = socket.getOutputStream().write((value + "\r\n").toByteArray(Charsets.UTF_8))
++    private fun command(value: String): Int? {
++        send(value)
++        return status()
++    }
++
++    val hasQueuedReplies get() = pending.isNotEmpty()
++    fun canFetch(id: String, allowQueued: Boolean) = pending.isEmpty() || (allowQueued && pending.peekFirst() == id)
++
++    fun fetch(id: String, next: List<String>, readDeadline: Long): Article {
++        deadline = readDeadline
++        // An incompatible idle lease is reused only when draining is cheaper than login.
++        if (pending.isNotEmpty() && pending.peekFirst() != id) {
++            deadline = minOf(readDeadline, System.nanoTime() + setupNanos)
++        }
++        while (pending.isNotEmpty() && pending.peekFirst() != id) {
++            pending.removeFirst()
++            when (status()) {
++                222 -> decodeArticle(input)
++                430, 423 -> Unit
++                else -> throw UsenetFailure("Unexpected queued Usenet response.")
++            }
++        }
++        deadline = readDeadline
++        val start = System.nanoTime()
++        val queued = pending.isNotEmpty()
++        // Commands share one authenticated connection. Responses stay in wire order.
++        // On a seek the pool selects a compatible socket or replaces the old one.
++        val commands = buildString {
++            if (pending.isEmpty()) {
++                append("BODY <").append(id).append(">\r\n")
++            } else {
++                check(pending.removeFirst() == id)
++            }
++            if (pending.withIndex().all { (i, queued) -> next.getOrNull(i) == queued }) {
++                for (i in pending.size until minOf(2, next.size)) {
++                    pending.addLast(next[i])
++                    append("BODY <").append(next[i]).append(">\r\n")
++                }
++            }
++        }
++        if (commands.isNotEmpty()) socket.getOutputStream().write(commands.toByteArray(Charsets.UTF_8))
++        val response = status()
++        val statusAt = System.nanoTime()
++        if (response == 430 || response == 423) throw MissingUsenetArticle()
++        ensureUsenet(response == 222, "Usenet provider could not return the article.")
++        return decodeArticle(input).also {
++            // A prefetched reply may already be in the kernel buffer; it would underestimate a cold transfer.
++            if (!queued) {
++                val end = System.nanoTime()
++                transferNanos = end - statusAt
++                transferLimited = transferNanos > statusAt - start
++            }
++        }
++    }
++    override fun close() = socket.close()
++}
++
++internal class MissingUsenetArticle : UsenetFailure("Usenet article unavailable on every configured provider.")
++
++/** A lease lasts for one BODY response. Idle authenticated sockets can follow playback between sessions. */
++private object NewsPool {
++    private val lock = Object()
++    class Slot(val server: NewsServer, val factory: SSLSocketFactory, var owner: NewsArticles) {
++        var busy = true
++        var socket: Socket? = null
++        var connection: NewsConnection? = null
++    }
++    private val slots = mutableListOf<Slot>()
++
++    fun acquire(server: NewsServer, factory: SSLSocketFactory, owner: NewsArticles, id: String, allowQueued: Boolean, readDeadline: Long): Slot {
++        val poolDeadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5)
++        synchronized(lock) {
++            while (true) {
++                ensureUsenet(!owner.closed, "Usenet session expired.")
++                val account = slots.filter { it.server.sameAccount(server) }
++                account.filter { !it.busy && it.factory === factory && it.server.sameLogin(server) &&
++                    it.connection?.canFetch(id, allowQueued) == true }.maxByOrNull { if (it.connection?.hasQueuedReplies == true) 1 else 0 }?.let {
++                    it.busy = true
++                    it.owner = owner
++                    return it
++                }
++                val cap = minOf(server.limit, account.minOfOrNull { it.server.limit } ?: server.limit)
++                val atAccountLimit = account.size >= cap
++                val pool = if (atAccountLimit) account else slots
++                if (atAccountLimit || slots.size >= 24) {
++                    if (atAccountLimit && allowQueued) account.firstOrNull { !it.busy &&
++                        it.factory === factory && it.server.sameLogin(server) && it.connection?.economicalDrain() == true
++                    }?.let {
++                        it.busy = true
++                        it.owner = owner
++                        return it
++                    }
++                    val idle = pool.firstOrNull { !it.busy }
++                    if (idle == null) {
++                        val limit = if (pool.any { it.owner === owner }) readDeadline else minOf(readDeadline, poolDeadline)
++                        val left = limit - System.nanoTime()
++                        ensureUsenet(left > 0, "The NNTP provider connection limit is busy.")
++                        java.util.concurrent.TimeUnit.NANOSECONDS.timedWait(lock, left)
++                        continue
++                    }
++                    remove(idle)
++                }
++                return Slot(server, factory, owner).also(slots::add)
++            }
++        }
++    }
++
++    /** Speculation may consume a spare lease, never wait, evict a slot or take the only allowance. */
++    fun spare(server: NewsServer, factory: SSLSocketFactory, owner: NewsArticles, id: String): Slot? = synchronized(lock) {
++        if (owner.closed) return null
++        val account = slots.filter { it.server.sameAccount(server) }
++        val cap = minOf(server.limit, account.minOfOrNull { it.server.limit } ?: server.limit)
++        if (cap < 2 || account.count { it.busy } >= cap - 1 || slots.count { it.busy } >= 23) return null
++        // Leave any queued sequential replies for their current reader.
++        account.firstOrNull { !it.busy && it.owner === owner && it.factory === factory &&
++            it.server.sameLogin(server) && it.connection?.canFetch(id, false) == true }?.let {
++            it.busy = true
++            return it
++        }
++        if (account.size >= cap || slots.size >= 24) return null
++        Slot(server, factory, owner).also(slots::add)
++    }
++
++    fun warmSlot(server: NewsServer, factory: SSLSocketFactory, owner: NewsArticles): Slot? = synchronized(lock) {
++        if (owner.closed) return null
++        val account = slots.filter { it.server.sameAccount(server) }
++        val cap = minOf(server.limit, account.minOfOrNull { it.server.limit } ?: server.limit)
++        if (account.size >= cap || slots.size >= 24) return null
++        Slot(server, factory, owner).also(slots::add)
++    }
++
++    fun register(slot: Slot, socket: Socket) = synchronized(lock) {
++        if (slot !in slots) {
++            socket.close()
++            throw UsenetFailure("Usenet session expired.")
++        }
++        slot.socket = socket
++    }
++
++    private fun remove(slot: Slot) {
++        slots.remove(slot)
++        runCatching { slot.socket?.close() }
++    }
++
++    fun finish(slot: Slot, healthy: Boolean) = synchronized(lock) {
++        if (healthy) slot.busy = false else remove(slot)
++        lock.notifyAll()
++    }
++
++    fun close(owner: NewsArticles) = synchronized(lock) {
++        slots.filter { it.owner === owner }.forEach(::remove)
++        lock.notifyAll()
++    }
++}
++
++private val defaultTls by lazy { SSLSocketFactory.getDefault() as SSLSocketFactory }
++
++/** Each socket has one exclusive lease. Account limits span readers and sessions. */
++internal class NewsArticles(serverUrls: List<String>, private val tlsFactory: SSLSocketFactory = defaultTls,
++                            private val readBudgetMs: Long = 45_000L, private val trace: UsenetStartupTrace? = null) : Closeable {
++    private val servers = serverUrls.take(8).mapNotNull(NewsServer::parse)
++    @Volatile private var preferred = 0
++    private val serialOnly = java.util.concurrent.atomic.AtomicIntegerArray(servers.size)
++    private val transferLimited = java.util.concurrent.atomic.AtomicIntegerArray(servers.size)
++    val sequentialReadAhead get() = canPrefetch && transferLimited.get(preferred) != 0
++    val canPrefetch get() = servers[preferred].limit > 1 && serialOnly.get(preferred) == 0
++    @Volatile var closed = false
++        private set
++    init {
++        ensureUsenet(servers.isNotEmpty(), "The add-on supplied no usable NNTP server.")
++        prefer(0)
++    }
++
++    @Synchronized private fun prefer(index: Int) {
++        preferred = index
++        trace?.connections(servers[index].limit, servers[index].limitFromAddon)
++    }
++
++    fun warm(count: Int) {
++        repeat(minOf(count, servers[preferred].limit)) {
++            kotlinx.coroutines.Dispatchers.IO.dispatch(kotlin.coroutines.EmptyCoroutineContext) {
++                val server = servers[preferred]
++                val slot = NewsPool.warmSlot(server, tlsFactory, this) ?: return@dispatch
++                var healthy = false
++                try {
++                    val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(15)
++                    slot.connection = NewsConnection(server, tlsFactory, deadline, trace) { NewsPool.register(slot, it) }
++                    healthy = true
++                } catch (_: Exception) {
++                    trace?.add("warm_failures")
++                } finally { NewsPool.finish(slot, healthy) }
++            }
++        }
++    }
++
++    fun fetchAhead(id: String): Article? {
++        val index = preferred
++        val server = servers[index]
++        if (serialOnly.get(index) != 0) return null
++        val slot = NewsPool.spare(server, tlsFactory, this, id) ?: return null
++        var healthy = false
++        try {
++            val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(readBudgetMs)
++            val connection = slot.connection ?: NewsConnection(server, tlsFactory, deadline, trace) { NewsPool.register(slot, it) }
++                .also { slot.connection = it }
++            return connection.fetch(id, emptyList(), deadline).also { healthy = true }
++        } finally {
++            NewsPool.finish(slot, healthy)
++        }
++    }
++
++    fun fetch(id: String, next: List<String> = emptyList()): Article {
++        ensureUsenet(!closed, "Usenet session expired.")
++        var lastFailure: String? = null
++        var missingProviders = 0
++        val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(readBudgetMs)
++        val firstProvider = preferred
++        for (step in servers.indices) {
++            val index = (firstProvider + step) % servers.size
++            // An idle socket can have been dropped by the server. Reconnect once in that case.
++            for (attempt in 0..1) {
++                ensureUsenet(!closed, "Usenet session expired.")
++                ensureUsenet(System.nanoTime() < deadline, "Timed out retrieving the Usenet article.")
++                var readingArticle = false
++                var pipelined = false
++                var slot: NewsPool.Slot? = null
++                var reused = false
++                var healthy = false
++                try {
++                    val lease = NewsPool.acquire(servers[index], tlsFactory, this, id, allowQueued = serialOnly.get(index) == 0, readDeadline = deadline)
++                    slot = lease
++                    reused = lease.connection != null
++                    val active = lease.connection ?: NewsConnection(servers[index], tlsFactory, deadline, trace) { NewsPool.register(lease, it) }
++                        .also { lease.connection = it }
++                    readingArticle = true
++                    val draining = !active.canFetch(id, allowQueued = true)
++                    // A speculative drain exceeding its budget should retry on a fresh connection.
++                    // It says nothing about whether this provider accepts pipelined commands.
++                    val ahead = if (draining || serialOnly.get(index) != 0) emptyList() else next
++                    pipelined = !draining && (active.hasQueuedReplies || ahead.isNotEmpty())
++                    val article = active.fetch(id, ahead, deadline)
++                    active.transferLimited?.let { transferLimited.set(index, if (it) 1 else 0) }
++                    healthy = true
++                    prefer(index)
++                    return article
++                } catch (error: IOException) {
++                    if (error is MissingUsenetArticle) {
++                        missingProviders++
++                        break
++                    }
++                    lastFailure = when (error) {
++                        is UsenetFailure -> error.message
++                        is UnknownHostException -> "Could not resolve the NNTP provider hostname."
++                        is SSLException -> "The secure connection to the NNTP provider failed. Check the TLS setting and port."
++                        is SocketTimeoutException -> if (readingArticle) "Timed out reading a Usenet article."
++                            else "Timed out connecting or signing in to the NNTP provider."
++                        is ConnectException -> "Could not reach the NNTP provider on port ${servers[index].port}."
++                        else -> if (readingArticle) "The connection dropped while reading a Usenet article."
++                            else "The connection to the NNTP provider failed during startup."
++                    }
++                    if (pipelined && serialOnly.get(index) == 0) {
++                        // Some servers/proxies reject overlapping BODY commands. Retry the
++                        // requested article alone on a fresh socket and remember this provider.
++                        serialOnly.set(index, 1)
++                    } else if (!reused) break
++                } finally {
++                    slot?.let { NewsPool.finish(it, healthy) }
++                }
++            }
++        }
++        if (missingProviders == servers.size) throw MissingUsenetArticle()
++        throw UsenetFailure(lastFailure ?: "Could not connect to the Usenet provider.")
++    }
++    override fun close() {
++        closed = true
++        NewsPool.close(this)
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/usenet/NzbDownload.kt b/app/src/main/java/com/nuvio/tv/core/usenet/NzbDownload.kt
+new file mode 100644
+index 000000000..9a79492a0
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/usenet/NzbDownload.kt
+@@ -0,0 +1,61 @@
++package com.nuvio.tv.core.usenet
++
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import java.io.Closeable
++import java.io.PushbackInputStream
++import java.util.zip.GZIPInputStream
++
++internal object NzbDownload {
++    private val cache = NzbMemoryCache()
++    fun onMemoryPressure() = cache.clear()
++    // Redirects are processed here to keep addon credentials on their original origin.
++    private val client by lazy { OkHttpClient.Builder().followRedirects(false).followSslRedirects(false)
++        .callTimeout(30, java.util.concurrent.TimeUnit.SECONDS).build() }
++
++    fun fetch(url: String, headers: Map<String, String>, preparation: UsenetPreparation, trace: UsenetStartupTrace? = null): NzbDocument {
++        preparation.own(Closeable {}) // A cache hit must still respect cancelled preparation ownership.
++        cache.get(url, headers)?.let { trace?.add("nzb_cache_hits"); return it }
++        val generation = cache.generation()
++        val limits = NzbLimits.forProfile(UsenetMemoryProfile.current)
++        var request = Request.Builder().url(url).apply {
++            headers.forEach { (name, value) ->
++                if (name.lowercase() !in setOf("host", "content-length", "connection", "accept-encoding")) header(name, value)
++            }
++        }.build()
++        val origin = request.url
++        repeat(11) { redirects ->
++            val call = client.newCall(request)
++            preparation.own(Closeable { call.cancel() })
++            call.execute().use { response ->
++                if (response.code in setOf(301, 302, 303, 307, 308)) {
++                    ensureUsenet(redirects < 10, "Too many NZB redirects.")
++                    val destination = response.header("Location")?.let { response.request.url.resolve(it) }
++                        ?: throw UsenetFailure("Invalid NZB redirect.")
++                    ensureUsenet(destination.scheme in setOf("http", "https") &&
++                        destination.username.isEmpty() && destination.password.isEmpty() &&
++                        (!request.url.isHttps || destination.isHttps), "Unsafe NZB redirect.")
++                    val sameOrigin = destination.scheme == origin.scheme && destination.host == origin.host && destination.port == origin.port
++                    request = if (sameOrigin) request.newBuilder().url(destination).build()
++                        else Request.Builder().url(destination).build()
++                } else {
++                    ensureUsenet(response.isSuccessful, "Could not download the NZB.")
++                    val body = response.body ?: throw UsenetFailure("Empty NZB response.")
++                    val wire = PushbackInputStream(body.byteStream(), 2)
++                    val first = wire.read()
++                    val second = wire.read()
++                    if (second >= 0) wire.unread(second)
++                    if (first >= 0) wire.unread(first)
++                    val decoded = if (first == 0x1f && second == 0x8b) GZIPInputStream(wire) else wire
++                    return decoded.use { NzbManifest.parse(it, limits) }.also {
++                        trace?.add("nzb_bytes", it.decodedBytes)
++                        trace?.add("nzb_retained_bytes", it.retainedBytes)
++                        cache.put(url, headers, it, generation)
++                    }
++                }
++            }
++        }
++        throw UsenetFailure("Too many NZB redirects.")
++    }
++
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/usenet/NzbInput.kt b/app/src/main/java/com/nuvio/tv/core/usenet/NzbInput.kt
+new file mode 100644
+index 000000000..dc59a10a0
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/usenet/NzbInput.kt
+@@ -0,0 +1,113 @@
++package com.nuvio.tv.core.usenet
++
++import java.io.FilterInputStream
++import java.io.FilterReader
++import java.io.InputStream
++import java.io.InputStreamReader
++import java.io.PushbackInputStream
++import java.io.PushbackReader
++import java.io.Reader
++import java.nio.charset.Charset
++
++internal class NzbBoundedInput(input: InputStream, private val limit: Long) : FilterInputStream(input) {
++    var count = 0L
++        private set
++    override fun read(): Int = super.read().also { if (it >= 0) charge(1) }
++    override fun read(b: ByteArray, off: Int, len: Int): Int {
++        if (len == 0) return 0
++        return `in`.read(b, off, minOf(len.toLong(), limit - count + 1).toInt()).also { if (it > 0) charge(it) }
++    }
++    private fun charge(n: Int) { count += n; if (count > limit) throw NzbTooLarge() }
++    override fun skip(n: Long): Long {
++        val buffer = ByteArray(minOf(n.coerceAtLeast(0), 8192).toInt())
++        var skipped = 0L
++        while (skipped < n) {
++            val count = read(buffer, 0, minOf(buffer.size.toLong(), n - skipped).toInt())
++            if (count < 0) break
++            skipped += count
++        }
++        return skipped
++    }
++}
++
++internal fun nzbReader(input: InputStream): Reader {
++    val stream = PushbackInputStream(input, 256)
++    val prefix = ByteArray(256)
++    var size = 0
++    while (size < prefix.size) {
++        val n = stream.read(prefix, size, prefix.size - size)
++        if (n < 0) break
++        size += n
++    }
++    stream.unread(prefix, 0, size)
++    val encoding = when {
++        size >= 2 && prefix[0] == 0xff.toByte() && prefix[1] == 0xfe.toByte() -> "UTF-16LE"
++        size >= 2 && prefix[0] == 0xfe.toByte() && prefix[1] == 0xff.toByte() -> "UTF-16BE"
++        size >= 4 && prefix[0] == 0.toByte() && prefix[1] == '<'.code.toByte() -> "UTF-16BE"
++        size >= 4 && prefix[0] == '<'.code.toByte() && prefix[1] == 0.toByte() -> "UTF-16LE"
++        else -> Regex("""encoding\s*=\s*["']([^"']+)["']""")
++            .find(String(prefix, 0, size, Charsets.ISO_8859_1))?.groupValues?.get(1) ?: "UTF-8"
++    }
++    val charset = try { Charset.forName(encoding) }
++        catch (_: Exception) { throw UsenetFailure("Unsupported NZB text encoding.") }
++    val reader = PushbackReader(InputStreamReader(stream, charset), 1)
++    val first = reader.read()
++    if (first >= 0 && first != 0xfeff) reader.unread(first)
++    return NzbSafeReader(reader)
++}
++
++/** Reject even unused declarations, including across decoder/SAX buffer boundaries.
++ * Bound a lexical XML token too: SAX otherwise accumulates arbitrarily large attributes,
++ * names and comments internally before invoking the bounded application handlers.
++ */
++private class NzbSafeReader(reader: Reader) : FilterReader(reader) {
++    private val forbidden = "<!ENTITY"
++    private var matched = 0
++    private var markup = 0
++    private var quote = '\u0000'
++    private val prefix = StringBuilder(9)
++    private var brackets = 0
++    private var previous = '\u0000'
++    private var beforePrevious = '\u0000'
++    private var thirdPrevious = '\u0000'
++    private var dtdComment = 0
++    private var dtdInstruction = false
++    override fun read(): Int = super.read().also { if (it >= 0) check(it.toChar()) }
++    override fun read(b: CharArray, off: Int, len: Int): Int = super.read(b, off, len).also { n ->
++        for (i in off until off + maxOf(0, n)) check(b[i])
++    }
++    private fun check(c: Char) {
++        matched = if (c == forbidden[matched]) matched + 1 else if (c == '<') 1 else 0
++        ensureUsenet(matched != forbidden.length, "Unsupported NZB document.")
++        if (markup == 0 && c == '<') {
++            markup = 1
++            prefix.setLength(0)
++            prefix.append(c)
++            brackets = 0
++            quote = '\u0000'
++            dtdComment = 0
++            dtdInstruction = false
++        }
++        else if (markup != 0) {
++            if (++markup > 65536) throw NzbTooLarge()
++            if (prefix.length < 9) prefix.append(c)
++            when {
++                prefix.startsWith("<!--") -> if (markup >= 7 && c == '>' && previous == '-' && beforePrevious == '-') markup = 0
++                prefix.startsWith("<![CDATA[") -> if (c == '>' && previous == ']' && beforePrevious == ']') markup = 0
++                prefix.startsWith("<?") -> if (c == '>' && previous == '?') markup = 0
++                dtdComment > 0 -> if (++dtdComment >= 7 && c == '>' && previous == '-' && beforePrevious == '-') dtdComment = 0
++                dtdInstruction -> if (c == '>' && previous == '?') dtdInstruction = false
++                quote != '\u0000' -> if (c == quote) quote = '\u0000'
++                c == '\'' || c == '"' -> quote = c
++                prefix.startsWith("<!DOCTYPE") && thirdPrevious == '<' && beforePrevious == '!' && previous == '-' && c == '-' -> dtdComment = 4
++                prefix.startsWith("<!DOCTYPE") && previous == '<' && c == '?' -> dtdInstruction = true
++                prefix.startsWith("<!DOCTYPE") && c == '[' -> brackets++
++                prefix.startsWith("<!DOCTYPE") && c == ']' -> brackets--
++                c == '>' && brackets == 0 -> markup = 0
++            }
++        }
++        thirdPrevious = beforePrevious
++        beforePrevious = previous
++        previous = c
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/usenet/NzbLimits.kt b/app/src/main/java/com/nuvio/tv/core/usenet/NzbLimits.kt
+new file mode 100644
+index 000000000..5f9194392
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/usenet/NzbLimits.kt
+@@ -0,0 +1,96 @@
++package com.nuvio.tv.core.usenet
++
++/** Bounds both transient parsing work and the data kept for the entire playback session. */
++internal data class NzbLimits(val retainedBytes: Long, val segments: Int, val decodedBytes: Long) {
++    companion object {
++        const val HARD_DECODED_BYTES = 128L * 1024 * 1024
++        const val HARD_SEGMENTS = 1_000_000
++        const val HARD_RETAINED_BYTES = 48L * 1024 * 1024
++        val LOW = NzbLimits(16L * 1024 * 1024, 250_000, 64L * 1024 * 1024)
++        val NORMAL = NzbLimits(HARD_RETAINED_BYTES, HARD_SEGMENTS, HARD_DECODED_BYTES)
++        fun forProfile(profile: UsenetMemoryProfile) = if (profile.cacheBytes < UsenetMemoryProfile.NORMAL.cacheBytes) LOW else NORMAL
++    }
++    init {
++        require(retainedBytes in 1..HARD_RETAINED_BYTES && segments in 1..HARD_SEGMENTS && decodedBytes in 1..HARD_DECODED_BYTES)
++    }
++}
++
++internal class NzbTooLarge : UsenetFailure("NZB is too large for this device.")
++
++/** Charges capacity before allocation, including conservative array/list/object overhead. */
++internal class NzbRetentionBudget(private val limit: Long) {
++    var bytes = 0L
++        private set
++    fun reserve(count: Long) {
++        if (count > limit - bytes) throw NzbTooLarge()
++        bytes += count
++    }
++}
++
++/** Immutable after publication. Only the requested ID becomes a String; lookup is O(1).
++ * Fixed pages avoid doubling/copying large buffers and let the parser accept shuffled ordinals.
++ */
++internal class NzbArticleIds(private val budget: NzbRetentionBudget, private val maxSegments: Int) :
++    AbstractList<String>(), java.util.RandomAccess {
++    private val data = ArrayList<ByteArray>()
++    private val index = ArrayList<LongArray?>()
++    private var used = PAGE_BYTES
++    private var highest = 0
++    private var overflowOrdinals: HashSet<Int>? = null
++    override var size = 0
++        private set
++    val complete get() = size > 0 && highest == size
++    var retainedBytes = 256L
++        private set
++
++    init { budget.reserve(retainedBytes) }
++
++    private fun reserve(bytes: Long) { budget.reserve(bytes); retainedBytes += bytes }
++
++    fun add(ordinal: Int, id: String) {
++        // A very large ordinal must not cause a proportional allocation. Such a file cannot
++        // be complete under the segment limit, but retains its slot just like other gaps.
++        highest = maxOf(highest, ordinal)
++        if (ordinal > maxSegments) {
++            val overflow = overflowOrdinals ?: HashSet<Int>().also { reserve(128); overflowOrdinals = it }
++            reserve(64)
++            ensureUsenet(overflow.add(ordinal), "Invalid NZB article identifier.")
++            size++
++            return
++        }
++        val slot = ordinal - 1
++        val page = slot / INDEX_ENTRIES
++        if (page >= index.size) {
++            reserve((page + 1L - index.size) * 16)
++            while (index.size <= page) index.add(null)
++        }
++        val offsets = index[page] ?: run {
++            reserve(INDEX_ENTRIES * 8L + 32)
++            LongArray(INDEX_ENTRIES).also { index[page] = it }
++        }
++        ensureUsenet(offsets[slot % INDEX_ENTRIES] == 0L, "Invalid NZB article identifier.")
++        if (used + id.length > PAGE_BYTES) {
++            reserve(PAGE_BYTES + 48L)
++            data.add(ByteArray(PAGE_BYTES))
++            used = 0
++        }
++        val position = (data.size - 1) * PAGE_BYTES + used
++        // Validation restricts IDs to printable ASCII, also their UTF-8 representation.
++        for (i in id.indices) data.last()[used + i] = id[i].code.toByte()
++        used += id.length
++        offsets[slot % INDEX_ENTRIES] = (position.toLong() shl 32) or id.length.toLong()
++        size++
++    }
++
++    override fun get(index: Int): String {
++        if (index !in 0 until size) throw IndexOutOfBoundsException()
++        val entry = this.index[index / INDEX_ENTRIES]!![index % INDEX_ENTRIES]
++        val position = (entry ushr 32).toInt()
++        return String(data[position / PAGE_BYTES], position % PAGE_BYTES, entry.toInt(), Charsets.US_ASCII)
++    }
++
++    companion object {
++        private const val PAGE_BYTES = 4096
++        private const val INDEX_ENTRIES = 256
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/usenet/NzbManifest.kt b/app/src/main/java/com/nuvio/tv/core/usenet/NzbManifest.kt
+new file mode 100644
+index 000000000..6f3ddd703
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/usenet/NzbManifest.kt
+@@ -0,0 +1,147 @@
++package com.nuvio.tv.core.usenet
++
++import org.xml.sax.Attributes
++import org.xml.sax.InputSource
++import org.xml.sax.helpers.DefaultHandler
++import java.io.IOException
++import java.io.StringReader
++import java.io.InputStream
++import javax.xml.parsers.SAXParserFactory
++
++internal open class UsenetFailure(message: String) : IOException(message)
++internal fun ensureUsenet(condition: Boolean, message: String) {
++    if (!condition) throw UsenetFailure(message)
++}
++
++internal data class NzbFile(val name: String, val articles: List<String>, val postedBytes: Long)
++
++internal class NzbDocument(val files: List<NzbFile>, val password: String?, val decodedBytes: Long = 0) {
++    val retainedBytes: Long = 128L + (password?.length ?: 0) * 2L + files.sumOf { file ->
++        192L + file.name.length * 2L + ((file.articles as? NzbArticleIds)?.retainedBytes
++            ?: file.articles.sumOf { 64L + it.length * 2L })
++    }
++}
++
++internal object NzbManifest {
++    private val quoted = Regex("\"([^\"]+)\"")
++    private val unquoted = Regex("""(?i)([^\s"]+\.(?:(?:7z|mkv|mp4|webm|avi|m4v|mov|m2ts|ts|mpg|mpeg|wmv)(?:\.\d{3,5})?|rar(?:\.\d{3,5})?|[r-z]\d{2,3}|par2|\d{3,5}))\b""")
++
++    fun parse(bytes: ByteArray): NzbDocument = parse(bytes.inputStream())
++
++    // The String overload already has decoded characters; a BOM preserves them regardless
++    // of an encoding declaration supplied by a test/caller. Downloads use InputStream only.
++    fun parse(xml: String): NzbDocument = parse(xml.byteInputStream(Charsets.UTF_16))
++
++    fun parse(input: InputStream, limits: NzbLimits = NzbLimits.forProfile(UsenetMemoryProfile.current)): NzbDocument {
++        val bounded = NzbBoundedInput(input, limits.decodedBytes)
++        val budget = NzbRetentionBudget(limits.retainedBytes)
++        budget.reserve(128 + 1024) // document and maximum password
++        val files = mutableListOf<NzbFile>()
++        val names = HashSet<String>()
++        fun accountName(name: String) {
++            if (name !in names) {
++                // SAX implementations intern names; bound that transient symbol table too.
++                budget.reserve(128L + name.length * 2L)
++                names.add(name)
++            }
++        }
++        var segments: NzbArticleIds? = null
++        var subject: String? = null
++        var number: Int? = null
++        val text = StringBuilder()
++        var postedBytes = 0L
++        var count = 0
++        var depth = 0
++        var head = false
++        var readingPassword = false
++        var password: String? = null
++        val meta = StringBuilder()
++        val handler = object : DefaultHandler() {
++            override fun resolveEntity(publicId: String?, systemId: String?) = InputSource(StringReader(""))
++            override fun startElement(uri: String?, local: String?, name: String, attrs: Attributes) {
++                accountName(name)
++                for (i in 0 until attrs.length) accountName(attrs.getQName(i))
++                ensureUsenet(++depth <= 32, "Invalid NZB structure.")
++                if (depth == 1) ensureUsenet(name == "nzb", "Invalid NZB root element.")
++                when (name) {
++                    "head" -> if (depth == 2) head = true
++                    "meta" -> if (head && depth == 3 && attrs.getValue("type").equals("password", true)) {
++                        readingPassword = true
++                        meta.setLength(0)
++                    }
++                    "file" -> {
++                        ensureUsenet(subject == null && files.size < 4096, "Invalid NZB file list.")
++                        subject = attrs.getValue("subject").orEmpty().take(2048)
++                        budget.reserve(192L + subject!!.length * 2L)
++                        postedBytes = 0
++                        segments = NzbArticleIds(budget, limits.segments)
++                    }
++                    "segment" -> {
++                        val ordinal = attrs.getValue("number")?.toIntOrNull() ?: 0
++                        val size = attrs.getValue("bytes")?.toLongOrNull() ?: 0L
++                        ensureUsenet(subject != null && number == null && ordinal > 0 &&
++                            size in 0..Int.MAX_VALUE.toLong(), "Invalid NZB segment.")
++                        if (++count > limits.segments) throw NzbTooLarge()
++                        number = ordinal
++                        postedBytes += size
++                        text.setLength(0)
++                    }
++                }
++            }
++            override fun characters(chars: CharArray, start: Int, length: Int) {
++                if (readingPassword) {
++                    ensureUsenet(meta.length + length <= 512, "NZB archive password is too long.")
++                    meta.append(chars, start, length)
++                }
++                if (number != null) {
++                    ensureUsenet(text.length + length <= 520, "Invalid NZB article identifier.")
++                    text.append(chars, start, length)
++                }
++            }
++            override fun endElement(uri: String?, local: String?, name: String) {
++                if (name == "meta" && depth == 3 && readingPassword) {
++                    password = meta.toString().takeIf { it.isNotEmpty() }
++                    readingPassword = false
++                    meta.setLength(0)
++                }
++                if (name == "head" && depth == 2) head = false
++                depth--
++                if (name == "segment") {
++                    val id = text.toString().trim().removeSurrounding("<", ">")
++                    ensureUsenet(id.length in 1..500 && id.all { it in '!'..'~' && it != '<' && it != '>' },
++                        "Invalid NZB article identifier.")
++                    segments!!.add(number!!, id)
++                    number = null
++                }
++                if (name == "file") {
++                    val title = subject.orEmpty()
++                    val filename = quoted.find(title)?.groupValues?.get(1)
++                        ?: unquoted.find(title)?.groupValues?.get(1) ?: title
++                    // Retain the slot of an incomplete file so fileIdx still identifies the requested episode.
++                    files += NzbFile(filename, segments!!.takeIf { it.complete } ?: emptyList(), postedBytes)
++                    segments = null
++                }
++                if (name == "file") subject = null
++            }
++        }
++        try {
++            val reader = SAXParserFactory.newInstance().newSAXParser().xmlReader
++            reader.contentHandler = handler
++            reader.entityResolver = handler
++            reader.errorHandler = handler
++            reader.parse(InputSource(nzbReader(bounded)))
++        } catch (failure: UsenetFailure) {
++            throw failure
++        } catch (failure: Exception) {
++            // Some SAX implementations wrap handler/Reader exceptions.
++            var cause: Throwable? = failure.cause
++            repeat(8) {
++                if (cause is UsenetFailure) throw cause as UsenetFailure
++                cause = cause?.cause
++            }
++            throw UsenetFailure("Could not read the NZB document.")
++        }
++        ensureUsenet(files.any { it.articles.isNotEmpty() }, "The NZB contains no complete files.")
++        return NzbDocument(files, password, bounded.count)
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/usenet/NzbMemoryCache.kt b/app/src/main/java/com/nuvio/tv/core/usenet/NzbMemoryCache.kt
+new file mode 100644
+index 000000000..d5b36f88a
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/usenet/NzbMemoryCache.kt
+@@ -0,0 +1,32 @@
++package com.nuvio.tv.core.usenet
++
++/** Passwords and signed request keys stay in process memory. No disk persistence. */
++internal class NzbMemoryCache(
++    private val limit: () -> Long = { if (UsenetMemoryProfile.current == UsenetMemoryProfile.NORMAL) 12L * 1024 * 1024 else 4L * 1024 * 1024 },
++    private val now: () -> Long = System::nanoTime
++) {
++    private data class Key(val url: String, val headers: Map<String, String>)
++    private data class Entry(val document: NzbDocument, val bytes: Long, val inserted: Long)
++    private val entries = LinkedHashMap<Key, Entry>(4, 0.75f, true)
++    private val ttl = java.util.concurrent.TimeUnit.MINUTES.toNanos(30)
++    private var epoch = 0L
++    @Synchronized fun generation() = epoch
++    @Synchronized fun clear() { entries.clear(); epoch++ }
++    @Synchronized fun retainedBytes() = entries.values.sumOf { it.bytes }
++    @Synchronized fun get(url: String, headers: Map<String, String>): NzbDocument? {
++        entries.entries.removeAll { now() - it.value.inserted >= ttl }
++        trim()
++        return entries[Key(url, headers)]?.document
++    }
++    @Synchronized fun put(url: String, headers: Map<String, String>, document: NzbDocument, generation: Long = epoch) {
++        if (generation != epoch) return // Pressure also invalidates in-flight insertions.
++        val key = Key(url, headers.toMap())
++        entries.remove(key)
++        val bytes = document.retainedBytes + 256 + url.length * 2L + headers.entries.sumOf { 128L + (it.key.length + it.value.length) * 2L }
++        if (bytes <= limit()) entries[key] = Entry(document, bytes, now())
++        trim()
++    }
++    private fun trim() {
++        while (entries.isNotEmpty() && (entries.size > 4 || retainedBytes() > limit())) entries.remove(entries.keys.first())
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/usenet/Par2Names.kt b/app/src/main/java/com/nuvio/tv/core/usenet/Par2Names.kt
+new file mode 100644
+index 000000000..856293547
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/usenet/Par2Names.kt
+@@ -0,0 +1,53 @@
++package com.nuvio.tv.core.usenet
++
++import java.nio.ByteBuffer
++import java.nio.ByteOrder
++import java.security.MessageDigest
++
++/** PAR2 FileDesc packets identify an original filename by size and MD5 of its first 16 KiB. */
++internal class Par2Names {
++    private data class Key(val size: Long, val prefixHash: List<Byte>)
++    private val names = mutableMapOf<Key, String?>()
++    private val magic = "PAR2\u0000PKT".toByteArray(Charsets.US_ASCII)
++    private val description = "PAR 2.0\u0000FileDesc".toByteArray(Charsets.US_ASCII)
++
++    fun read(file: UsenetFile, checkActive: () -> Unit) {
++        val window = minOf(file.size, 512 * 1024L)
++        var pos = 0L
++        repeat(512) {
++            if (pos > window - 64) return
++            checkActive()
++            val header = file.bytesAt(pos, 64)
++            if (!header.copyOf(8).contentEquals(magic)) return
++            val length = littleLong(header, 8)
++            if (length < 64 || length % 4 != 0L || length > window - pos) return
++            if (length in 124..4248 && header.copyOfRange(48, 64).contentEquals(description)) {
++                val body = file.bytesAt(pos + 64, length.toInt() - 64)
++                val md5 = MessageDigest.getInstance("MD5")
++                md5.update(header, 32, 32)
++                if (md5.digest(body).contentEquals(header.copyOfRange(16, 32))) {
++                    val name = String(body, 56, body.size - 56, Charsets.UTF_8).trimEnd('\u0000')
++                    val size = littleLong(body, 48)
++                    if (size > 0 && name.isNotBlank() && name.none(Char::isISOControl)) {
++                        val key = Key(size, body.copyOfRange(32, 48).toList())
++                        // Different descriptions can legitimately share a prefix. Never guess between names.
++                        if (key in names && names[key] != name) names[key] = null else names[key] = name
++                    }
++                }
++            }
++            pos += length
++        }
++    }
++
++    fun hasDescriptions() = names.isNotEmpty()
++
++    fun find(file: UsenetFile): String? {
++        if (names.keys.none { it.size == file.size }) return null
++        val prefix = file.bytesAt(0, minOf(file.size, 16384L).toInt())
++        val hash = MessageDigest.getInstance("MD5").digest(prefix)
++        return names[Key(file.size, hash.toList())]
++    }
++
++    private fun littleLong(bytes: ByteArray, start: Int) =
++        ByteBuffer.wrap(bytes, start, 8).order(ByteOrder.LITTLE_ENDIAN).long
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/usenet/PendingUsenetPlayback.kt b/app/src/main/java/com/nuvio/tv/core/usenet/PendingUsenetPlayback.kt
+new file mode 100644
+index 000000000..b8738024e
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/usenet/PendingUsenetPlayback.kt
+@@ -0,0 +1,48 @@
++package com.nuvio.tv.core.usenet
++
++// Adapted from haaihond/NuvioTV PR #4426 at 8f451a88bcce7ad5e91f5e997dda46fa381315a3.
++// Licensed under GPL-3.0, as is this project. See docs/usenet-upstream-review.md.
++
++/** Results-screen ownership until an internal or external player actually launches.
++ * Call on the UI thread. Releasing an abandoned URL must not affect a newer session.
++ */
++internal class PendingUsenetPlayback(private val releaseSession: (String) -> Unit) {
++    private var url: String? = null
++    /** Handed to an external player, which cannot release it; the results screen does when the user is back. */
++    private var external: String? = null
++
++    fun replace(next: String) {
++        if (url == next) return
++        release()
++        url = next
++    }
++
++    fun handoff(launchedUrl: String?) {
++        if (url == launchedUrl) url = null
++    }
++
++    /**
++     * Like [handoff], for an external player. The results screen stops while it plays, so
++     * [release] keeps the session; [externalPlayerReturned] releases it.
++     */
++    fun handoffExternal(launchedUrl: String?) {
++        if (url != launchedUrl || launchedUrl == null) return
++        url = null
++        externalPlayerReturned()
++        external = launchedUrl
++    }
++
++    /** Back from the external player: nothing plays its session any more. */
++    fun externalPlayerReturned() {
++        val returned = external ?: return
++        external = null
++        releaseSession(returned)
++    }
++
++    fun release(expectedUrl: String? = url) {
++        if (url != expectedUrl) return
++        val abandoned = url ?: return
++        url = null
++        releaseSession(abandoned)
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/usenet/RarEncryption.kt b/app/src/main/java/com/nuvio/tv/core/usenet/RarEncryption.kt
+new file mode 100644
+index 000000000..166285325
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/usenet/RarEncryption.kt
+@@ -0,0 +1,86 @@
++package com.nuvio.tv.core.usenet
++
++import java.security.MessageDigest
++import javax.crypto.Cipher
++import javax.crypto.Mac
++import javax.crypto.spec.IvParameterSpec
++import javax.crypto.spec.SecretKeySpec
++
++// RAR5 key schedule and CBC range layout follow the GPL-3.0 implementation in
++// haaihond/NuvioTV@8f451a8 native/usenet/internal/engine/rar_crypt.go.
++internal class RarEncryption(val roundsLog: Int, val salt: ByteArray, val iv: ByteArray, val verifier: ByteArray) {
++    fun sameCipher(other: RarEncryption?) = other != null && roundsLog == other.roundsLog &&
++        salt.contentEquals(other.salt) && iv.contentEquals(other.iv) && verifier.contentEquals(other.verifier)
++}
++
++/** Per-preparation key cache. The selected file retains just its AES key and IV. */
++internal class RarPasswords(private val password: String?, private val checkActive: () -> Unit) {
++    private class Derived(val key: SecretKeySpec, val verifier: ByteArray)
++    private val keys = linkedMapOf<Pair<Int, List<Byte>>, Derived>()
++
++    fun key(params: RarEncryption): SecretKeySpec {
++        val text = password ?: throw UsenetFailure("This RAR needs an archive password in the NZB.")
++        ensureUsenet(params.verifier.size == 12, "This RAR has no supported password check.")
++        ensureUsenet(params.roundsLog in 0..20, "RAR password verification exceeds the work limit.")
++        val id = params.roundsLog to params.salt.toList()
++        val result = keys[id] ?: derive(text, params).also {
++            if (keys.size == 8) keys.remove(keys.keys.first())
++            keys[id] = it
++        }
++        ensureUsenet(MessageDigest.isEqual(result.verifier, params.verifier), "The NZB password does not open this RAR.")
++        return result.key
++    }
++
++    private fun derive(text: String, params: RarEncryption): Derived {
++        val mac = Mac.getInstance("HmacSHA256")
++        val bytes = text.toByteArray(Charsets.UTF_8)
++        try { mac.init(SecretKeySpec(bytes, "HmacSHA256")) } finally { bytes.fill(0) }
++        mac.update(params.salt)
++        val u = mac.doFinal(byteArrayOf(0, 0, 0, 1))
++        val sum = u.copyOf()
++        fun rounds(n: Int) {
++            repeat(n) { i ->
++                if (i and 1023 == 0) checkActive()
++                mac.update(u)
++                mac.doFinal(u, 0)
++                for (j in sum.indices) sum[j] = (sum[j].toInt() xor u[j].toInt()).toByte()
++            }
++        }
++        try {
++            rounds((1 shl params.roundsLog) - 1)
++            val key = SecretKeySpec(sum, "AES")
++            rounds(32)
++            val check = sum.copyOf(8)
++            for (i in 8 until sum.size) check[i % 8] = (check[i % 8].toInt() xor sum[i].toInt()).toByte()
++            return Derived(key, check + MessageDigest.getInstance("SHA-256").digest(check).copyOf(4))
++        } finally {
++            u.fill(0)
++            sum.fill(0)
++        }
++    }
++}
++
++/** Random-access CBC decryption only needs the preceding ciphertext block. */
++internal class RarPlaintext(private val source: UsenetFile, private val base: Long, override val size: Long,
++                            private val key: SecretKeySpec, private val iv: ByteArray) : UsenetFile {
++    override val name get() = source.name
++
++    override fun read(position: Long, buffer: ByteArray, offset: Int, length: Int): Int {
++        if (length == 0) return 0
++        if (position >= size) return -1
++        val count = minOf(length.toLong(), size - position, 65536L).toInt()
++        val skip = (position % 16).toInt()
++        val start = position - skip
++        val previous = if (start == 0L) 0 else 16
++        val encrypted = source.bytesAt(base + start - previous, previous + ((skip + count + 15) and -16))
++        val cipher = Cipher.getInstance("AES/CBC/NoPadding")
++        val vector = if (previous == 0) IvParameterSpec(iv) else IvParameterSpec(encrypted, 0, 16)
++        cipher.init(Cipher.DECRYPT_MODE, key, vector)
++        if (skip == 0 && encrypted.size - previous == count && cipher.getOutputSize(count) == count) {
++            return cipher.doFinal(encrypted, previous, count, buffer, offset)
++        }
++        val plaintext = cipher.doFinal(encrypted, previous, encrypted.size - previous)
++        plaintext.copyInto(buffer, offset, skip, skip + count)
++        return count
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/usenet/StoredRar.kt b/app/src/main/java/com/nuvio/tv/core/usenet/StoredRar.kt
+new file mode 100644
+index 000000000..9d07f1d3d
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/usenet/StoredRar.kt
+@@ -0,0 +1,216 @@
++// Lazy archive behavior adapted from haaihond/NuvioTV (GPL-3.0),
++// native/usenet/internal/engine/rar.go, commit bc6decd434c5718d4cb98e1ffddd9f1708bdd8b6.
++package com.nuvio.tv.core.usenet
++
++import java.util.zip.CRC32
++
++private const val BAD_HEADER = "Invalid RAR header."
++private class Header(val bytes: ByteArray, var pos: Int = 0) {
++    fun byte(): Int {
++        ensureUsenet(pos in bytes.indices, BAD_HEADER)
++        return bytes[pos++].toInt() and 255
++    }
++    fun word() = byte() or (byte() shl 8)
++    fun dword() = word().toLong() or (word().toLong() shl 16)
++    fun vint(): Long {
++        var value = 0L
++        for (shift in 0..56 step 7) {
++            val next = byte()
++            value = value or ((next and 127).toLong() shl shift)
++            if (next < 128) return value
++        }
++        throw UsenetFailure(BAD_HEADER)
++    }
++    fun encryption(payload: Boolean): RarEncryption {
++        ensureUsenet(vint() == 0L, "Unsupported RAR encryption version.")
++        val flags = vint()
++        ensureUsenet(flags in 0..3, "Unsupported RAR encryption options.")
++        val rounds = byte()
++        fun take(n: Int) = ByteArray(n) { byte().toByte() }
++        return RarEncryption(rounds, take(16), if (payload) take(16) else byteArrayOf(),
++            if (flags and 1L != 0L) take(12) else byteArrayOf())
++    }
++    fun length(): Int {
++        val n = vint()
++        ensureUsenet(n <= bytes.size - pos, BAD_HEADER)
++        return n.toInt()
++    }
++    fun name(length: Int, charset: java.nio.charset.Charset): String {
++        ensureUsenet(length in 1..4096 && pos <= bytes.size - length, BAD_HEADER)
++        return String(bytes, pos, length, charset).substringBefore('\u0000').also { pos += length }
++    }
++}
++
++internal data class RarPart(
++    val name: String, val extent: FileExtent, val continues: Boolean, val more: Boolean,
++    val stored: Boolean, val encrypted: Boolean, val encryption: RarEncryption? = null, val unpacked: Long? = null,
++    val layout: RarLayout? = null
++)
++
++internal object StoredRar {
++    val signature = byteArrayOf(0x52, 0x61, 0x72, 0x21, 0x1a, 0x07)
++    // Quick Open template rule adapted from rarStableMainExtra in haaihond/NuvioTV
++    // native/usenet/internal/engine/rar.go, bc6decd434c5718d4cb98e1ffddd9f1708bdd8b6 (GPL-3.0).
++    private fun stableMainExtra(bytes: ByteArray): Boolean {
++        return try {
++            val extra = Header(bytes)
++            while (extra.pos < bytes.size) {
++                val length = extra.length()
++                val end = extra.pos + length
++                if (length == 0 || extra.vint() != 1L || extra.vint() != 1L) return false
++                extra.vint()
++                if (extra.pos != end) return false
++            }
++            true
++        } catch (_: UsenetFailure) { false }
++    }
++    fun index(volume: UsenetFile, passwords: RarPasswords, onVolumeNumber: (Long) -> Unit = {}): List<RarPart> =
++        parts(volume, passwords, onVolumeNumber).toList()
++
++    fun parts(volume: UsenetFile, passwords: RarPasswords, onVolumeNumber: (Long) -> Unit = {}): Sequence<RarPart> {
++        val prefix = volume.bytesAt(0, 8)
++        ensureUsenet(prefix.copyOf(6).contentEquals(signature), "Unrecognized RAR volume.")
++        return when (prefix[6].toInt()) {
++            0 -> readRar4(volume)
++            1 -> {
++                ensureUsenet(prefix[7].toInt() == 0, BAD_HEADER)
++                readRar5(volume, passwords, onVolumeNumber)
++            }
++            else -> throw UsenetFailure("Unsupported RAR version.")
++        }
++    }
++
++    private fun readRar4(file: UsenetFile): Sequence<RarPart> = sequence {
++        var pos = 7L
++        var stableMain = false
++        var blocks = 0
++        while (pos < file.size) {
++            ensureUsenet(++blocks <= 8192, BAD_HEADER)
++            val base = Header(file.bytesAt(pos, 7))
++            val crc = base.word()
++            val kind = base.byte()
++            val flags = base.word()
++            val length = base.word()
++            ensureUsenet(length >= 7, BAD_HEADER)
++            val header = Header(file.bytesAt(pos, length), 7)
++            ensureUsenet(CRC32().apply { update(header.bytes, 2, length - 2) }.value.toInt() and 65535 == crc, BAD_HEADER)
++            var packed = if (flags and 0x8000 != 0 || kind == 0x74) header.dword() else 0L
++            pos += length
++            if (kind == 0x73) {
++                ensureUsenet(flags and 0x80 == 0, "RAR volume headers are encrypted.")
++                stableMain = blocks == 1 && length == 13 && flags and 0x40 == 0
++            } else if (kind != 0x74) stableMain = false
++            if (kind == 0x7b) break
++            if (kind == 0x74) {
++                header.pos = 11
++                var unpacked = header.dword()
++                header.pos = 25
++                val method = header.byte()
++                val nameLength = header.word()
++                header.pos = 32
++                if (flags and 0x100 != 0) {
++                    val high = header.dword()
++                    ensureUsenet(high < 0x80000000L, BAD_HEADER)
++                    packed = packed or (high shl 32)
++                    val highUnpacked = header.dword()
++                    ensureUsenet(highUnpacked < 0x80000000L, BAD_HEADER)
++                    unpacked = unpacked or (highUnpacked shl 32)
++                }
++                val name = header.name(nameLength, Charsets.ISO_8859_1)
++                if (packed > 0 && flags and 0xe0 != 0xe0) {
++                    ensureUsenet(packed <= file.size - pos, "Truncated RAR volume.")
++                    yield(RarPart(name, FileExtent(file, pos, packed), flags and 1 != 0, flags and 2 != 0,
++                        method == 0x30, flags and 4 != 0, unpacked = unpacked, layout = if (stableMain) RarLayout(4) else null))
++                    stableMain = false
++                    if (flags and 2 != 0) break
++                }
++            }
++            ensureUsenet(packed <= file.size - pos, "Truncated RAR volume.")
++            pos += packed
++        }
++    }
++
++    private fun readRar5(file: UsenetFile, passwords: RarPasswords, onVolumeNumber: (Long) -> Unit): Sequence<RarPart> = sequence {
++        var layout: RarLayout? = null
++        var headerKey: javax.crypto.spec.SecretKeySpec? = null
++        var pos = 8L
++        var blocks = 0
++        while (pos < file.size) {
++            ensureUsenet(++blocks <= 8192, BAD_HEADER)
++            val blockStart = pos
++            val key = headerKey
++            val view = if (key == null) file else {
++                val iv = file.bytesAt(pos, 16)
++                pos += 16
++                RarPlaintext(file, pos, (file.size - pos) and -16L, key, iv)
++            }
++            val offset = if (key == null) pos else 0L
++            val prefix = Header(view.bytesAt(offset, minOf(7L, view.size - offset).toInt()))
++            val crc = prefix.dword()
++            val length = prefix.vint()
++            ensureUsenet(length in 1..1048576, BAD_HEADER)
++            val header = Header(view.bytesAt(offset + 4, prefix.pos - 4 + length.toInt()), prefix.pos - 4)
++            ensureUsenet(CRC32().apply { update(header.bytes) }.value == crc, BAD_HEADER)
++            val consumed = 4 + header.bytes.size
++            pos += if (key == null) consumed else (consumed + 15) and -16
++            val kind = header.vint()
++            val flags = header.vint().toInt()
++            val extra = if (flags and 1 != 0) header.length() else 0
++            val packedStart = header.pos
++            val packed = if (flags and 2 != 0) header.vint() else 0L
++            val packedWidth = header.pos - packedStart
++            ensureUsenet(packed <= file.size - pos, "Truncated RAR volume.")
++            if (kind == 4L) {
++                ensureUsenet(headerKey == null && packed == 0L, BAD_HEADER)
++                headerKey = passwords.key(header.encryption(payload = false))
++            }
++            if (kind == 1L) {
++                val archiveFlags = header.vint()
++                val numberStart = header.pos
++                val number = if (archiveFlags and 2L != 0L) header.vint() else 0
++                if (archiveFlags and 1L != 0L) onVolumeNumber(number)
++                // Only fixed-width Quick Open locators qualify; encrypted headers use the scan path.
++                ensureUsenet(header.pos <= header.bytes.size - extra, BAD_HEADER)
++                layout = if (key == null && blockStart == 8L && flags and 5.inv() == 0 &&
++                    archiveFlags and 0x10L.inv() == 3L && header.pos == header.bytes.size - extra &&
++                    stableMainExtra(header.bytes.takeLast(extra).toByteArray()))
++                    RarLayout(5, number, header.pos - numberStart, length, prefix.pos - 4) else null
++            }
++            if (kind == 5L) break
++            if (kind == 2L) {
++                val attributes = header.vint().toInt()
++                val unpacked = header.vint() // Logical size of the entire split file.
++                header.vint() // Host attributes.
++                if (attributes and 2 != 0) header.dword()
++                if (attributes and 4 != 0) header.dword()
++                val method = header.vint().toInt() and 0x380
++                header.vint() // Host OS.
++                val name = header.name(header.length(), Charsets.UTF_8)
++                ensureUsenet(header.pos <= header.bytes.size - extra, BAD_HEADER)
++                header.pos = header.bytes.size - extra
++                var encryption: RarEncryption? = null
++                while (header.pos < header.bytes.size) {
++                    val recordSize = header.length()
++                    val next = header.pos + recordSize
++                    val type = header.vint()
++                    ensureUsenet(header.pos <= next, BAD_HEADER)
++                    if (type == 1L) {
++                        ensureUsenet(encryption == null, BAD_HEADER)
++                        encryption = header.encryption(payload = true)
++                        ensureUsenet(header.pos <= next, BAD_HEADER)
++                    }
++                    header.pos = next
++                }
++                if (packed > 0 && attributes and 1 == 0) {
++                    yield(RarPart(name, FileExtent(file, pos, packed), flags and 8 != 0, flags and 16 != 0,
++                        method == 0, encryption != null, encryption, unpacked.takeIf { attributes and 8 == 0 },
++                        layout?.copy(packedWidth = packedWidth)))
++                    layout = null
++                    if (flags and 16 != 0) break
++                }
++            }
++            if (kind != 1L) layout = null
++            pos += packed
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/usenet/StoredSevenZip.kt b/app/src/main/java/com/nuvio/tv/core/usenet/StoredSevenZip.kt
+new file mode 100644
+index 000000000..35c8200ae
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/usenet/StoredSevenZip.kt
+@@ -0,0 +1,230 @@
++package com.nuvio.tv.core.usenet
++
++import org.tukaani.xz.LZMA2InputStream
++import org.tukaani.xz.LZMAInputStream
++import java.io.IOException
++import java.nio.ByteBuffer
++import java.nio.ByteOrder
++import java.util.zip.CRC32
++
++/** 7z Copy folders map directly onto NNTP ranges. Only the bounded index is ever decompressed. */
++internal object StoredSevenZip {
++    val signature = byteArrayOf(0x37, 0x7a, 0xbc.toByte(), 0xaf.toByte(), 0x27, 0x1c)
++    private const val INVALID = "Invalid or truncated 7z index."
++    private const val MAX_HEADER = 2 * 1024 * 1024
++    private const val MAX_FILES = 8192
++    private const val COPY = 0L
++    private const val AES = 0x06f10701L
++
++    private class Cursor(val bytes: ByteArray) {
++        var pos = 0
++        fun byte(): Int {
++            ensureUsenet(pos < bytes.size, INVALID)
++            return bytes[pos++].toInt() and 255
++        }
++
++        fun expect(id: Int) = ensureUsenet(byte() == id, INVALID)
++
++        fun take(n: Int): ByteArray {
++            ensureUsenet(n >= 0 && n <= bytes.size - pos, INVALID)
++            return bytes.copyOfRange(pos, pos + n).also { pos += n }
++        }
++
++        fun number(): Long {
++            val first = byte()
++            var mask = 128
++            var value = 0L
++            for (i in 0..7) {
++                if (first and mask == 0) return value or ((first and (mask - 1)).toLong() shl (8 * i))
++                value = value or (byte().toLong() shl (8 * i))
++                mask = mask ushr 1
++            }
++            ensureUsenet(value >= 0, INVALID)
++            return value
++        }
++
++        fun count(max: Int = MAX_FILES) = number().also { ensureUsenet(it <= max, INVALID) }.toInt()
++
++        fun flags(n: Int): BooleanArray {
++            var bits = 0
++            return BooleanArray(n) { i ->
++                if (i % 8 == 0) bits = byte()
++                bits and (128 ushr (i % 8)) != 0
++            }
++        }
++
++        fun digests(n: Int): List<Long?> {
++            val defined = if (byte() == 0) flags(n) else null
++            return List(n) { i ->
++                if (defined != null && !defined[i]) null else
++                    (0..3).fold(0L) { v, j -> v or (byte().toLong() shl (8 * j)) }
++            }
++        }
++    }
++
++    private data class Folder(val codec: Long, val props: ByteArray, val start: Long, val packed: Long,
++                              val size: Long, val crc: Long?)
++    private data class Member(val folder: Folder, val offset: Long, val size: Long)
++
++    /** Common Copy/LZMA/LZMA2 archives have one input, output and coder per folder. */
++    private fun streams(c: Cursor, limit: Long): List<Member> {
++        c.expect(6)
++        val relative = c.number()
++        ensureUsenet(relative <= limit - 32, INVALID)
++        var position = 32 + relative
++        val folders = c.count()
++        c.expect(9)
++        val packed = LongArray(folders) { c.number() }
++        var id = c.byte()
++        if (id == 10) { c.digests(folders); id = c.byte() }
++        ensureUsenet(id == 0, INVALID)
++        c.expect(7)
++        c.expect(11)
++        ensureUsenet(c.count() == folders, "Unsupported 7z coder layout.")
++        c.expect(0)
++        val methods = List(folders) {
++            ensureUsenet(c.count() == 1, "Chained or encrypted 7z coders cannot be streamed.")
++            val flags = c.byte()
++            val length = flags and 15
++            ensureUsenet(flags and 0xd0 == 0 && length in 1..8, "Unsupported 7z coder.")
++            var codec = 0L
++            repeat(length) { codec = (codec shl 8) or c.byte().toLong() }
++            codec to (if (flags and 32 != 0) c.take(c.count(64)) else byteArrayOf())
++        }
++        c.expect(12)
++        val sizes = LongArray(folders) { c.number() }
++        id = c.byte()
++        val crcs = if (id == 10) c.digests(folders).also { id = c.byte() } else emptyList()
++        ensureUsenet(id == 0, INVALID)
++        val descriptors = methods.mapIndexed { i, (codec, props) ->
++            ensureUsenet(packed[i] <= limit - position && (codec != COPY || packed[i] == sizes[i]), INVALID)
++            Folder(codec, props, position, packed[i], sizes[i], crcs.getOrNull(i)).also { position += packed[i] }
++        }
++        val members = ArrayList<Member>()
++        id = c.byte()
++        val substreams = id == 8
++        if (substreams) id = c.byte()
++        val counts = if (substreams && id == 13) IntArray(folders) { c.count() }.also { id = c.byte() }
++            else IntArray(folders) { 1 }
++        ensureUsenet(counts.sumOf { it.toLong() } <= MAX_FILES, INVALID)
++        val hasSizes = substreams && id == 9
++        descriptors.forEachIndexed { i, folder ->
++            var used = 0L
++            repeat(counts[i]) { j ->
++                val remaining = folder.size - used
++                val size = if (j + 1 == counts[i]) remaining else {
++                    ensureUsenet(hasSizes, INVALID)
++                    c.number().also { ensureUsenet(it <= remaining, INVALID) }
++                }
++                members += Member(folder, used, size)
++                used += size
++            }
++        }
++        if (hasSizes) id = c.byte()
++        if (substreams && id == 10) {
++            c.digests(counts.indices.sumOf { i -> if (counts[i] == 1 && descriptors[i].crc != null) 0 else counts[i] })
++            id = c.byte()
++        }
++        ensureUsenet(id == 0, INVALID)
++        if (substreams) c.expect(0)
++        return members
++    }
++
++    private fun unpackIndex(file: UsenetFile, folder: Folder): ByteArray {
++        ensureUsenet(folder.size in 1..MAX_HEADER.toLong() && folder.packed in 1..MAX_HEADER.toLong(), INVALID)
++        val packed = file.bytesAt(folder.start, folder.packed.toInt())
++        val props = folder.props
++        val size = folder.size.toInt()
++        val result = try {
++            val input = when (folder.codec) {
++                COPY -> packed.inputStream()
++                0x030101L -> {
++                    ensureUsenet(props.size == 5, INVALID)
++                    val dict = ByteBuffer.wrap(props, 1, 4).order(ByteOrder.LITTLE_ENDIAN).int.toLong() and 0xffffffffL
++                    val bounded = minOf(dict, folder.size).toInt()
++                    ensureUsenet(LZMAInputStream.getMemoryUsage(bounded, props[0]) <= 8192, "7z index requires too much memory.")
++                    LZMAInputStream(packed.inputStream(), folder.size, props[0], bounded).apply { enableRelaxedEndCondition() }
++                }
++                0x21L -> {
++                    ensureUsenet(props.size == 1 && (props[0].toInt() and 255) <= 40, INVALID)
++                    val p = props[0].toInt()
++                    val dict = (2L or (p and 1).toLong()) shl (p / 2 + 11)
++                    LZMA2InputStream(packed.inputStream(), minOf(dict, folder.size).coerceAtLeast(4096).toInt())
++                }
++                AES -> throw UsenetFailure("7z archive headers are password-protected.")
++                else -> throw UsenetFailure("Unsupported 7z header compression.")
++            }
++            input.use {
++                val data = ByteArray(size)
++                java.io.DataInputStream(it).readFully(data)
++                ensureUsenet(it.read() == -1, INVALID)
++                data
++            }
++        } catch (e: UsenetFailure) { throw e }
++          catch (_: IOException) { throw UsenetFailure(INVALID) }
++        ensureUsenet(folder.crc == null || crc(result) == folder.crc, INVALID)
++        return result
++    }
++
++    private fun crc(bytes: ByteArray) = CRC32().apply { update(bytes) }.value
++
++    fun index(file: UsenetFile): List<UsenetCandidate> {
++        val start = file.bytesAt(0, 32)
++        ensureUsenet(start.copyOf(6).contentEquals(signature) && start[6].toInt() == 0, "Unrecognized 7z volume.")
++        val header = ByteBuffer.wrap(start).order(ByteOrder.LITTLE_ENDIAN)
++        ensureUsenet(header.getInt(8) == crc(start.copyOfRange(12, 32)).toInt(), INVALID)
++        val offset = header.getLong(12)
++        val length = header.getLong(20)
++        ensureUsenet(length in 1..MAX_HEADER.toLong() && offset in 0..file.size - 32 - length, INVALID)
++        var limit = 32 + offset
++        val next = file.bytesAt(limit, length.toInt())
++        ensureUsenet(header.getInt(28) == crc(next).toInt(), INVALID)
++        var c = Cursor(next)
++        if (c.byte() == 23) {
++            val member = streams(c, limit).singleOrNull() ?: throw UsenetFailure(INVALID)
++            ensureUsenet(member.size == member.folder.size && c.pos == next.size, INVALID)
++            limit = member.folder.start
++            c = Cursor(unpackIndex(file, member.folder))
++            c.expect(1)
++        } else ensureUsenet(next[0].toInt() == 1, INVALID)
++        c.expect(4)
++        val members = streams(c, limit)
++        c.expect(5)
++        val n = c.count()
++        var names = emptyList<String>()
++        var empty = BooleanArray(n)
++        while (true) {
++            val id = c.byte()
++            if (id == 0) break
++            val property = Cursor(c.take(c.count(MAX_HEADER)))
++            when (id) {
++                17 -> {
++                    property.expect(0)
++                    names = List(n) {
++                        val begin = property.pos
++                        while ((property.byte() or property.byte()) != 0) {
++                            ensureUsenet(property.pos - begin <= 8192, INVALID)
++                        }
++                        String(property.bytes, begin, property.pos - 2 - begin, Charsets.UTF_16LE)
++                    }
++                    ensureUsenet(property.pos == property.bytes.size, INVALID)
++                }
++                14 -> empty = property.flags(n)
++            }
++        }
++        c.expect(0)
++        ensureUsenet(c.pos == c.bytes.size && names.size == n && empty.count { !it } == members.size, INVALID)
++        var nextMember = 0
++        return names.mapIndexedNotNull { i, name ->
++            if (empty[i]) return@mapIndexedNotNull null
++            val member = members[nextMember++]
++            UsenetCandidate(name, member.size) {
++                val folder = member.folder
++                ensureUsenet(folder.codec != AES, "This 7z video is password-protected.")
++                ensureUsenet(folder.codec == COPY, "This 7z video uses compression and cannot be streamed.")
++                ensureUsenet(member.size > 0, "The archived file is empty.")
++                StoredFile(name, listOf(FileExtent(file, folder.start + member.offset, member.size)))
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/usenet/UsenetFile.kt b/app/src/main/java/com/nuvio/tv/core/usenet/UsenetFile.kt
+new file mode 100644
+index 000000000..a15d2b152
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/usenet/UsenetFile.kt
+@@ -0,0 +1,281 @@
++package com.nuvio.tv.core.usenet
++
++import kotlinx.coroutines.asExecutor
++
++/** read() returns bytes from a single contiguous extent. Callers can span extents by reading again. */
++internal interface UsenetFile {
++    val name: String
++    val size: Long
++    fun read(position: Long, buffer: ByteArray, offset: Int, length: Int): Int
++    fun prefetch(position: Long) {}
++}
++
++internal class ArticleCache(
++    private val fetchAhead: ((String) -> Article?)? = null,
++    private val allowSequentialAhead: () -> Boolean = { true },
++    private val profile: UsenetMemoryProfile = UsenetMemoryProfile.LOW,
++    private val trace: UsenetStartupTrace? = null,
++    private val fetch: (String, List<String>) -> Article
++) {
++    private val entries = LinkedHashMap<String, Article>(16, 0.75f, true)
++    private val missing = LinkedHashSet<String>()
++    private val loading = mutableMapOf<String, java.util.concurrent.CompletableFuture<Article?>>()
++    private var used = 0
++    private var prefetchBusy = 0
++    private val heads = LinkedHashMap<String, HeadSlice>(16, 0.75f, true)
++    private val evicted = LinkedHashSet<String>()
++    internal data class HeadSlice(val article: Article, val length: Int)
++    @Synchronized fun headSlice(id: String): HeadSlice? = heads[id]
++    fun head(id: String): Article? = headSlice(id)?.article
++    @Synchronized fun retainedBytes(): Int = used
++
++    fun probeHeads(ids: List<String>, checkActive: () -> Unit) {
++        for (batch in ids.chunked(8)) {
++            checkActive()
++            val futures = batch.map { id ->
++                java.util.concurrent.CompletableFuture.runAsync({
++                    if (head(id) == null) try { get(id) } catch (_: java.io.IOException) { }
++                }, kotlinx.coroutines.Dispatchers.IO.asExecutor())
++            }
++            futures.forEach { it.join() }
++            checkActive()
++        }
++    }
++
++    fun window(ids: List<String>, index: Int, stride: Int) {
++        val count = minOf(profile.window, profile.aheadBytes / maxOf(1, stride))
++        for (i in index + 1..minOf(ids.lastIndex, index + count)) prefetch(ids[i])
++    }
++
++    fun archive(kind: String, volumes: Int) { trace?.archive(kind, volumes) }
++
++    val parallelAhead get() = fetchAhead != null
++
++    operator fun get(id: String): Article = load(id, emptyList())
++
++    fun load(id: String, next: List<String>): Article {
++        while (true) {
++            val mine = java.util.concurrent.CompletableFuture<Article?>()
++            val pending: java.util.concurrent.CompletableFuture<Article?>?
++            val ahead: List<String>
++            synchronized(this) {
++                entries[id]?.let { trace?.add("hits"); return it }
++                if (id in missing) throw MissingUsenetArticle()
++                pending = loading[id]
++                if (pending == null) loading[id] = mine
++                ahead = next.filterNot { it == id || it in entries || it in missing || it in loading }
++            }
++            if (pending != null) {
++                trace?.add("joins")
++                try {
++                    pending.get()?.let { return it }
++                } catch (error: java.util.concurrent.ExecutionException) {
++                    throw error.cause ?: error
++                } catch (error: InterruptedException) {
++                    Thread.currentThread().interrupt()
++                    throw java.io.InterruptedIOException("Interrupted waiting for the Usenet article.")
++                }
++                continue
++            }
++            try {
++                val article = fetch(id, ahead)
++                trace?.add("demand")
++                trace?.add("bytes", article.bytes.size.toLong())
++                synchronized(this) { store(id, article) }
++                mine.complete(article)
++                return article
++            } catch (error: Throwable) {
++                if (error is MissingUsenetArticle) synchronized(this) {
++                    if (missing.size >= 4096) missing.remove(missing.first())
++                    missing.add(id)
++                }
++                mine.completeExceptionally(error)
++                throw error
++            } finally {
++                synchronized(this) { loading.remove(id, mine) }
++            }
++        }
++    }
++
++    /** Bounded speculation; the provider pool reserves capacity for demand. */
++    fun prefetch(id: String?, archive: Boolean = false) {
++        val reader = fetchAhead ?: return
++        if (id == null || (!archive && !allowSequentialAhead())) return
++        val future = synchronized(this) {
++            if (prefetchBusy >= profile.window || (loading.size + 1L) * 4 * 1024 * 1024 > profile.cacheBytes * 3L / 4 ||
++                id in entries || id in missing || id in loading) return
++            prefetchBusy++
++            java.util.concurrent.CompletableFuture<Article?>().also { loading[id] = it }
++        }
++        kotlinx.coroutines.Dispatchers.IO.dispatch(kotlin.coroutines.EmptyCoroutineContext) {
++            var article: Article? = null
++            try {
++                article = reader(id)
++            } catch (_: java.io.IOException) {
++                // Demand retries through the normal provider fallback path.
++            } finally {
++                synchronized(this) {
++                    article?.let { store(id, it); trace?.add("speculative"); trace?.add("bytes", it.bytes.size.toLong()) }
++                    loading.remove(id)
++                    prefetchBusy--
++                }
++                future.complete(article)
++            }
++        }
++    }
++
++    private fun store(id: String, article: Article) {
++        if (evicted.remove(id)) trace?.add("refetches")
++        if (article.start == 0L) {
++            heads[id] = HeadSlice(article.copy(bytes = article.bytes.copyOf(minOf(16384, article.bytes.size))), article.bytes.size)
++            if (heads.size > 512) heads.remove(heads.keys.first())
++        }
++        used -= entries.put(id, article)?.bytes?.size ?: 0
++        used += article.bytes.size
++        val iterator = entries.entries.iterator()
++        while ((used > profile.cacheBytes || entries.size > 2048) && iterator.hasNext()) {
++            val entry = iterator.next()
++            used -= entry.value.bytes.size
++            evicted.add(entry.key)
++            if (evicted.size > 4096) evicted.remove(evicted.first())
++            iterator.remove()
++        }
++    }
++}
++
++internal class PostedFile(file: NzbFile, private val cache: ArticleCache, verifyTail: Boolean = true, nextHeads: List<String> = emptyList()) : UsenetFile {
++    override val name = file.name
++    private val ids = file.articles
++    private data class KnownPart(val index: Int, val end: Long)
++    private val offsets = java.util.TreeMap<Long, KnownPart>()
++    private val stride: Int
++    override val size: Long
++    init {
++        ensureUsenet(ids.isNotEmpty(), "NZB is missing one or more file segments.")
++        val lookAhead = if (verifyTail && ids.size > 1) listOf(ids.last()) else nextHeads
++        val retained = cache.headSlice(ids.first())
++        val first = retained?.article ?: cache.load(ids.first(), lookAhead)
++        stride = retained?.length ?: first.bytes.size
++        size = first.total
++        ensureUsenet(first.start == 0L && stride > 0 && stride <= size, "NZB is missing the start of a file.")
++        offsets[0] = KnownPart(0, stride.toLong())
++        if (ids.size == 1) {
++            ensureUsenet(stride.toLong() == size, "NZB is missing the end of a file.")
++        } else if (verifyTail) {
++            val last = cache[ids.last()]
++            ensureUsenet(last.total == size && last.end == size, "NZB is missing the end of a file.")
++            offsets[last.start] = KnownPart(ids.lastIndex, last.end)
++        }
++    }
++
++    override fun prefetch(position: Long) {
++        val index = (position / stride).coerceIn(0, ids.lastIndex.toLong()).toInt()
++        cache.prefetch(ids[index], archive = true)
++        cache.window(ids, index, stride)
++    }
++
++    override fun read(position: Long, buffer: ByteArray, offset: Int, length: Int): Int {
++        if (length == 0) return 0
++        if (position >= size) return -1
++        cache.head(ids.first())?.let { head ->
++            if (position < head.bytes.size) {
++                val count = minOf(length, head.bytes.size - position.toInt())
++                head.bytes.copyInto(buffer, offset, position.toInt(), position.toInt() + count)
++                return count
++            }
++        }
++        val (floor, nextIndex) = synchronized(offsets) {
++            (offsets.floorEntry(position) ?: throw UsenetFailure("Invalid Usenet video offset.")) to
++                (offsets.higherEntry(position)?.value?.index?.minus(1) ?: ids.lastIndex)
++        }
++        val known = floor.value
++        var low = if (position < known.end) known.index else known.index + 1
++        var high = nextIndex
++        if (position < known.end) high = low
++        ensureUsenet(low <= high, "The requested part of the video is missing.")
++        var index = if (position == known.end) low else
++            (known.index + (position - floor.key) / stride).coerceIn(low.toLong(), high.toLong()).toInt()
++        while (low <= high) {
++            val next = if (position == known.end && index == known.index + 1)
++                ids.subList(index + 1, minOf(ids.size, index + 3)) else emptyList()
++            // Parallel windows own these IDs; avoid also queuing the same bodies on the demand socket.
++            if (next.isNotEmpty()) cache.window(ids, index, stride)
++            val article = cache.load(ids[index], if (cache.parallelAhead) emptyList() else next)
++            ensureUsenet(article.total == size && (index != ids.lastIndex || article.end == size), "Inconsistent yEnc file size.")
++            synchronized(offsets) {
++                val existing = offsets[article.start]
++                val previous = offsets.lowerEntry(article.start)?.value
++                val following = offsets.higherEntry(article.start)
++                ensureUsenet((existing == null || (existing.index == index && existing.end == article.end)) &&
++                    (previous == null || (previous.index < index && previous.end <= article.start &&
++                        (previous.index + 1 != index || previous.end == article.start))) &&
++                    (following == null || (following.value.index > index && article.end <= following.key &&
++                        (following.value.index != index + 1 || article.end == following.key))),
++                    "Inconsistent or missing yEnc file segments.")
++                if (existing == null) offsets[article.start] = KnownPart(index, article.end)
++            }
++            when {
++                position < article.start -> high = index - 1
++                position >= article.end -> low = index + 1
++                else -> {
++                    val start = (position - article.start).toInt()
++                    val count = minOf(length, article.bytes.size - start)
++                    article.bytes.copyInto(buffer, offset, start, start + count)
++                    return count
++                }
++            }
++            index = (low + high) ushr 1
++        }
++        throw UsenetFailure("The requested part of the video is missing.")
++    }
++}
++
++internal fun UsenetFile.bytesAt(position: Long, length: Int): ByteArray {
++    ensureUsenet(position >= 0 && length >= 0 && position <= size - length, "Truncated posted file.")
++    val result = ByteArray(length)
++    var filled = 0
++    while (filled < length) {
++        val count = read(position + filled, result, filled, length - filled)
++        ensureUsenet(count > 0, "Truncated RAR volume.")
++        filled += count
++    }
++    return result
++}
++
++internal data class FileExtent(val volume: UsenetFile, val offset: Long, val length: Long)
++
++internal class StoredFile(override val name: String, private val extents: List<FileExtent>) : UsenetFile {
++    private val ends = LongArray(extents.size)
++    override val size: Long
++    init {
++        var sum = 0L
++        extents.forEachIndexed { i, extent ->
++            ensureUsenet(extent.length > 0 && extent.length <= Long.MAX_VALUE - sum, "Invalid archive extent size.")
++            sum += extent.length
++            ends[i] = sum
++        }
++        size = sum
++    }
++    override fun read(position: Long, buffer: ByteArray, offset: Int, length: Int): Int {
++        if (length == 0) return 0
++        if (position >= size) return -1
++        val index = ends.binarySearch(position + 1).let { if (it < 0) -it - 1 else it }
++        val extent = extents[index]
++        val within = position - (ends[index] - extent.length)
++        if (within + length >= extent.length) extents.getOrNull(index + 1)?.let { it.volume.prefetch(it.offset) }
++        return extent.volume.read(extent.offset + within, buffer, offset, minOf(length.toLong(), extent.length - within).toInt())
++    }
++}
++
++/** Split-file sizes are predictions until their decoded yEnc header is opened. */
++internal class LazyPostedFile(private val file: NzbFile, private val cache: ArticleCache,
++                              override val size: Long) : UsenetFile {
++    override val name = file.name
++    private val opened by lazy {
++        PostedFile(file, cache, verifyTail = false).also {
++            ensureUsenet(it.size == size, "Inconsistent split volume size.")
++        }
++    }
++    override fun prefetch(position: Long) { cache.prefetch(file.articles.firstOrNull(), archive = true) }
++    override fun read(position: Long, buffer: ByteArray, offset: Int, length: Int) = opened.read(position, buffer, offset, length)
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/usenet/UsenetHttpSession.kt b/app/src/main/java/com/nuvio/tv/core/usenet/UsenetHttpSession.kt
+new file mode 100644
+index 000000000..7f21c6d83
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/usenet/UsenetHttpSession.kt
+@@ -0,0 +1,105 @@
++package com.nuvio.tv.core.usenet
++
++import fi.iki.elonen.NanoHTTPD
++import java.io.Closeable
++import java.io.InputStream
++import java.util.UUID
++import java.util.concurrent.TimeUnit
++
++internal class UsenetHttpSession(val file: UsenetFile, private val articles: Closeable, private val trace: UsenetStartupTrace? = null) :
++    NanoHTTPD("127.0.0.1", 0), Closeable {
++    private val firstGet = java.util.concurrent.atomic.AtomicBoolean()
++    private val path = "/usenet/" + UUID.randomUUID() + "/video." + file.name.substringAfterLast('.').lowercase()
++    val url get() = "http://127.0.0.1:$listeningPort$path"
++    @Volatile private var lastRead = System.nanoTime()
++    fun isIdle() = System.nanoTime() - lastRead > TimeUnit.HOURS.toNanos(2)
++
++    override fun serve(session: IHTTPSession): Response {
++        if (session.uri != path) return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "")
++        if (session.method != Method.GET && session.method != Method.HEAD)
++            return newFixedLengthResponse(Response.Status.METHOD_NOT_ALLOWED, MIME_PLAINTEXT, "")
++        lastRead = System.nanoTime()
++        val range = session.headers["range"]
++        val bounds = if (range == null) 0L until file.size else parseRange(range, file.size)
++        if (bounds == null) return newFixedLengthResponse(Response.Status.RANGE_NOT_SATISFIABLE, MIME_PLAINTEXT, "").apply {
++            addHeader("Content-Range", "bytes */" + file.size)
++        }
++        // Verify the start of the range before committing a successful HTTP response. Retain the
++        // bytes so the player gets them without a second NNTP read. HEAD stays metadata-only.
++        val prefix = if (session.method == Method.GET) ByteArray(minOf(8192L, bounds.last - bounds.first + 1).toInt())
++            else byteArrayOf()
++        val first = session.method == Method.GET && firstGet.compareAndSet(false, true)
++        val waitStarted = System.nanoTime()
++        val available = try {
++            if (prefix.isEmpty()) 0 else file.read(bounds.first, prefix, 0, prefix.size).also {
++                ensureUsenet(it > 0, "Usenet video ended early.")
++            }
++        } catch (error: java.io.IOException) {
++            val status = if (error is MissingUsenetArticle) Response.Status.GONE else Response.Status.SERVICE_UNAVAILABLE
++            return newFixedLengthResponse(status, MIME_PLAINTEXT,
++                if (error is UsenetFailure) error.message.orEmpty() else "Could not read the Usenet video.").apply {
++                addHeader("Cache-Control", "no-store")
++            }
++        } finally {
++            if (first) trace?.firstGet(System.nanoTime() - waitStarted)
++        }
++        val stream = object : InputStream() {
++            @Volatile private var closed = false
++            override fun close() { closed = true }
++            var position = bounds.first
++            override fun read(): Int {
++                val one = ByteArray(1)
++                return if (read(one, 0, 1) <= 0) -1 else one[0].toInt() and 255
++            }
++            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
++                if (length == 0) return 0
++                if (closed || position > bounds.last || session.method == Method.HEAD) return -1
++                lastRead = System.nanoTime()
++                val prefixOffset = position - bounds.first
++                val count = if (prefixOffset < available) {
++                    val n = minOf(length, available - prefixOffset.toInt())
++                    prefix.copyInto(buffer, offset, prefixOffset.toInt(), prefixOffset.toInt() + n)
++                    n
++                } else file.read(position, buffer, offset, minOf(length.toLong(), bounds.last - position + 1).toInt())
++                ensureUsenet(count > 0, "Usenet video ended early.")
++                position += count
++                return count
++            }
++        }
++        val status = if (range == null) Response.Status.OK else Response.Status.PARTIAL_CONTENT
++        val mime = when (file.name.substringAfterLast('.').lowercase()) {
++            "mp4", "m4v" -> "video/mp4"
++            "mkv" -> "video/x-matroska"
++            "webm" -> "video/webm"
++            "m2ts", "ts" -> "video/mp2t"
++            else -> "application/octet-stream"
++        }
++        return newFixedLengthResponse(status, mime, stream, bounds.last - bounds.first + 1).apply {
++            addHeader("Accept-Ranges", "bytes")
++            addHeader("Cache-Control", "no-store")
++            if (range != null) addHeader("Content-Range", "bytes " + bounds.first + "-" + bounds.last + "/" + file.size)
++        }
++    }
++    override fun close() {
++        articles.close()
++        stop()
++    }
++
++    companion object {
++        private val sessionUrl = Regex("""http://127\.0\.0\.1:\d+/usenet/[\da-f-]{36}/video\.[\da-z]+""")
++        fun isSessionUrl(url: String) = url.startsWith("http://127.0.0.1:") && sessionUrl.matches(url)
++        private val rangePattern = Regex("""bytes=(\d*)-(\d*)""", RegexOption.IGNORE_CASE)
++        internal fun parseRange(value: String, size: Long): LongRange? {
++            val match = rangePattern.matchEntire(value.trim()) ?: return null
++            val (from, to) = match.destructured
++            if (size <= 0L) return null
++            if (from.isEmpty()) {
++                val suffix = to.toLongOrNull()?.takeIf { it > 0 } ?: return null
++                return (size - suffix).coerceAtLeast(0)..(size - 1)
++            }
++            val start = from.toLongOrNull() ?: return null
++            val end = if (to.isEmpty()) size - 1 else (to.toLongOrNull() ?: return null).coerceAtMost(size - 1)
++            return if (start <= end) start..end else null
++        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/usenet/UsenetPlayback.kt b/app/src/main/java/com/nuvio/tv/core/usenet/UsenetPlayback.kt
+new file mode 100644
+index 000000000..f5b94b425
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/usenet/UsenetPlayback.kt
+@@ -0,0 +1,132 @@
++package com.nuvio.tv.core.usenet
++
++import com.nuvio.tv.domain.model.Stream
++import com.nuvio.tv.domain.model.StreamBehaviorHints
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.ensureActive
++import kotlinx.coroutines.suspendCancellableCoroutine
++import kotlinx.coroutines.asExecutor
++import java.util.concurrent.Executors
++import java.util.concurrent.TimeUnit
++
++internal object UsenetPlayback {
++    private val sessions = LinkedHashMap<String, UsenetHttpSession>()
++    private val originalStreams = LinkedHashMap<String, Stream>()
++
++    fun originalStream(url: String): Stream? = synchronized(sessions) { originalStreams[url] }
++    fun hasSession(url: String): Boolean = synchronized(sessions) { sessions.containsKey(url) }
++    private val cleanup by lazy {
++        Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "Usenet session cleanup").apply { isDaemon = true } }.apply {
++            scheduleWithFixedDelay({
++                val idle = synchronized(sessions) { sessions.values.filter { it.isIdle() }.map { it.url } }
++                idle.forEach(::release)
++            }, 1, 1, TimeUnit.MINUTES)
++        }
++    }
++
++    fun release(url: String) {
++        val session = synchronized(sessions) {
++            originalStreams.remove(url)
++            sessions.remove(url)
++        } ?: return
++        cleanup.execute { session.close() }
++    }
++
++    // Prefer the episode coordinates sent to the add-on. TVDB display and tracking order can differ.
++    internal fun requestEpisode(videoId: String?, season: Int?, episode: Int?): Pair<Int?, Int?> {
++        if (episode == null) return null to null
++        val parts = videoId.orEmpty().split(':')
++        val prefixSize = if (parts.first().startsWith("tt") || parts.first().toLongOrNull() != null) 1 else 2
++        if (parts.size >= prefixSize + 2) {
++            val s = parts[parts.lastIndex - 1].toIntOrNull()
++            val e = parts.last().toIntOrNull()
++            if (s != null && s >= 0 && e != null && e > 0) return s to e
++        }
++        return season to episode
++    }
++
++    suspend fun resolve(stream: Stream, videoId: String? = null, season: Int? = null, episode: Int? = null): Stream {
++        val trace = UsenetStartupTrace()
++        var success = false
++        val (requestedSeason, requestedEpisode) = requestEpisode(videoId, season, episode)
++        var awaitingHandoff: Stream? = null
++        try {
++            val result = kotlinx.coroutines.withTimeoutOrNull(120_000L) {
++                resolveWithinDeadline(stream, requestedSeason, requestedEpisode, trace).also { awaitingHandoff = it }
++            } ?: throw UsenetFailure("Timed out preparing this Usenet release.")
++            awaitingHandoff = null
++            success = true
++            return result
++        } finally {
++            trace.finish(success)
++            awaitingHandoff?.url?.let(::release)
++        }
++    }
++
++    private suspend fun resolveWithinDeadline(stream: Stream, season: Int?, episode: Int?, trace: UsenetStartupTrace): Stream = suspendCancellableCoroutine { continuation ->
++        val preparation = UsenetPreparation()
++        continuation.invokeOnCancellation { preparation.close() }
++        Dispatchers.IO.asExecutor().execute {
++            try {
++                val prepared = prepare(stream, season, episode, preparation, trace) { continuation.context.ensureActive() }
++                continuation.resume(prepared, onCancellation = { _, value, _ -> value.url?.let(::release) })
++            } catch (error: Exception) {
++                preparation.close()
++                val failure = if (error is CancellationException || error is UsenetFailure) error
++                    else UsenetFailure("Could not open this Usenet stream.")
++                continuation.resumeWith(Result.failure(failure))
++            }
++        }
++    }
++
++    private fun prepare(stream: Stream, season: Int?, episode: Int?, preparation: UsenetPreparation, trace: UsenetStartupTrace, checkActive: () -> Unit): Stream {
++        val source = requireNotNull(stream.usenet)
++        val profile = UsenetMemoryProfile.current
++        val articles = NewsArticles(source.servers, trace = trace)
++        preparation.own(articles)
++        articles.warm(minOf(2, profile.window + 1))
++        trace.mark("nzb_request")
++        val document = NzbDownload.fetch(source.nzbUrl, stream.behaviorHints?.proxyHeaders?.request.orEmpty(), preparation, trace)
++        trace.mark("nzb_received")
++        trace.add("files", document.files.size.toLong())
++        checkActive()
++        var preparationCheck: (() -> Unit)? = checkActive
++        val cache = ArticleCache(
++            fetchAhead = if (articles.canPrefetch) articles::fetchAhead else null,
++            profile = profile, trace = trace
++        ) { id, next ->
++            preparationCheck?.invoke()
++            articles.fetch(id, next)
++        }
++        trace.mark("selection_started")
++        val file = UsenetSelection.select(document.files, cache, stream.fileIdx, source.filters, season, episode, document.password) {
++            preparationCheck?.invoke()
++        }
++        trace.mark("selection_done")
++        checkActive()
++        preparationCheck = null
++        val session = UsenetHttpSession(file, articles, trace)
++        preparation.own(java.io.Closeable { cleanup.execute { session.close() } })
++        session.start()
++        trace.mark("session_started")
++        synchronized(sessions) {
++            if (sessions.size >= 2) release(sessions.keys.first())
++            sessions[session.url] = session
++            originalStreams[session.url] = stream
++        }
++        try {
++            checkActive()
++            preparation.handoff()
++        } catch (error: Exception) {
++            release(session.url)
++            throw error
++        }
++        cleanup
++        val hints = stream.behaviorHints ?: StreamBehaviorHints(
++            notWebReady = null, bingeGroup = null, countryWhitelist = null, proxyHeaders = null
++        )
++        return stream.copy(url = session.url, usenet = null,
++            behaviorHints = hints.copy(filename = file.name, videoSize = file.size, proxyHeaders = null))
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/usenet/UsenetPreparation.kt b/app/src/main/java/com/nuvio/tv/core/usenet/UsenetPreparation.kt
+new file mode 100644
+index 000000000..ba3c43967
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/usenet/UsenetPreparation.kt
+@@ -0,0 +1,30 @@
++package com.nuvio.tv.core.usenet
++
++import java.io.Closeable
++
++/** Registers resources before a blocking operation so cancellation can close them immediately. */
++internal class UsenetPreparation : Closeable {
++    private val resources = mutableListOf<Closeable>()
++    private var closed = false
++
++    @Synchronized fun own(resource: Closeable) {
++        if (closed) {
++            resource.close()
++            throw UsenetFailure("Usenet preparation was cancelled.")
++        }
++        resources.add(resource)
++    }
++
++    @Synchronized fun handoff() {
++        ensureUsenet(!closed, "Usenet preparation was cancelled.")
++        resources.clear()
++    }
++
++    override fun close() {
++        val closing = synchronized(this) {
++            closed = true
++            resources.toList().also { resources.clear() }
++        }
++        closing.asReversed().forEach { runCatching { it.close() } }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/usenet/UsenetSelection.kt b/app/src/main/java/com/nuvio/tv/core/usenet/UsenetSelection.kt
+new file mode 100644
+index 000000000..1827858dc
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/usenet/UsenetSelection.kt
+@@ -0,0 +1,303 @@
++// Lazy archive behavior adapted from haaihond/NuvioTV (GPL-3.0),
++// native/usenet/internal/engine/select.go, commit bc6decd434c5718d4cb98e1ffddd9f1708bdd8b6.
++package com.nuvio.tv.core.usenet
++
++import com.google.re2j.Pattern
++import com.google.re2j.PatternSyntaxException
++import com.nuvio.tv.core.player.FilenameEpisodeMatcher
++
++internal class UsenetCandidate(val name: String, val estimate: Long, val open: () -> UsenetFile)
++
++internal object UsenetSelection {
++    private val videos = setOf("mkv", "mp4", "webm", "avi", "m4v", "mov", "m2ts", "ts", "mpg", "mpeg", "wmv")
++    private val rar = Regex("""(?i)^(.*?)(?:\.part(\d+)\.rar|\.([r-z])(\d{2,3})|\.rar)$""")
++    private val split = Regex("""(?i)^(.+)\.(\d{3,5})$""")
++    private val sidecars = setOf("par2", "nfo", "sfv", "srr", "nzb", "srt", "sub", "txt", "jpg", "png")
++
++    private fun videoName(name: String) = name.substringAfterLast('.').lowercase() in videos
++
++    private enum class Kind { RAR, SEVEN_ZIP, VIDEO, NUMERIC }
++    private data class Volume(val key: String, val number: Int, val first: Int, val kind: Kind)
++
++    private fun volume(name: String): Volume? {
++        val lower = name.lowercase()
++        rar.matchEntire(lower)?.let { match ->
++            val (stem, part, letter, digits) = match.destructured
++            if (part.isNotEmpty()) return Volume("$stem.part.rar", part.toIntOrNull() ?: -1, 1, Kind.RAR)
++            val number = if (letter.isEmpty()) 0 else (letter.single() - 'r') * 100 + digits.toInt() + 1
++            return Volume("$stem.rar", number, 0, Kind.RAR)
++        }
++        val parts = split.matchEntire(lower)
++        val key = parts?.groupValues?.get(1) ?: lower
++        val kind = when {
++            key.endsWith(".7z") -> Kind.SEVEN_ZIP
++            parts != null && videoName(key) -> Kind.VIDEO
++            parts != null -> Kind.NUMERIC
++            else -> return null
++        }
++        return Volume(key, parts?.groupValues?.get(2)?.toInt() ?: 0, if (parts == null) 0 else 1, kind)
++    }
++
++    private fun matcher(hints: List<String>): (String) -> Boolean {
++        ensureUsenet(hints.size <= 32, "Too many NZB filename filters.")
++        val filters = hints.map { hint ->
++            ensureUsenet(hint.length in 1..512, "Invalid NZB filename filter.")
++            if (hint.startsWith('/')) {
++                val end = hint.lastIndexOf('/')
++                ensureUsenet(end > 0 && hint.substring(end + 1) in setOf("", "i"), "Unsupported NZB filename filter.")
++                val pattern = try {
++                    Pattern.compile(hint.substring(1, end), if (hint.endsWith("/i")) Pattern.CASE_INSENSITIVE else 0)
++                } catch (_: PatternSyntaxException) { throw UsenetFailure("Unsupported NZB filename filter.") }
++                val matches: (String) -> Boolean = { name -> pattern.matcher(name).find() }
++                matches
++            } else {
++                { name: String -> name.contains(hint, ignoreCase = true) }
++            }
++        }
++        return { name -> filters.isEmpty() || filters.any { it(name) } }
++    }
++
++    private val sample = Regex("""(?i)(?:^|[\\/._ -])(?:sample|trailer)(?:[\\/._ -]|$)""")
++    private val episodeList = Regex("""(?i)S\s*(\d{1,3})\s*E\s*(\d{1,4})((?:-?E\d{1,4})+)""")
++    private val followingEpisode = Regex("""(?i)(-?)E(\d{1,4})""")
++
++    private fun episodeMatch(name: String, season: Int?, episode: Int): Boolean? {
++        val leaf = name.substringAfterLast('/').substringAfterLast('\\')
++        val coordinates = FilenameEpisodeMatcher.extractSeasonEpisode(leaf) ?: return null
++        if (coordinates.first != null && coordinates.first != season) return false
++        if (coordinates.second == episode) return true
++        val list = episodeList.find(leaf) ?: return false
++        var previous = coordinates.second
++        for (entry in followingEpisode.findAll(list.groupValues[3])) {
++            val next = entry.groupValues[2].toInt()
++            if (episode == next || (entry.groupValues[1] == "-" && episode in previous..next)) return true
++            previous = next
++        }
++        return false
++    }
++
++    private fun recognized(name: String) = videoName(name) || volume(name) != null
++
++    private fun recover(files: List<NzbFile>, cache: ArticleCache, checkActive: () -> Unit): List<NzbFile> {
++        fun unknown(file: NzbFile) = file.articles.isNotEmpty() && !recognized(file.name) &&
++            file.name.substringAfterLast('.').lowercase() !in sidecars
++        if (files.none(::unknown)) return files
++        val recovery = files.filter { it.name.endsWith(".par2", true) && it.articles.isNotEmpty() }
++        if (recovery.isEmpty() && files.any { recognized(it.name) }) return files
++        val names = Par2Names()
++        var failure: UsenetFailure? = null
++        val descriptions by lazy {
++            for (file in recovery.sortedBy { it.postedBytes }.take(3)) {
++                checkActive()
++                try { names.read(PostedFile(file, cache, verifyTail = false), checkActive) }
++                catch (e: UsenetFailure) { checkActive(); failure = e }
++                if (names.hasDescriptions()) break
++            }
++            names
++        }
++        cache.archive("obfuscated", files.count(::unknown))
++        cache.probeHeads(files.filter(::unknown).take(4096).map { it.articles.first() }, checkActive)
++        var probes = 0
++        val recovered = files.mapIndexed { i, file ->
++            if (!unknown(file) || probes >= 4096) return@mapIndexed file
++            checkActive()
++            probes++
++            try {
++                val head = cache.head(file.articles.first()) ?: cache[file.articles.first()]
++                val name = head.filename?.takeIf(::recognized)
++                    ?: when {
++                        head.bytes.startsWith(StoredSevenZip.signature) -> "unnamed-$i.7z"
++                        head.bytes.startsWith(StoredRar.signature) -> "unnamed-$i.rar"
++                        else -> null
++                    }
++                    ?: descriptions.takeIf { it.hasDescriptions() }?.find(PostedFile(file, cache, verifyTail = false))
++                        ?.takeIf(::recognized)
++                if (name == null) file else file.copy(name = name)
++            } catch (e: UsenetFailure) {
++                checkActive()
++                failure = e
++                file
++            }
++        }
++        if (recovered.none { recognized(it.name) }) failure?.let { throw it }
++        return recovered
++    }
++
++    // Some multipart posts have unrelated .rar filenames. RAR5 supplies the real ordinal.
++    // Join only one complete, unambiguous chain with matching member name and declared file size.
++    private fun regroup(files: List<NzbFile>, cache: ArticleCache, passwords: RarPasswords,
++                        checkActive: () -> Unit): List<NzbFile> {
++        val volumes = files.map { volume(it.name) }
++        val normalKeys = volumes.filterNotNull().filter { it.number != 0 }.mapTo(hashSetOf()) { it.key }
++        val possible = files.indices.filter { i ->
++            val v = volumes[i]
++            v?.kind == Kind.RAR && v.first == 0 && v.number == 0 && v.key !in normalKeys && files[i].articles.isNotEmpty()
++        }
++        if (possible.size !in 2..4096) return files
++        data class Piece(val position: Int, val number: Long, val part: RarPart)
++        val chains = mutableMapOf<Pair<String, Long>, MutableList<Piece>>()
++        for (i in possible) {
++            checkActive()
++            try {
++                val head = (cache.head(files[i].articles.first()) ?: cache[files[i].articles.first()]).bytes
++                if (!head.startsWith(StoredRar.signature)) continue
++                val version = head.getOrNull(6)?.toInt() ?: continue
++                var number = -1L
++                val member = StoredRar.index(PostedFile(files[i], cache, false), passwords) { number = it }.singleOrNull() ?: continue
++                if (!member.more && !member.continues) continue
++                val key = "$version:${member.name}" to (member.unpacked ?: continue)
++                val chain = chains.getOrPut(key) { mutableListOf() }
++                if (version == 0) number = chain.size.toLong() // RAR4 has no internal ordinal: preserve NZB order.
++                if (number !in 0..4095) continue
++                chain.add(Piece(i, number, member))
++            } catch (_: UsenetFailure) { /* The normal per-archive path reports an unreadable volume if selected. */ }
++        }
++        val result = files.toMutableList()
++        for (pieces in chains.values) {
++            val ordered = pieces.sortedBy { it.number }
++            if (ordered.size < 2 || !ordered.withIndex().all { (i, p) -> p.number == i.toLong() &&
++                    p.part.continues == (i > 0) && p.part.more == (i < ordered.lastIndex) }) continue
++            for (p in ordered) result[p.position] = result[p.position].copy(
++                name = "\u0000rar-group-${ordered.first().position}.part${p.number + 1}.rar")
++        }
++        return result
++    }
++
++    private fun ByteArray.startsWith(prefix: ByteArray) =
++        size >= prefix.size && prefix.indices.all { this[it] == prefix[it] }
++
++    private fun groupFiles(group: List<Pair<Volume, NzbFile>>, cache: ArticleCache,
++                           passwords: RarPasswords, checkActive: () -> Unit): Sequence<UsenetCandidate> = sequence {
++        val sorted = group.groupBy { it.second.name.lowercase() }.values.map { copies ->
++            copies.maxWith(compareBy<Pair<Volume, NzbFile>> { it.second.articles.isNotEmpty() }.thenBy { it.second.postedBytes })
++        }.sortedBy { it.first.number }
++        val info = sorted.first().first
++        val first = if (info.kind == Kind.RAR && info.number == 0) 0 else info.first
++        ensureUsenet(sorted.withIndex().all { (i, pair) -> pair.first.number == first + i && pair.first.first == info.first },
++            "NZB archive volumes are missing or duplicated.")
++        val opened = sorted.map { pair -> lazy {
++            checkActive()
++            PostedFile(pair.second, cache, verifyTail = false)
++        } }
++        fun openVolume(i: Int): UsenetFile = opened[i].value
++        val openers = sorted.indices.map { i -> { openVolume(i) } }
++        val kind = if (info.kind == Kind.NUMERIC) {
++            val head = openVolume(0).bytesAt(0, minOf(8L, openVolume(0).size).toInt())
++            when {
++                head.startsWith(StoredRar.signature) -> Kind.RAR
++                head.startsWith(StoredSevenZip.signature) -> Kind.SEVEN_ZIP
++                else -> throw UsenetFailure("Unrecognized split archive.")
++            }
++        } else info.kind
++        cache.archive(if (kind == Kind.RAR) "rar" else if (kind == Kind.SEVEN_ZIP) "7z" else "split", sorted.size)
++        val candidates = if (kind == Kind.RAR) {
++            RarWalker(openers, passwords, checkActive) { i, size -> LazyPostedFile(sorted[i].second, cache, size) }.candidates()
++        } else {
++            val head = openVolume(0)
++            val joined = StoredFile(info.key, sorted.indices.map { i ->
++                val file = if (i == 0) head else if (i == sorted.lastIndex) openVolume(i)
++                    else LazyPostedFile(sorted[i].second, cache, head.size)
++                FileExtent(file, 0, file.size)
++            })
++            if (kind == Kind.SEVEN_ZIP) StoredSevenZip.index(joined).asSequence()
++            else sequenceOf(UsenetCandidate(info.key, joined.size) { joined })
++        }
++        // Preserve explicit-index semantics: only a sole archive member is unwrapped.
++        // Ordinary video candidates are yielded before asking the walker for another entry.
++        val iterator = candidates.iterator()
++        if (!iterator.hasNext()) return@sequence
++        val firstCandidate = iterator.next()
++        val nestedRar = firstCandidate.name.endsWith(".rar", true)
++        val nestedSevenZip = firstCandidate.name.endsWith(".7z", true)
++        if ((nestedRar || nestedSevenZip) && !iterator.hasNext()) {
++            if (nestedRar) yieldAll(RarWalker(listOf(firstCandidate.open), passwords, checkActive).candidates())
++            else yieldAll(StoredSevenZip.index(firstCandidate.open()))
++        } else {
++            yield(firstCandidate)
++            while (iterator.hasNext()) yield(iterator.next())
++        }
++    }
++
++    fun select(files: List<NzbFile>, cache: ArticleCache, index: Int?, hints: List<String>,
++               season: Int? = null, episode: Int? = null, password: String? = null, checkActive: () -> Unit = {}): UsenetFile {
++        val passwords = RarPasswords(password, checkActive)
++        val matches = matcher(hints)
++        if (index != null && index in files.indices && videoName(files[index].name) &&
++            (0 until index).all { videoName(files[it].name) || files[it].name.substringAfterLast('.').lowercase() in sidecars }) {
++            checkActive()
++            val file = files[index]
++            ensureUsenet(matches(file.name), "The NZB contains no matching video.")
++            return PostedFile(file, cache)
++        }
++        if (index == null && episode != null) {
++            files.firstOrNull { videoName(it.name) && matches(it.name) && !sample.containsMatchIn(it.name) &&
++                episodeMatch(it.name, season, episode) == true }?.let {
++                checkActive()
++                return PostedFile(it, cache)
++            }
++        }
++        // Named episode sets can be selected before unrelated standalone .rar files need regrouping.
++        if (index == null && episode != null) {
++            val matchingGroups = files.mapNotNull { file -> volume(file.name)?.let { it to file } }
++                .groupBy { it.first.key }.filterKeys { episodeMatch(it, season, episode) == true }
++            for (group in matchingGroups.values) {
++                try {
++                    for (candidate in groupFiles(group, cache, passwords, checkActive)) {
++                        if (videoName(candidate.name) && matches(candidate.name) && !sample.containsMatchIn(candidate.name) &&
++                            episodeMatch(candidate.name, season, episode) == true) return candidate.open()
++                    }
++                } catch (_: UsenetFailure) { checkActive() /* Full inventory below preserves failure and fallback handling. */ }
++            }
++        }
++        val named = regroup(recover(files, cache, checkActive), cache, passwords, checkActive)
++        val groups = named.mapNotNull { file -> volume(file.name)?.let { it to file } }
++            .groupBy { it.first.key }.toMutableMap()
++        val candidates = mutableListOf<UsenetCandidate>()
++        var archiveError: UsenetFailure? = null
++        val ordered = if (index == null && episode != null) named.sortedByDescending {
++            episodeMatch(volume(it.name)?.key ?: it.name, season, episode) == true
++        } else named
++        for (file in ordered) {
++            checkActive()
++            val group = volume(file.name)
++            if (group == null) candidates += UsenetCandidate(file.name, file.postedBytes) { PostedFile(file, cache) }
++            else {
++                val entries = groups.remove(group.key) ?: continue
++                try {
++                    for (candidate in groupFiles(entries, cache, passwords, checkActive)) {
++                        candidates += candidate
++                        val eligible = videoName(candidate.name) && matches(candidate.name) && !sample.containsMatchIn(candidate.name)
++                        if (index == null && eligible && ((episode != null && episodeMatch(candidate.name, season, episode) == true) ||
++                            (episode == null && (hints.isNotEmpty() || candidate.estimate >= entries.sumOf { it.second.postedBytes } / 2)))) {
++                            checkActive()
++                            return candidate.open()
++                        }
++                        if (index != null && index in candidates.indices) break
++                    }
++                }
++                catch (error: UsenetFailure) {
++                    // Unknown member count makes every following explicit index ambiguous.
++                    if (index != null) throw error
++                    archiveError = error
++                }
++            }
++            ensureUsenet(candidates.size <= 16384, "Too many archived files.")
++            if (index != null && index in candidates.indices) break
++        }
++        val eligible = candidates.filter { videoName(it.name) && matches(it.name) }
++        val features = eligible.filterNot { sample.containsMatchIn(it.name) }.ifEmpty { eligible }
++        val selected = when {
++            index != null -> candidates.getOrNull(index)?.takeIf { it in eligible }
++            episode == null || features.isEmpty() ->
++                features.maxByOrNull { it.estimate }
++            else -> {
++                val marked = features.map { it to episodeMatch(it.name, season, episode) }
++                marked.filter { it.second == true }.maxByOrNull { it.first.estimate }?.first
++                    ?: marked.singleOrNull()?.takeIf { it.second == null && archiveError == null }?.first
++                    ?: throw UsenetFailure("Could not identify the requested episode in this release.")
++            }
++        }
++        checkActive()
++        return selected?.open() ?: throw (archiveError ?: UsenetFailure("The NZB contains no matching video."))
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/usenet/UsenetStartupTrace.kt b/app/src/main/java/com/nuvio/tv/core/usenet/UsenetStartupTrace.kt
+new file mode 100644
+index 000000000..264383fbd
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/usenet/UsenetStartupTrace.kt
+@@ -0,0 +1,51 @@
++package com.nuvio.tv.core.usenet
++
++internal data class UsenetMemoryProfile(val cacheBytes: Int, val window: Int, val aheadBytes: Int) {
++    companion object {
++        val LOW = UsenetMemoryProfile(16 * 1024 * 1024, 6, 8 * 1024 * 1024)
++        val NORMAL = UsenetMemoryProfile(32 * 1024 * 1024, 12, 16 * 1024 * 1024)
++        @Volatile var current = LOW
++        private var callbacksRegistered = false
++        @Synchronized
++        fun init(context: android.content.Context) {
++            val manager = context.getSystemService(android.content.Context.ACTIVITY_SERVICE) as android.app.ActivityManager
++            current = if (manager.isLowRamDevice || manager.memoryClass < 192) LOW else NORMAL
++            if (!callbacksRegistered) {
++                context.applicationContext.registerComponentCallbacks(object : android.content.ComponentCallbacks2 {
++                    override fun onTrimMemory(level: Int) { NzbDownload.onMemoryPressure() }
++                    override fun onLowMemory() { NzbDownload.onMemoryPressure() }
++                    override fun onConfigurationChanged(config: android.content.res.Configuration) = Unit
++                })
++                callbacksRegistered = true
++            }
++        }
++    }
++}
++
++/** Only fixed stage labels and numeric counters reach logcat. Never include exception text. */
++internal class UsenetStartupTrace(private val log: (String) -> Unit = { android.util.Log.i("UsenetStartup", it); Unit }) {
++    private val start = System.nanoTime()
++    private val marks = linkedMapOf<String, Long>()
++    private val counts = linkedMapOf<String, Long>()
++    private var reported = false
++    private var kind = "direct"
++    private var connectionAllowance: String? = null
++    @Synchronized fun connections(limit: Int, fromAddon: Boolean) {
++        connectionAllowance = "conns=$limit (${if (fromAddon) "addon" else "default"})"
++    }
++    @Synchronized fun archive(kind: String, volumes: Int) {
++        if (this.kind != "obfuscated") this.kind = kind
++        counts["volumes"] = volumes.toLong()
++    }
++    @Synchronized fun mark(stage: String) { marks.putIfAbsent(stage, (System.nanoTime() - start) / 1_000_000) }
++    @Synchronized fun add(counter: String, value: Long = 1) { counts[counter] = (counts[counter] ?: 0) + value }
++    @Synchronized fun finish(success: Boolean) {
++        if (reported) return
++        reported = true
++        log("total=${(System.nanoTime() - start) / 1_000_000}ms success=$success kind=$kind " +
++            (connectionAllowance?.let { "$it " } ?: "") +
++            marks.entries.joinToString(" ") { "${it.key}=${it.value}ms" } + " " +
++            counts.entries.joinToString(" ") { "${it.key}=${it.value}" })
++    }
++    fun firstGet(waitNanos: Long) { log("first_get_wait=${waitNanos / 1_000_000}ms") }
++}
 diff --git a/app/src/main/java/com/nuvio/tv/core/util/AppLogo.kt b/app/src/main/java/com/nuvio/tv/core/util/AppLogo.kt
 index 6623fe910..f22914b83 100644
 --- a/app/src/main/java/com/nuvio/tv/core/util/AppLogo.kt
@@ -429680,6 +432502,34 @@ index 21df098e7..ec3882180 100644
          }
          decodeCaches.remove(profileId)
      }
+diff --git a/app/src/main/java/com/nuvio/tv/data/mapper/StreamMapper.kt b/app/src/main/java/com/nuvio/tv/data/mapper/StreamMapper.kt
+index 136efa4fb..9c64ce4cb 100644
+--- a/app/src/main/java/com/nuvio/tv/data/mapper/StreamMapper.kt
++++ b/app/src/main/java/com/nuvio/tv/data/mapper/StreamMapper.kt
+@@ -9,6 +9,7 @@ import com.nuvio.tv.data.remote.dto.StreamClientResolveDto
+ import com.nuvio.tv.data.remote.dto.StreamDto
+ import com.nuvio.tv.domain.model.ProxyHeaders
+ import com.nuvio.tv.domain.model.Stream
++import com.nuvio.tv.domain.model.UsenetSource
+ import com.nuvio.tv.domain.model.StreamBehaviorHints
+ import com.nuvio.tv.domain.model.Subtitle
+ import com.nuvio.tv.domain.model.StreamClientResolve
+@@ -23,6 +24,15 @@ fun StreamDto.toDomain(addonName: String, addonLogo: String?): Stream = Stream(
+     title = title,
+     description = description,
+     url = url,
++    usenet = nzbUrl?.takeIf { it.isNotBlank() && url.isNullOrBlank() && externalUrl.isNullOrBlank() }?.let {
++        val filters = when (val hint = fileMustInclude) {
++            null -> emptyList()
++            is String -> listOf(hint)
++            is List<*> -> hint.map { value -> value as? String ?: "" }
++            else -> listOf("")
++        }
++        UsenetSource(it, (servers as? List<*>)?.filterIsInstance<String>().orEmpty(), filters)
++    },
+     ytId = ytId,
+     infoHash = infoHash,
+     fileIdx = fileIdx,
 diff --git a/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListEpisodeMappingService.kt b/app/src/main/java/com/nuvio/tv/data/mdblist/MdbListEpisodeMappingService.kt
 new file mode 100644
 index 000000000..8c7841629
@@ -430447,6 +433297,22 @@ index b83fa1421..c0cae7864 100644
 +    // GitHub's own SHA-256 of the uploaded file, as "sha256:<hex>" (missing on older uploads).
      val digest: String? = null
  )
+diff --git a/app/src/main/java/com/nuvio/tv/data/remote/dto/StreamResponseDto.kt b/app/src/main/java/com/nuvio/tv/data/remote/dto/StreamResponseDto.kt
+index 7c1c0fbc3..2ea4cfc08 100644
+--- a/app/src/main/java/com/nuvio/tv/data/remote/dto/StreamResponseDto.kt
++++ b/app/src/main/java/com/nuvio/tv/data/remote/dto/StreamResponseDto.kt
+@@ -21,7 +21,10 @@ data class StreamDto(
+     @Json(name = "behaviorHints") val behaviorHints: BehaviorHintsDto? = null,
+     @Json(name = "sources") val sources: List<String>? = null,
+     @Json(name = "subtitles") val subtitles: List<SubtitleDto>? = null,
+-    @Json(name = "clientResolve") val clientResolve: StreamClientResolveDto? = null
++    @Json(name = "clientResolve") val clientResolve: StreamClientResolveDto? = null,
++    @Json(name = "nzbUrl") val nzbUrl: String? = null,
++    @Json(name = "servers") val servers: Any? = null,
++    @Json(name = "fileMustInclude") val fileMustInclude: Any? = null
+ )
+ 
+ @JsonClass(generateAdapter = true)
 diff --git a/app/src/main/java/com/nuvio/tv/data/remote/dto/trakt/TraktSyncDtos.kt b/app/src/main/java/com/nuvio/tv/data/remote/dto/trakt/TraktSyncDtos.kt
 index 3cf89e0dc..d4ec24b46 100644
 --- a/app/src/main/java/com/nuvio/tv/data/remote/dto/trakt/TraktSyncDtos.kt
@@ -434048,20 +436914,50 @@ index 000000000..7f7f3a06e
 +    (seeds.map { it.contentId + ":" + it.weight.toInt() } + leftOut.sorted().map(Int::toString) +
 +        leftOutLanguages.sorted().map { "lang:$it" }).joinToString(",")
 diff --git a/app/src/main/java/com/nuvio/tv/domain/model/Stream.kt b/app/src/main/java/com/nuvio/tv/domain/model/Stream.kt
-index 721536401..d4cd3be79 100644
+index 721536401..3bcc50146 100644
 --- a/app/src/main/java/com/nuvio/tv/domain/model/Stream.kt
 +++ b/app/src/main/java/com/nuvio/tv/domain/model/Stream.kt
-@@ -30,7 +30,9 @@ data class Stream(
+@@ -30,7 +30,10 @@ data class Stream(
      val badges: List<StreamBadge> = emptyList(),
      val subtitles: List<Subtitle> = emptyList(),
      val serverTarget: ServerPlaybackTarget? = null,
 -    val pluginSourceName: String? = null
 +    val pluginSourceName: String? = null,
++    @Transient val usenet: UsenetSource? = null,
 +    /** True when [url] was produced by Nuvio's own debrid resolver, not returned by the add-on. */
 +    val debridResolved: Boolean = false
  ) {
      /**
       * Returns the primary stream source URL
+@@ -149,7 +152,7 @@ data class Stream(
+     fun stableKey(occurrence: Int = 0): String = buildString {
+         append(addonName)
+         append('\u0000')
+-        append(url ?: infoHash ?: clientResolve?.infoHash ?: ytId ?: externalUrl ?: serverTarget?.key() ?: "")
++        append(url ?: infoHash ?: clientResolve?.infoHash ?: ytId ?: externalUrl ?: serverTarget?.key() ?: usenet?.identity ?: "")
+         append('\u0000')
+         append(getEffectiveFileIdx() ?: "")
+         append('\u0000')
+@@ -167,6 +170,19 @@ data class Stream(
+     }
+ }
+ 
++/** Provider URLs can contain credentials. Keep only the digest in UI keys and diagnostics. */
++data class UsenetSource(val nzbUrl: String, val servers: List<String>, val filters: List<String>) {
++    val identity by lazy {
++        val digest = java.security.MessageDigest.getInstance("SHA-256")
++        for (field in listOf(nzbUrl) + servers + filters) {
++            digest.update(field.toByteArray(Charsets.UTF_8))
++            digest.update(0)
++        }
++        digest.digest().joinToString("") { "%02x".format(it) }
++    }
++    override fun toString() = "UsenetSource(redacted)"
++}
++
+ @Immutable
+ @Serializable
+ data class StreamBadge(
 diff --git a/app/src/main/java/com/nuvio/tv/domain/model/V2Appearance.kt b/app/src/main/java/com/nuvio/tv/domain/model/V2Appearance.kt
 new file mode 100644
 index 000000000..bd709b5f9
@@ -548765,7 +551661,7 @@ index 000000000..51405f354
 +    else -> VpnR.string.vpn_scope_off_detail
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreen.kt
-index c89ee78bf..223d931f9 100644
+index c89ee78bf..d44037109 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreen.kt
 @@ -16,6 +16,8 @@ import androidx.compose.animation.slideInHorizontally
@@ -548792,7 +551688,42 @@ index c89ee78bf..223d931f9 100644
  import com.nuvio.tv.ui.util.toAbsoluteAlignment
  import com.nuvio.tv.ui.util.localizeEpisodeTitle
  import androidx.tv.material3.Border
-@@ -642,6 +651,7 @@ internal fun StreamBackdrop(
+@@ -217,7 +226,7 @@ fun StreamScreen(
+     }
+ 
+     fun launchInternalPlayer(playbackInfo: StreamPlaybackInfo) {
+-        viewModel.onInternalPlayerLaunching()
++        viewModel.onInternalPlayerLaunching(playbackInfo.url)
+         onStreamSelected(playbackInfo)
+     }
+ 
+@@ -286,7 +295,7 @@ fun StreamScreen(
+                     viewModel.onEvent(StreamScreenEvent.OnAutoPlayConsumed)
+                 }
+                 else -> {
+-                    viewModel.onInternalPlayerLaunching()
++                    viewModel.onInternalPlayerLaunching(playbackInfo.url)
+                     onAutoPlayResolved(playbackInfo)
+                 }
+             }
+@@ -401,7 +410,7 @@ fun StreamScreen(
+                     viewModel.onEvent(StreamScreenEvent.OnAutoPlayConsumed)
+                 }
+                 else -> {
+-                    viewModel.onInternalPlayerLaunching()
++                    viewModel.onInternalPlayerLaunching(playbackInfo.url)
+                     onAutoPlayResolved(playbackInfo)
+                     viewModel.onEvent(StreamScreenEvent.OnAutoPlayConsumed)
+                 }
+@@ -591,6 +600,7 @@ fun StreamScreen(
+                     pendingPlaybackInfo = null
+                 },
+                 onDismiss = {
++                    viewModel.releasePendingUsenetPlayback()
+                     showPlayerChoiceDialog = false
+                     pendingPlaybackInfo = null
+                 }
+@@ -642,6 +652,7 @@ internal fun StreamBackdrop(
  
      Box(modifier = modifier
          .fillMaxSize()
@@ -548800,7 +551731,7 @@ index c89ee78bf..223d931f9 100644
          .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
      ) {
          // Backdrop image
-@@ -954,33 +964,24 @@ private fun RightStreamSection(
+@@ -954,33 +965,24 @@ private fun RightStreamSection(
                  modifier = Modifier
                      .fillMaxSize()
                      .clip(RoundedCornerShape(NuvioTheme.radii.xl))
@@ -548846,7 +551777,7 @@ index c89ee78bf..223d931f9 100644
                  }
  
                  ForkStreamRefreshStatus(
-@@ -1109,6 +1110,11 @@ private fun ErrorState(
+@@ -1109,6 +1111,11 @@ private fun ErrorState(
  
          Spacer(modifier = Modifier.height(NuvioTheme.spacing.xl))
  
@@ -548858,7 +551789,7 @@ index c89ee78bf..223d931f9 100644
          var isFocused by remember { mutableStateOf(false) }
          Card(
              onClick = onRetry,
-@@ -1133,6 +1139,7 @@ private fun ErrorState(
+@@ -1133,6 +1140,7 @@ private fun ErrorState(
                  modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp)
              )
          }
@@ -548866,7 +551797,7 @@ index c89ee78bf..223d931f9 100644
      }
  }
  
-@@ -1469,8 +1476,12 @@ private fun StreamCard(
+@@ -1469,8 +1477,12 @@ private fun StreamCard(
          }
      }
  
@@ -548880,7 +551811,7 @@ index c89ee78bf..223d931f9 100644
          modifier = Modifier
              .fillMaxWidth()
              .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
-@@ -1482,24 +1493,7 @@ private fun StreamCard(
+@@ -1482,24 +1494,7 @@ private fun StreamCard(
                  if (event.nativeKeyEvent.action == KeyEvent.ACTION_DOWN && event.key == Key.DirectionUp) {
                      onUpKey(); true
                  } else false
@@ -548906,7 +551837,7 @@ index c89ee78bf..223d931f9 100644
      ) {
          Row(
              modifier = Modifier
-@@ -1613,6 +1607,83 @@ private fun StreamCard(
+@@ -1613,6 +1608,83 @@ private fun StreamCard(
      }
  }
  
@@ -548990,7 +551921,7 @@ index c89ee78bf..223d931f9 100644
  @Composable
  private fun outlineBorder(outlined: Boolean, shape: RoundedCornerShape): Border =
      if (outlined) {
-@@ -1636,6 +1707,31 @@ internal fun PlayerChoiceDialog(
+@@ -1636,6 +1708,31 @@ internal fun PlayerChoiceDialog(
          focusRequester.requestFocus()
      }
  
@@ -549022,6 +551953,123 @@ index c89ee78bf..223d931f9 100644
      androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
          Box(
              modifier = Modifier
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
+index 28089142b..563d53926 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
+@@ -12,6 +12,8 @@ import com.nuvio.tv.core.debrid.DirectDebridResolver
+ import com.nuvio.tv.core.debrid.DirectDebridStreamPreparer
+ import com.nuvio.tv.core.plugin.PluginManager
+ import com.nuvio.tv.core.network.NetworkResult
++import com.nuvio.tv.core.usenet.UsenetFailure
++import com.nuvio.tv.core.usenet.UsenetPlayback
+ import com.nuvio.tv.core.torrent.TorrentSettings
+ import com.nuvio.tv.core.torrent.TorrentService
+ import com.nuvio.tv.core.torrent.TorrentState
+@@ -117,6 +119,8 @@ class StreamScreenViewModel @Inject constructor(
+     private var directAutoPlayModeInitializedForSession = false
+     private var directAutoPlayFlowEnabledForSession = false
+     private var isTorrentStreamStarted = false
++    private var usenetPrepareJob: Job? = null
++    private val pendingUsenetPlayback = com.nuvio.tv.core.usenet.PendingUsenetPlayback(UsenetPlayback::release)
+     private var streamLoadJob: Job? = null
+     private var streamLoadScope: kotlinx.coroutines.CoroutineScope? = null
+     private var streamLoadCompleted = false
+@@ -1525,7 +1529,35 @@ class StreamScreenViewModel @Inject constructor(
+     }
+ 
+     suspend fun resolveStreamForPlayback(stream: Stream, saveLastLink: Boolean = true): StreamPlaybackInfo? {
++        pendingUsenetPlayback.release()
++        usenetPrepareJob?.let { previous ->
++            previous.cancel()
++            usenetPrepareJob = null
++            updateUiStateIfChanged { it.copy(showDirectAutoPlayOverlay = false, directAutoPlayMessage = null) }
++        }
+         stream.serverTarget?.let { target -> return prepareServerStream(stream, target) }
++        if (stream.usenet != null) {
++            val preparing = kotlin.coroutines.coroutineContext[Job]
++            usenetPrepareJob = preparing
++            updateUiStateIfChanged { it.copy(showDirectAutoPlayOverlay = true,
++                directAutoPlayMessage = context.getString(R.string.usenet_opening), playbackErrorMessage = null) }
++            return try {
++                val resolved = UsenetPlayback.resolve(stream, videoId, season, episode)
++                pendingUsenetPlayback.replace(requireNotNull(resolved.url))
++                updateUiStateIfChanged { it.copy(showDirectAutoPlayOverlay = it.isDirectAutoPlayFlow, directAutoPlayMessage = null) }
++                getStreamForPlayback(resolved, saveLastLink)
++            } catch (error: UsenetFailure) {
++                showDirectDebridPlaybackError(error.message.orEmpty(), refreshStreams = false)
++                null
++            } finally {
++                if (usenetPrepareJob === preparing) {
++                    usenetPrepareJob = null
++                    if (preparing?.isCancelled == true) updateUiStateIfChanged {
++                        it.copy(showDirectAutoPlayOverlay = false, directAutoPlayMessage = null)
++                    }
++                }
++            }
++        }
+         if (stream.youTubeIdToResolve() != null) {
+             return resolveYouTubeStreamForPlayback(stream)
+         }
+@@ -1708,13 +1740,16 @@ class StreamScreenViewModel @Inject constructor(
+         updateUiStateIfChanged { it.copy(playbackErrorMessage = null) }
+     }
+ 
+-    fun onInternalPlayerLaunching() {
++    fun onInternalPlayerLaunching(url: String? = null) {
++        pendingUsenetPlayback.handoff(url)
+         streamRepository.setLocalPluginSearchPaused(false)
+         updateUiStateIfChanged {
+             it.copy(showDirectAutoPlayOverlay = false, directAutoPlayMessage = null)
+         }
+     }
+ 
++    fun releasePendingUsenetPlayback() = pendingUsenetPlayback.release()
++
+     /**
+      * Returns true if an external player is currently active (launched but not yet returned).
+      * Used to keep the overlay visible while external player is on screen.
+@@ -1757,6 +1792,7 @@ class StreamScreenViewModel @Inject constructor(
+         if (System.currentTimeMillis() - externalPlayerLaunchTimeMs < 500L) return
+         externalPlayerLaunched = false
+         externalPlayerLaunchTimeMs = 0L
++        pendingUsenetPlayback.externalPlayerReturned()
+         if (isTorrentStreamStarted) {
+             torrentService.stopStream()
+             isTorrentStreamStarted = false
+@@ -1885,6 +1921,8 @@ class StreamScreenViewModel @Inject constructor(
+ 
+     override fun onCleared() {
+         super.onCleared()
++        usenetPrepareJob?.cancel()
++        pendingUsenetPlayback.release()
+         if (isTorrentStreamStarted && !externalPlaybackTracker.isOwningTorrentStream) {
+             torrentService.stopStream()
+             isTorrentStreamStarted = false
+@@ -2150,8 +2188,14 @@ class StreamScreenViewModel @Inject constructor(
+                 ownsTorrentStream = isTorrentStreamStarted,
+                 context = context
+             )
++            if (launched) {
++                pendingUsenetPlayback.handoffExternal(url)
++            }
+         } finally {
+-            if (!launched) abortExternalHandoff()
++            if (!launched) {
++                pendingUsenetPlayback.release(url)
++                abortExternalHandoff()
++            }
+         }
+     }
+ 
+@@ -2160,6 +2204,7 @@ class StreamScreenViewModel @Inject constructor(
+         streamRepository.setLocalPluginSearchPaused(false)
+         externalPlayerLaunched = false
+         externalPlayerLaunchTimeMs = 0L
++        pendingUsenetPlayback.externalPlayerReturned()
+         if (isTorrentStreamStarted) {
+             torrentService.stopStream()
+             isTorrentStreamStarted = false
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
 index 9572f75df..376fddc2d 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/tvchannels/TvChannelsScreen.kt
@@ -759213,7 +762261,7 @@ index 000000000..824575f29
 +    <string name="scout_menu_visible_sub">Scout\'s Home rows keep their own switches</string>
 +</resources>
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index b4264552c..285063bfb 100644
+index b4264552c..4cde6cbf5 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
 @@ -343,6 +343,8 @@
@@ -759427,7 +762475,15 @@ index b4264552c..285063bfb 100644
      <string name="library_empty_simkl_not_auth_title">Simkl not connected</string>
      <string name="library_empty_simkl_not_auth_subtitle">Connect your Simkl account in Settings to view your Simkl library</string>
      <string name="library_list_create_dialog_title">Create List</string>
-@@ -2586,6 +2679,8 @@
+@@ -2306,6 +2399,7 @@
+     <string name="cloud_library_type_all">All</string>
+     <string name="cloud_library_type_torrents">Torrents</string>
+     <string name="cloud_library_type_usenet">Usenet</string>
++    <string name="usenet_opening">Opening Usenet video…</string>
+     <string name="cloud_library_type_web">Web</string>
+     <string name="cloud_library_type_files">Files</string>
+ 
+@@ -2586,6 +2680,8 @@
      <string name="update_checking">Checking for updates…</string>
      <string name="update_waiting_for_stable">You’ll receive the next stable release when it becomes available</string>
      <string name="update_download_complete">Download complete. Ready to install.</string>
@@ -759436,7 +762492,7 @@ index b4264552c..285063bfb 100644
      <string name="update_installed_automatically">Updated automatically while the device was idle</string>
      <string name="update_up_to_date">System is up to date. Latest changes:</string>
      <string name="update_close">Close</string>
-@@ -2678,6 +2773,13 @@
+@@ -2678,6 +2774,13 @@
      <string name="cd_switch_player_engine">Switch player engine</string>
      <string name="cd_episodes">Episodes</string>
      <string name="player_chapter_number">Chapter %1$d</string>
@@ -759450,7 +762506,7 @@ index b4264552c..285063bfb 100644
      <string name="player_chapters">Chapters</string>
      <string name="player_chapters_title">Chapters (%1$d)</string>
      <string name="player_chapter_remaining">%1$s left</string>
-@@ -3508,17 +3610,17 @@
+@@ -3508,17 +3611,17 @@
      <string name="stream_test_no_stream">No playback recorded. Play a video to run diagnostic tests on its host.</string>
      <string name="stream_test_btn_start">Start Test</string>
      <string name="stream_test_btn_measuring_baseline">Measuring Baseline...</string>
@@ -759476,7 +762532,7 @@ index b4264552c..285063bfb 100644
      <string name="stream_test_error_prefix">Error: %1$s</string>
      <string name="stream_test_video_bitrate">Average Video Bitrate: %1$s</string>
      <string name="stream_test_error_connection">Connection failed. The last played stream link may have expired or is unreachable. Please play the video again and retry.</string>
-@@ -3585,9 +3687,7 @@
+@@ -3585,9 +3688,7 @@
      <string name="autosync_tolerance_value">%1$d ms</string>
      <string name="autosync_thorough_title">Thorough Auto Sync Search</string>
      <string name="autosync_thorough_description">Keep comparing other subtitles and embedded tracks for a closer match before syncing. When off, the first strong match is used sooner. Only confident matches are ever applied.</string>
@@ -759487,7 +762543,7 @@ index b4264552c..285063bfb 100644
      <string name="autosync_label_synced">Auto synced</string>
      <string name="stream_resume_from_time">Resume from %1$s</string>
      <string name="stream_resume_from_percent">Resume from %1$d%%</string>
-@@ -3743,4 +3843,16 @@
+@@ -3743,4 +3844,16 @@
      <string name="iptv_free_channel_count">%1$d channels</string>
      <string name="iptv_free_source_summary">Free channels · %1$d countries · %2$d channels</string>
      <string name="iptv_free_source_summary_short">Free channels · %1$d countries</string>
@@ -774582,6 +777638,28 @@ index 000000000..7f07ead02
 +        } catch (_: AutomaticUpdateDeferred) { }
 +    }
 +}
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index 4c5748cab..3df677964 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -29,6 +29,8 @@ jsoup = "1.17.2"
+ gson = "2.10.1"
+ markdownRenderer = "0.33.0"
+ nanohttpd = "2.3.1"
++re2j = "1.8"
++xz = "1.10"
+ cloudstream = "v4.7.0"
+ nicehttp = "0.4.16"
+ conscrypt = { strictly = "2.5.2" }
+@@ -116,6 +118,8 @@ quickjs-kt = { group = "io.github.dokar3", name = "quickjs-kt-android", version.
+ jsoup = { group = "org.jsoup", name = "jsoup", version.ref = "jsoup" }
+ gson = { group = "com.google.code.gson", name = "gson", version.ref = "gson" }
+ nanohttpd = { group = "org.nanohttpd", name = "nanohttpd", version.ref = "nanohttpd" }
++re2j = { group = "com.google.re2j", name = "re2j", version.ref = "re2j" }
++xz = { group = "org.tukaani", name = "xz", version.ref = "xz" }
+ cloudstream-library = { group = "com.github.recloudstream.cloudstream", name = "library", version.ref = "cloudstream" }
+ nicehttp = { group = "com.github.Blatzar", name = "NiceHttp", version.ref = "nicehttp" }
+ conscrypt-android = { group = "org.conscrypt", name = "conscrypt-android", version.ref = "conscrypt" }
 diff --git a/settings.gradle.kts b/settings.gradle.kts
 index 8aa713207..345504f25 100644
 --- a/settings.gradle.kts
