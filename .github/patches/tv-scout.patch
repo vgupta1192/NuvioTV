@@ -343444,6 +343444,25 @@ zoPc4!(#;NU8?tj+2Qk%bhgg1wG;=qjFg?uRe^}$fu*T4&3ltEBwb*9k6Jy{XYYHj6
 z?g&}`8L8lc?I&}|F8e5(VOTrLej}{0`)1Jn&nSN1UL@A{3#h4{DFm`=m5%HU;g|B#
 c;%rPIj*&>nhR@RZf|ML1tli2PeXK72KU_@#asU7T
 
+diff --git a/app/proguard-rules.pro b/app/proguard-rules.pro
+index 772eb86a8..dc5ad46d4 100644
+--- a/app/proguard-rules.pro
++++ b/app/proguard-rules.pro
+@@ -177,3 +177,14 @@
+ -dontwarn java.beans.Transient
+ # dnsjava (used by the YouTube engine) mentions desktop-Java classes that Android doesn't have and never calls.
+ -dontwarn org.xbill.DNS.spi.**
++
++# Stores decode JSON by reflective field walk (gson.fromJson(json, Class::class.java), or
++# TypeTokens whose element graph Gson walks the same way): CwProjectionStore, DeviceWatchEventStore,
++# WatchStateMutationStore, DebridSettingsDataStore. R8 renames fields and strips generic
++# signatures of obfuscated classes, so a Map<String, X> field then decodes its values as Gson
++# LinkedTreeMaps and every typed read ClassCastException-crashes (release-only, at startup).
++# Keep the persisted graphs' field names and signatures: real JSON keys also survive across builds.
++-keep class com.nuvio.tv.data.cw.** { <fields>; }
++-keep class com.nuvio.tv.data.local.** { <fields>; }
++-keep class com.nuvio.tv.core.tracking.** { <fields>; }
++-keep class com.nuvio.tv.core.sync.** { <fields>; }
 diff --git a/app/src/androidTest/java/com/nuvio/tv/ui/screens/addon/AddonManagerFocusRestorationTest.kt b/app/src/androidTest/java/com/nuvio/tv/ui/screens/addon/AddonManagerFocusRestorationTest.kt
 new file mode 100644
 index 000000000..80ba34f4e
@@ -437552,12 +437571,13 @@ index 000000000..5a7169ec7
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/data/cw/CwProjectionStore.kt b/app/src/main/java/com/nuvio/tv/data/cw/CwProjectionStore.kt
 new file mode 100644
-index 000000000..afa2053ba
+index 000000000..a5d2c2b2f
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/data/cw/CwProjectionStore.kt
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,74 @@
 +package com.nuvio.tv.data.cw
 +
++import android.util.Log
 +import com.google.gson.Gson
 +import com.google.gson.reflect.TypeToken
 +import com.nuvio.tv.data.local.CachedInProgressItem
@@ -437574,11 +437594,22 @@ index 000000000..afa2053ba
 +    fun read(profile: Int, source: String): CwProjection {
 +        val target = file(profile, source)
 +        if (target.exists()) {
-+            val json = com.google.gson.JsonParser.parseString(target.readText()).asJsonObject
-+            val decoded = gson.fromJson(json, CwProjection::class.java)
-+            val value = if (json.has("completed")) decoded else decoded.copy(completed = emptyMap())
-+            require(value.schema == 1 && value.profileId == profile && value.source == source) { "Invalid CW projection" }
-+            return value
++            // A file a broken build wrote (unreadable, wrong shape or another profile's) must
++            // never crash-loop the app: start fresh and let the write replace it; the selected
++            // provider's next refresh rebuilds the cards.
++            val decoded = try {
++                val json = com.google.gson.JsonParser.parseString(target.readText()).asJsonObject
++                val value = gson.fromJson(json, CwProjection::class.java).let { parsed ->
++                    if (json.has("completed")) parsed else parsed.copy(completed = emptyMap())
++                }
++                require(value.schema == 1 && value.profileId == profile && value.source == source) { "Invalid CW projection" }
++                value
++            } catch (t: Throwable) {
++                Log.w(TAG, "CW projection unreadable (${t.javaClass.simpleName}); starting fresh")
++                runCatching { target.delete() }
++                null
++            } ?: return CwProjection(profileId = profile, source = source)
++            return decoded
 +        }
 +        // Claim the legacy snapshot only once, for the first selected source. Keep the old
 +        // files intact: migration must not clear a user's history or enrichment cache.
@@ -437612,6 +437643,10 @@ index 000000000..afa2053ba
 +        // rename(2) atomically replaces a same-directory file on every supported
 +        // Android API. On failure it throws and leaves the previous revision intact.
 +        Os.rename(pending.path, target.path)
++    }
++
++    private companion object {
++        const val TAG = "CwProjectionStore"
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/data/cw/ScopedCwProjection.kt b/app/src/main/java/com/nuvio/tv/data/cw/ScopedCwProjection.kt
