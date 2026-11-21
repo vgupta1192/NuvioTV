@@ -428059,7 +428059,7 @@ index 000000000..b1a32a5b9
 +internal fun isFreshLaunchIntent(hasSavedInstanceState: Boolean, intentFlags: Int): Boolean =
 +    !hasSavedInstanceState && intentFlags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY == 0
 diff --git a/app/src/main/java/com/nuvio/tv/MainActivity.kt b/app/src/main/java/com/nuvio/tv/MainActivity.kt
-index 89d1031ea..8c7150e78 100644
+index 89d1031ea..4d522ec5d 100644
 --- a/app/src/main/java/com/nuvio/tv/MainActivity.kt
 +++ b/app/src/main/java/com/nuvio/tv/MainActivity.kt
 @@ -34,6 +34,7 @@ import androidx.compose.foundation.clickable
@@ -428952,7 +428952,7 @@ index 89d1031ea..8c7150e78 100644
      }
  
      private fun captureDeepLinkIntent(intent: Intent?) {
-@@ -1516,8 +2070,119 @@ open class MainActivity : ComponentActivity() {
+@@ -1516,8 +2070,120 @@ open class MainActivity : ComponentActivity() {
          pendingLaunchIntent.value = intent
      }
  
@@ -429063,6 +429063,7 @@ index 89d1031ea..8c7150e78 100644
 +
      override fun onPause() {
 +        HomeForegroundDelivery.detach(this)
++        volumeKeyRepeat.stop() // a held volume button leaving the foreground would never send UP
 +        builtMapper()?.let {
 +            it.actionExecutor.detachForegroundHandler(this)
 +            it.cancelPendingGestures()
@@ -429072,7 +429073,18 @@ index 89d1031ea..8c7150e78 100644
          if (::jankStats.isInitialized) jankStats.isTrackingEnabled = false
      }
  
-@@ -1539,6 +2204,22 @@ open class MainActivity : ComponentActivity() {
+@@ -1532,6 +2198,10 @@ open class MainActivity : ComponentActivity() {
+ 
+     private val ambientIdleController = AmbientIdleController()
+ 
++    // Launcher: volume stepping while the remote button is held (the accessibility key filter
++    // switches Android's own key auto-repeat off).
++    private val volumeKeyRepeat by lazy { com.nuvio.tv.core.launcher.VolumeKeyRepeatController(this) }
++
+     override fun onUserInteraction() {
+         super.onUserInteraction()
+         ambientIdleController.onInteraction()
+@@ -1539,6 +2209,22 @@ open class MainActivity : ComponentActivity() {
      }
  
      override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -429095,7 +429107,7 @@ index 89d1031ea..8c7150e78 100644
          // Nuvio fork: OLED screensaver — while the dim overlay is visible, the first key
          // press wakes it and the whole press (down, repeats, matching up) is swallowed so
          // waking never also navigates (ported from Nuvio-KE).
-@@ -1557,6 +2238,28 @@ open class MainActivity : ComponentActivity() {
+@@ -1557,7 +2243,35 @@ open class MainActivity : ComponentActivity() {
          }
          screensaverController.notifyInteraction()
          if (com.nuvio.tv.core.sound.DxSounds.onKey(this, event)) return true // dx.bi sounds hook
@@ -429122,9 +429134,16 @@ index 89d1031ea..8c7150e78 100644
 +            return true
 +        }
          if (ambientIdleController.consumeKeyEvent(event)) return true
++        // Launcher: with the accessibility key filter on, Android stops auto-repeating held keys
++        // (only the first down and the final up arrive), so holding Volume moved one step per press.
++        // Step on our own timer here instead; the ambient wake above still claims the first press.
++        if (com.nuvio.tv.core.launcher.VolumeKeyRepeatController.handles(event.keyCode)) {
++            return volumeKeyRepeat.onKeyEvent(event)
++        }
          if (event.keyCode == KeyEvent.KEYCODE_BACK) {
              if (longPressBackHeld.value) {
-@@ -1573,17 +2276,29 @@ open class MainActivity : ComponentActivity() {
+                 if (event.action == KeyEvent.ACTION_UP) longPressBackHeld.value = false
+@@ -1573,17 +2287,32 @@ open class MainActivity : ComponentActivity() {
              }
              return true
          }
@@ -429143,7 +429162,10 @@ index 89d1031ea..8c7150e78 100644
  
      override fun onWindowFocusChanged(hasFocus: Boolean) {
          super.onWindowFocusChanged(hasFocus)
-+        if (!hasFocus) builtMapper()?.cancelPendingGestures()
++        if (!hasFocus) {
++            builtMapper()?.cancelPendingGestures()
++            volumeKeyRepeat.stop()
++        }
          // Nuvio fork: Compose dialogs are separate platform windows whose keys never reach
          // this Activity — pause screensaver idle detection while this window lacks focus.
          screensaverController.setWindowFocused(hasFocus)
@@ -429154,7 +429176,7 @@ index 89d1031ea..8c7150e78 100644
          // Returning from an external player: raise the auto-next loader before the player's
          // result is dispatched and before the window repaints, so the transition shows the
          // loader instantly with no episode-list flash. No-op unless a series episode is being
-@@ -1595,9 +2310,20 @@ open class MainActivity : ComponentActivity() {
+@@ -1595,9 +2324,20 @@ open class MainActivity : ComponentActivity() {
          androidTvChannelSyncService.onForegroundChanged(true)
          // Nuvio fork: a quick return is not idle for the nightly self-trim.
          nightlySelfTrim.onAppForegrounded()
@@ -429175,7 +429197,7 @@ index 89d1031ea..8c7150e78 100644
          externalPlaybackTracker.onExternalPlayerCoveredApp()
          super.onStop()
          startupSyncService.stopPeriodicSurfacePulls()
-@@ -1606,11 +2332,17 @@ open class MainActivity : ComponentActivity() {
+@@ -1606,11 +2346,17 @@ open class MainActivity : ComponentActivity() {
          androidTvChannelSyncService.onForegroundChanged(false)
          // Nuvio fork: schedule the nightly self-trim while backgrounded.
          nightlySelfTrim.onAppBackgrounded()
@@ -429194,7 +429216,7 @@ index 89d1031ea..8c7150e78 100644
      }
  }
  
-@@ -1742,7 +2474,10 @@ private fun LegacySidebarScaffold(
+@@ -1742,7 +2488,10 @@ private fun LegacySidebarScaffold(
      var legacyDrawerInteractionVersion by remember { mutableStateOf(0) }
  
  
@@ -429206,7 +429228,7 @@ index 89d1031ea..8c7150e78 100644
          pendingSidebarFocusRequest = true
          drawerState.setValue(DrawerValue.Open)
      }
-@@ -1881,14 +2616,36 @@ private fun LegacySidebarScaffold(
+@@ -1881,14 +2630,36 @@ private fun LegacySidebarScaffold(
                          }
                      }
  
@@ -429248,7 +429270,7 @@ index 89d1031ea..8c7150e78 100644
                          drawerItems.forEach { item ->
                              key(item.route) {
                                  LegacySidebarButton(
-@@ -1917,6 +2674,7 @@ private fun LegacySidebarScaffold(
+@@ -1917,6 +2688,7 @@ private fun LegacySidebarScaffold(
                          }
                      }
                  }
@@ -429256,7 +429278,7 @@ index 89d1031ea..8c7150e78 100644
              }
          }
          }
-@@ -1979,9 +2737,43 @@ private fun LegacySidebarScaffold(
+@@ -1979,9 +2751,43 @@ private fun LegacySidebarScaffold(
                      }
                  }
          ) {
@@ -429301,7 +429323,7 @@ index 89d1031ea..8c7150e78 100644
              ) {
                  NuvioNavHost(
                      navController = navController,
-@@ -2104,8 +2896,9 @@ private fun LegacySidebarButton(
+@@ -2104,8 +2910,9 @@ private fun LegacySidebarButton(
  private fun ModernSidebarScaffold(
      longPressBackHeld: MutableState<Boolean>,
      navController: NavHostController,
@@ -429312,7 +429334,7 @@ index 89d1031ea..8c7150e78 100644
      rootRoutes: Set<String>,
      drawerItems: List<DrawerItem>,
      selectedDrawerRoute: String?,
-@@ -2123,6 +2916,7 @@ private fun ModernSidebarScaffold(
+@@ -2123,6 +2930,7 @@ private fun ModernSidebarScaffold(
  ) {
      val showSidebar = currentRoute in rootRoutes && !LiveTvPlayerSidebarGate.playerActive
      val sidebarTokens = NuvioComponents.tokens.sidebar
@@ -429320,7 +429342,7 @@ index 89d1031ea..8c7150e78 100644
      val collapsedSidebarWidth = if (sidebarCollapsed) NuvioTheme.spacing.none else sidebarTokens.collapsedWidth
      val openSidebarWidth = sidebarTokens.expandedWidth
  
-@@ -2137,6 +2931,18 @@ private fun ModernSidebarScaffold(
+@@ -2137,6 +2945,18 @@ private fun ModernSidebarScaffold(
      var pendingContentFocusTransfer by remember { mutableStateOf(false) }
      var pendingSidebarFocusRequest by remember { mutableStateOf(false) }
      var focusedDrawerIndex by remember { mutableStateOf(-1) }
@@ -429339,7 +429361,7 @@ index 89d1031ea..8c7150e78 100644
      var isFloatingPillIconOnly by remember { mutableStateOf(false) }
      var pillExpandRequestCount by remember { mutableIntStateOf(0) }
      val keepFloatingPillExpanded = false
-@@ -2176,7 +2982,10 @@ private fun ModernSidebarScaffold(
+@@ -2176,7 +2996,10 @@ private fun ModernSidebarScaffold(
          }
      }
  
@@ -429351,7 +429373,7 @@ index 89d1031ea..8c7150e78 100644
          isSidebarExpanded = true
          sidebarCollapsePending = false
          pendingSidebarFocusRequest = true
-@@ -2216,9 +3025,16 @@ private fun ModernSidebarScaffold(
+@@ -2216,9 +3039,16 @@ private fun ModernSidebarScaffold(
      }
  
      val sidebarVisible = showSidebar && (isSidebarExpanded || !sidebarCollapsed)
@@ -429370,7 +429392,7 @@ index 89d1031ea..8c7150e78 100644
      // re-layouts and haze doesn't re-render blur every frame.
      val sidebarWidth = if (sidebarVisible) openSidebarWidth else collapsedSidebarWidth
      val animationDuration = if (sidebarVisible) 400 else 300
-@@ -2230,7 +3046,6 @@ private fun ModernSidebarScaffold(
+@@ -2230,7 +3060,6 @@ private fun ModernSidebarScaffold(
          animationSpec = tween(durationMillis = if (isSidebarExpanded) 280 else 200, easing = animationEasing),
          label = "sidebarSurfaceAlpha"
      )
@@ -429378,7 +429400,7 @@ index 89d1031ea..8c7150e78 100644
      val sidebarTransition = updateTransition(
          targetState = isSidebarExpanded,
          label = "sidebarTransition"
-@@ -2238,7 +3053,7 @@ private fun ModernSidebarScaffold(
+@@ -2238,7 +3067,7 @@ private fun ModernSidebarScaffold(
      // Labels and icons are always at full size — the panel is rendered
      // complete and the open/close animation is purely graphicsLayer.
      val sidebarLabelAlpha = 1f
@@ -429387,7 +429409,7 @@ index 89d1031ea..8c7150e78 100644
          transitionSpec = {
              if (targetState) {
                  tween(durationMillis = NuvioMotion.tokens.durations.sidebarPanelIn, easing = FastOutSlowInEasing)
-@@ -2250,11 +3065,67 @@ private fun ModernSidebarScaffold(
+@@ -2250,11 +3079,67 @@ private fun ModernSidebarScaffold(
      ) { expanded ->
          if (expanded) 1f else 0f
      }
@@ -429455,7 +429477,7 @@ index 89d1031ea..8c7150e78 100644
  
      val sidebarIconScale = 1f
      val sidebarBloomScale = 1f
-@@ -2298,6 +3169,14 @@ private fun ModernSidebarScaffold(
+@@ -2298,6 +3183,14 @@ private fun ModernSidebarScaffold(
          modifier = Modifier
              .fillMaxSize()
              .onPreviewKeyEvent { keyEvent ->
@@ -429470,7 +429492,7 @@ index 89d1031ea..8c7150e78 100644
                  // Consume all Back key events after long-press until released,
                  // preventing the exit-app BackHandler from firing during the hold.
                  if (longPressBackHeld.value && keyEvent.key == Key.Back) {
-@@ -2311,7 +3190,7 @@ private fun ModernSidebarScaffold(
+@@ -2311,7 +3204,7 @@ private fun ModernSidebarScaffold(
              modifier = Modifier
                  .fillMaxSize()
                  .then(
@@ -429479,7 +429501,7 @@ index 89d1031ea..8c7150e78 100644
                      else Modifier
                  )
                  .onPreviewKeyEvent { keyEvent ->
-@@ -2342,7 +3221,10 @@ private fun ModernSidebarScaffold(
+@@ -2342,7 +3235,10 @@ private fun ModernSidebarScaffold(
                      if (
                          isSidebarExpanded &&
                          !sidebarCollapsePending &&
@@ -429491,7 +429513,7 @@ index 89d1031ea..8c7150e78 100644
                          keyEvent.type == KeyEventType.KeyDown &&
                          isBlockedContentKey(keyEvent.key)
                      ) {
-@@ -2381,33 +3263,77 @@ private fun ModernSidebarScaffold(
+@@ -2381,33 +3277,77 @@ private fun ModernSidebarScaffold(
                      }
                  }
          ) {
@@ -429579,7 +429601,7 @@ index 89d1031ea..8c7150e78 100644
                          transformOrigin = TransformOrigin(0f, 0f)
                      }
                      .selectableGroup()
-@@ -2419,10 +3345,18 @@ private fun ModernSidebarScaffold(
+@@ -2419,10 +3359,18 @@ private fun ModernSidebarScaffold(
                              Key.DirectionUp -> {
                                  if (focusedDrawerIndex == sidebarTopBoundaryIndex) {
                                      true
@@ -429599,7 +429621,7 @@ index 89d1031ea..8c7150e78 100644
                                      true
                                  }
                              }
-@@ -2440,7 +3374,9 @@ private fun ModernSidebarScaffold(
+@@ -2440,7 +3388,9 @@ private fun ModernSidebarScaffold(
                                      }
                                      true
                                  } else {
@@ -429610,7 +429632,7 @@ index 89d1031ea..8c7150e78 100644
                                      true
                                  }
                              }
-@@ -2448,7 +3384,10 @@ private fun ModernSidebarScaffold(
+@@ -2448,7 +3398,10 @@ private fun ModernSidebarScaffold(
                              Key.DirectionRight, Key.DirectionLeft -> {
                                  val collapseKey = if (isRtl) Key.DirectionLeft else Key.DirectionRight
                                  if (keyEvent.key == collapseKey) {
@@ -429622,7 +429644,7 @@ index 89d1031ea..8c7150e78 100644
                                      sidebarCollapsePending = true
                                      true
                                  } else {
-@@ -2460,29 +3399,59 @@ private fun ModernSidebarScaffold(
+@@ -2460,29 +3413,59 @@ private fun ModernSidebarScaffold(
                          }
                      }
              ) {
@@ -429691,7 +429713,7 @@ index 89d1031ea..8c7150e78 100644
                              pendingSidebarFocusRequest = false
                              isSidebarExpanded = false
                              sidebarCollapsePending = false
-@@ -2502,13 +3471,37 @@ private fun ModernSidebarScaffold(
+@@ -2502,13 +3485,37 @@ private fun ModernSidebarScaffold(
                  sidebarShowCollapsedPill &&
                  selectedDrawerRoute != Screen.Search.route
              ) {
@@ -429732,7 +429754,7 @@ index 89d1031ea..8c7150e78 100644
                      modifier = Modifier
                          .align(Alignment.TopStart)
                          .offset {
-@@ -2548,13 +3541,16 @@ private fun CollapsedSidebarPill(
+@@ -2548,13 +3555,16 @@ private fun CollapsedSidebarPill(
      onExpand: () -> Unit
  ) {
      val pillShape = RoundedCornerShape(NuvioRadii.tokens.full)
@@ -429751,7 +429773,7 @@ index 89d1031ea..8c7150e78 100644
          Brush.verticalGradient(listOf(
              Color(0xFF1C1C1E).copy(alpha = alpha),
              Color(0xFF1C1C1E).copy(alpha = alpha)
-@@ -2575,18 +3571,21 @@ private fun CollapsedSidebarPill(
+@@ -2575,18 +3585,21 @@ private fun CollapsedSidebarPill(
          Box(
              modifier = Modifier
                  .height(NuvioTheme.sizes.player.control)
@@ -429781,7 +429803,7 @@ index 89d1031ea..8c7150e78 100644
          ) {
              Row(
                  modifier = Modifier
-@@ -2640,6 +3639,24 @@ private fun CollapsedSidebarPill(
+@@ -2640,6 +3653,24 @@ private fun CollapsedSidebarPill(
      }
  }
  
@@ -429806,7 +429828,7 @@ index 89d1031ea..8c7150e78 100644
  private fun navigateToDrawerRoute(
      navController: NavHostController,
      currentRoute: String?,
-@@ -2682,7 +3699,7 @@ private fun isBlockedContentKey(key: Key): Boolean {
+@@ -2682,7 +3713,7 @@ private fun isBlockedContentKey(key: Key): Boolean {
  }
  
  @Composable
@@ -429815,7 +429837,7 @@ index 89d1031ea..8c7150e78 100644
      iconRes: Int?,
      icon: ImageVector?,
      modifier: Modifier = Modifier,
-@@ -2722,6 +3739,47 @@ private fun DrawerItemIcon(
+@@ -2722,6 +3753,47 @@ private fun DrawerItemIcon(
  object LocaleCache {
      const val UNSET = "__UNSET__"
  
@@ -437845,6 +437867,87 @@ index 000000000..566501094
 +                )
 +            }
 +        }
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/launcher/VolumeKeyRepeatController.kt b/app/src/main/java/com/nuvio/tv/core/launcher/VolumeKeyRepeatController.kt
+new file mode 100644
+index 000000000..ffdc377ac
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/launcher/VolumeKeyRepeatController.kt
+@@ -0,0 +1,75 @@
++package com.nuvio.tv.core.launcher
++
++import android.content.Context
++import android.media.AudioManager
++import android.os.Handler
++import android.os.Looper
++import android.view.KeyEvent
++import android.view.ViewConfiguration
++
++/**
++ * Keeps the volume buttons stepping while a remote button is held.
++ *
++ * While the launcher accessibility service is enabled Android routes key events through its
++ * input filter, and filtered keys never auto-repeat (only the initial down and the final up
++ * arrive), so holding Volume moved the volume by a single step per press. This controller
++ * takes over the two volume keys in the foreground activity instead: the first press steps
++ * once, a held button keeps stepping on its own timer, and system repeats (when they do
++ * arrive, with the service off) are only keep-alive pings for the timer.
++ */
++class VolumeKeyRepeatController(context: Context) {
++
++    private val audio = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
++    private val handler = Handler(Looper.getMainLooper())
++    private var heldKeyCode = 0
++
++    fun onKeyEvent(event: KeyEvent): Boolean {
++        when (event.action) {
++            KeyEvent.ACTION_DOWN -> {
++                if (event.repeatCount == 0) {
++                    heldKeyCode = event.keyCode
++                    adjust(event.keyCode)
++                    scheduleNext(ViewConfiguration.getKeyRepeatTimeout().toLong())
++                } else if (heldKeyCode != event.keyCode) {
++                    // The hold outlived the timer being stopped (focus change or pause); restart it.
++                    heldKeyCode = event.keyCode
++                    scheduleNext(ViewConfiguration.getKeyRepeatDelay().toLong())
++                }
++            }
++            KeyEvent.ACTION_UP -> if (event.keyCode == heldKeyCode) stop()
++        }
++        return true
++    }
++
++    /** Called when the activity loses focus or pauses: a released remote would never send UP here. */
++    fun stop() {
++        heldKeyCode = 0
++        handler.removeCallbacks(step)
++    }
++
++    private fun scheduleNext(delayMs: Long) {
++        handler.removeCallbacks(step)
++        handler.postDelayed(step, delayMs)
++    }
++
++    private fun adjust(keyCode: Int) {
++        val direction =
++            if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER
++        runCatching {
++            audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, direction, AudioManager.FLAG_SHOW_UI)
++        }
++    }
++
++    private val step = object : Runnable {
++        override fun run() {
++            if (heldKeyCode == 0) return
++            adjust(heldKeyCode)
++            handler.postDelayed(this, ViewConfiguration.getKeyRepeatDelay().toLong())
++        }
++    }
++
++    companion object {
++        fun handles(keyCode: Int): Boolean =
++            keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/core/logging/LogDiagnostics.kt b/app/src/main/java/com/nuvio/tv/core/logging/LogDiagnostics.kt
