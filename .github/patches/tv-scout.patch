@@ -430426,7 +430426,7 @@ index d348aabef..30b2ce03f 100644
          Row(
              modifier = Modifier
 diff --git a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
-index 456774cca..ccb55d69e 100644
+index 456774cca..2c998b130 100644
 --- a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
 +++ b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
 @@ -8,6 +8,7 @@ import android.os.StrictMode
@@ -430437,7 +430437,7 @@ index 456774cca..ccb55d69e 100644
  import coil3.disk.DiskCache
  import coil3.memory.MemoryCache
  import coil3.gif.GifDecoder
-@@ -26,10 +27,12 @@ import com.nuvio.tv.core.sync.StartupSyncService
+@@ -26,11 +27,14 @@ import com.nuvio.tv.core.sync.StartupSyncService
  import com.nuvio.tv.core.sync.androidtv.AndroidTvChannelSyncService
  import com.nuvio.tv.core.network.IPv4FirstDns
  import com.nuvio.tv.core.network.NoDelaySocketFactory
@@ -430448,9 +430448,11 @@ index 456774cca..ccb55d69e 100644
  import com.nuvio.tv.data.simkl.SimklAnimeIdPreferenceHolder
 +import com.nuvio.tv.ui.screens.settings.MemoryBudget
  import dagger.hilt.android.HiltAndroidApp
++import kotlinx.coroutines.launch
  import okhttp3.Cookie
  import okhttp3.CookieJar
-@@ -42,12 +45,16 @@ import javax.inject.Inject
+ import okhttp3.HttpUrl
+@@ -42,12 +46,16 @@ import javax.inject.Inject
  @HiltAndroidApp
  class NuvioApplication : Application(), SingletonImageLoader.Factory {
  
@@ -430473,7 +430475,7 @@ index 456774cca..ccb55d69e 100644
      @Inject lateinit var releaseReminderCoordinator: com.nuvio.tv.core.reminders.ReleaseReminderCoordinator
  
      companion object {
-@@ -92,15 +99,21 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+@@ -92,15 +100,21 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
          }
      }
  
@@ -430496,7 +430498,7 @@ index 456774cca..ccb55d69e 100644
          com.nuvio.tv.core.diagnostics.ForkStability.install(this) // Nuvio fork: breadcrumbs and main thread freeze watchdog
          com.nuvio.tv.youtube.YouTubeContentRegion.apply(this) // Nuvio fork: YouTube content region
          com.nuvio.tv.core.network.DohSetting.init(this) // Nuvio fork: DNS over HTTPS choice
-@@ -108,16 +121,35 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+@@ -108,16 +122,41 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
          PluginRuntimeHooks.onApplicationCreate(this)
          com.nuvio.tv.reshaped.subtitlefont.SubtitleFontStore.warmUp(this) // Nuvio fork: custom subtitle font, loaded off the main thread
          com.nuvio.tv.ui.screens.player.PlayerEffects.ensureLoaded(this) // Nuvio fork: picture and sound effects, read by stream auto-play
@@ -430527,6 +430529,12 @@ index 456774cca..ccb55d69e 100644
 +            // Launcher: keeps this app's own accessibility service switched on once the phone setup has
 +            // granted the permission. Reads system settings, so it runs off the main thread.
 +            runCatching { com.nuvio.tv.core.launcher.AccessibilityWatchdog.start(this) }
++            // Live TV fork: the intended start-up warm-up, which had no caller — loads the saved
++            // guide with the app (and, through ensureLoaded, the addon live-TV scan) instead of at
++            // the first guide open. Skips itself when Live TV is off or has no live playlist.
++            kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default).launch {
++                runCatching { com.nuvio.tv.livetv.startup.LiveTvPreload.start(this@NuvioApplication) }
++            }
 +        }
      }
  
@@ -430534,7 +430542,7 @@ index 456774cca..ccb55d69e 100644
      override fun newImageLoader(context: android.content.Context): ImageLoader {
          val imageOkHttpClient by lazy {
              val imageDispatcher = okhttp3.Dispatcher().apply {
-@@ -149,6 +181,7 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+@@ -149,6 +188,7 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
  
          return ImageLoader.Builder(this)
              .components {
@@ -430542,7 +430550,7 @@ index 456774cca..ccb55d69e 100644
                  add(CustomPosterFallbackInterceptor())
                  if (Build.VERSION.SDK_INT >= 28) {
                      add(AnimatedImageDecoder.Factory())
-@@ -157,7 +190,7 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+@@ -157,7 +197,7 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
                  }
                  add(SvgDecoder.Factory())
                  add(
@@ -430551,7 +430559,7 @@ index 456774cca..ccb55d69e 100644
                          callFactory = { imageOkHttpClient },
                          cacheStrategy = {
                              StaleWhileRevalidateCacheStrategy(
-@@ -179,18 +212,28 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+@@ -179,18 +219,28 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
                  // Normal devices (>3GB): use 0.25 for snappy image loading.
                  // - allowHardware(false) keeps bitmaps on heap instead of GPU memory
                  val cachePercent = when {
@@ -430588,7 +430596,7 @@ index 456774cca..ccb55d69e 100644
              }
              .diskCache {
                  DiskCache.Builder()
-@@ -201,7 +244,7 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+@@ -201,7 +251,7 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
              .crossfade(false)
              .precision(coil3.size.Precision.INEXACT)
              .allowHardware(false)
@@ -485884,10 +485892,10 @@ index 000000000..36f164193
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/data/LiveTvRepository.kt b/app/src/main/java/com/nuvio/tv/livetv/data/LiveTvRepository.kt
 new file mode 100644
-index 000000000..3bf122f5a
+index 000000000..f22db1b0a
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/data/LiveTvRepository.kt
-@@ -0,0 +1,3976 @@
+@@ -0,0 +1,3989 @@
 +package com.nuvio.tv.livetv.data
 +
 +import io.ktor.http.encodeURLParameter
@@ -485964,7 +485972,10 @@ index 000000000..3bf122f5a
 +    private val stalker: com.nuvio.tv.livetv.stalker.StalkerGateway,
 +    private val addonChannels: AddonChannelBridge,
 +    // The classic screen's IPTV sources (lazy: only touched while the V2 engine is selected).
-+    private val classicIptv: dagger.Lazy<com.nuvio.tv.data.iptv.IptvRepository>
++    private val classicIptv: dagger.Lazy<com.nuvio.tv.data.iptv.IptvRepository>,
++    // The classic screen's addon scan (lazy: its initialize() also feeds the settings' Live TV
++    // Addons list; only started from ensureLoaded so it runs with the guide, not app start).
++    private val tvChannelsRepository: dagger.Lazy<com.nuvio.tv.data.repository.TvChannelsRepository>
 +) {
 +    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 +
@@ -486122,6 +486133,16 @@ index 000000000..3bf122f5a
 +
 +    /** Loads cached data immediately, then refreshes anything older than the configured interval. */
 +    fun ensureLoaded(updateCheckDelayMs: Long = 0L) {
++        // IPTV V2: the addon live-TV scan used to run only through the classic TV Channels screen
++        // (its view model was the only caller of TvChannelsRepository.initialize()), so with the
++        // V2 engine selected the guide never saw addon channels until that screen had been opened
++        // once. Start the scan and re-attempt a due addon refresh on every guide build — both are
++        // idempotent and rate-limit themselves (the bridge also keeps a disk cache, so a loaded
++        // guide opens with its channels at once).
++        scope.launch {
++            runCatching { tvChannelsRepository.get().initialize() }
++            runCatching { addonChannels.current(startNumber = 1) }
++        }
 +        if (initialized) return
 +        initialized = true
 +        scope.launch {
@@ -592690,7 +592711,7 @@ index 3f434bb4c..dd31518d9 100644
          }
      }
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/addon/CatalogOrderViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/addon/CatalogOrderViewModel.kt
-index c6f1a9256..6187c6c55 100644
+index c6f1a9256..7057e5196 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/addon/CatalogOrderViewModel.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/addon/CatalogOrderViewModel.kt
 @@ -1,5 +1,7 @@
@@ -593209,7 +593230,7 @@ index c6f1a9256..6187c6c55 100644
                  }
              }
          }
-@@ -212,87 +446,68 @@ class CatalogOrderViewModel @Inject constructor(
+@@ -212,87 +446,71 @@ class CatalogOrderViewModel @Inject constructor(
          followAddonsOrder: Boolean = false
      ): List<CatalogOrderItem> {
          val defaultEntries = buildDefaultCatalogEntries(addons)
@@ -593332,17 +593353,20 @@ index c6f1a9256..6187c6c55 100644
 +            val missing = unpinnedDefaultOrderKeys.filterNot { it in savedKeySet }
 +            unpinnedEffectiveOrder = savedValidUnpinned + missing
          }
-+        // Launcher: until the user has placed the Apps row, Home shows it first; show it first here too.
++        // Launcher: the Apps row leads Home while this app is the device's home app (always, not
++        // just until the user places it); otherwise it goes first only until the user places it.
 +        val appsKey = com.nuvio.tv.core.apps.INSTALLED_APPS_CATALOG_KEY
 +        val rawOrder = pinnedKeys + unpinnedEffectiveOrder
-+        val effectiveOrder = if (appsKey !in savedOrderKeys && appsKey in rawOrder) {
++        val effectiveOrder = if (appsKey in rawOrder &&
++            (launcherRoleState?.isDefaultLauncher?.value == true || appsKey !in savedOrderKeys)
++        ) {
 +            listOf(appsKey) + rawOrder.filterNot { it == appsKey }
 +        } else rawOrder
 +        val firstUnpinnedIndex = pinnedKeySet.size
  
          return effectiveOrder.mapIndexedNotNull { index, key ->
              val entry = availableMap[key] ?: return@mapIndexedNotNull null
-@@ -301,16 +516,19 @@ class CatalogOrderViewModel @Inject constructor(
+@@ -301,16 +519,19 @@ class CatalogOrderViewModel @Inject constructor(
  
              val canMoveUp: Boolean
              val canMoveDown: Boolean
@@ -593365,7 +593389,7 @@ index c6f1a9256..6187c6c55 100644
                  canMoveDown = index < effectiveOrder.lastIndex
              }
  
-@@ -319,15 +537,61 @@ class CatalogOrderViewModel @Inject constructor(
+@@ -319,15 +540,61 @@ class CatalogOrderViewModel @Inject constructor(
                  disableKey = entry.disableKey,
                  catalogName = displayName,
                  addonName = entry.addonName,
@@ -593428,7 +593452,7 @@ index c6f1a9256..6187c6c55 100644
      /**
       * Ensures collections are positioned at addon block boundaries.
       * If a collection ended up between two catalogs of the same addon,
-@@ -335,7 +599,7 @@ class CatalogOrderViewModel @Inject constructor(
+@@ -335,7 +602,7 @@ class CatalogOrderViewModel @Inject constructor(
       */
      private fun normalizeCollectionPositions(
          order: List<String>,
@@ -593437,7 +593461,7 @@ index c6f1a9256..6187c6c55 100644
      ): List<String> {
          val result = order.toMutableList()
          var changed = true
-@@ -348,14 +612,14 @@ class CatalogOrderViewModel @Inject constructor(
+@@ -348,14 +615,14 @@ class CatalogOrderViewModel @Inject constructor(
                      i++
                      continue
                  }
@@ -593456,7 +593480,7 @@ index c6f1a9256..6187c6c55 100644
                      ) {
                          insertPos++
                      }
-@@ -370,27 +634,27 @@ class CatalogOrderViewModel @Inject constructor(
+@@ -370,27 +637,27 @@ class CatalogOrderViewModel @Inject constructor(
          return result
      }
  
@@ -593490,7 +593514,7 @@ index c6f1a9256..6187c6c55 100644
              }
          }
          return null
-@@ -426,6 +690,7 @@ class CatalogOrderViewModel @Inject constructor(
+@@ -426,6 +693,7 @@ class CatalogOrderViewModel @Inject constructor(
                                  ),
                                  catalogName = catalog.name,
                                  addonName = addon.displayName,
@@ -593498,7 +593522,7 @@ index c6f1a9256..6187c6c55 100644
                                  typeLabel = catalog.apiType
                              )
                          )
-@@ -444,7 +709,8 @@ class CatalogOrderViewModel @Inject constructor(
+@@ -444,7 +712,8 @@ class CatalogOrderViewModel @Inject constructor(
  data class CatalogOrderUiState(
      val isLoading: Boolean = true,
      val items: List<CatalogOrderItem> = emptyList(),
@@ -593508,7 +593532,7 @@ index c6f1a9256..6187c6c55 100644
  )
  
  data class CatalogOrderItem(
-@@ -452,10 +718,13 @@ data class CatalogOrderItem(
+@@ -452,10 +721,13 @@ data class CatalogOrderItem(
      val disableKey: String,
      val catalogName: String,
      val addonName: String,
@@ -593523,7 +593547,7 @@ index c6f1a9256..6187c6c55 100644
  )
  
  private data class CatalogOrderEntry(
-@@ -464,5 +733,7 @@ private data class CatalogOrderEntry(
+@@ -464,5 +736,7 @@ private data class CatalogOrderEntry(
      val legacyDisableKey: String? = null,
      val catalogName: String,
      val addonName: String,
@@ -600558,7 +600582,7 @@ index afeb24963..d333fb248 100644
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/ClassicHomeContent.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/ClassicHomeContent.kt
-index 1fadd0a56..695f39457 100644
+index 1fadd0a56..0606deec3 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/home/ClassicHomeContent.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/ClassicHomeContent.kt
 @@ -1,5 +1,6 @@
@@ -600625,7 +600649,18 @@ index 1fadd0a56..695f39457 100644
                  is HomeRow.PlaceholderCatalog -> row.stableCatalogKey
              }
          }.apply {
-@@ -547,6 +564,7 @@ fun ClassicHomeContent(
+@@ -453,7 +470,9 @@ fun ClassicHomeContent(
+             // Nuvio fork: the Smart Highlights rail sits between the hero and the CW sections.
+             val smartHighlightsOffset = if (smartHighlightsPicks.isNotEmpty()) 1 else 0
+             val cwOffset = if (uiState.continueWatchingEnabled && uiState.continueWatchingItems.isNotEmpty()) 1 else 0
+-            val rowsOffset = heroOffset + smartHighlightsOffset + cwOffset
++            // Launcher: the hoisted Apps row sits above the CW section.
++            val appsRowOffset = if (uiState.appsRowFirst && latestVisibleHomeRows.value.any { it is HomeRow.InstalledApps }) 1 else 0
++            val rowsOffset = heroOffset + smartHighlightsOffset + appsRowOffset + cwOffset
+             for (idx in firstVisible.coerceAtLeast(0)..(lastVisible + prefetchAhead)) {
+                 val rowIdx = idx - rowsOffset
+                 val row = rows.getOrNull(rowIdx) ?: continue
+@@ -547,6 +566,7 @@ fun ClassicHomeContent(
      LazyColumn(
          state = columnListState,
          modifier = Modifier
@@ -600633,7 +600668,25 @@ index 1fadd0a56..695f39457 100644
              .fillMaxSize()
              .onFocusChanged { contentHasFocus.value = it.hasFocus }
              .focusRequester(contentFocusRequester)
-@@ -831,12 +849,13 @@ fun ClassicHomeContent(
+@@ -673,6 +693,17 @@ fun ClassicHomeContent(
+             }
+         }
+ 
++        // Launcher: with the HOME role held, the Apps row leads Home — above Continue Watching.
++        val appsRowHoisted = uiState.appsRowFirst && visibleHomeRows.any { it is HomeRow.InstalledApps }
++        if (appsRowHoisted) {
++            item(key = "installed_apps_row_first", contentType = "installed_apps_row") {
++                com.nuvio.tv.ui.components.InstalledAppsHomeRow(
++                    startPadding = NuvioTheme.spacing.xxxl,
++                    titleStyle = MaterialTheme.typography.headlineMedium
++                )
++            }
++        }
++
+         if (uiState.continueWatchingEnabled && uiState.continueWatchingItems.isNotEmpty()) {
+             item(key = "continue_watching", contentType = "continue_watching") {
+                 LaunchedEffect(cwPendingScrollToStart.intValue) {
+@@ -831,12 +862,13 @@ fun ClassicHomeContent(
                                  ?.toClassicFocusArtwork(uiState.focusedPosterBackdropExpandEnabled)
                          }
                      },
@@ -600649,7 +600702,7 @@ index 1fadd0a56..695f39457 100644
                  )
              }
          }
-@@ -857,6 +876,7 @@ fun ClassicHomeContent(
+@@ -857,6 +889,7 @@ fun ClassicHomeContent(
                          "${r.stableKey()}_$index"
                      }
                      is HomeRow.CollectionRow -> "collection_${item.collection.id}"
@@ -600657,7 +600710,7 @@ index 1fadd0a56..695f39457 100644
                      is HomeRow.PlaceholderCatalog -> "${item.stableCatalogKey}_$index"
                  }
              },
-@@ -864,6 +884,7 @@ fun ClassicHomeContent(
+@@ -864,6 +897,7 @@ fun ClassicHomeContent(
                  when (item) {
                      is HomeRow.Catalog -> "catalog_row"
                      is HomeRow.CollectionRow -> "collection_row"
@@ -600665,13 +600718,16 @@ index 1fadd0a56..695f39457 100644
                      is HomeRow.PlaceholderCatalog -> "catalog_row"
                  }
              }
-@@ -989,6 +1010,11 @@ fun ClassicHomeContent(
+@@ -989,6 +1023,14 @@ fun ClassicHomeContent(
                      )
                  }
  
 +                is HomeRow.InstalledApps -> {
-+                    // Launcher: the installed apps, placed like any other row.
-+                    com.nuvio.tv.ui.components.InstalledAppsHomeRow(startPadding = NuvioTheme.spacing.xxxl, titleStyle = MaterialTheme.typography.headlineMedium)
++                    // Launcher: the installed apps, placed like any other row — already hoisted
++                    // above Continue Watching when the HOME role is held.
++                    if (!appsRowHoisted) {
++                        com.nuvio.tv.ui.components.InstalledAppsHomeRow(startPadding = NuvioTheme.spacing.xxxl, titleStyle = MaterialTheme.typography.headlineMedium)
++                    }
 +                }
 +
                  is HomeRow.PlaceholderCatalog -> { }
@@ -601580,7 +601636,7 @@ index 000000000..3b841b0ff
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeUiState.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeUiState.kt
-index 64f05d957..178b35d15 100644
+index 64f05d957..79bf379a4 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeUiState.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeUiState.kt
 @@ -5,6 +5,7 @@ import com.nuvio.tv.core.tracking.TrackingMembershipRemovalConfirmation
@@ -601622,7 +601678,16 @@ index 64f05d957..178b35d15 100644
      val heroEnrichmentEnabled: Boolean = false,
      val startupAuthNotice: StartupAuthNotice? = null,
      val homeRows: List<HomeRow> = emptyList(),
-@@ -84,6 +95,7 @@ data class HomeUiState(
+@@ -78,12 +89,15 @@ data class HomeUiState(
+     val customPosterEnabledScreens: Set<com.nuvio.tv.core.poster.CustomPosterScreen> =
+         com.nuvio.tv.core.poster.CustomPosterScreen.ALL,
+     val mdbListShowOnHero: Boolean = false,
+-    val mdbListRatingOrder: List<String> = com.nuvio.tv.domain.model.MDBListSettings.DEFAULT_RATING_ORDER
++    val mdbListRatingOrder: List<String> = com.nuvio.tv.domain.model.MDBListSettings.DEFAULT_RATING_ORDER,
++    /** Launcher: with the HOME role held, the Apps row leads Home — above Continue Watching. */
++    val appsRowFirst: Boolean = false
+ )
+ 
  @Immutable
  sealed class ContinueWatchingItem {
      abstract val shufflePlayback: Boolean
@@ -601630,7 +601695,7 @@ index 64f05d957..178b35d15 100644
      @Immutable
      data class InProgress(
          val progress: WatchProgress,
-@@ -97,7 +109,10 @@ sealed class ContinueWatchingItem {
+@@ -97,7 +111,10 @@ sealed class ContinueWatchingItem {
          val originalPoster: String? = null,
          val customLandscapePoster: String? = null,
          val mdbListRatings: com.nuvio.tv.domain.model.MDBListRatings? = null,
@@ -601642,7 +601707,7 @@ index 64f05d957..178b35d15 100644
      ) : ContinueWatchingItem()
  
      @Immutable
-@@ -105,7 +120,8 @@ sealed class ContinueWatchingItem {
+@@ -105,7 +122,8 @@ sealed class ContinueWatchingItem {
          val info: NextUpInfo,
          override val shufflePlayback: Boolean = false,
          val originalPoster: String? = null,
@@ -601652,7 +601717,7 @@ index 64f05d957..178b35d15 100644
      ) : ContinueWatchingItem()
  }
  
-@@ -115,6 +131,12 @@ val ContinueWatchingItem.shuffleFocusKey: String?
+@@ -115,6 +133,12 @@ val ContinueWatchingItem.shuffleFocusKey: String?
          is ContinueWatchingItem.NextUp -> "cw_shuffle_${info.contentId}"
      }
  
@@ -601665,7 +601730,7 @@ index 64f05d957..178b35d15 100644
  @Immutable
  data class NextUpInfo(
      val contentId: String,
-@@ -144,7 +166,16 @@ data class NextUpInfo(
+@@ -144,7 +168,16 @@ data class NextUpInfo(
      val seedEpisode: Int? = null,
      val contentLanguage: String? = null,
      val mdbListRatings: com.nuvio.tv.domain.model.MDBListRatings? = null,
@@ -601683,7 +601748,7 @@ index 64f05d957..178b35d15 100644
  )
  
  @Immutable
-@@ -155,6 +186,10 @@ sealed class HomeRow {
+@@ -155,6 +188,10 @@ sealed class HomeRow {
      @Immutable
      data class CollectionRow(val collection: Collection) : HomeRow()
  
@@ -601694,7 +601759,7 @@ index 64f05d957..178b35d15 100644
      /**
       * Placeholder for a catalog row whose data hasn't been fetched yet.
       * Rendered as a shimmer/skeleton row until the user scrolls near it
-@@ -207,6 +242,9 @@ sealed class GridItem {
+@@ -207,6 +244,9 @@ sealed class GridItem {
          val collectionId: String,
          val title: String
      ) : GridItem()
@@ -601704,7 +601769,7 @@ index 64f05d957..178b35d15 100644
      @Immutable
      data class CollectionFolder(
          val collectionId: String,
-@@ -225,9 +263,64 @@ sealed class HomeEvent {
+@@ -225,9 +265,64 @@ sealed class HomeEvent {
          val episode: Int? = null,
          val isNextUp: Boolean = false
      ) : HomeEvent()
@@ -601770,7 +601835,7 @@ index 64f05d957..178b35d15 100644
      return "${itemType.lowercase()}|$itemId"
  }
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModel.kt
-index 909f51e33..5c4f0f912 100644
+index 909f51e33..721a66d91 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModel.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModel.kt
 @@ -1,5 +1,6 @@
@@ -601873,15 +601938,17 @@ index 909f51e33..5c4f0f912 100644
              watchedSeriesStateHolder.loadFromDisk()
              observeExternalMetaPrefetchPreference()
              observeContinueWatchingSortMode()
-@@ -381,6 +422,16 @@ class HomeViewModel @Inject constructor(
+@@ -381,6 +422,18 @@ class HomeViewModel @Inject constructor(
              loadFollowAddonsOrder()
              loadDisabledHomeCatalogPreference()
              loadCustomCatalogTitles()
 +            observeInstalledAppsRowPipeline()
-+            // Launcher: the Apps row appears/disappears with the HOME role; rebuild when it flips.
++            // Launcher: the Apps row appears/disappears with the HOME role; rebuild when it flips
++            // and lead Home with it (above Continue Watching) while the role is held.
 +            launcherRoleState?.let { role ->
 +                viewModelScope.launch {
-+                    role.isDefaultLauncher.collect {
++                    role.isDefaultLauncher.collect { isLauncher ->
++                        _uiState.update { it.copy(appsRowFirst = isLauncher) }
 +                        rebuildCatalogOrder(addonsCache)
 +                        scheduleUpdateCatalogRows()
 +                    }
@@ -601890,7 +601957,7 @@ index 909f51e33..5c4f0f912 100644
              observeLibraryState()
              observeTmdbSettings()
              observeMdbListSettings()
-@@ -388,6 +439,7 @@ class HomeViewModel @Inject constructor(
+@@ -388,6 +441,7 @@ class HomeViewModel @Inject constructor(
              observeProgressSourceChanges()
              observeCollections()
              observeInstalledAddons()
@@ -601898,7 +601965,7 @@ index 909f51e33..5c4f0f912 100644
              observeManualAddonRefresh()
              // Smart Highlights rail removed (needs an AI key); the picks flow stays empty.
  
-@@ -454,7 +506,15 @@ class HomeViewModel @Inject constructor(
+@@ -454,7 +508,15 @@ class HomeViewModel @Inject constructor(
          }
      }
  
@@ -601914,7 +601981,7 @@ index 909f51e33..5c4f0f912 100644
          cwMetaCache.clear()
          cwMetaNegativeCacheTimestamps.clear()
          cwBadgeEpisodeCache.clear()
-@@ -470,7 +530,9 @@ class HomeViewModel @Inject constructor(
+@@ -470,7 +532,9 @@ class HomeViewModel @Inject constructor(
          cwLastBadgeEpisodeKeys = emptySet()
          cwLastShowIdSiblings = emptyMap()
          watchedSeriesStateHolder.clearValidationState()
@@ -601925,7 +601992,7 @@ index 909f51e33..5c4f0f912 100644
          // Bump trigger so the pipeline's collectLatest restarts with fresh state.
          cwPipelineRefreshTrigger.value++
      }
-@@ -594,23 +656,37 @@ class HomeViewModel @Inject constructor(
+@@ -594,23 +658,37 @@ class HomeViewModel @Inject constructor(
          }
      }
  
@@ -601968,7 +602035,7 @@ index 909f51e33..5c4f0f912 100644
  
      private fun loadHomeCatalogOrderPreference() = loadHomeCatalogOrderPreferencePipeline()
  
-@@ -653,7 +729,7 @@ class HomeViewModel @Inject constructor(
+@@ -653,7 +731,7 @@ class HomeViewModel @Inject constructor(
                      val profileChanged = previousProfileId != null && previousProfileId != currentProfileId
                      if (previousSource != null && previousSource != source && !profileChanged) {
                          // Genuine in-profile source change — clear CW caches to prevent mixing.
@@ -601977,7 +602044,7 @@ index 909f51e33..5c4f0f912 100644
                          cwEnrichedNextUpOverlay.clear()
                          cwEnrichedInProgressOverlay.clear()
                          discoveredOlderNextUpItems.clear()
-@@ -664,6 +740,7 @@ class HomeViewModel @Inject constructor(
+@@ -664,6 +742,7 @@ class HomeViewModel @Inject constructor(
                              runCatching { cwEnrichmentCache.saveInProgressSnapshot(emptyList(), force = true) }
                          }
                          // Reload CW from fresh source.
@@ -601985,7 +602052,7 @@ index 909f51e33..5c4f0f912 100644
                          loadContinueWatching()
                      }
                      previousSource = source
-@@ -702,6 +779,7 @@ class HomeViewModel @Inject constructor(
+@@ -702,6 +781,7 @@ class HomeViewModel @Inject constructor(
      fun onEvent(event: HomeEvent) {
          when (event) {
              is HomeEvent.OnItemClick -> navigateToDetail(event.itemId, event.itemType)
@@ -601993,7 +602060,7 @@ index 909f51e33..5c4f0f912 100644
              is HomeEvent.OnLoadMoreCatalog -> loadMoreCatalogItems(event.catalogId, event.addonId, event.type)
              is HomeEvent.OnRemoveContinueWatching -> removeContinueWatching(
                  contentId = event.contentId,
-@@ -714,88 +792,8 @@ class HomeViewModel @Inject constructor(
+@@ -714,88 +794,8 @@ class HomeViewModel @Inject constructor(
      }
  
      private fun loadContinueWatching() {
@@ -602084,7 +602151,7 @@ index 909f51e33..5c4f0f912 100644
          loadContinueWatchingPipeline()
      }
  
-@@ -811,10 +809,20 @@ class HomeViewModel @Inject constructor(
+@@ -811,10 +811,20 @@ class HomeViewModel @Inject constructor(
          isNextUp = isNextUp
      )
  
@@ -602245,7 +602312,7 @@ index b59b5a3a3..5507e5cc6 100644
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogUtils.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogUtils.kt
-index ed0b50a8a..e0b3ea749 100644
+index ed0b50a8a..66097def2 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogUtils.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogUtils.kt
 @@ -230,8 +230,14 @@ internal fun HomeViewModel.removeTruncatedRowCacheEntry(key: String) {
@@ -602264,15 +602331,18 @@ index ed0b50a8a..e0b3ea749 100644
      val allAvailable = (defaultOrder + collectionKeys).toSet()
  
      if (followAddonsOrderEnabled) {
-@@ -313,6 +319,12 @@ internal fun HomeViewModel.rebuildCatalogOrder(addons: List<Addon>) {
+@@ -313,6 +319,15 @@ internal fun HomeViewModel.rebuildCatalogOrder(addons: List<Addon>) {
              catalogOrder.addAll(mergedOrder)
          }
      }
 +
-+    // Launcher: until the user has put the Apps row somewhere, it goes first, right under Continue Watching.
++    // Launcher: while this app is the device's home app, the Apps row is always the first catalog
++    // row (the home contents hoist it above Continue Watching, which is not part of this order).
 +    synchronized(catalogStateLock) {
 +        val appsKey = com.nuvio.tv.core.apps.INSTALLED_APPS_CATALOG_KEY
-+        if (appsKey !in homeCatalogOrderKeys && catalogOrder.remove(appsKey)) catalogOrder.add(0, appsKey)
++        if (launcherRoleState?.isDefaultLauncher?.value == true && catalogOrder.remove(appsKey)) {
++            catalogOrder.add(0, appsKey)
++        }
 +    }
  }
  
@@ -603207,7 +603277,7 @@ index 000000000..1bd378208
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelPresentationPipeline.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelPresentationPipeline.kt
-index 5711ca18d..593b8d18a 100644
+index 5711ca18d..638e8d00d 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelPresentationPipeline.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelPresentationPipeline.kt
 @@ -284,11 +284,15 @@ private data class ContinueWatchingPosterInput(
@@ -603252,25 +603322,27 @@ index 5711ca18d..593b8d18a 100644
                          upcomingItems = input.upcomingItems.withCustomPosterUrls(pattern),
                      )
                  }
-@@ -331,6 +339,8 @@ internal fun HomeViewModel.observeModernHomePresentationPipeline() {
+@@ -331,6 +339,9 @@ internal fun HomeViewModel.observeModernHomePresentationPipeline() {
                      homeRows = state.homeRows,
                      catalogRows = state.catalogRows,
                      continueWatchingItems = overlay.continueWatchingItems,
 +                    onDemandItems = overlay.onDemandItems,
 +                    youtubeItems = overlay.youtubeItems,
++                    appsRowFirst = state.appsRowFirst,
                      upcomingItems = overlay.upcomingItems,
                      useLandscapePosters = state.modernLandscapePostersEnabled,
                      showCatalogTypeSuffix = state.catalogTypeSuffixEnabled,
-@@ -347,6 +357,8 @@ internal fun HomeViewModel.observeModernHomePresentationPipeline() {
+@@ -347,6 +358,9 @@ internal fun HomeViewModel.observeModernHomePresentationPipeline() {
              .distinctUntilChanged { old, new ->
                  old.homeRows === new.homeRows
                      && old.continueWatchingItems == new.continueWatchingItems
 +                    && old.onDemandItems == new.onDemandItems
 +                    && old.youtubeItems == new.youtubeItems
++                    && old.appsRowFirst == new.appsRowFirst
                      && old.upcomingItems == new.upcomingItems
                      && old.useLandscapePosters == new.useLandscapePosters
                      && old.showCatalogTypeSuffix == new.showCatalogTypeSuffix
-@@ -481,6 +493,8 @@ internal fun HomeViewModel.requestTrailerPreviewPipeline(
+@@ -481,6 +495,8 @@ internal fun HomeViewModel.requestTrailerPreviewPipeline(
                          if (trailerPreviewUrlsState[itemId] != fallbackSource.videoUrl) {
                              trailerPreviewUrlsState[itemId] = fallbackSource.videoUrl
                          }
@@ -603279,7 +603351,7 @@ index 5711ca18d..593b8d18a 100644
                          val fallbackAudio = fallbackSource.audioUrl
                          if (fallbackAudio.isNullOrBlank()) {
                              trailerPreviewAudioUrlsState.remove(itemId)
-@@ -495,12 +509,15 @@ internal fun HomeViewModel.requestTrailerPreviewPipeline(
+@@ -495,12 +511,15 @@ internal fun HomeViewModel.requestTrailerPreviewPipeline(
                          }
                          trailerPreviewUrlsState.remove(itemId)
                          trailerPreviewAudioUrlsState.remove(itemId)
@@ -603982,19 +604054,21 @@ index 03447d156..1cb0b5d9d 100644
  
  internal fun catalogRowKey(row: CatalogRow): String {
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomePresentation.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomePresentation.kt
-index 2fcb30199..6313575c6 100644
+index 2fcb30199..8dab232bc 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomePresentation.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomePresentation.kt
-@@ -18,6 +18,8 @@ internal data class ModernHomePresentationInput(
+@@ -18,6 +18,10 @@ internal data class ModernHomePresentationInput(
      val homeRows: List<HomeRow>,
      val catalogRows: List<CatalogRow>,
      val continueWatchingItems: List<ContinueWatchingItem>,
 +    val onDemandItems: List<ContinueWatchingItem> = emptyList(),
 +    val youtubeItems: List<ContinueWatchingItem> = emptyList(),
++    /** Launcher: with the HOME role held, the Apps row leads the carousel — above Continue Watching. */
++    val appsRowFirst: Boolean = false,
      val upcomingItems: List<ContinueWatchingItem>,
      val useLandscapePosters: Boolean,
      val showCatalogTypeSuffix: Boolean,
-@@ -90,6 +92,86 @@ internal fun buildModernHomePresentation(
+@@ -90,6 +94,86 @@ internal fun buildModernHomePresentation(
              cache.continueWatchingRow = null
          }
  
@@ -604081,7 +604155,7 @@ index 2fcb30199..6313575c6 100644
          // Upcoming row (SPLIT_UPCOMING mode)
          val strUpcomingSectionTitle = localizedContext.getString(R.string.upcoming_section_title)
          if (input.upcomingItems.isNotEmpty()) {
-@@ -271,6 +353,28 @@ internal fun buildModernHomePresentation(
+@@ -271,6 +355,28 @@ internal fun buildModernHomePresentation(
                      add(mappedRow)
                  }
  
@@ -604110,7 +604184,28 @@ index 2fcb30199..6313575c6 100644
                  is HomeRow.PlaceholderCatalog -> {
                      if (catalogRowLimit != null && renderedCatalogRows >= catalogRowLimit) {
                          return@forEachIndexed
-@@ -347,6 +451,7 @@ private fun resolveVisibleHomeRows(input: ModernHomePresentationInput): List<Hom
+@@ -328,9 +434,18 @@ internal fun buildModernHomePresentation(
+         cache.collectionRows.keys.retainAll(activeCollectionKeys)
+     }
+ 
+-    val lookups = buildCarouselRowLookups(rows)
++    // Launcher: the Continue Watching rows are added first by design (they are not part of the
++    // catalog order); with the HOME role held the Apps row leads instead.
++    val orderedRows = if (input.appsRowFirst) {
++        rows.toMutableList().apply {
++            val appsIndex = indexOfFirst { it.key == com.nuvio.tv.core.apps.INSTALLED_APPS_CATALOG_KEY }
++            if (appsIndex > 0) add(0, removeAt(appsIndex))
++        }
++    } else rows
++
++    val lookups = buildCarouselRowLookups(orderedRows)
+     return ModernHomePresentationState(
+-        rows = rows.asStable(),
++        rows = orderedRows.asStable(),
+         lookups = lookups
+     )
+ }
+@@ -347,6 +462,7 @@ private fun resolveVisibleHomeRows(input: ModernHomePresentationInput): List<Hom
                  is HomeRow.CollectionRow -> {
                      homeRow.collection.takeIf(Collection::hasVisibleFolders)?.let(HomeRow::CollectionRow)
                  }
@@ -604118,7 +604213,7 @@ index 2fcb30199..6313575c6 100644
                  is HomeRow.PlaceholderCatalog -> {
                      // Keep placeholder rows as-is — they'll be rendered as shimmer skeletons
                      homeRow
-@@ -404,7 +509,12 @@ internal fun buildCarouselRowLookups(carouselRows: List<HeroCarouselRow>): Carou
+@@ -404,7 +520,12 @@ internal fun buildCarouselRowLookups(carouselRows: List<HeroCarouselRow>): Carou
                      itemIdentities += "folder:${payload.folderId}"
                  }
                  is ModernPayload.ContinueWatching -> {
