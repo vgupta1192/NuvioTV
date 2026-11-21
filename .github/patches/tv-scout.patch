@@ -634612,10 +634612,10 @@ index 000000000..337e0001e
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SubtitleFontPicker.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SubtitleFontPicker.kt
 new file mode 100644
-index 000000000..0d53156cd
+index 000000000..4b2d109b9
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SubtitleFontPicker.kt
-@@ -0,0 +1,260 @@
+@@ -0,0 +1,263 @@
 +@file:OptIn(ExperimentalTvMaterial3Api::class)
 +
 +package com.nuvio.tv.ui.screens.settings
@@ -634688,6 +634688,9 @@ index 000000000..0d53156cd
 +    val focusRequester = remember { FocusRequester() }
 +    val listState = rememberLazyListState(initialFirstVisibleItemIndex = focusedIndex)
 +    val select: (String) -> Unit = { fontId ->
++        // mpv and the overlay typefaces read the single-font store, which only knows the last
++        // import; keep it in step when an older imported font is picked again.
++        viewModel.syncImportedFont(fontId)
 +        onFontSelected(fontId)
 +        onDismiss()
 +    }
@@ -634878,10 +634881,10 @@ index 000000000..0d53156cd
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SubtitleFontsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SubtitleFontsViewModel.kt
 new file mode 100644
-index 000000000..765429ada
+index 000000000..b3e4f7f4d
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SubtitleFontsViewModel.kt
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,144 @@
 +package com.nuvio.tv.ui.screens.settings
 +
 +import android.content.Context
@@ -634893,11 +634896,12 @@ index 000000000..765429ada
 +import com.nuvio.tv.core.player.SubtitleFontStore
 +import com.nuvio.tv.core.player.SubtitleFonts
 +import com.nuvio.tv.core.qr.QrCodeGenerator
-+import com.nuvio.tv.core.server.DeviceIpAddress
 +import com.nuvio.tv.core.server.SubtitleFontUploadServer
 +import com.nuvio.tv.core.util.readAppLogoBytes
 +import com.nuvio.tv.core.util.withAppLocale
 +import com.nuvio.tv.data.local.PlayerSettingsDataStore
++import com.nuvio.tv.reshaped.net.LanAddress
++import com.nuvio.tv.reshaped.subtitlefont.SubtitleFontStore as ReshapedSubtitleFontStore
 +import dagger.hilt.android.lifecycle.HiltViewModel
 +import dagger.hilt.android.qualifiers.ApplicationContext
 +import kotlinx.coroutines.Dispatchers
@@ -634933,13 +634937,23 @@ index 000000000..765429ada
 +    fun remove(font: SubtitleFont, selectedFontId: String) {
 +        viewModelScope.launch {
 +            withContext(Dispatchers.IO) { store.remove(font.id) }
-+            if (selectedFontId == font.id) playerSettingsDataStore.setSubtitleFontId(SubtitleFonts.DEFAULT)
++            if (selectedFontId == font.id) {
++                playerSettingsDataStore.setSubtitleFontId(SubtitleFonts.DEFAULT)
++                // The mirrored single-font copy backs mpv and the overlay typefaces; drop it so
++                // they fall back to the default face together with the selection.
++                withContext(Dispatchers.IO) {
++                    runCatching { ReshapedSubtitleFontStore.clear(context) }
++                }
++            }
 +        }
 +    }
 +
 +    fun startImport() {
 +        stopServer()
-+        val ip = DeviceIpAddress.get(context)
++        // LanAddress asks Android for the Wi-Fi/Ethernet network itself and never a VPN or
++        // hotspot interface; DeviceIpAddress's first-IPv4 fallback can advertise an address a
++        // phone on the home network cannot open (the QR page then never loads).
++        val ip = LanAddress.get(context)
 +        if (ip == null) {
 +            showImportError(R.string.error_network_required)
 +            return
@@ -634969,12 +634983,29 @@ index 000000000..765429ada
 +
 +    private fun importUploadedFont(fileName: String, bytes: ByteArray): Boolean {
 +        val font = runCatching { store.import(fileName, bytes) }.getOrNull() ?: return false
++        // mpv (initOptions) and the Live TV/preview overlays read the reshaped single-font store,
++        // not this picker's multi-font store; mirror the import so the phone-sent face reaches
++        // every playback path, not just ExoPlayer's styled subtitles.
++        runCatching {
++            ReshapedSubtitleFontStore.importFromStream(context, bytes.inputStream(), declaredLength = bytes.size.toLong())
++        }
 +        viewModelScope.launch {
 +            playerSettingsDataStore.setSubtitleFontId(font.id)
 +            delay(IMPORT_CLOSE_DELAY_MS)
 +            stopImport()
 +        }
 +        return true
++    }
++
++    /** Keeps the single-font store in step when a previously imported font is picked again. */
++    fun syncImportedFont(fontId: String) {
++        if (!SubtitleFonts.isCustom(fontId)) return
++        viewModelScope.launch(Dispatchers.IO) {
++            val file = store.fontFile(fontId) ?: return@launch
++            runCatching {
++                ReshapedSubtitleFontStore.importFromStream(context, file.inputStream(), declaredLength = file.length())
++            }
++        }
 +    }
 +
 +    private fun showImportError(message: Int) {
@@ -636289,10 +636320,10 @@ index 000000000..d745a8826
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/VpnSettingsContent.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/VpnSettingsContent.kt
 new file mode 100644
-index 000000000..dbe2f5d27
+index 000000000..c6852eead
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/VpnSettingsContent.kt
-@@ -0,0 +1,565 @@
+@@ -0,0 +1,584 @@
 +@file:OptIn(androidx.tv.material3.ExperimentalTvMaterial3Api::class)
 +
 +package com.nuvio.tv.ui.screens.settings
@@ -636485,6 +636516,17 @@ index 000000000..dbe2f5d27
 +                            onClick = {},
 +                            modifier = Modifier.focusRequester(topRequester)
 +                        )
++                        // The module's own screen (VpnProfilesActivity) puts a Turn off action on
++                        // this card once a connection runs or a scope is saved; turnOff() is the
++                        // controller's same affordance (end the tunnel, or set the scope to Off).
++                        if (live.canTurnOff) {
++                            SettingsActionRow(
++                                title = stringResource(VpnR.string.vpn_turn_off),
++                                subtitle = null,
++                                onClick = { if (!busy) controller.turnOff() },
++                                trailingIcon = null
++                            )
++                        }
 +                    }
 +                }
 +            }
@@ -636501,6 +636543,14 @@ index 000000000..dbe2f5d27
 +                        subtitle = stringResource(R.string.vpn_phone_add_detail),
 +                        leadingIcon = Icons.Default.Add,
 +                        onClick = { phoneOpen = true }
++                    )
++                    // The phone row replaced this in the QR-port commit, leaving no way to import
++                    // OpenVPN from the TV; the module screen offers WireGuard and OpenVPN side by side.
++                    SettingsActionRow(
++                        title = stringResource(VpnR.string.vpn_openvpn_title),
++                        subtitle = stringResource(VpnR.string.vpn_openvpn_detail),
++                        leadingIcon = Icons.Default.Add,
++                        onClick = { choose(openVpn = true) }
 +                    )
 +                    // Import results and errors show right under the buttons that caused them.
 +                    val notice = current?.notice
