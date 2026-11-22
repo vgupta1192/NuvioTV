@@ -428059,7 +428059,7 @@ index 000000000..b1a32a5b9
 +internal fun isFreshLaunchIntent(hasSavedInstanceState: Boolean, intentFlags: Int): Boolean =
 +    !hasSavedInstanceState && intentFlags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY == 0
 diff --git a/app/src/main/java/com/nuvio/tv/MainActivity.kt b/app/src/main/java/com/nuvio/tv/MainActivity.kt
-index 89d1031ea..eec6228ff 100644
+index 89d1031ea..aca65b12d 100644
 --- a/app/src/main/java/com/nuvio/tv/MainActivity.kt
 +++ b/app/src/main/java/com/nuvio/tv/MainActivity.kt
 @@ -34,6 +34,7 @@ import androidx.compose.foundation.clickable
@@ -428952,7 +428952,7 @@ index 89d1031ea..eec6228ff 100644
      }
  
      private fun captureDeepLinkIntent(intent: Intent?) {
-@@ -1516,8 +2070,123 @@ open class MainActivity : ComponentActivity() {
+@@ -1516,8 +2070,119 @@ open class MainActivity : ComponentActivity() {
          pendingLaunchIntent.value = intent
      }
  
@@ -429038,9 +429038,6 @@ index 89d1031ea..eec6228ff 100644
 +        nuvioHandlesHomeKey = runCatching { LauncherSetup.handlesHome(this) }.getOrDefault(false)
 +        // Launcher: shared signal for Home's Apps row and other role-aware consumers.
 +        launcherRoleState.refresh()
-+        // Launcher: the accessibility key filter tracks the HOME role (native HOME needs no filter,
-+        // and filtering is what blocks Android's key auto-repeat — held volume moved one step).
-+        com.nuvio.tv.core.launcher.LauncherAccessibilityService.refreshKeyFiltering()
 +    }
 +
 +    /**
@@ -429066,7 +429063,6 @@ index 89d1031ea..eec6228ff 100644
 +
      override fun onPause() {
 +        HomeForegroundDelivery.detach(this)
-+        volumeKeyRepeat.stop() // a held volume button leaving the foreground would never send UP
 +        builtMapper()?.let {
 +            it.actionExecutor.detachForegroundHandler(this)
 +            it.cancelPendingGestures()
@@ -429076,18 +429072,7 @@ index 89d1031ea..eec6228ff 100644
          if (::jankStats.isInitialized) jankStats.isTrackingEnabled = false
      }
  
-@@ -1532,6 +2201,10 @@ open class MainActivity : ComponentActivity() {
- 
-     private val ambientIdleController = AmbientIdleController()
- 
-+    // Launcher: volume stepping while the remote button is held (the accessibility key filter
-+    // switches Android's own key auto-repeat off).
-+    private val volumeKeyRepeat by lazy { com.nuvio.tv.core.launcher.VolumeKeyRepeatController(this) }
-+
-     override fun onUserInteraction() {
-         super.onUserInteraction()
-         ambientIdleController.onInteraction()
-@@ -1539,6 +2212,22 @@ open class MainActivity : ComponentActivity() {
+@@ -1539,6 +2204,22 @@ open class MainActivity : ComponentActivity() {
      }
  
      override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -429110,7 +429095,7 @@ index 89d1031ea..eec6228ff 100644
          // Nuvio fork: OLED screensaver — while the dim overlay is visible, the first key
          // press wakes it and the whole press (down, repeats, matching up) is swallowed so
          // waking never also navigates (ported from Nuvio-KE).
-@@ -1557,7 +2246,39 @@ open class MainActivity : ComponentActivity() {
+@@ -1557,7 +2238,32 @@ open class MainActivity : ComponentActivity() {
          }
          screensaverController.notifyInteraction()
          if (com.nuvio.tv.core.sound.DxSounds.onKey(this, event)) return true // dx.bi sounds hook
@@ -429137,20 +429122,13 @@ index 89d1031ea..eec6228ff 100644
 +            return true
 +        }
          if (ambientIdleController.consumeKeyEvent(event)) return true
-+        // Launcher: with the accessibility key filter on, Android stops auto-repeating held keys
-+        // (only the first down and the final up arrive), so holding Volume moved one step per press.
-+        // Step on our own timer here instead; the ambient wake above still claims the first press.
-+        // The filter is only installed while the HOME fallback or a global Button Mapper binding
-+        // needs it — as the plain default launcher keys arrive with native auto-repeat untouched.
-+        if (com.nuvio.tv.core.launcher.VolumeKeyRepeatController.handles(event.keyCode) &&
-+            com.nuvio.tv.core.launcher.LauncherAccessibilityService.keyFilterActive
-+        ) {
-+            return volumeKeyRepeat.onKeyEvent(event)
-+        }
++        // Volume keys fall straight through with the platform's native auto-repeat — the
++        // accessibility service never requests key filtering (a filter silently disables
++        // auto-repeat system-wide, which is what broke held Volume in earlier builds).
          if (event.keyCode == KeyEvent.KEYCODE_BACK) {
              if (longPressBackHeld.value) {
                  if (event.action == KeyEvent.ACTION_UP) longPressBackHeld.value = false
-@@ -1573,17 +2294,32 @@ open class MainActivity : ComponentActivity() {
+@@ -1573,17 +2279,31 @@ open class MainActivity : ComponentActivity() {
              }
              return true
          }
@@ -429171,7 +429149,6 @@ index 89d1031ea..eec6228ff 100644
          super.onWindowFocusChanged(hasFocus)
 +        if (!hasFocus) {
 +            builtMapper()?.cancelPendingGestures()
-+            volumeKeyRepeat.stop()
 +        }
          // Nuvio fork: Compose dialogs are separate platform windows whose keys never reach
          // this Activity — pause screensaver idle detection while this window lacks focus.
@@ -429183,7 +429160,7 @@ index 89d1031ea..eec6228ff 100644
          // Returning from an external player: raise the auto-next loader before the player's
          // result is dispatched and before the window repaints, so the transition shows the
          // loader instantly with no episode-list flash. No-op unless a series episode is being
-@@ -1595,9 +2331,20 @@ open class MainActivity : ComponentActivity() {
+@@ -1595,9 +2315,20 @@ open class MainActivity : ComponentActivity() {
          androidTvChannelSyncService.onForegroundChanged(true)
          // Nuvio fork: a quick return is not idle for the nightly self-trim.
          nightlySelfTrim.onAppForegrounded()
@@ -429204,7 +429181,7 @@ index 89d1031ea..eec6228ff 100644
          externalPlaybackTracker.onExternalPlayerCoveredApp()
          super.onStop()
          startupSyncService.stopPeriodicSurfacePulls()
-@@ -1606,11 +2353,17 @@ open class MainActivity : ComponentActivity() {
+@@ -1606,11 +2337,17 @@ open class MainActivity : ComponentActivity() {
          androidTvChannelSyncService.onForegroundChanged(false)
          // Nuvio fork: schedule the nightly self-trim while backgrounded.
          nightlySelfTrim.onAppBackgrounded()
@@ -429223,7 +429200,7 @@ index 89d1031ea..eec6228ff 100644
      }
  }
  
-@@ -1742,7 +2495,10 @@ private fun LegacySidebarScaffold(
+@@ -1742,7 +2479,10 @@ private fun LegacySidebarScaffold(
      var legacyDrawerInteractionVersion by remember { mutableStateOf(0) }
  
  
@@ -429235,7 +429212,7 @@ index 89d1031ea..eec6228ff 100644
          pendingSidebarFocusRequest = true
          drawerState.setValue(DrawerValue.Open)
      }
-@@ -1881,14 +2637,36 @@ private fun LegacySidebarScaffold(
+@@ -1881,14 +2621,36 @@ private fun LegacySidebarScaffold(
                          }
                      }
  
@@ -429277,7 +429254,7 @@ index 89d1031ea..eec6228ff 100644
                          drawerItems.forEach { item ->
                              key(item.route) {
                                  LegacySidebarButton(
-@@ -1917,6 +2695,7 @@ private fun LegacySidebarScaffold(
+@@ -1917,6 +2679,7 @@ private fun LegacySidebarScaffold(
                          }
                      }
                  }
@@ -429285,7 +429262,7 @@ index 89d1031ea..eec6228ff 100644
              }
          }
          }
-@@ -1979,9 +2758,43 @@ private fun LegacySidebarScaffold(
+@@ -1979,9 +2742,43 @@ private fun LegacySidebarScaffold(
                      }
                  }
          ) {
@@ -429330,7 +429307,7 @@ index 89d1031ea..eec6228ff 100644
              ) {
                  NuvioNavHost(
                      navController = navController,
-@@ -2104,8 +2917,9 @@ private fun LegacySidebarButton(
+@@ -2104,8 +2901,9 @@ private fun LegacySidebarButton(
  private fun ModernSidebarScaffold(
      longPressBackHeld: MutableState<Boolean>,
      navController: NavHostController,
@@ -429341,7 +429318,7 @@ index 89d1031ea..eec6228ff 100644
      rootRoutes: Set<String>,
      drawerItems: List<DrawerItem>,
      selectedDrawerRoute: String?,
-@@ -2123,6 +2937,7 @@ private fun ModernSidebarScaffold(
+@@ -2123,6 +2921,7 @@ private fun ModernSidebarScaffold(
  ) {
      val showSidebar = currentRoute in rootRoutes && !LiveTvPlayerSidebarGate.playerActive
      val sidebarTokens = NuvioComponents.tokens.sidebar
@@ -429349,7 +429326,7 @@ index 89d1031ea..eec6228ff 100644
      val collapsedSidebarWidth = if (sidebarCollapsed) NuvioTheme.spacing.none else sidebarTokens.collapsedWidth
      val openSidebarWidth = sidebarTokens.expandedWidth
  
-@@ -2137,6 +2952,18 @@ private fun ModernSidebarScaffold(
+@@ -2137,6 +2936,18 @@ private fun ModernSidebarScaffold(
      var pendingContentFocusTransfer by remember { mutableStateOf(false) }
      var pendingSidebarFocusRequest by remember { mutableStateOf(false) }
      var focusedDrawerIndex by remember { mutableStateOf(-1) }
@@ -429368,7 +429345,7 @@ index 89d1031ea..eec6228ff 100644
      var isFloatingPillIconOnly by remember { mutableStateOf(false) }
      var pillExpandRequestCount by remember { mutableIntStateOf(0) }
      val keepFloatingPillExpanded = false
-@@ -2176,7 +3003,10 @@ private fun ModernSidebarScaffold(
+@@ -2176,7 +2987,10 @@ private fun ModernSidebarScaffold(
          }
      }
  
@@ -429380,7 +429357,7 @@ index 89d1031ea..eec6228ff 100644
          isSidebarExpanded = true
          sidebarCollapsePending = false
          pendingSidebarFocusRequest = true
-@@ -2216,9 +3046,16 @@ private fun ModernSidebarScaffold(
+@@ -2216,9 +3030,16 @@ private fun ModernSidebarScaffold(
      }
  
      val sidebarVisible = showSidebar && (isSidebarExpanded || !sidebarCollapsed)
@@ -429399,7 +429376,7 @@ index 89d1031ea..eec6228ff 100644
      // re-layouts and haze doesn't re-render blur every frame.
      val sidebarWidth = if (sidebarVisible) openSidebarWidth else collapsedSidebarWidth
      val animationDuration = if (sidebarVisible) 400 else 300
-@@ -2230,7 +3067,6 @@ private fun ModernSidebarScaffold(
+@@ -2230,7 +3051,6 @@ private fun ModernSidebarScaffold(
          animationSpec = tween(durationMillis = if (isSidebarExpanded) 280 else 200, easing = animationEasing),
          label = "sidebarSurfaceAlpha"
      )
@@ -429407,7 +429384,7 @@ index 89d1031ea..eec6228ff 100644
      val sidebarTransition = updateTransition(
          targetState = isSidebarExpanded,
          label = "sidebarTransition"
-@@ -2238,7 +3074,7 @@ private fun ModernSidebarScaffold(
+@@ -2238,7 +3058,7 @@ private fun ModernSidebarScaffold(
      // Labels and icons are always at full size — the panel is rendered
      // complete and the open/close animation is purely graphicsLayer.
      val sidebarLabelAlpha = 1f
@@ -429416,7 +429393,7 @@ index 89d1031ea..eec6228ff 100644
          transitionSpec = {
              if (targetState) {
                  tween(durationMillis = NuvioMotion.tokens.durations.sidebarPanelIn, easing = FastOutSlowInEasing)
-@@ -2250,11 +3086,67 @@ private fun ModernSidebarScaffold(
+@@ -2250,11 +3070,67 @@ private fun ModernSidebarScaffold(
      ) { expanded ->
          if (expanded) 1f else 0f
      }
@@ -429484,7 +429461,7 @@ index 89d1031ea..eec6228ff 100644
  
      val sidebarIconScale = 1f
      val sidebarBloomScale = 1f
-@@ -2298,6 +3190,14 @@ private fun ModernSidebarScaffold(
+@@ -2298,6 +3174,14 @@ private fun ModernSidebarScaffold(
          modifier = Modifier
              .fillMaxSize()
              .onPreviewKeyEvent { keyEvent ->
@@ -429499,7 +429476,7 @@ index 89d1031ea..eec6228ff 100644
                  // Consume all Back key events after long-press until released,
                  // preventing the exit-app BackHandler from firing during the hold.
                  if (longPressBackHeld.value && keyEvent.key == Key.Back) {
-@@ -2311,7 +3211,7 @@ private fun ModernSidebarScaffold(
+@@ -2311,7 +3195,7 @@ private fun ModernSidebarScaffold(
              modifier = Modifier
                  .fillMaxSize()
                  .then(
@@ -429508,7 +429485,7 @@ index 89d1031ea..eec6228ff 100644
                      else Modifier
                  )
                  .onPreviewKeyEvent { keyEvent ->
-@@ -2342,7 +3242,10 @@ private fun ModernSidebarScaffold(
+@@ -2342,7 +3226,10 @@ private fun ModernSidebarScaffold(
                      if (
                          isSidebarExpanded &&
                          !sidebarCollapsePending &&
@@ -429520,7 +429497,7 @@ index 89d1031ea..eec6228ff 100644
                          keyEvent.type == KeyEventType.KeyDown &&
                          isBlockedContentKey(keyEvent.key)
                      ) {
-@@ -2381,33 +3284,77 @@ private fun ModernSidebarScaffold(
+@@ -2381,33 +3268,77 @@ private fun ModernSidebarScaffold(
                      }
                  }
          ) {
@@ -429608,7 +429585,7 @@ index 89d1031ea..eec6228ff 100644
                          transformOrigin = TransformOrigin(0f, 0f)
                      }
                      .selectableGroup()
-@@ -2419,10 +3366,18 @@ private fun ModernSidebarScaffold(
+@@ -2419,10 +3350,18 @@ private fun ModernSidebarScaffold(
                              Key.DirectionUp -> {
                                  if (focusedDrawerIndex == sidebarTopBoundaryIndex) {
                                      true
@@ -429628,7 +429605,7 @@ index 89d1031ea..eec6228ff 100644
                                      true
                                  }
                              }
-@@ -2440,7 +3395,9 @@ private fun ModernSidebarScaffold(
+@@ -2440,7 +3379,9 @@ private fun ModernSidebarScaffold(
                                      }
                                      true
                                  } else {
@@ -429639,7 +429616,7 @@ index 89d1031ea..eec6228ff 100644
                                      true
                                  }
                              }
-@@ -2448,7 +3405,10 @@ private fun ModernSidebarScaffold(
+@@ -2448,7 +3389,10 @@ private fun ModernSidebarScaffold(
                              Key.DirectionRight, Key.DirectionLeft -> {
                                  val collapseKey = if (isRtl) Key.DirectionLeft else Key.DirectionRight
                                  if (keyEvent.key == collapseKey) {
@@ -429651,7 +429628,7 @@ index 89d1031ea..eec6228ff 100644
                                      sidebarCollapsePending = true
                                      true
                                  } else {
-@@ -2460,29 +3420,59 @@ private fun ModernSidebarScaffold(
+@@ -2460,29 +3404,59 @@ private fun ModernSidebarScaffold(
                          }
                      }
              ) {
@@ -429720,7 +429697,7 @@ index 89d1031ea..eec6228ff 100644
                              pendingSidebarFocusRequest = false
                              isSidebarExpanded = false
                              sidebarCollapsePending = false
-@@ -2502,13 +3492,37 @@ private fun ModernSidebarScaffold(
+@@ -2502,13 +3476,37 @@ private fun ModernSidebarScaffold(
                  sidebarShowCollapsedPill &&
                  selectedDrawerRoute != Screen.Search.route
              ) {
@@ -429761,7 +429738,7 @@ index 89d1031ea..eec6228ff 100644
                      modifier = Modifier
                          .align(Alignment.TopStart)
                          .offset {
-@@ -2548,13 +3562,16 @@ private fun CollapsedSidebarPill(
+@@ -2548,13 +3546,16 @@ private fun CollapsedSidebarPill(
      onExpand: () -> Unit
  ) {
      val pillShape = RoundedCornerShape(NuvioRadii.tokens.full)
@@ -429780,7 +429757,7 @@ index 89d1031ea..eec6228ff 100644
          Brush.verticalGradient(listOf(
              Color(0xFF1C1C1E).copy(alpha = alpha),
              Color(0xFF1C1C1E).copy(alpha = alpha)
-@@ -2575,18 +3592,21 @@ private fun CollapsedSidebarPill(
+@@ -2575,18 +3576,21 @@ private fun CollapsedSidebarPill(
          Box(
              modifier = Modifier
                  .height(NuvioTheme.sizes.player.control)
@@ -429810,7 +429787,7 @@ index 89d1031ea..eec6228ff 100644
          ) {
              Row(
                  modifier = Modifier
-@@ -2640,6 +3660,24 @@ private fun CollapsedSidebarPill(
+@@ -2640,6 +3644,24 @@ private fun CollapsedSidebarPill(
      }
  }
  
@@ -429835,7 +429812,7 @@ index 89d1031ea..eec6228ff 100644
  private fun navigateToDrawerRoute(
      navController: NavHostController,
      currentRoute: String?,
-@@ -2682,7 +3720,7 @@ private fun isBlockedContentKey(key: Key): Boolean {
+@@ -2682,7 +3704,7 @@ private fun isBlockedContentKey(key: Key): Boolean {
  }
  
  @Composable
@@ -429844,7 +429821,7 @@ index 89d1031ea..eec6228ff 100644
      iconRes: Int?,
      icon: ImageVector?,
      modifier: Modifier = Modifier,
-@@ -2722,6 +3760,47 @@ private fun DrawerItemIcon(
+@@ -2722,6 +3744,47 @@ private fun DrawerItemIcon(
  object LocaleCache {
      const val UNSET = "__UNSET__"
  
@@ -435656,10 +435633,10 @@ index 000000000..95ce96352
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/core/launcher/ButtonMappingRepository.kt b/app/src/main/java/com/nuvio/tv/core/launcher/ButtonMappingRepository.kt
 new file mode 100644
-index 000000000..d6c7685ef
+index 000000000..50b54ba6e
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/launcher/ButtonMappingRepository.kt
-@@ -0,0 +1,329 @@
+@@ -0,0 +1,308 @@
 +package com.nuvio.tv.core.launcher
 +
 +import android.view.KeyEvent
@@ -435681,8 +435658,8 @@ index 000000000..d6c7685ef
 + * observed per-button capability state.
 + *
 + * Keeps an in-memory [StateFlow] snapshot synchronized with [ButtonMappingDataStore] so
-+ * foreground (`MainActivity.dispatchKeyEvent`) and global (`LauncherAccessibilityService.onKeyEvent`)
-+ * key handlers never perform disk or database I/O on the input thread.
++ * foreground (`MainActivity.dispatchKeyEvent`) key handlers never perform disk or database
++ * I/O on the input thread.
 + */
 +@Singleton
 +class ButtonMappingRepository(
@@ -435715,7 +435692,7 @@ index 000000000..d6c7685ef
 +    }
 +
 +    /**
-+     * Fast, non-blocking snapshot read for `onKeyEvent` and `dispatchKeyEvent`.
++     * Fast, non-blocking snapshot read for `dispatchKeyEvent`.
 +     */
 +    fun currentSnapshot(): ButtonMapperPersistedState = _state.value
 +
@@ -435756,24 +435733,6 @@ index 000000000..d6c7685ef
 +            mapping.scope.allowsForeground()
 +        }
 +        return if (scopeAllowed && mapping.hasAnyAssignedAction()) mapping else null
-+    }
-+
-+    /**
-+     * True when at least one enabled mapping actually acts outside Nuvio (global scope, non-factory
-+     * for Home). Only that needs the accessibility service's key filter — which disables Android's
-+     * own key auto-repeat — so the plain default launcher runs filter-free and Volume repeats natively.
-+     */
-+    fun hasGlobalCaptureConfigured(): Boolean {
-+        val snapshot = _state.value
-+        if (!snapshot.masterEnabled) return false
-+        return snapshot.mappings.any { mapping ->
-+            if (!mapping.enabled || !mapping.scope.allowsGlobal()) return@any false
-+            when (mapping.keyCode) {
-+                KeyEvent.KEYCODE_HOME ->
-+                    snapshot.homeCustomizationEnabled && !mapping.matchesFactoryHomeDefaults()
-+                else -> mapping.hasAnyAssignedAction()
-+            }
-+        }
 +    }
 +
 +    /**
@@ -435959,9 +435918,6 @@ index 000000000..d6c7685ef
 +            observedForegroundKeyCodes = next.observedForegroundKeyCodes + runtimeObservedForeground,
 +            observedGlobalKeyCodes = next.observedGlobalKeyCodes + runtimeObservedGlobal
 +        )
-+        // Mapping set changed: the accessibility service's key filter tracks whether any of the
-+        // bindings act globally (see LauncherAccessibilityService.applyKeyFiltering).
-+        LauncherAccessibilityService.refreshKeyFiltering()
 +        return _state.value
 +    }
 +
@@ -436335,10 +436291,10 @@ index 000000000..18088fa47
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/core/launcher/LauncherAccessibilityService.kt b/app/src/main/java/com/nuvio/tv/core/launcher/LauncherAccessibilityService.kt
 new file mode 100644
-index 000000000..f0a919e01
+index 000000000..36f3104eb
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/launcher/LauncherAccessibilityService.kt
-@@ -0,0 +1,385 @@
+@@ -0,0 +1,268 @@
 +package com.nuvio.tv.core.launcher
 +
 +import android.accessibilityservice.AccessibilityService
@@ -436351,12 +436307,21 @@ index 000000000..f0a919e01
 +import android.os.SystemClock
 +import android.provider.Settings
 +import android.util.Log
-+import android.view.KeyEvent
 +import android.view.accessibility.AccessibilityEvent
 +import com.nuvio.tv.MainActivity
 +import kotlinx.coroutines.flow.MutableStateFlow
 +import kotlinx.coroutines.flow.asStateFlow
 +
++/**
++ * HOME takeover via window-state events, with no key-event filtering at all (flix-launcher
++ * parity). Filtering every key (FLAG_REQUEST_FILTER_KEY_EVENTS) silently disables Android's
++ * auto-repeat system-wide — held Volume moved a single step per press in every app — and the
++ * runtime flag-clear cannot undo what the service XML asks for at bind time, so neither the
++ * XML nor the runtime requests it. Consequences: a Home press while another app is in front
++ * may flash the stock launcher for a moment before the window watcher brings Nuvio back, and
++ * Button Mapper bindings only fire while Nuvio itself is the foreground window (in-app key
++ * handling in [com.nuvio.tv.MainActivity] still covers everything Nuvio can see).
++ */
 +class LauncherAccessibilityService : AccessibilityService() {
 +    private var delivery = HomeFallbackPolicy()
 +    private var boundAtElapsed = 0L
@@ -436394,7 +436359,6 @@ index 000000000..f0a919e01
 +            info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
 +            info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
 +            serviceInfo = info
-+            applyKeyFiltering()
 +            LauncherSetup.observeNativeHome(this, LauncherSetup.isDefaultHome(this))
 +            operational.value = true
 +            LauncherSetup.noteOverrideWasOn(this)
@@ -436408,37 +436372,6 @@ index 000000000..f0a919e01
 +    }
 +
 +    /**
-+     * Key filtering (FLAG_REQUEST_FILTER_KEY_EVENTS) is only requested while something actually has to
-+     * be taken globally: the HOME fallback when Nuvio is not the system's home, or a Button Mapper
-+     * binding that acts outside Nuvio. While the flag is on, Android routes every key through this
-+     * service's input filter and silently stops auto-repeating held keys system-wide — holding Volume
-+     * moved one step per press, in every app (the defect flix-launcher fixed by dropping the flag).
-+     * As the plain default launcher the flag is not set and the platform's own key repeat works.
-+     */
-+    private fun applyKeyFiltering() {
-+        val filtering = wantsKeyFiltering(this)
-+        keyFilterActive = filtering
-+        val info = serviceInfo ?: return
-+        val target = if (filtering) {
-+            info.flags or AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS
-+        } else {
-+            info.flags and AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS.inv()
-+        }
-+        if (info.flags == target) return
-+        info.flags = target
-+        serviceInfo = info
-+    }
-+
-+    private fun wantsKeyFiltering(context: Context): Boolean {
-+        if (!LauncherSetup.isDefaultHome(context)) return true
-+        // Foreground-scoped mapper actions are handled inside the app and need no filter; only a
-+        // mapping that acts in other apps does (the capture dialog runs in-app as well).
-+        return runCatching {
-+            ButtonKeyEventHandler.fromContext(context)?.repository?.hasGlobalCaptureConfigured() == true
-+        }.getOrDefault(false)
-+    }
-+
-+    /**
 +     * After a power cycle the firmware's own launcher comes up. When Nuvio is only the accessibility
 +     * fallback (not the system's default launcher), bring Nuvio to the front once the service is up
 +     * shortly after boot, as a default launcher would be.
@@ -436447,75 +436380,6 @@ index 000000000..f0a919e01
 +        if (SystemClock.elapsedRealtime() > BOOT_WINDOW_MS) return
 +        if (LauncherSetup.isDefaultHome(this) || !LauncherSetup.accessibilityFallbackAllowed(this)) return
 +        Handler(Looper.getMainLooper()).postDelayed({ launchHome(SystemClock.uptimeMillis()) }, BOOT_OPEN_DELAY_MS)
-+    }
-+
-+    /**
-+     * Only the Home button is touched; every other key (Back, D-pad, media, Volume) passes straight
-+     * through. With Nuvio as the system's Home app Android delivers HOME to it directly and this does
-+     * nothing; otherwise the press is taken here and Nuvio is brought to the front, so Home always
-+     * lands on the launcher's home page and a quick second press reaches the profile switcher.
-+     */
-+    override fun onKeyEvent(event: KeyEvent): Boolean {
-+        if (mappedKeyHandled(event)) return true
-+        if (AppsKeyStore.matches(this, event.keyCode)) return onAppsKey(event)
-+        if (event.keyCode != KeyEvent.KEYCODE_HOME) return super.onKeyEvent(event)
-+        // isDefaultHome is a PackageManager binder call: only pay for it for the Home key.
-+        val nativeHome = LauncherSetup.isDefaultHome(this)
-+        LauncherSetup.observeNativeHome(this, nativeHome)
-+        if (nativeHome || !LauncherSetup.accessibilityFallbackAllowed(this)) {
-+            // Native HOME is preferred. In particular, don't fight a working HOME role.
-+            return super.onKeyEvent(event)
-+        }
-+        // Consume the whole sequence, but only forward uncanceled releases, never held-key DOWNs.
-+        if (delivery.acceptKeyRelease(event.eventTime, event.action == KeyEvent.ACTION_UP, event.isCanceled)) {
-+            launchHome(event.eventTime, fromKeyPress = true)
-+            // Not tied to a stock-launcher window event: re-fronting its existing task may not emit one.
-+            scheduleHomeRecheck()
-+        }
-+        return true
-+    }
-+
-+    /**
-+     * Button Mapper, for every app: a remote button the user gave actions to (or that is being taught in
-+     * Settings) is taken here, so Android TV can't act on it first. Only buttons that can be mapped at all
-+     * reach the mapper (never the D-pad, Back, volume or power), and nothing is built until one of them is pressed.
-+     * Home is only taken when the user changed what it does; otherwise it keeps the handling below.
-+     */
-+    private fun mappedKeyHandled(event: KeyEvent): Boolean {
-+        val code = event.keyCode
-+        if (!RemoteButtonCatalog.isMappableKey(code)) return false
-+        val mapper = ButtonKeyEventHandler.fromContext(this) ?: return false
-+        val foreground = HomeForegroundDelivery.isResumed
-+        val source = if (foreground) ButtonEventSource.FOREGROUND else ButtonEventSource.GLOBAL
-+        // Teaching a button in Settings: the press belongs to the capture.
-+        if (mapper.captureController.isCapturingOrReleasing(code, event.action)) {
-+            return mapper.onKeyEvent(event = event, source = source, accessibilityEnabled = true, nativeHomeActive = LauncherSetup.isDefaultHome(this))
-+        }
-+        val mapping = mapper.repository.activeMappingFor(code, isGlobal = !foreground) ?: return false
-+        if (code == KeyEvent.KEYCODE_HOME && mapping.matchesFactoryHomeDefaults()) return false
-+        val handled = mapper.onKeyEvent(event = event, source = source, accessibilityEnabled = true, nativeHomeActive = LauncherSetup.isDefaultHome(this))
-+        if (handled && code == KeyEvent.KEYCODE_HOME) delivery.onLaunch(SystemClock.uptimeMillis())
-+        return handled
-+    }
-+
-+    /**
-+     * The remote's Apps button. In front of the launcher it is handled by the app; with another app
-+     * on screen it would open the TV's own app list, so it is taken here and opens the Apps page.
-+     */
-+    private fun onAppsKey(event: KeyEvent): Boolean {
-+        if (HomeForegroundDelivery.isResumed) return super.onKeyEvent(event)
-+        if (!LauncherSetup.isDefaultHome(this) && !LauncherSetup.accessibilityFallbackAllowed(this)) return super.onKeyEvent(event)
-+        if (event.action == KeyEvent.ACTION_UP && !event.isCanceled) {
-+            runCatching {
-+                startActivity(
-+                    Intent(this, MainActivity::class.java).apply {
-+                        putExtra(LauncherHomeRequest.EXTRA_OPEN_APPS, true)
-+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-+                    }
-+                )
-+            }.onFailure { Log.e(TAG, "Failed to open Apps", it) }
-+        }
-+        return true
 +    }
 +
 +    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -436585,7 +436449,6 @@ index 000000000..f0a919e01
 +    override fun onUnbind(intent: Intent?): Boolean {
 +        cancelHomeRecheck()
 +        operational.value = false
-+        keyFilterActive = false
 +        if (activeServiceRef?.get() === this) {
 +            activeServiceRef = null
 +        }
@@ -436600,7 +436463,6 @@ index 000000000..f0a919e01
 +    override fun onDestroy() {
 +        cancelHomeRecheck()
 +        operational.value = false
-+        keyFilterActive = false
 +        if (activeServiceRef?.get() === this) {
 +            activeServiceRef = null
 +        }
@@ -436611,24 +436473,20 @@ index 000000000..f0a919e01
 +    private val recentLaunches = ArrayDeque<Long>()
 +
 +    /**
-+     * [fromKeyPress]: the start was asked for by a real Home button release. Those are already spaced out
-+     * ([HomeFallbackPolicy.acceptKeyRelease]) and are never a loop, so they are neither counted nor refused;
-+     * otherwise three quick presses in five seconds made the next one do nothing. Only starts the service
-+     * decides on its own (window events, re-checks, after boot) are counted against the loop limit.
++     * All starts here are ones the service decides on its own (window events, re-checks, after boot),
++     * so they are guarded against loops: a window that closes itself and is reopened by Android
++     * (Google's setup recovery screen when the TV's own launcher is gone) would otherwise make this
++     * start Nuvio again and again until the system crashed. Three starts within five seconds is a
++     * loop, not Home presses: stop and let it settle.
 +     */
-+    private fun launchHome(pressedAtMs: Long, fromKeyPress: Boolean = false) {
-+        // A window that closes itself and is reopened by Android (Google's setup recovery screen when the TV's own
-+        // launcher is gone) would make this start Nuvio again and again until the system crashed. Three automatic
-+        // starts within five seconds is a loop, not a Home press: stop and let it settle.
++    private fun launchHome(pressedAtMs: Long) {
 +        val now = SystemClock.uptimeMillis()
-+        if (!fromKeyPress) {
-+            while (recentLaunches.isNotEmpty() && now - recentLaunches.first() > 5_000L) recentLaunches.removeFirst()
-+            if (recentLaunches.size >= 3) {
-+                Log.w(TAG, "Takeover loop: ${recentLaunches.size} starts in 5 s; skipping")
-+                return
-+            }
-+            recentLaunches.addLast(now)
++        while (recentLaunches.isNotEmpty() && now - recentLaunches.first() > 5_000L) recentLaunches.removeFirst()
++        if (recentLaunches.size >= 3) {
++            Log.w(TAG, "Takeover loop: ${recentLaunches.size} starts in 5 s; skipping")
++            return
 +        }
++        recentLaunches.addLast(now)
 +        try {
 +            if (!HomeForegroundDelivery.deliver(pressedAtMs)) {
 +                val intent = Intent(this, MainActivity::class.java).apply {
@@ -436660,27 +436518,8 @@ index 000000000..f0a919e01
 +        @Volatile
 +        private var activeServiceRef: java.lang.ref.WeakReference<LauncherAccessibilityService>? = null
 +
-+        /**
-+         * True while this service's key filter is installed system-wide (HOME fallback active or a
-+         * global Button Mapper binding exists). The foreground activity uses it to decide whether
-+         * volume keys need its own repeat timer ([VolumeKeyRepeatController]) or arrive with the
-+         * platform's native auto-repeat.
-+         */
-+        @Volatile
-+        internal var keyFilterActive = false
-+
 +        /** Live binding/configuration, not proof this firmware actually delivers HOME keys. */
 +        internal val isOperational = operational.asStateFlow()
-+
-+        /**
-+         * Re-evaluates whether the key filter is needed (HOME role flipped, or a Button Mapper
-+         * mapping was added/removed) and updates the live service info. Cheap no-op when the state
-+         * did not change.
-+         */
-+        fun refreshKeyFiltering() {
-+            val service = activeServiceRef?.get() ?: return
-+            service.mainHandler.post { service.applyKeyFiltering() }
-+        }
 +
 +        fun performGlobalBack(): Boolean = runCatching {
 +            activeServiceRef?.get()?.performGlobalAction(GLOBAL_ACTION_BACK) == true
@@ -437947,87 +437786,6 @@ index 000000000..566501094
 +                )
 +            }
 +        }
-+    }
-+}
-diff --git a/app/src/main/java/com/nuvio/tv/core/launcher/VolumeKeyRepeatController.kt b/app/src/main/java/com/nuvio/tv/core/launcher/VolumeKeyRepeatController.kt
-new file mode 100644
-index 000000000..ffdc377ac
---- /dev/null
-+++ b/app/src/main/java/com/nuvio/tv/core/launcher/VolumeKeyRepeatController.kt
-@@ -0,0 +1,75 @@
-+package com.nuvio.tv.core.launcher
-+
-+import android.content.Context
-+import android.media.AudioManager
-+import android.os.Handler
-+import android.os.Looper
-+import android.view.KeyEvent
-+import android.view.ViewConfiguration
-+
-+/**
-+ * Keeps the volume buttons stepping while a remote button is held.
-+ *
-+ * While the launcher accessibility service is enabled Android routes key events through its
-+ * input filter, and filtered keys never auto-repeat (only the initial down and the final up
-+ * arrive), so holding Volume moved the volume by a single step per press. This controller
-+ * takes over the two volume keys in the foreground activity instead: the first press steps
-+ * once, a held button keeps stepping on its own timer, and system repeats (when they do
-+ * arrive, with the service off) are only keep-alive pings for the timer.
-+ */
-+class VolumeKeyRepeatController(context: Context) {
-+
-+    private val audio = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-+    private val handler = Handler(Looper.getMainLooper())
-+    private var heldKeyCode = 0
-+
-+    fun onKeyEvent(event: KeyEvent): Boolean {
-+        when (event.action) {
-+            KeyEvent.ACTION_DOWN -> {
-+                if (event.repeatCount == 0) {
-+                    heldKeyCode = event.keyCode
-+                    adjust(event.keyCode)
-+                    scheduleNext(ViewConfiguration.getKeyRepeatTimeout().toLong())
-+                } else if (heldKeyCode != event.keyCode) {
-+                    // The hold outlived the timer being stopped (focus change or pause); restart it.
-+                    heldKeyCode = event.keyCode
-+                    scheduleNext(ViewConfiguration.getKeyRepeatDelay().toLong())
-+                }
-+            }
-+            KeyEvent.ACTION_UP -> if (event.keyCode == heldKeyCode) stop()
-+        }
-+        return true
-+    }
-+
-+    /** Called when the activity loses focus or pauses: a released remote would never send UP here. */
-+    fun stop() {
-+        heldKeyCode = 0
-+        handler.removeCallbacks(step)
-+    }
-+
-+    private fun scheduleNext(delayMs: Long) {
-+        handler.removeCallbacks(step)
-+        handler.postDelayed(step, delayMs)
-+    }
-+
-+    private fun adjust(keyCode: Int) {
-+        val direction =
-+            if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER
-+        runCatching {
-+            audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, direction, AudioManager.FLAG_SHOW_UI)
-+        }
-+    }
-+
-+    private val step = object : Runnable {
-+        override fun run() {
-+            if (heldKeyCode == 0) return
-+            adjust(heldKeyCode)
-+            handler.postDelayed(this, ViewConfiguration.getKeyRepeatDelay().toLong())
-+        }
-+    }
-+
-+    companion object {
-+        fun handles(keyCode: Int): Boolean =
-+            keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/core/logging/LogDiagnostics.kt b/app/src/main/java/com/nuvio/tv/core/logging/LogDiagnostics.kt
@@ -885091,16 +884849,20 @@ index 000000000..0cf65f40a
 +</resources>
 diff --git a/app/src/main/res/xml/launcher_accessibility_service_config.xml b/app/src/main/res/xml/launcher_accessibility_service_config.xml
 new file mode 100644
-index 000000000..b783207a9
+index 000000000..d574ad041
 --- /dev/null
 +++ b/app/src/main/res/xml/launcher_accessibility_service_config.xml
-@@ -0,0 +1,9 @@
+@@ -0,0 +1,13 @@
 +<?xml version="1.0" encoding="utf-8"?>
++<!-- No key-event filtering, ever: with flagRequestFilterKeyEvents Android routes every key
++     through this service's input filter and silently stops auto-repeating held keys
++     system-wide — holding Volume changed the volume once per press in every app
++     (the accessibility defect flix-launcher fixed by dropping the flag). Do not add key
++     flags back here; a runtime flag-clear does not help, because the system installs the
++     filter from this XML at bind time. HOME is covered by window-state events instead. -->
 +<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
 +    android:accessibilityEventTypes="typeWindowStateChanged"
 +    android:accessibilityFeedbackType="feedbackGeneric"
-+    android:accessibilityFlags="flagRequestFilterKeyEvents|flagDefault"
-+    android:canRequestFilterKeyEvents="true"
 +    android:canRetrieveWindowContent="false"
 +    android:description="@string/launcher_accessibility_service_description"
 +    android:notificationTimeout="50" />
