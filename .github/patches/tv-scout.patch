@@ -428059,7 +428059,7 @@ index 000000000..b1a32a5b9
 +internal fun isFreshLaunchIntent(hasSavedInstanceState: Boolean, intentFlags: Int): Boolean =
 +    !hasSavedInstanceState && intentFlags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY == 0
 diff --git a/app/src/main/java/com/nuvio/tv/MainActivity.kt b/app/src/main/java/com/nuvio/tv/MainActivity.kt
-index 89d1031ea..70a1ff2a6 100644
+index 89d1031ea..64b1d86a4 100644
 --- a/app/src/main/java/com/nuvio/tv/MainActivity.kt
 +++ b/app/src/main/java/com/nuvio/tv/MainActivity.kt
 @@ -34,6 +34,7 @@ import androidx.compose.foundation.clickable
@@ -428312,7 +428312,26 @@ index 89d1031ea..70a1ff2a6 100644
          isFirstResumeAfterCreate = true
          window?.setBackgroundDrawable(ColorDrawable(android.graphics.Color.TRANSPARENT))
  
-@@ -471,6 +605,14 @@ open class MainActivity : ComponentActivity() {
+@@ -450,6 +584,18 @@ open class MainActivity : ComponentActivity() {
+             }
+         }
+ 
++        // Live TV (classic IPTV, IPTV V2, guide preview, Sports, Multiview) holds the screen too:
++        // no dim overlay while a channel is on, including after pause/resume.
++        lifecycleScope.launch {
++            combine(
++                com.nuvio.tv.core.diagnostics.LiveTvIdleGuard.active,
++                com.nuvio.tv.livetv.ui.ScreenAwake.held,
++                com.nuvio.tv.livetv.player.LiveWatching.active,
++                com.nuvio.tv.livetv.ui.LiveTvFullscreen.active
++            ) { g, h, w, f -> g || h || w != null || f }
++                .collect { on -> screensaverController.setSourceActive("livetv", on) }
++        }
++
+         PluginRuntimeHooks.onActivityCreate(this)
+ 
+         window?.decorView?.post {
+@@ -471,6 +617,14 @@ open class MainActivity : ComponentActivity() {
          val launchEpisodeTitle = intent?.getStringExtra("episodeTitle")
          captureDeepLinkIntent(intent)
  
@@ -428327,7 +428346,7 @@ index 89d1031ea..70a1ff2a6 100644
          setContent {
              var hasSelectedProfileThisSession by rememberSaveable { mutableStateOf(false) }
              var startupSession by remember { mutableIntStateOf(0) }
-@@ -706,6 +848,32 @@ open class MainActivity : ComponentActivity() {
+@@ -706,6 +860,32 @@ open class MainActivity : ComponentActivity() {
              }
              val discoverLocation = mainUiPrefs.discoverLocation
  
@@ -428360,7 +428379,7 @@ index 89d1031ea..70a1ff2a6 100644
              NuvioTheme(
                  appTheme = mainUiPrefs.theme,
                  customThemeColors = mainUiPrefs.customThemeColors,
-@@ -714,7 +882,9 @@ open class MainActivity : ComponentActivity() {
+@@ -714,7 +894,9 @@ open class MainActivity : ComponentActivity() {
                  amoledSurfacesMode = mainUiPrefs.amoledSurfacesMode,
                  quietFocus = mainUiPrefs.quietFocus,
                  glassIntensity = mainUiPrefs.glassIntensity,
@@ -428371,7 +428390,7 @@ index 89d1031ea..70a1ff2a6 100644
              ) {
                  val defaultBringIntoViewSpec = LocalBringIntoViewSpec.current
                  val bringIntoViewSpec = if (mainUiPrefs.smoothBringIntoViewEnabled) {
-@@ -807,6 +977,8 @@ open class MainActivity : ComponentActivity() {
+@@ -807,6 +989,8 @@ open class MainActivity : ComponentActivity() {
                      )
                  }
                  CompositionLocalProvider(
@@ -428380,7 +428399,7 @@ index 89d1031ea..70a1ff2a6 100644
                      LocalDensity provides clampedFontScaleDensity,
                      LocalBringIntoViewSpec provides bringIntoViewSpec,
                      LocalFastHorizontalNavigationEnabled provides mainUiPrefs.fastHorizontalNavigationEnabled,
-@@ -817,6 +989,7 @@ open class MainActivity : ComponentActivity() {
+@@ -817,6 +1001,7 @@ open class MainActivity : ComponentActivity() {
                      LocalMemberAccess provides mainUiPrefs.memberAccess,
                      LocalAmbientIdleController provides ambientIdleController,
                      com.nuvio.tv.core.player.LocalTrailerPlayerPool provides trailerPlayerPool,
@@ -428388,7 +428407,7 @@ index 89d1031ea..70a1ff2a6 100644
                      LocalSplashBackground provides splashBackground,
                      LocalStartupLoadingState provides startupLoadingState,
                      LocalStartupSplashEnabled provides startupSplashEnabled
-@@ -853,7 +1026,22 @@ open class MainActivity : ComponentActivity() {
+@@ -853,7 +1038,22 @@ open class MainActivity : ComponentActivity() {
                      val surfaceContentReady = hasSeenAuthQrOnFirstLaunch != null &&
                          authState !is AuthState.Loading
  
@@ -428412,7 +428431,7 @@ index 89d1031ea..70a1ff2a6 100644
                          // Still loading auth state; nothing to show yet.
                      } else if (
                          hasSeenAuthQrOnFirstLaunch == false &&
-@@ -970,14 +1158,26 @@ open class MainActivity : ComponentActivity() {
+@@ -970,14 +1170,26 @@ open class MainActivity : ComponentActivity() {
                          )
                      } else {
                      val sidebarCollapsed = mainUiPrefs.sidebarCollapsed
@@ -428443,7 +428462,7 @@ index 89d1031ea..70a1ff2a6 100644
                          else -> Screen.LayoutSelection.route
                      }
                      val navController = rememberNavController()
-@@ -985,6 +1185,22 @@ open class MainActivity : ComponentActivity() {
+@@ -985,6 +1197,22 @@ open class MainActivity : ComponentActivity() {
                      var optimisticRoute by remember { mutableStateOf<String?>(null) }
                      val navBackStackEntry by navController.currentBackStackEntryAsState()
                      val actualRoute = navBackStackEntry?.destination?.route
@@ -428466,7 +428485,7 @@ index 89d1031ea..70a1ff2a6 100644
                      val currentRoute = optimisticRoute ?: actualRoute
                      startupDestination = startupDestinationForRoute(actualRoute ?: startDestination)
  
-@@ -993,6 +1209,66 @@ open class MainActivity : ComponentActivity() {
+@@ -993,6 +1221,68 @@ open class MainActivity : ComponentActivity() {
                          ambientIdleController.onInteraction()
                      }
  
@@ -428478,7 +428497,9 @@ index 89d1031ea..70a1ff2a6 100644
 +                        if (homeRequestNonce == 0 || layoutChosen != true) return@LaunchedEffect
 +                        // The Home key opens the page the app starts on ("Open the App On"), Home by default only
 +                        // when that is Home.
-+                        val homeTarget = com.nuvio.tv.ui.screens.settings.ForkStartPage.get(this@MainActivity)
++                        // Not the home app: the Home key is Home, as before the launcher changes.
++                        val homeTarget = if (!launcherRoleState.current) Screen.Home.route
++                            else com.nuvio.tv.ui.screens.settings.ForkStartPage.get(this@MainActivity)
 +                            ?: com.nuvio.tv.livetv.startup.StartPage.cachedRoute(this@MainActivity)
 +                            ?: Screen.Home.route
 +                        if (navController.currentDestination?.route == homeTarget) {
@@ -428499,7 +428520,7 @@ index 89d1031ea..70a1ff2a6 100644
 +                    }
 +                    val openAppsNonce by pendingOpenAppsNonce.collectAsStateWithLifecycle()
 +                    LaunchedEffect(openAppsNonce, layoutChosen) {
-+                        if (openAppsNonce == 0 || layoutChosen != true) return@LaunchedEffect
++                        if (openAppsNonce == 0 || layoutChosen != true || !launcherRoleState.current) return@LaunchedEffect
 +                        if (navController.currentDestination?.route == Screen.Apps.route) return@LaunchedEffect
 +                        navController.navigate(Screen.Apps.route) {
 +                            popUpTo(navController.graph.startDestinationId) { saveState = true }
@@ -428533,7 +428554,7 @@ index 89d1031ea..70a1ff2a6 100644
                      // Auto-play next episode for EXTERNAL players: the tracker resolves the
                      // next episode and we navigate into the same Screen.Stream auto-play route
                      // the internal onPlaybackEnded path uses. Collected from the root composable
-@@ -1170,14 +1446,114 @@ open class MainActivity : ComponentActivity() {
+@@ -1170,14 +1460,115 @@ open class MainActivity : ComponentActivity() {
                          }
                      }
  
@@ -428629,7 +428650,8 @@ index 89d1031ea..70a1ff2a6 100644
 +                    // Live TV fork: the guide's Back opens the menu; Recordings opened from the
 +                    // guide belongs to the guide.
 +                    val liveTvPlaying by com.nuvio.tv.livetv.player.LiveWatching.active.collectAsState()
-+                    val rootRoutes = remember(discoverLocation, scoutInMenu, liveTvInSidebar, onDemandInSidebar, recordingsFromGuide) {
++                    val isLauncherNow by launcherRoleState.isDefaultLauncher.collectAsState()
++                    val rootRoutes = remember(isLauncherNow, discoverLocation, scoutInMenu, liveTvInSidebar, onDemandInSidebar, recordingsFromGuide) {
                          buildSet {
                              add(Screen.Home.route)
                              add(Screen.TvChannels.route)
@@ -428642,14 +428664,14 @@ index 89d1031ea..70a1ff2a6 100644
                              add(Screen.Search.route)
                              add(Screen.Library.route)
 +                            // Launcher: the Apps page (also opened by the remote's Apps button).
-+                            add(Screen.Apps.route)
++                            if (isLauncherNow) add(Screen.Apps.route)
 +                            if (scoutInMenu) add(Screen.Scout.route)
                              add(Screen.YouTube.route)
 +                            add(Screen.Music.route)
                              add(Screen.Settings.route)
                              if (discoverLocation == DiscoverLocation.IN_SIDEBAR) {
                                  add(Screen.Discover.route)
-@@ -1185,28 +1561,85 @@ open class MainActivity : ComponentActivity() {
+@@ -1185,28 +1576,85 @@ open class MainActivity : ComponentActivity() {
                          }
                      }
  
@@ -428736,7 +428758,7 @@ index 89d1031ea..70a1ff2a6 100644
                          buildList {
                              // Nuvio fork: per-profile hidden pages (Home and Settings are never hidden)
                              fun addPage(item: DrawerItem) {
-@@ -1228,7 +1661,8 @@ open class MainActivity : ComponentActivity() {
+@@ -1228,7 +1676,8 @@ open class MainActivity : ComponentActivity() {
                                      )
                                  )
                              }
@@ -428746,13 +428768,13 @@ index 89d1031ea..70a1ff2a6 100644
                                  DrawerItem(
                                      route = Screen.TvChannels.route,
                                      label = strNavTvChannels,
-@@ -1257,6 +1691,33 @@ open class MainActivity : ComponentActivity() {
+@@ -1257,6 +1706,33 @@ open class MainActivity : ComponentActivity() {
                                      iconRes = R.raw.sidebar_library
                                  )
                              )
 +                            // Launcher: the Apps page (also opened by the remote's Apps button), hidden
-+                            // per profile like the rest.
-+                            addPage(
++                            // per profile like the rest, and only while Nuvio is the home app.
++                            if (isLauncherNow) addPage(
 +                                DrawerItem(
 +                                    route = Screen.Apps.route,
 +                                    label = strNavApps,
@@ -428780,7 +428802,7 @@ index 89d1031ea..70a1ff2a6 100644
                              addPage(
                                  DrawerItem(
                                      route = Screen.YouTube.route,
-@@ -1264,7 +1725,17 @@ open class MainActivity : ComponentActivity() {
+@@ -1264,7 +1740,17 @@ open class MainActivity : ComponentActivity() {
                                      icon = Icons.Default.PlayCircle
                                  )
                              )
@@ -428798,7 +428820,7 @@ index 89d1031ea..70a1ff2a6 100644
                                  DrawerItem(
                                      route = Screen.Settings.route,
                                      label = strNavSettings,
-@@ -1272,12 +1743,42 @@ open class MainActivity : ComponentActivity() {
+@@ -1272,12 +1758,42 @@ open class MainActivity : ComponentActivity() {
                                  )
                              )
                          }.let { items ->
@@ -428847,7 +428869,7 @@ index 89d1031ea..70a1ff2a6 100644
                          }
                      }
                      val selectedDrawerRoute = drawerItems.firstOrNull { item ->
-@@ -1310,7 +1811,9 @@ open class MainActivity : ComponentActivity() {
+@@ -1310,7 +1826,9 @@ open class MainActivity : ComponentActivity() {
                      val updateViewModel: UpdateViewModel = hiltViewModel(this@MainActivity)
                      val updateState by updateViewModel.uiState.collectAsState()
                      val updateBannerState = updateState.copy(
@@ -428858,7 +428880,7 @@ index 89d1031ea..70a1ff2a6 100644
                      )
  
                      UpdateBannerHost(
-@@ -1346,19 +1849,63 @@ open class MainActivity : ComponentActivity() {
+@@ -1346,19 +1864,63 @@ open class MainActivity : ComponentActivity() {
                                  }
                              }
                          }
@@ -428926,7 +428948,21 @@ index 89d1031ea..70a1ff2a6 100644
                                          modernSidebarBlurEnabled = modernSidebarBlurEnabled,
                                          hideBuiltInHeaders = hideBuiltInHeadersForFloatingPill,
                                          activeProfileName = activeProfile?.name ?: "",
-@@ -1468,7 +2015,16 @@ open class MainActivity : ComponentActivity() {
+@@ -1408,7 +1970,12 @@ open class MainActivity : ComponentActivity() {
+                             LaunchedEffect(isTrailerPlaying) {
+                                 if (!isTrailerPlaying) ambientIdleController.onInteraction()
+                             }
+-                            val isLiveTvPlaying by com.nuvio.tv.core.diagnostics.LiveTvIdleGuard.active.collectAsState()
++                            val liveTvGuard by com.nuvio.tv.core.diagnostics.LiveTvIdleGuard.active.collectAsState()
++                            val liveTvHeld by com.nuvio.tv.livetv.ui.ScreenAwake.held.collectAsState()
++                            val liveTvChannelOn by com.nuvio.tv.livetv.player.LiveWatching.active.collectAsState()
++                            val liveTvFull by com.nuvio.tv.livetv.ui.LiveTvFullscreen.active.collectAsState()
++                            // Classic IPTV, IPTV V2, guide preview, Sports, Multiview: any of them playing means not idle.
++                            val isLiveTvPlaying = liveTvGuard || liveTvHeld || liveTvChannelOn != null || liveTvFull
+                             LaunchedEffect(isLiveTvPlaying) {
+                                 if (!isLiveTvPlaying) ambientIdleController.onInteraction()
+                             }
+@@ -1468,7 +2035,16 @@ open class MainActivity : ComponentActivity() {
          }
  
          jankStats = JankStats.createAndTrack(window) { frameData ->
@@ -428944,7 +428980,7 @@ index 89d1031ea..70a1ff2a6 100644
                  Log.w(
                      "JankStats",
                      "JANK: ${frameData.frameDurationUiNanos / 1_000_000}ms | states: ${frameData.states}"
-@@ -1479,7 +2035,20 @@ open class MainActivity : ComponentActivity() {
+@@ -1479,7 +2055,20 @@ open class MainActivity : ComponentActivity() {
  
      override fun onResume() {
          super.onResume()
@@ -428965,7 +429001,7 @@ index 89d1031ea..70a1ff2a6 100644
          if (::jankStats.isInitialized) jankStats.isTrackingEnabled = true
          memberAccessRepository.refreshIfStale()
          lifecycleScope.launch {
-@@ -1502,6 +2071,8 @@ open class MainActivity : ComponentActivity() {
+@@ -1502,6 +2091,8 @@ open class MainActivity : ComponentActivity() {
          setIntent(intent)
          captureDeepLinkIntent(intent)
          captureLaunchIntent(intent)
@@ -428974,7 +429010,7 @@ index 89d1031ea..70a1ff2a6 100644
      }
  
      private fun captureDeepLinkIntent(intent: Intent?) {
-@@ -1516,8 +2087,119 @@ open class MainActivity : ComponentActivity() {
+@@ -1516,8 +2107,119 @@ open class MainActivity : ComponentActivity() {
          pendingLaunchIntent.value = intent
      }
  
@@ -429094,7 +429130,7 @@ index 89d1031ea..70a1ff2a6 100644
          if (::jankStats.isInitialized) jankStats.isTrackingEnabled = false
      }
  
-@@ -1539,6 +2221,22 @@ open class MainActivity : ComponentActivity() {
+@@ -1539,6 +2241,22 @@ open class MainActivity : ComponentActivity() {
      }
  
      override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -429117,7 +429153,7 @@ index 89d1031ea..70a1ff2a6 100644
          // Nuvio fork: OLED screensaver — while the dim overlay is visible, the first key
          // press wakes it and the whole press (down, repeats, matching up) is swallowed so
          // waking never also navigates (ported from Nuvio-KE).
-@@ -1557,7 +2255,32 @@ open class MainActivity : ComponentActivity() {
+@@ -1557,7 +2275,32 @@ open class MainActivity : ComponentActivity() {
          }
          screensaverController.notifyInteraction()
          if (com.nuvio.tv.core.sound.DxSounds.onKey(this, event)) return true // dx.bi sounds hook
@@ -429150,7 +429186,7 @@ index 89d1031ea..70a1ff2a6 100644
          if (event.keyCode == KeyEvent.KEYCODE_BACK) {
              if (longPressBackHeld.value) {
                  if (event.action == KeyEvent.ACTION_UP) longPressBackHeld.value = false
-@@ -1573,17 +2296,31 @@ open class MainActivity : ComponentActivity() {
+@@ -1573,17 +2316,31 @@ open class MainActivity : ComponentActivity() {
              }
              return true
          }
@@ -429182,7 +429218,7 @@ index 89d1031ea..70a1ff2a6 100644
          // Returning from an external player: raise the auto-next loader before the player's
          // result is dispatched and before the window repaints, so the transition shows the
          // loader instantly with no episode-list flash. No-op unless a series episode is being
-@@ -1595,9 +2332,20 @@ open class MainActivity : ComponentActivity() {
+@@ -1595,9 +2352,20 @@ open class MainActivity : ComponentActivity() {
          androidTvChannelSyncService.onForegroundChanged(true)
          // Nuvio fork: a quick return is not idle for the nightly self-trim.
          nightlySelfTrim.onAppForegrounded()
@@ -429203,7 +429239,7 @@ index 89d1031ea..70a1ff2a6 100644
          externalPlaybackTracker.onExternalPlayerCoveredApp()
          super.onStop()
          startupSyncService.stopPeriodicSurfacePulls()
-@@ -1606,11 +2354,17 @@ open class MainActivity : ComponentActivity() {
+@@ -1606,11 +2374,17 @@ open class MainActivity : ComponentActivity() {
          androidTvChannelSyncService.onForegroundChanged(false)
          // Nuvio fork: schedule the nightly self-trim while backgrounded.
          nightlySelfTrim.onAppBackgrounded()
@@ -429222,7 +429258,7 @@ index 89d1031ea..70a1ff2a6 100644
      }
  }
  
-@@ -1742,7 +2496,10 @@ private fun LegacySidebarScaffold(
+@@ -1742,7 +2516,10 @@ private fun LegacySidebarScaffold(
      var legacyDrawerInteractionVersion by remember { mutableStateOf(0) }
  
  
@@ -429234,7 +429270,7 @@ index 89d1031ea..70a1ff2a6 100644
          pendingSidebarFocusRequest = true
          drawerState.setValue(DrawerValue.Open)
      }
-@@ -1881,14 +2638,36 @@ private fun LegacySidebarScaffold(
+@@ -1881,14 +2658,36 @@ private fun LegacySidebarScaffold(
                          }
                      }
  
@@ -429276,7 +429312,7 @@ index 89d1031ea..70a1ff2a6 100644
                          drawerItems.forEach { item ->
                              key(item.route) {
                                  LegacySidebarButton(
-@@ -1917,6 +2696,7 @@ private fun LegacySidebarScaffold(
+@@ -1917,6 +2716,7 @@ private fun LegacySidebarScaffold(
                          }
                      }
                  }
@@ -429284,7 +429320,7 @@ index 89d1031ea..70a1ff2a6 100644
              }
          }
          }
-@@ -1979,9 +2759,43 @@ private fun LegacySidebarScaffold(
+@@ -1979,9 +2779,43 @@ private fun LegacySidebarScaffold(
                      }
                  }
          ) {
@@ -429329,7 +429365,7 @@ index 89d1031ea..70a1ff2a6 100644
              ) {
                  NuvioNavHost(
                      navController = navController,
-@@ -2104,8 +2918,9 @@ private fun LegacySidebarButton(
+@@ -2104,8 +2938,9 @@ private fun LegacySidebarButton(
  private fun ModernSidebarScaffold(
      longPressBackHeld: MutableState<Boolean>,
      navController: NavHostController,
@@ -429340,7 +429376,7 @@ index 89d1031ea..70a1ff2a6 100644
      rootRoutes: Set<String>,
      drawerItems: List<DrawerItem>,
      selectedDrawerRoute: String?,
-@@ -2123,6 +2938,7 @@ private fun ModernSidebarScaffold(
+@@ -2123,6 +2958,7 @@ private fun ModernSidebarScaffold(
  ) {
      val showSidebar = currentRoute in rootRoutes && !LiveTvPlayerSidebarGate.playerActive
      val sidebarTokens = NuvioComponents.tokens.sidebar
@@ -429348,7 +429384,7 @@ index 89d1031ea..70a1ff2a6 100644
      val collapsedSidebarWidth = if (sidebarCollapsed) NuvioTheme.spacing.none else sidebarTokens.collapsedWidth
      val openSidebarWidth = sidebarTokens.expandedWidth
  
-@@ -2137,6 +2953,18 @@ private fun ModernSidebarScaffold(
+@@ -2137,6 +2973,18 @@ private fun ModernSidebarScaffold(
      var pendingContentFocusTransfer by remember { mutableStateOf(false) }
      var pendingSidebarFocusRequest by remember { mutableStateOf(false) }
      var focusedDrawerIndex by remember { mutableStateOf(-1) }
@@ -429367,7 +429403,7 @@ index 89d1031ea..70a1ff2a6 100644
      var isFloatingPillIconOnly by remember { mutableStateOf(false) }
      var pillExpandRequestCount by remember { mutableIntStateOf(0) }
      val keepFloatingPillExpanded = false
-@@ -2176,7 +3004,10 @@ private fun ModernSidebarScaffold(
+@@ -2176,7 +3024,10 @@ private fun ModernSidebarScaffold(
          }
      }
  
@@ -429379,7 +429415,7 @@ index 89d1031ea..70a1ff2a6 100644
          isSidebarExpanded = true
          sidebarCollapsePending = false
          pendingSidebarFocusRequest = true
-@@ -2216,9 +3047,16 @@ private fun ModernSidebarScaffold(
+@@ -2216,9 +3067,16 @@ private fun ModernSidebarScaffold(
      }
  
      val sidebarVisible = showSidebar && (isSidebarExpanded || !sidebarCollapsed)
@@ -429398,7 +429434,7 @@ index 89d1031ea..70a1ff2a6 100644
      // re-layouts and haze doesn't re-render blur every frame.
      val sidebarWidth = if (sidebarVisible) openSidebarWidth else collapsedSidebarWidth
      val animationDuration = if (sidebarVisible) 400 else 300
-@@ -2230,7 +3068,6 @@ private fun ModernSidebarScaffold(
+@@ -2230,7 +3088,6 @@ private fun ModernSidebarScaffold(
          animationSpec = tween(durationMillis = if (isSidebarExpanded) 280 else 200, easing = animationEasing),
          label = "sidebarSurfaceAlpha"
      )
@@ -429406,7 +429442,7 @@ index 89d1031ea..70a1ff2a6 100644
      val sidebarTransition = updateTransition(
          targetState = isSidebarExpanded,
          label = "sidebarTransition"
-@@ -2238,7 +3075,7 @@ private fun ModernSidebarScaffold(
+@@ -2238,7 +3095,7 @@ private fun ModernSidebarScaffold(
      // Labels and icons are always at full size — the panel is rendered
      // complete and the open/close animation is purely graphicsLayer.
      val sidebarLabelAlpha = 1f
@@ -429415,7 +429451,7 @@ index 89d1031ea..70a1ff2a6 100644
          transitionSpec = {
              if (targetState) {
                  tween(durationMillis = NuvioMotion.tokens.durations.sidebarPanelIn, easing = FastOutSlowInEasing)
-@@ -2250,11 +3087,67 @@ private fun ModernSidebarScaffold(
+@@ -2250,11 +3107,67 @@ private fun ModernSidebarScaffold(
      ) { expanded ->
          if (expanded) 1f else 0f
      }
@@ -429483,7 +429519,7 @@ index 89d1031ea..70a1ff2a6 100644
  
      val sidebarIconScale = 1f
      val sidebarBloomScale = 1f
-@@ -2298,6 +3191,14 @@ private fun ModernSidebarScaffold(
+@@ -2298,6 +3211,14 @@ private fun ModernSidebarScaffold(
          modifier = Modifier
              .fillMaxSize()
              .onPreviewKeyEvent { keyEvent ->
@@ -429498,7 +429534,7 @@ index 89d1031ea..70a1ff2a6 100644
                  // Consume all Back key events after long-press until released,
                  // preventing the exit-app BackHandler from firing during the hold.
                  if (longPressBackHeld.value && keyEvent.key == Key.Back) {
-@@ -2311,7 +3212,7 @@ private fun ModernSidebarScaffold(
+@@ -2311,7 +3232,7 @@ private fun ModernSidebarScaffold(
              modifier = Modifier
                  .fillMaxSize()
                  .then(
@@ -429507,7 +429543,7 @@ index 89d1031ea..70a1ff2a6 100644
                      else Modifier
                  )
                  .onPreviewKeyEvent { keyEvent ->
-@@ -2342,7 +3243,10 @@ private fun ModernSidebarScaffold(
+@@ -2342,7 +3263,10 @@ private fun ModernSidebarScaffold(
                      if (
                          isSidebarExpanded &&
                          !sidebarCollapsePending &&
@@ -429519,7 +429555,7 @@ index 89d1031ea..70a1ff2a6 100644
                          keyEvent.type == KeyEventType.KeyDown &&
                          isBlockedContentKey(keyEvent.key)
                      ) {
-@@ -2381,33 +3285,77 @@ private fun ModernSidebarScaffold(
+@@ -2381,33 +3305,77 @@ private fun ModernSidebarScaffold(
                      }
                  }
          ) {
@@ -429607,7 +429643,7 @@ index 89d1031ea..70a1ff2a6 100644
                          transformOrigin = TransformOrigin(0f, 0f)
                      }
                      .selectableGroup()
-@@ -2419,10 +3367,18 @@ private fun ModernSidebarScaffold(
+@@ -2419,10 +3387,18 @@ private fun ModernSidebarScaffold(
                              Key.DirectionUp -> {
                                  if (focusedDrawerIndex == sidebarTopBoundaryIndex) {
                                      true
@@ -429627,7 +429663,7 @@ index 89d1031ea..70a1ff2a6 100644
                                      true
                                  }
                              }
-@@ -2440,7 +3396,9 @@ private fun ModernSidebarScaffold(
+@@ -2440,7 +3416,9 @@ private fun ModernSidebarScaffold(
                                      }
                                      true
                                  } else {
@@ -429638,7 +429674,7 @@ index 89d1031ea..70a1ff2a6 100644
                                      true
                                  }
                              }
-@@ -2448,7 +3406,10 @@ private fun ModernSidebarScaffold(
+@@ -2448,7 +3426,10 @@ private fun ModernSidebarScaffold(
                              Key.DirectionRight, Key.DirectionLeft -> {
                                  val collapseKey = if (isRtl) Key.DirectionLeft else Key.DirectionRight
                                  if (keyEvent.key == collapseKey) {
@@ -429650,7 +429686,7 @@ index 89d1031ea..70a1ff2a6 100644
                                      sidebarCollapsePending = true
                                      true
                                  } else {
-@@ -2460,29 +3421,59 @@ private fun ModernSidebarScaffold(
+@@ -2460,29 +3441,59 @@ private fun ModernSidebarScaffold(
                          }
                      }
              ) {
@@ -429719,7 +429755,7 @@ index 89d1031ea..70a1ff2a6 100644
                              pendingSidebarFocusRequest = false
                              isSidebarExpanded = false
                              sidebarCollapsePending = false
-@@ -2502,13 +3493,37 @@ private fun ModernSidebarScaffold(
+@@ -2502,13 +3513,37 @@ private fun ModernSidebarScaffold(
                  sidebarShowCollapsedPill &&
                  selectedDrawerRoute != Screen.Search.route
              ) {
@@ -429760,7 +429796,7 @@ index 89d1031ea..70a1ff2a6 100644
                      modifier = Modifier
                          .align(Alignment.TopStart)
                          .offset {
-@@ -2548,13 +3563,16 @@ private fun CollapsedSidebarPill(
+@@ -2548,13 +3583,16 @@ private fun CollapsedSidebarPill(
      onExpand: () -> Unit
  ) {
      val pillShape = RoundedCornerShape(NuvioRadii.tokens.full)
@@ -429779,7 +429815,7 @@ index 89d1031ea..70a1ff2a6 100644
          Brush.verticalGradient(listOf(
              Color(0xFF1C1C1E).copy(alpha = alpha),
              Color(0xFF1C1C1E).copy(alpha = alpha)
-@@ -2575,18 +3593,21 @@ private fun CollapsedSidebarPill(
+@@ -2575,18 +3613,21 @@ private fun CollapsedSidebarPill(
          Box(
              modifier = Modifier
                  .height(NuvioTheme.sizes.player.control)
@@ -429809,7 +429845,7 @@ index 89d1031ea..70a1ff2a6 100644
          ) {
              Row(
                  modifier = Modifier
-@@ -2640,6 +3661,24 @@ private fun CollapsedSidebarPill(
+@@ -2640,6 +3681,24 @@ private fun CollapsedSidebarPill(
      }
  }
  
@@ -429834,7 +429870,7 @@ index 89d1031ea..70a1ff2a6 100644
  private fun navigateToDrawerRoute(
      navController: NavHostController,
      currentRoute: String?,
-@@ -2682,7 +3721,7 @@ private fun isBlockedContentKey(key: Key): Boolean {
+@@ -2682,7 +3741,7 @@ private fun isBlockedContentKey(key: Key): Boolean {
  }
  
  @Composable
@@ -429843,7 +429879,7 @@ index 89d1031ea..70a1ff2a6 100644
      iconRes: Int?,
      icon: ImageVector?,
      modifier: Modifier = Modifier,
-@@ -2722,6 +3761,47 @@ private fun DrawerItemIcon(
+@@ -2722,6 +3781,47 @@ private fun DrawerItemIcon(
  object LocaleCache {
      const val UNSET = "__UNSET__"
  
@@ -536796,10 +536832,10 @@ index 000000000..0ea66a50c
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/startup/LiveTvStartup.kt b/app/src/main/java/com/nuvio/tv/livetv/startup/LiveTvStartup.kt
 new file mode 100644
-index 000000000..23e9007c8
+index 000000000..882df6bea
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/startup/LiveTvStartup.kt
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,136 @@
 +package com.nuvio.tv.livetv.startup
 +
 +import android.content.Context
@@ -536899,12 +536935,16 @@ index 000000000..23e9007c8
 +    /** Saved in place of a route when the app should open on Home (no saved value means the default, Apps). */
 +    private const val HOME = "home"
 +
++    /** Apps only exists while Nuvio is the device's home app; otherwise Home (null). */
++    private fun launcherOnly(context: Context, route: String): String? =
++        if (route == Screen.Apps.route && !runCatching { com.nuvio.tv.core.launcher.LauncherSetup.homeAppSet(context) }.getOrDefault(false)) null else route
++
 +    /** The page to open on, or null for Home. Nothing saved yet: Apps (the default). */
 +    fun cachedRoute(context: Context): String? {
 +        val saved = runCatching {
 +            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY, null)
-+        }.getOrNull() ?: return Screen.Apps.route
-+        return saved.takeIf { it in ROUTES }
++        }.getOrNull() ?: return launcherOnly(context, Screen.Apps.route)
++        return saved.takeIf { it in ROUTES }?.let { launcherOnly(context, it) }
 +    }
 +
 +    /** The page for a setting ([LiveTvSettings.openOn]); null for Home. Live TV only while it's in the menu. */
@@ -541097,10 +541137,10 @@ index 000000000..d8f4d8852
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/ui/KeepScreenAwake.kt b/app/src/main/java/com/nuvio/tv/livetv/ui/KeepScreenAwake.kt
 new file mode 100644
-index 000000000..646a322c6
+index 000000000..88f61932b
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/ui/KeepScreenAwake.kt
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,41 @@
 +package com.nuvio.tv.livetv.ui
 +
 +import android.view.View
@@ -541128,14 +541168,18 @@ index 000000000..646a322c6
 +internal object ScreenAwake {
 +    private var holders = 0
 +
++    /** True while any Live TV screen (guide preview, full screen, Sports, Multiview) holds the screen awake. */
++    val held = kotlinx.coroutines.flow.MutableStateFlow(false)
++
 +    fun acquire(view: View) {
 +        holders++
++        held.value = true
 +        view.keepScreenOn = true
 +    }
 +
 +    fun release(view: View) {
 +        holders = (holders - 1).coerceAtLeast(0)
-+        if (holders == 0) view.keepScreenOn = false
++        if (holders == 0) { view.keepScreenOn = false; held.value = false }
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/ui/LiveGuideClock.kt b/app/src/main/java/com/nuvio/tv/livetv/ui/LiveGuideClock.kt
@@ -592837,7 +592881,7 @@ index 3f434bb4c..dd31518d9 100644
          }
      }
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/addon/CatalogOrderViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/addon/CatalogOrderViewModel.kt
-index c6f1a9256..7057e5196 100644
+index c6f1a9256..2b67865e3 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/addon/CatalogOrderViewModel.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/addon/CatalogOrderViewModel.kt
 @@ -1,5 +1,7 @@
@@ -593363,7 +593407,7 @@ index c6f1a9256..7057e5196 100644
 -        val collectionEntries = collections.map { collection ->
 +        // Launcher: the Apps row is listed like a collection, so it can be moved and turned off
 +        // here — but only while this app is the device's home app; otherwise it doesn't exist.
-+        val appsEntry = if (launcherRoleState?.isDefaultLauncher?.value == true) CatalogOrderEntry(
++        val appsEntry = if (false) CatalogOrderEntry(
 +            key = com.nuvio.tv.core.apps.INSTALLED_APPS_CATALOG_KEY,
 +            disableKey = com.nuvio.tv.core.apps.INSTALLED_APPS_CATALOG_KEY,
 +            catalogName = "Apps",
@@ -601972,7 +602016,7 @@ index 64f05d957..79bf379a4 100644
      return "${itemType.lowercase()}|$itemId"
  }
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModel.kt
-index 909f51e33..721a66d91 100644
+index 909f51e33..85a4e800e 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModel.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModel.kt
 @@ -1,5 +1,6 @@
@@ -602085,7 +602129,7 @@ index 909f51e33..721a66d91 100644
 +            launcherRoleState?.let { role ->
 +                viewModelScope.launch {
 +                    role.isDefaultLauncher.collect { isLauncher ->
-+                        _uiState.update { it.copy(appsRowFirst = isLauncher) }
++                        _uiState.update { it.copy(appsRowFirst = false) }
 +                        rebuildCatalogOrder(addonsCache)
 +                        scheduleUpdateCatalogRows()
 +                    }
@@ -602310,7 +602354,7 @@ index 909f51e33..721a66d91 100644
       * Set when the catalogs were last loaded or refreshed, so returning to Home right after
       * the initial load does not immediately re-request everything. Monotonic, so a clock
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogPipeline.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogPipeline.kt
-index b59b5a3a3..5507e5cc6 100644
+index b59b5a3a3..60d164b91 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogPipeline.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogPipeline.kt
 @@ -35,6 +35,10 @@ import kotlinx.coroutines.sync.withPermit
@@ -602390,7 +602434,7 @@ index b59b5a3a3..5507e5cc6 100644
 +            if (key == com.nuvio.tv.core.apps.INSTALLED_APPS_CATALOG_KEY) {
 +                // Launcher: belt-and-braces — the key is absent from the order when this app is
 +                // not the home app, but a stale cached order must not resurrect the row either.
-+                if (launcherRoleState?.isDefaultLauncher?.value == true) {
++                if (false) {
 +                    installedAppsCache.takeIf { it.isNotEmpty() }?.let { add(HomeRow.InstalledApps(it)) }
 +                }
 +                continue
@@ -602449,7 +602493,7 @@ index b59b5a3a3..5507e5cc6 100644
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogUtils.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogUtils.kt
-index ed0b50a8a..66097def2 100644
+index ed0b50a8a..4539032e5 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogUtils.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/HomeViewModelCatalogUtils.kt
 @@ -230,8 +230,14 @@ internal fun HomeViewModel.removeTruncatedRowCacheEntry(key: String) {
@@ -602461,7 +602505,7 @@ index ed0b50a8a..66097def2 100644
 -    val collectionKeys = collectionsCache.map { "collection_${it.id}" }
 +    // Launcher: the Apps row only exists on Home while this app is the device's home app; when it
 +    // isn't, the key is left out of the order entirely (rows, reorder screen and sync all follow).
-+    val appsCollectionKeys = if (launcherRoleState?.isDefaultLauncher?.value == true) {
++    val appsCollectionKeys = if (false) {
 +        listOf(com.nuvio.tv.core.apps.INSTALLED_APPS_CATALOG_KEY)
 +    } else emptyList()
 +    val collectionKeys = collectionsCache.map { "collection_${it.id}" } + appsCollectionKeys
@@ -602477,7 +602521,7 @@ index ed0b50a8a..66097def2 100644
 +    // row (the home contents hoist it above Continue Watching, which is not part of this order).
 +    synchronized(catalogStateLock) {
 +        val appsKey = com.nuvio.tv.core.apps.INSTALLED_APPS_CATALOG_KEY
-+        if (launcherRoleState?.isDefaultLauncher?.value == true && catalogOrder.remove(appsKey)) {
++        if (false && catalogOrder.remove(appsKey)) {
 +            catalogOrder.add(0, appsKey)
 +        }
 +    }
@@ -645714,10 +645758,10 @@ index 3d7c4f155..93354d296 100644
                  )
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SideMenuSettingsContent.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SideMenuSettingsContent.kt
 new file mode 100644
-index 000000000..5650de1f0
+index 000000000..0dac867bb
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SideMenuSettingsContent.kt
-@@ -0,0 +1,474 @@
+@@ -0,0 +1,476 @@
 +package com.nuvio.tv.ui.screens.settings
 +
 +import androidx.compose.foundation.ExperimentalFoundationApi
@@ -645791,7 +645835,9 @@ index 000000000..5650de1f0
 +    fun update(t: (LiveTvSettings) -> LiveTvSettings) = scope.launch { prefs.updateSettings(t) }
 +    var dialog by remember { mutableStateOf<String?>(null) }
 +
-+    val order = SideMenuPages.order(s.sideMenuOrder)
++    // Apps page only exists while Nuvio is the device's home app.
++    val isLauncher = remember { com.nuvio.tv.core.launcher.LauncherSetup.homeAppSet(context) }
++    val order = SideMenuPages.order(s.sideMenuOrder).filter { isLauncher || it != SideMenuPages.APPS }
 +    val hidden = SideMenuPages.hidden(s.sideMenuHidden)
 +    val startRoute = com.nuvio.tv.livetv.startup.StartPage.routeFor(s, sportsSettings.showInSidebar)
 +    fun move(id: String, by: Int) {
@@ -645878,7 +645924,7 @@ index 000000000..5650de1f0
 +
 +    val startChoices = buildList {
 +        add("HOME" to "Home")
-+        if (SideMenuPages.APPS !in hidden) add("APPS" to "Apps")
++        if (isLauncher && SideMenuPages.APPS !in hidden) add("APPS" to "Apps")
 +        if (s.showInSidebar) add("LIVE_TV" to "Live TV")
 +        if (sportsSettings.showInSidebar) add("SPORTS" to "Sports")
 +        if (s.onDemandEnabled && s.onDemandInSidebar && onDemandHas) add("ON_DEMAND" to "On Demand")
