@@ -428059,7 +428059,7 @@ index 000000000..b1a32a5b9
 +internal fun isFreshLaunchIntent(hasSavedInstanceState: Boolean, intentFlags: Int): Boolean =
 +    !hasSavedInstanceState && intentFlags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY == 0
 diff --git a/app/src/main/java/com/nuvio/tv/MainActivity.kt b/app/src/main/java/com/nuvio/tv/MainActivity.kt
-index 89d1031ea..4d522ec5d 100644
+index 89d1031ea..eec6228ff 100644
 --- a/app/src/main/java/com/nuvio/tv/MainActivity.kt
 +++ b/app/src/main/java/com/nuvio/tv/MainActivity.kt
 @@ -34,6 +34,7 @@ import androidx.compose.foundation.clickable
@@ -428952,7 +428952,7 @@ index 89d1031ea..4d522ec5d 100644
      }
  
      private fun captureDeepLinkIntent(intent: Intent?) {
-@@ -1516,8 +2070,120 @@ open class MainActivity : ComponentActivity() {
+@@ -1516,8 +2070,123 @@ open class MainActivity : ComponentActivity() {
          pendingLaunchIntent.value = intent
      }
  
@@ -429038,6 +429038,9 @@ index 89d1031ea..4d522ec5d 100644
 +        nuvioHandlesHomeKey = runCatching { LauncherSetup.handlesHome(this) }.getOrDefault(false)
 +        // Launcher: shared signal for Home's Apps row and other role-aware consumers.
 +        launcherRoleState.refresh()
++        // Launcher: the accessibility key filter tracks the HOME role (native HOME needs no filter,
++        // and filtering is what blocks Android's key auto-repeat — held volume moved one step).
++        com.nuvio.tv.core.launcher.LauncherAccessibilityService.refreshKeyFiltering()
 +    }
 +
 +    /**
@@ -429073,7 +429076,7 @@ index 89d1031ea..4d522ec5d 100644
          if (::jankStats.isInitialized) jankStats.isTrackingEnabled = false
      }
  
-@@ -1532,6 +2198,10 @@ open class MainActivity : ComponentActivity() {
+@@ -1532,6 +2201,10 @@ open class MainActivity : ComponentActivity() {
  
      private val ambientIdleController = AmbientIdleController()
  
@@ -429084,7 +429087,7 @@ index 89d1031ea..4d522ec5d 100644
      override fun onUserInteraction() {
          super.onUserInteraction()
          ambientIdleController.onInteraction()
-@@ -1539,6 +2209,22 @@ open class MainActivity : ComponentActivity() {
+@@ -1539,6 +2212,22 @@ open class MainActivity : ComponentActivity() {
      }
  
      override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -429107,7 +429110,7 @@ index 89d1031ea..4d522ec5d 100644
          // Nuvio fork: OLED screensaver — while the dim overlay is visible, the first key
          // press wakes it and the whole press (down, repeats, matching up) is swallowed so
          // waking never also navigates (ported from Nuvio-KE).
-@@ -1557,7 +2243,35 @@ open class MainActivity : ComponentActivity() {
+@@ -1557,7 +2246,39 @@ open class MainActivity : ComponentActivity() {
          }
          screensaverController.notifyInteraction()
          if (com.nuvio.tv.core.sound.DxSounds.onKey(this, event)) return true // dx.bi sounds hook
@@ -429137,13 +429140,17 @@ index 89d1031ea..4d522ec5d 100644
 +        // Launcher: with the accessibility key filter on, Android stops auto-repeating held keys
 +        // (only the first down and the final up arrive), so holding Volume moved one step per press.
 +        // Step on our own timer here instead; the ambient wake above still claims the first press.
-+        if (com.nuvio.tv.core.launcher.VolumeKeyRepeatController.handles(event.keyCode)) {
++        // The filter is only installed while the HOME fallback or a global Button Mapper binding
++        // needs it — as the plain default launcher keys arrive with native auto-repeat untouched.
++        if (com.nuvio.tv.core.launcher.VolumeKeyRepeatController.handles(event.keyCode) &&
++            com.nuvio.tv.core.launcher.LauncherAccessibilityService.keyFilterActive
++        ) {
 +            return volumeKeyRepeat.onKeyEvent(event)
 +        }
          if (event.keyCode == KeyEvent.KEYCODE_BACK) {
              if (longPressBackHeld.value) {
                  if (event.action == KeyEvent.ACTION_UP) longPressBackHeld.value = false
-@@ -1573,17 +2287,32 @@ open class MainActivity : ComponentActivity() {
+@@ -1573,17 +2294,32 @@ open class MainActivity : ComponentActivity() {
              }
              return true
          }
@@ -429176,7 +429183,7 @@ index 89d1031ea..4d522ec5d 100644
          // Returning from an external player: raise the auto-next loader before the player's
          // result is dispatched and before the window repaints, so the transition shows the
          // loader instantly with no episode-list flash. No-op unless a series episode is being
-@@ -1595,9 +2324,20 @@ open class MainActivity : ComponentActivity() {
+@@ -1595,9 +2331,20 @@ open class MainActivity : ComponentActivity() {
          androidTvChannelSyncService.onForegroundChanged(true)
          // Nuvio fork: a quick return is not idle for the nightly self-trim.
          nightlySelfTrim.onAppForegrounded()
@@ -429197,7 +429204,7 @@ index 89d1031ea..4d522ec5d 100644
          externalPlaybackTracker.onExternalPlayerCoveredApp()
          super.onStop()
          startupSyncService.stopPeriodicSurfacePulls()
-@@ -1606,11 +2346,17 @@ open class MainActivity : ComponentActivity() {
+@@ -1606,11 +2353,17 @@ open class MainActivity : ComponentActivity() {
          androidTvChannelSyncService.onForegroundChanged(false)
          // Nuvio fork: schedule the nightly self-trim while backgrounded.
          nightlySelfTrim.onAppBackgrounded()
@@ -429216,7 +429223,7 @@ index 89d1031ea..4d522ec5d 100644
      }
  }
  
-@@ -1742,7 +2488,10 @@ private fun LegacySidebarScaffold(
+@@ -1742,7 +2495,10 @@ private fun LegacySidebarScaffold(
      var legacyDrawerInteractionVersion by remember { mutableStateOf(0) }
  
  
@@ -429228,7 +429235,7 @@ index 89d1031ea..4d522ec5d 100644
          pendingSidebarFocusRequest = true
          drawerState.setValue(DrawerValue.Open)
      }
-@@ -1881,14 +2630,36 @@ private fun LegacySidebarScaffold(
+@@ -1881,14 +2637,36 @@ private fun LegacySidebarScaffold(
                          }
                      }
  
@@ -429270,7 +429277,7 @@ index 89d1031ea..4d522ec5d 100644
                          drawerItems.forEach { item ->
                              key(item.route) {
                                  LegacySidebarButton(
-@@ -1917,6 +2688,7 @@ private fun LegacySidebarScaffold(
+@@ -1917,6 +2695,7 @@ private fun LegacySidebarScaffold(
                          }
                      }
                  }
@@ -429278,7 +429285,7 @@ index 89d1031ea..4d522ec5d 100644
              }
          }
          }
-@@ -1979,9 +2751,43 @@ private fun LegacySidebarScaffold(
+@@ -1979,9 +2758,43 @@ private fun LegacySidebarScaffold(
                      }
                  }
          ) {
@@ -429323,7 +429330,7 @@ index 89d1031ea..4d522ec5d 100644
              ) {
                  NuvioNavHost(
                      navController = navController,
-@@ -2104,8 +2910,9 @@ private fun LegacySidebarButton(
+@@ -2104,8 +2917,9 @@ private fun LegacySidebarButton(
  private fun ModernSidebarScaffold(
      longPressBackHeld: MutableState<Boolean>,
      navController: NavHostController,
@@ -429334,7 +429341,7 @@ index 89d1031ea..4d522ec5d 100644
      rootRoutes: Set<String>,
      drawerItems: List<DrawerItem>,
      selectedDrawerRoute: String?,
-@@ -2123,6 +2930,7 @@ private fun ModernSidebarScaffold(
+@@ -2123,6 +2937,7 @@ private fun ModernSidebarScaffold(
  ) {
      val showSidebar = currentRoute in rootRoutes && !LiveTvPlayerSidebarGate.playerActive
      val sidebarTokens = NuvioComponents.tokens.sidebar
@@ -429342,7 +429349,7 @@ index 89d1031ea..4d522ec5d 100644
      val collapsedSidebarWidth = if (sidebarCollapsed) NuvioTheme.spacing.none else sidebarTokens.collapsedWidth
      val openSidebarWidth = sidebarTokens.expandedWidth
  
-@@ -2137,6 +2945,18 @@ private fun ModernSidebarScaffold(
+@@ -2137,6 +2952,18 @@ private fun ModernSidebarScaffold(
      var pendingContentFocusTransfer by remember { mutableStateOf(false) }
      var pendingSidebarFocusRequest by remember { mutableStateOf(false) }
      var focusedDrawerIndex by remember { mutableStateOf(-1) }
@@ -429361,7 +429368,7 @@ index 89d1031ea..4d522ec5d 100644
      var isFloatingPillIconOnly by remember { mutableStateOf(false) }
      var pillExpandRequestCount by remember { mutableIntStateOf(0) }
      val keepFloatingPillExpanded = false
-@@ -2176,7 +2996,10 @@ private fun ModernSidebarScaffold(
+@@ -2176,7 +3003,10 @@ private fun ModernSidebarScaffold(
          }
      }
  
@@ -429373,7 +429380,7 @@ index 89d1031ea..4d522ec5d 100644
          isSidebarExpanded = true
          sidebarCollapsePending = false
          pendingSidebarFocusRequest = true
-@@ -2216,9 +3039,16 @@ private fun ModernSidebarScaffold(
+@@ -2216,9 +3046,16 @@ private fun ModernSidebarScaffold(
      }
  
      val sidebarVisible = showSidebar && (isSidebarExpanded || !sidebarCollapsed)
@@ -429392,7 +429399,7 @@ index 89d1031ea..4d522ec5d 100644
      // re-layouts and haze doesn't re-render blur every frame.
      val sidebarWidth = if (sidebarVisible) openSidebarWidth else collapsedSidebarWidth
      val animationDuration = if (sidebarVisible) 400 else 300
-@@ -2230,7 +3060,6 @@ private fun ModernSidebarScaffold(
+@@ -2230,7 +3067,6 @@ private fun ModernSidebarScaffold(
          animationSpec = tween(durationMillis = if (isSidebarExpanded) 280 else 200, easing = animationEasing),
          label = "sidebarSurfaceAlpha"
      )
@@ -429400,7 +429407,7 @@ index 89d1031ea..4d522ec5d 100644
      val sidebarTransition = updateTransition(
          targetState = isSidebarExpanded,
          label = "sidebarTransition"
-@@ -2238,7 +3067,7 @@ private fun ModernSidebarScaffold(
+@@ -2238,7 +3074,7 @@ private fun ModernSidebarScaffold(
      // Labels and icons are always at full size — the panel is rendered
      // complete and the open/close animation is purely graphicsLayer.
      val sidebarLabelAlpha = 1f
@@ -429409,7 +429416,7 @@ index 89d1031ea..4d522ec5d 100644
          transitionSpec = {
              if (targetState) {
                  tween(durationMillis = NuvioMotion.tokens.durations.sidebarPanelIn, easing = FastOutSlowInEasing)
-@@ -2250,11 +3079,67 @@ private fun ModernSidebarScaffold(
+@@ -2250,11 +3086,67 @@ private fun ModernSidebarScaffold(
      ) { expanded ->
          if (expanded) 1f else 0f
      }
@@ -429477,7 +429484,7 @@ index 89d1031ea..4d522ec5d 100644
  
      val sidebarIconScale = 1f
      val sidebarBloomScale = 1f
-@@ -2298,6 +3183,14 @@ private fun ModernSidebarScaffold(
+@@ -2298,6 +3190,14 @@ private fun ModernSidebarScaffold(
          modifier = Modifier
              .fillMaxSize()
              .onPreviewKeyEvent { keyEvent ->
@@ -429492,7 +429499,7 @@ index 89d1031ea..4d522ec5d 100644
                  // Consume all Back key events after long-press until released,
                  // preventing the exit-app BackHandler from firing during the hold.
                  if (longPressBackHeld.value && keyEvent.key == Key.Back) {
-@@ -2311,7 +3204,7 @@ private fun ModernSidebarScaffold(
+@@ -2311,7 +3211,7 @@ private fun ModernSidebarScaffold(
              modifier = Modifier
                  .fillMaxSize()
                  .then(
@@ -429501,7 +429508,7 @@ index 89d1031ea..4d522ec5d 100644
                      else Modifier
                  )
                  .onPreviewKeyEvent { keyEvent ->
-@@ -2342,7 +3235,10 @@ private fun ModernSidebarScaffold(
+@@ -2342,7 +3242,10 @@ private fun ModernSidebarScaffold(
                      if (
                          isSidebarExpanded &&
                          !sidebarCollapsePending &&
@@ -429513,7 +429520,7 @@ index 89d1031ea..4d522ec5d 100644
                          keyEvent.type == KeyEventType.KeyDown &&
                          isBlockedContentKey(keyEvent.key)
                      ) {
-@@ -2381,33 +3277,77 @@ private fun ModernSidebarScaffold(
+@@ -2381,33 +3284,77 @@ private fun ModernSidebarScaffold(
                      }
                  }
          ) {
@@ -429601,7 +429608,7 @@ index 89d1031ea..4d522ec5d 100644
                          transformOrigin = TransformOrigin(0f, 0f)
                      }
                      .selectableGroup()
-@@ -2419,10 +3359,18 @@ private fun ModernSidebarScaffold(
+@@ -2419,10 +3366,18 @@ private fun ModernSidebarScaffold(
                              Key.DirectionUp -> {
                                  if (focusedDrawerIndex == sidebarTopBoundaryIndex) {
                                      true
@@ -429621,7 +429628,7 @@ index 89d1031ea..4d522ec5d 100644
                                      true
                                  }
                              }
-@@ -2440,7 +3388,9 @@ private fun ModernSidebarScaffold(
+@@ -2440,7 +3395,9 @@ private fun ModernSidebarScaffold(
                                      }
                                      true
                                  } else {
@@ -429632,7 +429639,7 @@ index 89d1031ea..4d522ec5d 100644
                                      true
                                  }
                              }
-@@ -2448,7 +3398,10 @@ private fun ModernSidebarScaffold(
+@@ -2448,7 +3405,10 @@ private fun ModernSidebarScaffold(
                              Key.DirectionRight, Key.DirectionLeft -> {
                                  val collapseKey = if (isRtl) Key.DirectionLeft else Key.DirectionRight
                                  if (keyEvent.key == collapseKey) {
@@ -429644,7 +429651,7 @@ index 89d1031ea..4d522ec5d 100644
                                      sidebarCollapsePending = true
                                      true
                                  } else {
-@@ -2460,29 +3413,59 @@ private fun ModernSidebarScaffold(
+@@ -2460,29 +3420,59 @@ private fun ModernSidebarScaffold(
                          }
                      }
              ) {
@@ -429713,7 +429720,7 @@ index 89d1031ea..4d522ec5d 100644
                              pendingSidebarFocusRequest = false
                              isSidebarExpanded = false
                              sidebarCollapsePending = false
-@@ -2502,13 +3485,37 @@ private fun ModernSidebarScaffold(
+@@ -2502,13 +3492,37 @@ private fun ModernSidebarScaffold(
                  sidebarShowCollapsedPill &&
                  selectedDrawerRoute != Screen.Search.route
              ) {
@@ -429754,7 +429761,7 @@ index 89d1031ea..4d522ec5d 100644
                      modifier = Modifier
                          .align(Alignment.TopStart)
                          .offset {
-@@ -2548,13 +3555,16 @@ private fun CollapsedSidebarPill(
+@@ -2548,13 +3562,16 @@ private fun CollapsedSidebarPill(
      onExpand: () -> Unit
  ) {
      val pillShape = RoundedCornerShape(NuvioRadii.tokens.full)
@@ -429773,7 +429780,7 @@ index 89d1031ea..4d522ec5d 100644
          Brush.verticalGradient(listOf(
              Color(0xFF1C1C1E).copy(alpha = alpha),
              Color(0xFF1C1C1E).copy(alpha = alpha)
-@@ -2575,18 +3585,21 @@ private fun CollapsedSidebarPill(
+@@ -2575,18 +3592,21 @@ private fun CollapsedSidebarPill(
          Box(
              modifier = Modifier
                  .height(NuvioTheme.sizes.player.control)
@@ -429803,7 +429810,7 @@ index 89d1031ea..4d522ec5d 100644
          ) {
              Row(
                  modifier = Modifier
-@@ -2640,6 +3653,24 @@ private fun CollapsedSidebarPill(
+@@ -2640,6 +3660,24 @@ private fun CollapsedSidebarPill(
      }
  }
  
@@ -429828,7 +429835,7 @@ index 89d1031ea..4d522ec5d 100644
  private fun navigateToDrawerRoute(
      navController: NavHostController,
      currentRoute: String?,
-@@ -2682,7 +3713,7 @@ private fun isBlockedContentKey(key: Key): Boolean {
+@@ -2682,7 +3720,7 @@ private fun isBlockedContentKey(key: Key): Boolean {
  }
  
  @Composable
@@ -429837,7 +429844,7 @@ index 89d1031ea..4d522ec5d 100644
      iconRes: Int?,
      icon: ImageVector?,
      modifier: Modifier = Modifier,
-@@ -2722,6 +3753,47 @@ private fun DrawerItemIcon(
+@@ -2722,6 +3760,47 @@ private fun DrawerItemIcon(
  object LocaleCache {
      const val UNSET = "__UNSET__"
  
@@ -435649,10 +435656,10 @@ index 000000000..95ce96352
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/core/launcher/ButtonMappingRepository.kt b/app/src/main/java/com/nuvio/tv/core/launcher/ButtonMappingRepository.kt
 new file mode 100644
-index 000000000..58d4bb9ca
+index 000000000..d6c7685ef
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/launcher/ButtonMappingRepository.kt
-@@ -0,0 +1,308 @@
+@@ -0,0 +1,329 @@
 +package com.nuvio.tv.core.launcher
 +
 +import android.view.KeyEvent
@@ -435749,6 +435756,24 @@ index 000000000..58d4bb9ca
 +            mapping.scope.allowsForeground()
 +        }
 +        return if (scopeAllowed && mapping.hasAnyAssignedAction()) mapping else null
++    }
++
++    /**
++     * True when at least one enabled mapping actually acts outside Nuvio (global scope, non-factory
++     * for Home). Only that needs the accessibility service's key filter — which disables Android's
++     * own key auto-repeat — so the plain default launcher runs filter-free and Volume repeats natively.
++     */
++    fun hasGlobalCaptureConfigured(): Boolean {
++        val snapshot = _state.value
++        if (!snapshot.masterEnabled) return false
++        return snapshot.mappings.any { mapping ->
++            if (!mapping.enabled || !mapping.scope.allowsGlobal()) return@any false
++            when (mapping.keyCode) {
++                KeyEvent.KEYCODE_HOME ->
++                    snapshot.homeCustomizationEnabled && !mapping.matchesFactoryHomeDefaults()
++                else -> mapping.hasAnyAssignedAction()
++            }
++        }
 +    }
 +
 +    /**
@@ -435934,6 +435959,9 @@ index 000000000..58d4bb9ca
 +            observedForegroundKeyCodes = next.observedForegroundKeyCodes + runtimeObservedForeground,
 +            observedGlobalKeyCodes = next.observedGlobalKeyCodes + runtimeObservedGlobal
 +        )
++        // Mapping set changed: the accessibility service's key filter tracks whether any of the
++        // bindings act globally (see LauncherAccessibilityService.applyKeyFiltering).
++        LauncherAccessibilityService.refreshKeyFiltering()
 +        return _state.value
 +    }
 +
@@ -436307,10 +436335,10 @@ index 000000000..18088fa47
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/core/launcher/LauncherAccessibilityService.kt b/app/src/main/java/com/nuvio/tv/core/launcher/LauncherAccessibilityService.kt
 new file mode 100644
-index 000000000..a64fd9b93
+index 000000000..f0a919e01
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/launcher/LauncherAccessibilityService.kt
-@@ -0,0 +1,333 @@
+@@ -0,0 +1,385 @@
 +package com.nuvio.tv.core.launcher
 +
 +import android.accessibilityservice.AccessibilityService
@@ -436365,8 +436393,8 @@ index 000000000..a64fd9b93
 +            val info = serviceInfo ?: AccessibilityServiceInfo()
 +            info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
 +            info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
-+            info.flags = AccessibilityServiceInfo.DEFAULT or AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS
 +            serviceInfo = info
++            applyKeyFiltering()
 +            LauncherSetup.observeNativeHome(this, LauncherSetup.isDefaultHome(this))
 +            operational.value = true
 +            LauncherSetup.noteOverrideWasOn(this)
@@ -436377,6 +436405,37 @@ index 000000000..a64fd9b93
 +            operational.value = false
 +            Log.e(TAG, "Error configuring AccessibilityServiceInfo", e)
 +        }
++    }
++
++    /**
++     * Key filtering (FLAG_REQUEST_FILTER_KEY_EVENTS) is only requested while something actually has to
++     * be taken globally: the HOME fallback when Nuvio is not the system's home, or a Button Mapper
++     * binding that acts outside Nuvio. While the flag is on, Android routes every key through this
++     * service's input filter and silently stops auto-repeating held keys system-wide — holding Volume
++     * moved one step per press, in every app (the defect flix-launcher fixed by dropping the flag).
++     * As the plain default launcher the flag is not set and the platform's own key repeat works.
++     */
++    private fun applyKeyFiltering() {
++        val filtering = wantsKeyFiltering(this)
++        keyFilterActive = filtering
++        val info = serviceInfo ?: return
++        val target = if (filtering) {
++            info.flags or AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS
++        } else {
++            info.flags and AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS.inv()
++        }
++        if (info.flags == target) return
++        info.flags = target
++        serviceInfo = info
++    }
++
++    private fun wantsKeyFiltering(context: Context): Boolean {
++        if (!LauncherSetup.isDefaultHome(context)) return true
++        // Foreground-scoped mapper actions are handled inside the app and need no filter; only a
++        // mapping that acts in other apps does (the capture dialog runs in-app as well).
++        return runCatching {
++            ButtonKeyEventHandler.fromContext(context)?.repository?.hasGlobalCaptureConfigured() == true
++        }.getOrDefault(false)
 +    }
 +
 +    /**
@@ -436526,6 +436585,7 @@ index 000000000..a64fd9b93
 +    override fun onUnbind(intent: Intent?): Boolean {
 +        cancelHomeRecheck()
 +        operational.value = false
++        keyFilterActive = false
 +        if (activeServiceRef?.get() === this) {
 +            activeServiceRef = null
 +        }
@@ -436540,6 +436600,7 @@ index 000000000..a64fd9b93
 +    override fun onDestroy() {
 +        cancelHomeRecheck()
 +        operational.value = false
++        keyFilterActive = false
 +        if (activeServiceRef?.get() === this) {
 +            activeServiceRef = null
 +        }
@@ -436599,8 +436660,27 @@ index 000000000..a64fd9b93
 +        @Volatile
 +        private var activeServiceRef: java.lang.ref.WeakReference<LauncherAccessibilityService>? = null
 +
++        /**
++         * True while this service's key filter is installed system-wide (HOME fallback active or a
++         * global Button Mapper binding exists). The foreground activity uses it to decide whether
++         * volume keys need its own repeat timer ([VolumeKeyRepeatController]) or arrive with the
++         * platform's native auto-repeat.
++         */
++        @Volatile
++        internal var keyFilterActive = false
++
 +        /** Live binding/configuration, not proof this firmware actually delivers HOME keys. */
 +        internal val isOperational = operational.asStateFlow()
++
++        /**
++         * Re-evaluates whether the key filter is needed (HOME role flipped, or a Button Mapper
++         * mapping was added/removed) and updates the live service info. Cheap no-op when the state
++         * did not change.
++         */
++        fun refreshKeyFiltering() {
++            val service = activeServiceRef?.get() ?: return
++            service.mainHandler.post { service.applyKeyFiltering() }
++        }
 +
 +        fun performGlobalBack(): Boolean = runCatching {
 +            activeServiceRef?.get()?.performGlobalAction(GLOBAL_ACTION_BACK) == true
@@ -467324,7 +467404,7 @@ index 310ec9294..0bc9356e3 100644
          if (quiet) service.updateOptimisticProgressQuietly(progress) else service.applyOptimisticProgress(progress)
      }
 diff --git a/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
-index ba9b59305..462a7100d 100644
+index ba9b59305..a5a864bfb 100644
 --- a/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/repository/TvChannelsRepository.kt
 @@ -6,6 +6,7 @@ import com.nuvio.tv.core.network.safeApiCall
@@ -467343,7 +467423,18 @@ index ba9b59305..462a7100d 100644
  import com.nuvio.tv.domain.model.onlyLiveTvCatalogs
  import com.nuvio.tv.domain.model.resolvePlayableTvStreamUrl
  import com.nuvio.tv.domain.repository.AddonRepository
-@@ -53,6 +55,12 @@ class TvChannelsRepository @Inject constructor(
+@@ -31,8 +33,10 @@ import kotlinx.coroutines.coroutineScope
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.flow.Flow
+ import kotlinx.coroutines.flow.collectLatest
+ import kotlinx.coroutines.flow.combine
++import kotlinx.coroutines.flow.distinctUntilChanged
+ import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.flow.update
+ import kotlinx.coroutines.launch
+@@ -53,6 +57,12 @@ class TvChannelsRepository @Inject constructor(
  ) {
      companion object {
          private const val TAG = "TvChannelsRepo"
@@ -467356,7 +467447,7 @@ index ba9b59305..462a7100d 100644
      }
  
      private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-@@ -215,6 +223,230 @@ class TvChannelsRepository @Inject constructor(
+@@ -215,6 +225,242 @@ class TvChannelsRepository @Inject constructor(
      private fun List<Addon>.liveTvOnly(): List<Addon> =
          filter { it.hasLiveTvCatalogs() }.map { it.onlyLiveTvCatalogs() }
  
@@ -467375,14 +467466,26 @@ index ba9b59305..462a7100d 100644
 +    /**
 +     * The enabled, selected addons whose Live TV catalogs feed the V2 guide (install order).
 +     */
-+    suspend fun addonLiveChannelAddons(): List<Addon> {
-+        val installed = addonRepository.getInstalledAddons().first().enabledAddons().liveTvOnly()
-+        if (installed.isEmpty()) return emptyList()
-+        val selected = tvChannelsDataStore.selectedAddonUrls.first()
-+        if (selected == null) return installed
-+        val urls = selected.filter { url -> installed.any { it.baseUrl == url } }
-+        return if (urls.isEmpty()) installed else installed.filter { it.baseUrl in urls }
-+    }
++    suspend fun addonLiveChannelAddons(): List<Addon> = addonLiveChannelAddonsFlow().first()
++
++    /**
++     * The same list, reactive: it emits again whenever the installed addons or their selection
++     * change. The V2 guide's bridge waits on this instead of a one-shot read, so a late addon
++     * list (its manifest cache still loading at a cold start) is picked up as soon as it lands —
++     * the way the classic screen's channel list re-runs whenever the addons flow emits.
++     */
++    fun addonLiveChannelAddonsFlow(): Flow<List<Addon>> =
++        combine(
++            addonRepository.getInstalledAddons(),
++            tvChannelsDataStore.selectedAddonUrls
++        ) { installed, selected ->
++            val enabled = installed.enabledAddons().liveTvOnly()
++            if (selected == null) enabled
++            else {
++                val urls = selected.filter { url -> enabled.any { it.baseUrl == url } }
++                if (urls.isEmpty()) enabled else enabled.filter { it.baseUrl in urls }
++            }
++        }.distinctUntilChanged()
 +
 +    /**
 +     * One addon's live-TV rows (uncapped: the guide takes everything, adding each addon's
@@ -480177,10 +480280,10 @@ index 000000000..a4f922dab
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/data/AddonChannelBridge.kt b/app/src/main/java/com/nuvio/tv/livetv/data/AddonChannelBridge.kt
 new file mode 100644
-index 000000000..7c36ee679
+index 000000000..e1aede3ee
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/data/AddonChannelBridge.kt
-@@ -0,0 +1,381 @@
+@@ -0,0 +1,402 @@
 +package com.nuvio.tv.livetv.data
 +
 +import android.content.Context
@@ -480196,10 +480299,10 @@ index 000000000..7c36ee679
 +import kotlinx.coroutines.CoroutineScope
 +import kotlinx.coroutines.Dispatchers
 +import kotlinx.coroutines.SupervisorJob
-+import kotlinx.coroutines.delay
 +import kotlinx.coroutines.flow.MutableStateFlow
 +import kotlinx.coroutines.flow.StateFlow
 +import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.flow.first
 +import kotlinx.coroutines.flow.update
 +import kotlinx.coroutines.launch
 +import kotlinx.coroutines.sync.Mutex
@@ -480236,9 +480339,13 @@ index 000000000..7c36ee679
 +        /** A resolved stream link is reused for this long before the addon is asked again for it. */
 +        private const val RESOLVED_TTL_MS = 12 * 60 * 60_000L
 +        private const val PLAY_RESOLVE_TIMEOUT_MS = 20_000L
-+        /** An empty answer is usually the addon list still loading: try again rather than show an empty guide. */
-+        private const val EMPTY_RETRIES = 6
-+        private const val EMPTY_RETRY_DELAY_MS = 10_000L
++        // Nuvio fork: the addon list is waited for reactively (like the classic screen) instead of
++        // a bounded give-up — its manifest cache loads in the background and can land late at a
++        // cold start, long after the first ask.
++        /** How long the addon list is waited for before an attempt ends empty. */
++        private const val ADDON_LIST_WAIT_MS = 90_000L
++        /** After an empty outcome the next attempt waits only this long, so a late addon list joins the guide promptly. */
++        private const val EMPTY_RETRY_SPACING_MS = 25_000L
 +        /** How many addons are read at once (their catalogs, one after another within each addon). */
 +        private const val ADDON_CONCURRENCY = 3
 +        /** Least time between two list rebuilds while catalogs land one by one (bursts coalesce). */
@@ -480256,6 +480363,11 @@ index 000000000..7c36ee679
 +    private val _working = MutableStateFlow(false)
 +    val working: StateFlow<Boolean> = _working.asStateFlow()
 +
++    /** True once this run has seen at least one Live-TV addon configured (its catalogs may still
++     *  be loading): an addons-only setup is a real source, never "No playlists yet". */
++    private val _addonsConfigured = MutableStateFlow(false)
++    val addonsConfigured: StateFlow<Boolean> = _addonsConfigured.asStateFlow()
++
 +    /** Every channel's fetch recipe (addon + catalog id), so a channel can resolve when picked. */
 +    private val rowsByKey = ConcurrentHashMap<String, TvChannelsRepository.AddonLiveChannelRow>()
 +
@@ -480269,6 +480381,8 @@ index 000000000..7c36ee679
 +    /** Once per app run the saved list is refreshed even when it isn't stale yet. */
 +    @Volatile private var refreshedThisRun = false
 +    @Volatile private var lastRefreshAttemptAt = 0L
++    /** The last attempt ended with nothing (the addon list or the catalogs): the next one waits only [EMPTY_RETRY_SPACING_MS], not [REFRESH_SPACING_MS]. */
++    @Volatile private var lastRefreshEmpty = false
 +    private val refreshMutex = Mutex()
 +    private val resolvePermits = Semaphore(/* permits */ 4)
 +    private val cacheFile by lazy { File(File(context.cacheDir, "addon_live_channels"), "cache.json").also { it.parentFile?.mkdirs() } }
@@ -480281,6 +480395,7 @@ index 000000000..7c36ee679
 +            saved.rows.forEach { rowsByKey[channelKey(it)] = it }
 +            resolvedByKey.putAll(saved.resolved)
 +            _channels.value = saved.rows.map { it.toChannel() }
++            _addonsConfigured.value = true
 +            lastRefreshAt = if (System.currentTimeMillis() - saved.savedAt < LIST_TTL_MS) saved.savedAt else 0L
 +            Log.i(TAG, "Addon channels from disk: ${saved.rows.size} (${saved.resolved.size} links resolved)")
 +        }
@@ -480317,7 +480432,10 @@ index 000000000..7c36ee679
 +        // the guide while you watch. Later refreshes wait for the copy to go stale, with this
 +        // much space between attempts so a failing addon isn't asked over and over.
 +        val due = !refreshedThisRun || now - lastRefreshAt > LIST_TTL_MS
-+        if (due && now - lastRefreshAttemptAt > REFRESH_SPACING_MS && refreshMutex.tryLock()) {
++        // After an empty attempt (the addon list hadn't landed yet) only the short spacing
++        // applies, so a late addon list is picked up promptly instead of five minutes later.
++        val spacing = if (lastRefreshEmpty) EMPTY_RETRY_SPACING_MS else REFRESH_SPACING_MS
++        if (due && now - lastRefreshAttemptAt > spacing && refreshMutex.tryLock()) {
 +            lastRefreshAttemptAt = now
 +            refreshedThisRun = true
 +            _working.value = true
@@ -480411,22 +480529,26 @@ index 000000000..7c36ee679
 +
 +    @VisibleForTesting
 +    internal suspend fun refreshLocked(startNumber: Int) {
-+        // The addon list loads a beat behind the app: an empty answer here usually means
-+        // "not yet", not "none" — ask again instead of showing an empty guide for hours.
-+        var addons = emptyList<com.nuvio.tv.domain.model.Addon>()
-+        for (attempt in 0 until EMPTY_RETRIES) {
-+            addons = runCatching { tvChannelsRepository.addonLiveChannelAddons() }
-+                .onFailure { Log.w(TAG, "Addon list fetch failed", it) }
-+                .getOrNull().orEmpty()
-+            if (addons.isNotEmpty()) break
-+            if (attempt < EMPTY_RETRIES - 1) delay(EMPTY_RETRY_DELAY_MS)
-+        }
++        // The addon list loads a beat behind the app (its manifest cache is read in the
++        // background): wait for it reactively — the flow emits as soon as it lands — instead of
++        // asking a few times and giving up, which left an addons-only guide empty for good when
++        // the cache outlasted the retries. An empty answer at the end of the wait means "none",
++        // and even then the attempt stays due (see the empty returns below).
++        val addons = runCatching {
++            withTimeoutOrNull(ADDON_LIST_WAIT_MS) {
++                tvChannelsRepository.addonLiveChannelAddonsFlow().first { it.isNotEmpty() }
++            }
++        }.onFailure { Log.w(TAG, "Addon list fetch failed", it) }.getOrNull().orEmpty()
 +        // A failed ask never empties the guide: whatever is on screen (this session's or the
-+        // disk cache's) stays, and the next guide build tries again.
++        // disk cache's) stays, and the next guide build tries again — with only the short
++        // spacing, not the five-minute one (lastRefreshAt stays 0, so the attempt is due).
 +        if (addons.isEmpty()) {
++            lastRefreshEmpty = true
 +            lastRefreshAt = 0L
 +            return
 +        }
++        lastRefreshEmpty = false
++        _addonsConfigured.value = true
 +        // Every addon's rows, published as soon as each catalog lands — like the classic screen,
 +        // a fast catalog's channels are on screen while slower ones (even of the same addon,
 +        // which can hold dozens of catalogs) are still being read. Addon order is kept (addon
@@ -480459,7 +480581,9 @@ index 000000000..7c36ee679
 +        publishIfDue(final = true)
 +        val total = synchronized(perAddon) { perAddon.sumOf { it.size } }
 +        if (total == 0) {
-+            // Nothing came back (addons unreachable or throttled): retry on the next guide build.
++            // Nothing came back (addons unreachable or throttled): retry on the next guide build,
++            // with only the short spacing (see the empty addon list above).
++            lastRefreshEmpty = true
 +            lastRefreshAt = 0L
 +            return
 +        }
@@ -485995,10 +486119,10 @@ index 000000000..36f164193
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/data/LiveTvRepository.kt b/app/src/main/java/com/nuvio/tv/livetv/data/LiveTvRepository.kt
 new file mode 100644
-index 000000000..f22db1b0a
+index 000000000..b1111d791
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/data/LiveTvRepository.kt
-@@ -0,0 +1,3989 @@
+@@ -0,0 +1,4014 @@
 +package com.nuvio.tv.livetv.data
 +
 +import io.ktor.http.encodeURLParameter
@@ -486082,6 +486206,11 @@ index 000000000..f22db1b0a
 +) {
 +    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 +
++    // Declared before the init block below, which fills it in (V2 engine only).
++    private val _classicIptvHasSources = MutableStateFlow(false)
++    /** The classic IPTV source watcher (one at a time; stopped while the V2 engine isn't selected). */
++    @Volatile private var classicSourcesJob: kotlinx.coroutines.Job? = null
++
 +    init {
 +        // Non-playlist channels join the guide while the IPTV V2 engine is selected, and leave
 +        // it again when the classic one returns: the addons' live catalogs (the classic TV
@@ -486095,10 +486224,22 @@ index 000000000..f22db1b0a
 +                .collectLatest { engine ->
 +                    if (engine != com.nuvio.tv.domain.model.IptvEngine.V2) {
 +                        _channels.update { list -> list.filter { !isMergedSource(it.sourceId) } }
++                        classicSourcesJob?.cancel()
++                        classicSourcesJob = null
++                        _classicIptvHasSources.value = false
 +                        return@collectLatest
 +                    }
 +                    addonChannels.current(startNumber = 1)
 +                    runCatching { classicIptv.get().initialize() }
++                    // The classic IPTV sources count as guide sources too (see
++                    // classicIptvHasSources): watched so an IPTV-only setup never reads as
++                    // "No playlists yet" while its channels are still loading. One watcher at a
++                    // time, restarted when the V2 engine comes back.
++                    classicSourcesJob?.cancel()
++                    classicSourcesJob = scope.launch {
++                        classicIptv.get().sources.map { it.isNotEmpty() }
++                            .collect { _classicIptvHasSources.value = it }
++                    }
 +                    // One merge for both sources, so the channel numbers stay consistent however
 +                    // each of them lands (a fast catalog never renumbers what follows it).
 +                    kotlinx.coroutines.flow.combine(addonChannels.channels, classicIptv.get().channels) { addons, iptv -> addons to iptv }
@@ -486126,6 +486267,14 @@ index 000000000..f22db1b0a
 +    /** True while the addons' channel refresh is being asked for: a guide with nothing on it yet
 +     *  is loading, not empty (it would otherwise read as "No playlists yet" until a catalog lands). */
 +    val addonChannelsWorking: StateFlow<Boolean> get() = addonChannels.working
++
++    /** True once the addon side (the classic screen's Live-TV addons) reports at least one addon
++     *  configured, however long its catalogs are still taking: a configured addon is a source. */
++    val addonSourcesConfigured: StateFlow<Boolean> get() = addonChannels.addonsConfigured
++
++    /** True while classic IPTV sources (M3U/Xtream/Stalker) are configured: they merge into the
++     *  V2 guide, so an IPTV-only setup is a source even before its channels land. */
++    val classicIptvHasSources: StateFlow<Boolean> get() = _classicIptvHasSources
 +
 +    /** A classic IPTV source channel (free channels, Broadcasters, user M3U) as a guide channel.
 +     *  Stalker portals are skipped: the classic ones answer with fresh play links, which the
@@ -506467,10 +506616,10 @@ index 000000000..485aedc55
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/player/LivePictureShape.kt b/app/src/main/java/com/nuvio/tv/livetv/player/LivePictureShape.kt
 new file mode 100644
-index 000000000..4a33ced21
+index 000000000..364ca06d1
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/player/LivePictureShape.kt
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,105 @@
 +package com.nuvio.tv.livetv.player
 +
 +import android.graphics.Rect
@@ -506550,6 +506699,15 @@ index 000000000..4a33ced21
 +        frame.scaleX = scale.scaleX
 +        frame.scaleY = scale.scaleY
 +        center(view, frame)
++        // Nuvio fork: Custom Stretch — the picture area the black-bar tracker found (kept on the
++        // view's tag by setExoCustomStretchRect) is scaled over the whole player on top of the
++        // plain stretch, exactly like the classic screen's applyExoAspectMode does.
++        if (mode == AspectMode.CUSTOM_STRETCH) {
++            (view.getTag(com.nuvio.tv.R.id.player_view_custom_stretch_tag)
++                as? com.nuvio.tv.ui.screens.player.VideoContentRect)
++                ?.takeIf { it.width > 0f && it.height > 0f }
++                ?.let { com.nuvio.tv.ui.screens.player.applyCustomStretchRect(frame, it) }
++        }
 +    }
 +
 +    private fun reset(v: View) {
@@ -536858,10 +537016,10 @@ index 000000000..0ea66a50c
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/startup/LiveTvStartup.kt b/app/src/main/java/com/nuvio/tv/livetv/startup/LiveTvStartup.kt
 new file mode 100644
-index 000000000..3e12ca8a9
+index 000000000..8c756bc83
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/startup/LiveTvStartup.kt
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,124 @@
 +package com.nuvio.tv.livetv.startup
 +
 +import android.content.Context
@@ -536909,8 +537067,12 @@ index 000000000..3e12ca8a9
 +        kotlinx.coroutines.delay(300)
 +        val prefs = entry.liveTvPreferences()
 +        val settings = prefs.settings.first()
-+        val playlists = prefs.playlists.first()
-+        if (!settings.showInSidebar || playlists.none { it.liveEnabled }) return
++        // Only the Live-TV-off switch keeps the start-up away: a setup with no V2 playlists of
++        // its own (only addons, or classic M3U/Xtream merged in) is still a working guide, and
++        // ensureLoaded is what kicks the addon scan and reads the saved channels at a cold start.
++        // It is idempotent and cache-first, so a setup with playlists gains nothing and loses
++        // nothing by running it here too.
++        if (!settings.showInSidebar) return
 +        entry.liveTvRepository().ensureLoaded(updateCheckDelayMs = 20_000)
 +    }
 +}
@@ -541342,10 +541504,10 @@ index 000000000..ae95073f7
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/ui/LiveTvComponents.kt b/app/src/main/java/com/nuvio/tv/livetv/ui/LiveTvComponents.kt
 new file mode 100644
-index 000000000..e1a976df7
+index 000000000..410ef3f5b
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/ui/LiveTvComponents.kt
-@@ -0,0 +1,1038 @@
+@@ -0,0 +1,1091 @@
 +package com.nuvio.tv.livetv.ui
 +
 +import com.nuvio.tv.livetv.model.EpgProgram
@@ -541399,6 +541561,7 @@ index 000000000..e1a976df7
 +import androidx.compose.ui.unit.TextUnit
 +import androidx.compose.ui.unit.dp
 +import androidx.compose.runtime.collectAsState
++import kotlinx.coroutines.delay
 +import kotlinx.coroutines.launch
 +import androidx.compose.ui.unit.sp
 +import androidx.compose.ui.viewinterop.AndroidView
@@ -541408,6 +541571,7 @@ index 000000000..e1a976df7
 +import androidx.media3.ui.AspectRatioFrameLayout
 +import androidx.media3.ui.PlayerView
 +import coil3.compose.AsyncImage
++import com.nuvio.tv.ui.screens.player.captureVideoLuma
 +import androidx.compose.ui.draw.drawBehind
 +import androidx.compose.ui.draw.drawWithCache
 +import androidx.compose.ui.geometry.Offset
@@ -541974,6 +542138,11 @@ index 000000000..e1a976df7
 +    }
 +}
 +
++/** Custom Stretch sampling, timed like the classic screen's live preview (TvChannelPreviewPlayer). */
++private const val LIVE_STRETCH_FIRST_SAMPLE_MS = 2_500L
++private const val LIVE_STRETCH_CALIBRATION_MS = 2_000L
++private const val LIVE_STRETCH_STEADY_MS = 30_000L
++
 +@Composable
 +internal fun LivePlayerSurface(
 +    player: Player?,
@@ -541985,7 +542154,11 @@ index 000000000..e1a976df7
 +    /** Called when this view takes over the picture (the player's watchdog checks it starts). */
 +    onAttached: () -> Unit = {},
 +    /** How to treat the stream's pixel-shape flag (fixes 24/7 movies that come out tall). */
-+    pictureShape: com.nuvio.tv.livetv.player.PictureShape = com.nuvio.tv.livetv.player.PictureShape.AUTO
++    pictureShape: com.nuvio.tv.livetv.player.PictureShape = com.nuvio.tv.livetv.player.PictureShape.AUTO,
++    /** The playing stream's link: Custom Stretch remembers its measured picture area under it. */
++    customStretchKey: String? = null,
++    /** Channels with unusually wide baked-in bars get the tracker's relaxed live limits. */
++    customStretchWideBars: Boolean = false
 +) {
 +    val layout = if (useSurfaceView) R.layout.live_tv_surface_player_view else R.layout.live_tv_texture_player_view
 +    var viewRef by remember { mutableStateOf<PlayerView?>(null) }
@@ -542028,6 +542201,48 @@ index 000000000..e1a976df7
 +        onDispose { player.removeListener(listener); remove() }
 +    }
 +    androidx.compose.runtime.LaunchedEffect(pictureShape, aspectMode) { viewRef?.let { reshape(it) } }
++    // Nuvio fork: Custom Stretch — sample the stream, measure the bars baked into the frame and
++    // stretch the picture area over the player (the classic screen's BlackBarTracker machinery,
++    // applied by LivePictureShape from the view's tag). Plain modes and the preview (null mode)
++    // never sample, and leave the tag cleared.
++    androidx.compose.runtime.LaunchedEffect(viewRef, aspectMode, customStretchKey, customStretchWideBars) {
++        val view = viewRef ?: return@LaunchedEffect
++        if (aspectMode != com.nuvio.tv.ui.screens.player.AspectMode.CUSTOM_STRETCH) {
++            com.nuvio.tv.ui.screens.player.setExoCustomStretchRect(view, null)
++            reshape(view)
++            return@LaunchedEffect
++        }
++        fun applyRect(rect: com.nuvio.tv.ui.screens.player.VideoContentRect?) {
++            com.nuvio.tv.ui.screens.player.setExoCustomStretchRect(view, rect)
++            reshape(view)
++        }
++        applyRect(null)
++        val tracker = com.nuvio.tv.ui.screens.player.BlackBarTracker(liveTv = customStretchWideBars)
++        if (customStretchKey != null) {
++            com.nuvio.tv.ui.screens.player.CustomStretchMemory.get(customStretchKey)?.let {
++                tracker.seed(it)
++                applyRect(it)
++            }
++        }
++        delay(LIVE_STRETCH_FIRST_SAMPLE_MS)
++        while (true) {
++            val p = view.player
++            // Sample only while a frame is really on screen: reading the surface during a channel
++            // change or a codec restart can crash weak TV boxes (and a black frame reads as bars).
++            val ready = p != null && p.playbackState == Player.STATE_READY && p.isPlaying && p.videoSize.width > 0
++            if (ready) {
++                val surface = com.nuvio.tv.ui.screens.player.exoVideoSurfaceView(view)
++                val frame = runCatching { surface?.captureVideoLuma() }.getOrNull()
++                val sample = runCatching { frame?.detectContent() }.getOrNull()
++                val committed = tracker.offer(sample)
++                committed?.let {
++                    applyRect(it)
++                    if (customStretchKey != null) com.nuvio.tv.ui.screens.player.CustomStretchMemory.put(customStretchKey, it)
++                }
++            }
++            delay(if (tracker.isCalibrating) LIVE_STRETCH_CALIBRATION_MS else LIVE_STRETCH_STEADY_MS)
++        }
++    }
 +    DisposableEffect(Unit) {
 +        onDispose { viewRef?.player = null }
 +    }
@@ -543054,10 +543269,10 @@ index 000000000..a6b1f797b
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/ui/LiveTvGuideScreen.kt b/app/src/main/java/com/nuvio/tv/livetv/ui/LiveTvGuideScreen.kt
 new file mode 100644
-index 000000000..701a0046b
+index 000000000..7a6abd8d8
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/ui/LiveTvGuideScreen.kt
-@@ -0,0 +1,5113 @@
+@@ -0,0 +1,5123 @@
 +package com.nuvio.tv.livetv.ui
 +
 +import com.nuvio.tv.livetv.data.LiveTvRepository
@@ -543172,6 +543387,7 @@ index 000000000..701a0046b
 +import com.nuvio.tv.livetv.model.LiveTvSettings
 +import com.nuvio.tv.livetv.model.effectiveGuideSize
 +import com.nuvio.tv.ui.components.tvTextFieldNavigation
++import com.nuvio.tv.ui.screens.tvchannels.components.isWideBarsChannel
 +import com.nuvio.tv.ui.theme.NuvioTheme
 +import dev.chrisbanes.haze.hazeSource
 +import dev.chrisbanes.haze.hazeEffect
@@ -544750,7 +544966,9 @@ index 000000000..701a0046b
 +                                action = "Press OK to open Live TV settings"
 +                            )
 +                            channels.isEmpty() && (status.loading || ui.addonLoading) -> EmptyGuideMessage(
-+                                title = status.message ?: "Loading…",
++                                // The addon scan reports through its own working flag (status.message
++                                // is playlist/EPG work only): say what is really being waited for.
++                                title = status.message ?: if (ui.addonLoading) "Loading addon channels…" else "Loading…",
 +                                body = "Large playlists and guides can take several minutes the first time. It keeps going if you leave this screen, and next time it opens straight away.",
 +                                action = null
 +                            )
@@ -544881,7 +545099,11 @@ index 000000000..701a0046b
 +            modifier = videoModifier,
 +            onAttached = { viewModel.playback.onSurfaceAttached() },
 +            aspectMode = if (fullscreen) aspectModeOf(settings.aspectMode) else null,
-+            pictureShape = pictureShapeNow
++            pictureShape = pictureShapeNow,
++            // Custom Stretch keys its remembered picture area by the playing stream and relaxes
++            // its bar limits for the wide-bars channels, like the classic screen's player does.
++            customStretchKey = viewModel.playback.playingUrl,
++            customStretchWideBars = isWideBarsChannel(viewModel.playback.playingChannel?.name)
 +        )
 +        // Rounded corners for the preview. The video surface can't be clipped to a rounded
 +        // shape on most TVs, so its four corners are painted over in exactly what's behind
@@ -544967,8 +545189,11 @@ index 000000000..701a0046b
 +                }
 +            }
 +        }
-+        if (settings.showImportProgress && !fullscreen && (settings.showProgramDetails || settings.showPreview) && status.loading && !status.silent) {
-+            status.message?.let {
++        // The addon bridge's working state counts as loading too (it isn't in status.loading):
++        // an addons-only guide says what it is waiting for instead of looking finished and empty.
++        if (settings.showImportProgress && !fullscreen && (settings.showProgramDetails || settings.showPreview) && (status.loading || ui.addonLoading) && !status.silent) {
++            val statusLine = status.message ?: if (ui.addonLoading) "Loading addon channels…" else null
++            statusLine?.let {
 +                LiveText(
 +                    it,
 +                    modifier = Modifier.align(Alignment.TopEnd).padding(top = 2.dp, end = 32.dp),
@@ -550417,10 +550642,10 @@ index 000000000..b4e9b53ae
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/ui/LiveTvPlayerScreen.kt b/app/src/main/java/com/nuvio/tv/livetv/ui/LiveTvPlayerScreen.kt
 new file mode 100644
-index 000000000..7da5d1cc6
+index 000000000..c2398545b
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/ui/LiveTvPlayerScreen.kt
-@@ -0,0 +1,1945 @@
+@@ -0,0 +1,1950 @@
 +package com.nuvio.tv.livetv.ui
 +
 +import com.nuvio.tv.livetv.data.LiveTvRepository
@@ -550491,6 +550716,7 @@ index 000000000..7da5d1cc6
 +import com.nuvio.tv.livetv.player.LiveTrackOption
 +import com.nuvio.tv.livetv.player.LiveFrameRateStabilizer
 +import com.nuvio.tv.livetv.player.liveFrameRateForSession
++import com.nuvio.tv.ui.screens.tvchannels.components.isWideBarsChannel
 +import com.nuvio.tv.ui.theme.NuvioTheme
 +import kotlinx.coroutines.delay
 +import kotlinx.coroutines.launch
@@ -551277,7 +551503,11 @@ index 000000000..7da5d1cc6
 +            useSurfaceView = true,
 +            onAttached = { viewModel.playback.onSurfaceAttached() },
 +            aspectMode = aspectModeOf(settings.aspectMode),
-+            pictureShape = pictureShape
++            pictureShape = pictureShape,
++            // Custom Stretch keys its remembered picture area by the playing stream and relaxes
++            // its bar limits for the wide-bars channels, like the classic screen's player does.
++            customStretchKey = viewModel.playback.playingUrl,
++            customStretchWideBars = isWideBarsChannel(current?.name)
 +        )
 +
 +        // Status in the middle of the screen. "Loading…" only for channels that are actually
@@ -553225,10 +553455,10 @@ index 000000000..d13a9cfe8
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/livetv/ui/LiveTvViewModel.kt b/app/src/main/java/com/nuvio/tv/livetv/ui/LiveTvViewModel.kt
 new file mode 100644
-index 000000000..575fcdc8c
+index 000000000..c73d6c42a
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/livetv/ui/LiveTvViewModel.kt
-@@ -0,0 +1,1869 @@
+@@ -0,0 +1,1874 @@
 +package com.nuvio.tv.livetv.ui
 +
 +import androidx.lifecycle.ViewModel
@@ -553427,13 +553657,18 @@ index 000000000..575fcdc8c
 +
 +    // Playlists count as sources, and so do the IPTV V2 addon channels and the classic screen's
 +    // IPTV sources: an addons-only setup (no M3U/Xtream at all) is a working guide, not the
-+    // "No playlists yet" empty state — while the addons are still being asked it is "loading".
++    // "No playlists yet" empty state — while the addons are still being asked it is "loading",
++    // and once an addon or a classic IPTV source is configured it stays a source even while its
++    // channels are still loading.
 +    private val hasSources: StateFlow<Boolean> = combine(
 +        prefs.playlists,
 +        repository.channels,
-+        repository.addonChannelsWorking
-+    ) { playlists, channels, working -> playlists.isNotEmpty() || channels.isNotEmpty() || working }
-+        .stateIn(viewModelScope, SharingStarted.Eagerly, true)
++        repository.addonChannelsWorking,
++        repository.addonSourcesConfigured,
++        repository.classicIptvHasSources
++    ) { playlists, channels, working, addons, classic ->
++        playlists.isNotEmpty() || channels.isNotEmpty() || working || addons || classic
++    }.stateIn(viewModelScope, SharingStarted.Eagerly, true)
 +
 +    /**
 +     * Channels with the user's renames and renumbering applied. Worked out once for the whole
@@ -603541,7 +603776,7 @@ index 000000000..eaa8d09e2
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt
-index 67b55a0ee..bce031d18 100644
+index 67b55a0ee..dead5fdb9 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/home/ModernHomeContent.kt
 @@ -6,6 +6,8 @@
@@ -603633,7 +603868,42 @@ index 67b55a0ee..bce031d18 100644
              }
          } ?: false
          if (staleSelection) {
-@@ -696,11 +705,13 @@ fun ModernHomeContent(
+@@ -499,11 +508,24 @@ fun ModernHomeContent(
+         val hadActiveRow = focusHolder.activeRowKey != null
+         val existingActive = focusHolder.activeRowKey?.let { rowByKey[it] }
+         val firstRow = carouselRows.list.firstOrNull()
++        // Launcher: with the HOME role held the Apps row leads Home — also on a cold load whose
++        // first pass parked on the row that led before the role was observed (Continue Watching).
++        // Only while focus still sits on that auto-selected row and nothing was restored; once the
++        // user moves (or the Apps row itself is active) the normal rules apply.
++        val appsLeadRow =
++            if (uiState.appsRowFirst) rowByKey.map[com.nuvio.tv.core.apps.INSTALLED_APPS_CATALOG_KEY]
++            else null
++        val autoSelectedStillParked = !focusState.hasSavedFocus &&
++            initialAutoSelectedKey != null &&
++            focusHolder.activeRowKey == initialAutoSelectedKey &&
++            focusHolder.activeRowKey != appsLeadRow?.key
++        val redirectedToApps = appsLeadRow != null && autoSelectedStillParked && hadActiveRow
+ 
+         val resolvedActive = when {
++            redirectedToApps -> appsLeadRow
+             existingActive != null -> existingActive
+             hadActiveRow -> null // Wait for data to reappear
+-            else -> firstRow     // Initial state
++            else -> appsLeadRow ?: firstRow // Initial state; the Apps row leads while launcher
+         }
+ 
+         if (resolvedActive != null) {
+@@ -518,7 +540,7 @@ fun ModernHomeContent(
+             heroItem.value = resolvedActive.items.getOrNull(resolvedIndex)?.heroPreview
+                 ?: resolvedActive.items.firstOrNull()?.heroPreview
+ 
+-            if (!focusState.hasSavedFocus && !hadActiveRow) {
++            if (!focusState.hasSavedFocus && (!hadActiveRow || redirectedToApps)) {
+                 initialAutoSelectedKey = resolvedActive.key
+                 pendingRowFocusKey.value = resolvedActive.key
+                 pendingRowFocusIndex.value = resolvedIndex
+@@ -696,11 +718,13 @@ fun ModernHomeContent(
      // Poster style reuses the portrait catalog dimensions so its artwork matches the catalogs below it.
      val continueWatchingStyle = uiState.continueWatchingCardStyle
      val continueWatchingScale = 1.34f
@@ -603649,7 +603919,7 @@ index 67b55a0ee..bce031d18 100644
      }
      val continueWatchingCardHeight = when (continueWatchingStyle) {
          ContinueWatchingCardStyle.POSTER -> portraitCatalogCardHeight
-@@ -708,13 +719,37 @@ fun ModernHomeContent(
+@@ -708,13 +732,37 @@ fun ModernHomeContent(
          ContinueWatchingCardStyle.CARD -> continueWatchingCardWidth / 1.77f
      }
  
@@ -603691,7 +603961,7 @@ index 67b55a0ee..bce031d18 100644
  
              val activeCarouselItemState = remember(carouselRows, rowByKey) {
                  derivedStateOf {
-@@ -810,6 +845,7 @@ fun ModernHomeContent(
+@@ -810,6 +858,7 @@ fun ModernHomeContent(
              val heroTrailerUrlsState = remember(trailerPreviewUrls, trailerPreviewAudioUrls) {
                  derivedStateOf {
                      val expandedFocusedSelection = expandedFocusedSelectionState.value
@@ -603699,7 +603969,7 @@ index 67b55a0ee..bce031d18 100644
                      val itemId = (expandedFocusedSelection?.payload as? ModernPayload.Catalog)?.itemId
                      val url = itemId?.let { trailerPreviewUrls[it] }
                      val audioUrl = itemId?.let { trailerPreviewAudioUrls[it] }
-@@ -849,7 +885,7 @@ fun ModernHomeContent(
+@@ -849,7 +898,7 @@ fun ModernHomeContent(
                          effectiveAutoplayEnabled &&
                          !isSidebarExpanded.value &&
                          !isRapidHorizontalNav.value &&
@@ -603708,7 +603978,7 @@ index 67b55a0ee..bce031d18 100644
                          !heroTrailerUrlsState.value.first.isNullOrBlank()
                  }
              }
-@@ -905,9 +941,12 @@ fun ModernHomeContent(
+@@ -905,9 +954,12 @@ fun ModernHomeContent(
              }
              // Keep the top-level flag in sync so the row-scroll BackHandler
              // stays disabled while a fullscreen trailer is visible.
@@ -603723,7 +603993,7 @@ index 67b55a0ee..bce031d18 100644
                      focusedCatalogSelection.value = null
                      expandedCatalogFocusKey.value = null
                  }
-@@ -1038,8 +1077,8 @@ fun ModernHomeContent(
+@@ -1038,8 +1090,8 @@ fun ModernHomeContent(
                  }
              }
  
@@ -603734,7 +604004,7 @@ index 67b55a0ee..bce031d18 100644
              }
              val isFullScreenLambda = remember {
                  { isFullScreenState.value }
-@@ -1083,7 +1122,7 @@ fun ModernHomeContent(
+@@ -1083,7 +1135,7 @@ fun ModernHomeContent(
                      NuvioTheme.spacing.sm + captionTitle + NuvioTheme.spacing.xxs + captionSubtitle
                  }
              }
@@ -603743,7 +604013,7 @@ index 67b55a0ee..bce031d18 100644
                  remember(screenHeight, rowTitleHeight, immersiveFirstRowCardHeight, immersiveFirstRowCaptionHeight) {
                      (rowTitleHeight + 14.dp + immersiveFirstRowCardHeight + immersiveFirstRowCaptionHeight + NuvioTheme.spacing.lg)
                          .coerceAtMost(screenHeight)
-@@ -1109,8 +1148,8 @@ fun ModernHomeContent(
+@@ -1109,8 +1161,8 @@ fun ModernHomeContent(
                  animationSpec = tween(durationMillis = 240),
                  label = "immersiveRowsViewport"
              )
@@ -603754,7 +604024,7 @@ index 67b55a0ee..bce031d18 100644
                  else (screenHeight - rowsViewportHeight + rowTitleHeight + 14.dp).coerceAtMost(screenHeight)
              }
              val verticalRowBringIntoViewSpec = remember(localDensity, defaultBringIntoViewSpec) {
-@@ -1128,24 +1167,24 @@ fun ModernHomeContent(
+@@ -1128,24 +1180,24 @@ fun ModernHomeContent(
                  }
              }
              val contentFocusRequester = LocalContentFocusRequester.current
@@ -603786,7 +604056,7 @@ index 67b55a0ee..bce031d18 100644
                  }
              }
  
-@@ -1159,7 +1198,9 @@ fun ModernHomeContent(
+@@ -1159,7 +1211,9 @@ fun ModernHomeContent(
                      if (shouldPlayCollectionHeroVideoState.value && collectionHeroVideoPlaybackKey != null) {
                          endedCollectionHeroVideoPlaybackKey = collectionHeroVideoPlaybackKey
                      } else {
@@ -603797,7 +604067,7 @@ index 67b55a0ee..bce031d18 100644
                      }
                  }
              }
-@@ -1194,8 +1235,10 @@ fun ModernHomeContent(
+@@ -1194,8 +1248,10 @@ fun ModernHomeContent(
              val shouldPlayTrailerLambda = remember { { shouldPlayCatalogHeroTrailerUpdated || shouldPlayCollectionHeroVideoUpdated } }
              val heroTrailerRenderedLambda = remember { { heroTrailerFirstFrameRenderedUpdated } }
  
@@ -603810,7 +604080,7 @@ index 67b55a0ee..bce031d18 100644
                      .align(Alignment.BottomStart)
                      .padding(start = rowHorizontalPadding, end = NuvioTheme.spacing.xxxl, bottom = NuvioTheme.spacing.none + rowsViewportHeight + NuvioTheme.spacing.lg)
                      .fillMaxWidth(MODERN_HERO_TEXT_WIDTH_FRACTION)
-@@ -1228,12 +1271,17 @@ fun ModernHomeContent(
+@@ -1228,12 +1284,17 @@ fun ModernHomeContent(
                      },
                      modifier = Modifier
                  )
@@ -603831,7 +604101,18 @@ index 67b55a0ee..bce031d18 100644
                              {
                                  onNavigateToDetail(payload.itemId, payload.itemType, payload.addonBaseUrl)
                              }
-@@ -1272,6 +1320,9 @@ fun ModernHomeContent(
+@@ -1245,7 +1306,9 @@ fun ModernHomeContent(
+                     }
+                     else -> null
+                 }
+-                if (homeImmersiveHeroEnabled && heroViewTitleNavigate != null) {
++                // Launcher: when Nuvio is the system's default launcher the hero is mirror-only —
++                // the "View title" pill is dropped (the whole launcher home is one title surface).
++                if (homeImmersiveHeroEnabled && heroViewTitleNavigate != null && !uiState.appsRowFirst) {
+                     // Continue-watching heroes carry watch progress — surface the same
+                     // "49% Watched" / "1h 5m left" line the CW card shows, above the button.
+                     val heroCwProgress = (activeCarouselItemState.value?.payload as? ModernPayload.ContinueWatching)?.let { payload ->
+@@ -1272,6 +1335,9 @@ fun ModernHomeContent(
                              color = NuvioTheme.extendedColors.textSecondary
                          )
                      }
@@ -603841,7 +604122,7 @@ index 67b55a0ee..bce031d18 100644
                      HeroViewTitleButton(
                          onClick = { heroViewTitleNavigate() },
                          onFocusedChanged = { heroViewTitleFocused.value = it },
-@@ -1353,7 +1404,7 @@ fun ModernHomeContent(
+@@ -1353,7 +1419,7 @@ fun ModernHomeContent(
                  isFastScrolling = isFastScrolling,
                  onFastScrollingChanged = onFastScrollingChangedLambda,
                  contentFocusRequester = contentFocusRequester,
@@ -603850,7 +604131,7 @@ index 67b55a0ee..bce031d18 100644
                  catalogBottomPadding = NuvioTheme.spacing.none,
                  trailerContentAlpha = stableTrailerContentAlphaLambda,
                  verticalRowBringIntoViewSpec = verticalRowBringIntoViewSpec,
-@@ -1412,7 +1463,7 @@ fun ModernHomeContent(
+@@ -1412,7 +1478,7 @@ fun ModernHomeContent(
                  onExpansionInteractionNonceChange = onExpansionInteractionNonceChangeLambda,
                  blockLeftOnFirstExpandedItem = blockLeftOnFirstExpandedItem,
                  isVerticalRowsScrollingState = isVerticalRowsScrollingState,
@@ -607988,7 +608269,7 @@ index 000000000..4fdcd7893
 +        }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerAspectScaleUtils.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerAspectScaleUtils.kt
-index 1c98fae3f..2ed05f5c3 100644
+index 1c98fae3f..8d4bcf1ed 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerAspectScaleUtils.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerAspectScaleUtils.kt
 @@ -56,20 +56,32 @@ internal fun libassOverlayMargins(
@@ -608031,6 +608312,17 @@ index 1c98fae3f..2ed05f5c3 100644
      )
  }
  
+@@ -197,8 +209,9 @@ internal fun applyExoAspectMode(playerView: PlayerView, mode: AspectMode) {
+ /**
+  * Custom Stretch on top of the plain stretch: the target view shows the whole frame and
+  * already covers the player, so scale it once more so the picture area covers the player.
++ * Shared with the Live TV V2 surface (same transform, same tracker — see LivePictureShape).
+  */
+-private fun applyCustomStretchRect(targetView: View, rect: VideoContentRect) {
++internal fun applyCustomStretchRect(targetView: View, rect: VideoContentRect) {
+     if (rect.width <= 0f || rect.height <= 0f || targetView.width <= 0 || targetView.height <= 0) return
+     val scaleX = targetView.scaleX / rect.width
+     val scaleY = targetView.scaleY / rect.height
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerBadges.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerBadges.kt
 index 03efeb764..08849c115 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerBadges.kt
@@ -611864,7 +612156,7 @@ index 000000000..256bd305b
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
-index 1b2a021a4..6d5811ad5 100644
+index 1b2a021a4..8420877e7 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
 @@ -6,6 +6,10 @@
@@ -611886,7 +612178,15 @@ index 1b2a021a4..6d5811ad5 100644
  import androidx.compose.foundation.layout.BoxWithConstraints
  import androidx.compose.foundation.layout.PaddingValues
  import androidx.compose.foundation.layout.Column
-@@ -90,6 +95,7 @@ import androidx.compose.material.icons.rounded.Groups
+@@ -79,7 +84,6 @@ import androidx.compose.material.icons.filled.PlayCircle
+ import androidx.compose.material.icons.filled.Repeat
+ import androidx.compose.material.icons.filled.RepeatOne
+ import androidx.compose.material.icons.filled.ClosedCaption
+-import com.nuvio.tv.ui.screens.player.GeneratedSubtitles
+ import androidx.compose.material.icons.filled.Info
+ import androidx.compose.material.icons.filled.Pause
+ import androidx.compose.material.icons.filled.PlayArrow
+@@ -90,6 +94,7 @@ import androidx.compose.material.icons.rounded.Groups
  import androidx.compose.runtime.Composable
  import androidx.compose.runtime.DisposableEffect
  import androidx.compose.runtime.LaunchedEffect
@@ -611894,7 +612194,7 @@ index 1b2a021a4..6d5811ad5 100644
  import androidx.compose.runtime.collectAsState
  import androidx.compose.runtime.getValue
  import androidx.compose.runtime.mutableStateOf
-@@ -194,8 +200,20 @@ import androidx.media3.exoplayer.ExoPlayer
+@@ -194,8 +199,20 @@ import androidx.media3.exoplayer.ExoPlayer
  import com.nuvio.tv.libass.media.widget.AssSubtitleSurfaceView
  import kotlin.math.abs
  import kotlinx.coroutines.flow.collectLatest
@@ -611915,7 +612215,7 @@ index 1b2a021a4..6d5811ad5 100644
  import com.nuvio.tv.core.intro.PlaybackIntroState
  
  private const val PLAYER_CONTROLS_FADE_DURATION_MS = 200
-@@ -244,11 +262,14 @@ fun PlayerScreen(
+@@ -244,11 +261,14 @@ fun PlayerScreen(
      youtubeLoopOn: Boolean = false,
      /** YouTube fork: sees every key first; returns true to keep the player from acting on it. */
      previewKeyHook: ((androidx.compose.ui.input.key.KeyEvent) -> Boolean)? = null,
@@ -611930,7 +612230,7 @@ index 1b2a021a4..6d5811ad5 100644
      // YouTube's translated captions are served by YouTubeMpdServer as a segmented track that ExoPlayer
      // fetches but never turns into cues, so the current line is read and shown here instead.
      val youtubeCaptionVideo = viewModel.controller.contentId
-@@ -298,6 +319,9 @@ fun PlayerScreen(
+@@ -298,6 +318,9 @@ fun PlayerScreen(
      val context = LocalContext.current
      val isRtl = LocalLayoutDirection.current == LayoutDirection.Rtl
      val containerFocusRequester = remember { FocusRequester() }
@@ -611940,7 +612240,7 @@ index 1b2a021a4..6d5811ad5 100644
      val playPauseFocusRequester = remember { FocusRequester() }
      val progressBarFocusRequester = remember { FocusRequester() }
      val episodesFocusRequester = remember { FocusRequester() }
-@@ -334,16 +358,32 @@ fun PlayerScreen(
+@@ -334,16 +357,32 @@ fun PlayerScreen(
      val ratingViewModel: com.nuvio.tv.ui.screens.detail.UserRatingViewModel = hiltViewModel()
      val forkRateImdbId = com.nuvio.tv.ui.screens.detail.ratingImdbId(viewModel.controller.contentId.orEmpty(), null)
      val forkRateIsMovie = uiState.contentType.equals("movie", ignoreCase = true)
@@ -611973,7 +612273,7 @@ index 1b2a021a4..6d5811ad5 100644
  
      val exitPlayer: () -> Unit = exitPlayer@{
          if (exitDispatched) return@exitPlayer
-@@ -354,6 +394,17 @@ fun PlayerScreen(
+@@ -354,6 +393,17 @@ fun PlayerScreen(
              (!timeline.isLive &&
                  timeline.duration > 0L &&
                  (timeline.currentPosition.toFloat() / timeline.duration.toFloat()) >= WatchProgress.COMPLETED_THRESHOLD)
@@ -611991,7 +612291,7 @@ index 1b2a021a4..6d5811ad5 100644
          val (focusSeason, focusEpisode) = uiState.returnFocusSeasonEpisode(completed)
          onBackPress(
              uiState.currentVideoId,
-@@ -437,7 +488,6 @@ fun PlayerScreen(
+@@ -437,7 +487,6 @@ fun PlayerScreen(
  
      val handleBackPress = handleBackPress@{
          if (externalHandoffInProgress) return@handleBackPress
@@ -611999,7 +612299,7 @@ index 1b2a021a4..6d5811ad5 100644
          if (postPlayRecommendationState.canReturnToPlayer && !uiState.playbackEnded) {
              returnToPlayerFromPostPlay()
              viewModel.hideControls()
-@@ -543,6 +593,18 @@ fun PlayerScreen(
+@@ -543,6 +592,18 @@ fun PlayerScreen(
          val forkRatePromptNow = shouldDispatchNatural && forkRatePromptPref && !forkRatePromptShown &&
              forkRateIsMovie && forkRateAvailable
          when {
@@ -612018,7 +612318,7 @@ index 1b2a021a4..6d5811ad5 100644
              forkRatePromptNow -> {
                  forkRatePromptShown = true
                  forkRateOpen = true
-@@ -640,6 +702,14 @@ fun PlayerScreen(
+@@ -640,6 +701,14 @@ fun PlayerScreen(
          }
      }
  
@@ -612033,7 +612333,7 @@ index 1b2a021a4..6d5811ad5 100644
      // Frame rate matching lifecycle.
      val activity = LocalContext.current as? android.app.Activity
      LaunchedEffect(activity) {
-@@ -686,26 +756,37 @@ fun PlayerScreen(
+@@ -686,26 +755,37 @@ fun PlayerScreen(
          uiState.showAudioOverlay,
          uiState.showSubtitleOverlay,
          uiState.showSpeedDialog,
@@ -612077,7 +612377,7 @@ index 1b2a021a4..6d5811ad5 100644
          } else if (!uiState.showControls) {
              // When controls are hidden, let skip intro button take focus if visible
              val skipVisible = uiState.activeSkipInterval != null && !uiState.skipIntervalDismissed
-@@ -1358,6 +1439,11 @@ fun PlayerScreen(
+@@ -1358,6 +1438,11 @@ fun PlayerScreen(
                          onSubtitleTextMetricsChanged = { subtitleTextMetrics = it },
                          modifier = Modifier.fillMaxSize()
                      )
@@ -612089,7 +612389,7 @@ index 1b2a021a4..6d5811ad5 100644
                  } else {
                      viewModel.exoPlayer?.let { player ->
                          ExoPlayerSurface(
-@@ -1738,6 +1824,7 @@ fun PlayerScreen(
+@@ -1738,6 +1823,7 @@ fun PlayerScreen(
                  uiState = uiState,
                  playerBadges = playerBadges,
                  viewModel = viewModel,
@@ -612097,7 +612397,7 @@ index 1b2a021a4..6d5811ad5 100644
                  subtitleReportingActive = playerControlsVisible,
                  onSubtitleClearanceChanged = {
                      if (latestPlayerControlsVisible) subtitleControlsClearancePx = it
-@@ -1954,8 +2041,6 @@ fun PlayerScreen(
+@@ -1954,8 +2040,6 @@ fun PlayerScreen(
              )
          }
  
@@ -612106,7 +612406,7 @@ index 1b2a021a4..6d5811ad5 100644
          AnimatedVisibility(
              visible = seekOverlayVisible,
              enter = fadeIn(animationSpec = tween(150)),
-@@ -2036,6 +2121,7 @@ fun PlayerScreen(
+@@ -2036,6 +2120,7 @@ fun PlayerScreen(
                      onAddonFilterSelected = { viewModel.onEvent(PlayerEvent.OnEpisodeAddonFilterSelected(it)) },
                      onEpisodeSelected = { viewModel.onEvent(PlayerEvent.OnEpisodeSelected(it)) },
                      onStreamSelected = { viewModel.onEvent(PlayerEvent.OnEpisodeStreamSelected(it)) },
@@ -612114,7 +612414,7 @@ index 1b2a021a4..6d5811ad5 100644
                      modifier = Modifier.align(Alignment.CenterEnd)
                  )
              }
-@@ -2247,8 +2333,7 @@ fun PlayerScreen(
+@@ -2247,8 +2332,7 @@ fun PlayerScreen(
              modifier = Modifier
                  .fillMaxSize()
                  .zIndex(2.6f)
@@ -612124,7 +612424,7 @@ index 1b2a021a4..6d5811ad5 100644
          )
  
          SubtitleSelectionOverlay(
-@@ -2329,6 +2414,40 @@ fun PlayerScreen(
+@@ -2329,6 +2413,40 @@ fun PlayerScreen(
      }
  }
  
@@ -612165,7 +612465,7 @@ index 1b2a021a4..6d5811ad5 100644
  @Composable
  private fun MpvPlayerSurface(
      viewModel: PlayerViewModel,
-@@ -2488,6 +2607,8 @@ private fun ExoPlayerSurface(
+@@ -2488,6 +2606,8 @@ private fun ExoPlayerSurface(
                  enabled = useLibass,
                  renderMode = libassRenderMode
              )
@@ -612174,7 +612474,7 @@ index 1b2a021a4..6d5811ad5 100644
              latestBindSubtitleView(it.subtitleView)
          }
      )
-@@ -2833,11 +2954,9 @@ private fun PlayerView.applySubtitleStyleIfNeeded(
+@@ -2833,11 +2953,9 @@ private fun PlayerView.applySubtitleStyleIfNeeded(
  
          // Nuvio fork: custom subtitle font (null = default system font)
          val typeface = com.nuvio.tv.reshaped.subtitlefont.SubtitleFontStore.exoTypeface(context, subtitleStyle.bold)
@@ -612189,7 +612489,7 @@ index 1b2a021a4..6d5811ad5 100644
  
          val forkShadow = if (subtitleStyle.outlineEnabled) 0 else TvForkPlayerPrefs.subtitleShadow
          val edgeType = if (subtitleStyle.outlineEnabled) {
-@@ -3025,6 +3144,7 @@ private fun PlayerControlsOverlay(
+@@ -3025,6 +3143,7 @@ private fun PlayerControlsOverlay(
      uiState: PlayerUiState,
      playerBadges: List<StreamBadge>,
      viewModel: PlayerViewModel,
@@ -612197,7 +612497,7 @@ index 1b2a021a4..6d5811ad5 100644
      playPauseFocusRequester: FocusRequester,
      progressBarFocusRequester: FocusRequester,
      streamInfoFocusRequester: FocusRequester,
-@@ -3092,6 +3212,68 @@ private fun PlayerControlsOverlay(
+@@ -3092,6 +3211,68 @@ private fun PlayerControlsOverlay(
      val customAspectPainter = rememberRawSvgPainter(R.raw.ic_player_aspect_ratio)
      val customEpisodesPainter = rememberRawSvgPainter(R.raw.ic_player_episodes)
      var showEngineSwitchConfirm by remember { mutableStateOf(false) }
@@ -612266,7 +612566,7 @@ index 1b2a021a4..6d5811ad5 100644
      val playbackTimeline by viewModel.playbackTimeline.collectAsState()
      val isLivePlayback = playbackTimeline.isLive
      val progressUpTarget = if (isLivePlayback) {
-@@ -3234,7 +3416,6 @@ private fun PlayerControlsOverlay(
+@@ -3234,7 +3415,6 @@ private fun PlayerControlsOverlay(
                                  }
                              }
                      ) {
@@ -612274,7 +612574,24 @@ index 1b2a021a4..6d5811ad5 100644
                          PlayerControlsProgressBarHost(
                              viewModel = viewModel,
                              chapters = uiState.chapters,
-@@ -3538,16 +3719,22 @@ private fun PlayerControlsOverlay(
+@@ -3276,11 +3456,11 @@ private fun PlayerControlsOverlay(
+                     val hiddenBtns by com.nuvio.tv.data.repository.ForkTvPlayerButtons.hidden.collectAsState()
+                     val btnContext = androidx.compose.ui.platform.LocalContext.current
+                     androidx.compose.runtime.LaunchedEffect(Unit) { com.nuvio.tv.data.repository.ForkTvPlayerButtons.ensureLoaded(btnContext) }
+-                    // Nuvio fork: the generated-subtitle entries (online + on-device) must keep
+-                    // the CC button reachable even when this stream has no subtitle tracks and
+-                    // no add-on subtitles were found.
+-                    val generatedSubsAvailable = GeneratedSubtitles.groqKey.value.isNotBlank() || GeneratedSubtitles.onDevice.value
+-                    val hasSubtitleControl = uiState.subtitleTracks.isNotEmpty() || uiState.addonSubtitles.isNotEmpty() || (GeneratedSubtitles.supported && generatedSubsAvailable)
++                    // Nuvio fork: the CC button is always offered. Generated subtitles (online
++                    // Groq / on-device) can be produced for any title straight from the stream
++                    // URL — including ones without a TMDB/IMDb id — so a stream with no embedded
++                    // tracks and no add-on subtitles still has a working subtitle menu.
++                    val hasSubtitleControl = true
+                     val hasAudioControl = uiState.audioTracks.isNotEmpty()
+                     val showNextEpisodeButton = uiState.nextEpisode?.hasAired == true &&
+                         (uiState.postPlayMode as? PostPlayMode.AutoPlay)?.let {
+@@ -3538,16 +3718,22 @@ private fun PlayerControlsOverlay(
                              )
                              }
                              com.nuvio.tv.data.repository.ForkTvPlayerButtons.moreOrder().forEach { moreBtns[it]?.invoke() }
@@ -612307,12 +612624,13 @@ index 1b2a021a4..6d5811ad5 100644
                          }
                      }
  
-@@ -3591,8 +3778,90 @@ private fun PlayerControlsOverlay(
+@@ -3591,8 +3777,90 @@ private fun PlayerControlsOverlay(
      }
  }
  
 +/** Whether the experimental seek-bar thumbnails are turned on in Playback settings. */
-+@Composable
+ @Composable
+-private fun PlayerControlsProgressBarHost(
 +private fun rememberSeekPreviewEnabled(viewModel: PlayerViewModel): Boolean =
 +    remember(viewModel) {
 +        viewModel.uiState.map { it.seekPreviewEnabled }.distinctUntilChanged()
@@ -612393,13 +612711,12 @@ index 1b2a021a4..6d5811ad5 100644
 +    }
 +}
 +
- @Composable
--private fun PlayerControlsProgressBarHost(
++@Composable
 +internal fun PlayerControlsProgressBarHost(
      viewModel: PlayerViewModel,
      chapters: List<PlayerChapter>,
      focusRequester: FocusRequester,
-@@ -3603,30 +3872,53 @@ private fun PlayerControlsProgressBarHost(
+@@ -3603,30 +3871,70 @@ private fun PlayerControlsProgressBarHost(
      onClick: (() -> Unit)? = null
  ) {
      val playbackTimeline by viewModel.playbackTimeline.collectAsState()
@@ -612430,6 +612747,13 @@ index 1b2a021a4..6d5811ad5 100644
 +        warmPositionMs = playbackTimeline.currentPosition,
 +        enabled = seekPreviewEnabled
      )
++    // Nuvio fork: unify the scrub picture. The seek-bar preview (System A) draws above; when it
++    // has no frame for this position — setting off, unsupported stream, or still decoding — and
++    // Seek Thumbnails (System B) is on, System B's bubble takes the same spot. A wins as soon
++    // as its frame is ready, so the two never render together; with both off nothing shows.
++    val seekThumbSettings by com.nuvio.tv.livetv.thumbs.SeekThumbSettings.values.collectAsState()
++    val previewFrame = previewController?.frame
++    val seekThumbPosition = scrubPosition?.takeIf { seekThumbSettings.enabled && previewFrame == null }
 +
 +    Box(modifier = Modifier.fillMaxWidth()) {
 +        Column {
@@ -612459,6 +612783,16 @@ index 1b2a021a4..6d5811ad5 100644
 +            fraction = if (playbackTimeline.duration > 0L) playbackTimeline.currentPosition.toFloat() / playbackTimeline.duration.toFloat() else 0f,
 +            liftDp = 36
 +        )
++        seekThumbPosition?.let { position ->
++            com.nuvio.tv.livetv.thumbs.SeekThumbAbove(
++                owner = com.nuvio.tv.livetv.thumbs.SeekThumbs.Owner.MAIN,
++                positionMs = position,
++                fraction = if (playbackTimeline.duration > 0L) position.toFloat() / playbackTimeline.duration.toFloat() else 0f,
++                timeLabel = com.nuvio.tv.livetv.thumbs.seekThumbTime(position),
++                visible = true,
++                modifier = Modifier.align(Alignment.TopStart)
++            )
++        }
 +    }
  }
  
@@ -612473,7 +612807,7 @@ index 1b2a021a4..6d5811ad5 100644
      val playbackTimeline by viewModel.playbackTimeline.collectAsState()
      // Remaining-time toggle lives in PlayerUiState: the controls leave composition when they
      // auto-hide, so a remember here used to reset the toggle on every re-show.
-@@ -3650,8 +3942,29 @@ private fun PlayerControlsTimeTextHost(viewModel: PlayerViewModel) {
+@@ -3650,8 +3958,29 @@ private fun PlayerControlsTimeTextHost(viewModel: PlayerViewModel) {
          softWrap = false,
          modifier = Modifier
              .onFocusChanged { focused = it.isFocused }
@@ -612504,7 +612838,7 @@ index 1b2a021a4..6d5811ad5 100644
              )
              .clickable(enabled = !playbackTimeline.isLive) {
                  viewModel.onEvent(PlayerEvent.OnToggleRemainingDuration)
-@@ -3717,6 +4030,7 @@ private fun ControlButton(
+@@ -3717,6 +4046,7 @@ private fun ControlButton(
      avatarUrl: String? = null
  ) {
      var isFocused by remember { mutableStateOf(false) }
@@ -612512,7 +612846,7 @@ index 1b2a021a4..6d5811ad5 100644
  
      IconButton(
          onClick = onClick,
-@@ -3758,12 +4072,16 @@ private fun ControlButton(
+@@ -3758,12 +4088,16 @@ private fun ControlButton(
              .onFocusChanged {
                  isFocused = it.isFocused
                  if (it.isFocused) onFocused?.invoke()
@@ -612532,7 +612866,7 @@ index 1b2a021a4..6d5811ad5 100644
          ),
          shape = IconButtonDefaults.shape(shape = CircleShape)
      ) {
-@@ -3808,6 +4126,10 @@ private fun ProgressBar(
+@@ -3808,6 +4142,10 @@ private fun ProgressBar(
      chapters: List<PlayerChapter> = emptyList()
  ) {
      val accentBrush = NuvioTheme.palette.accentBrush()
@@ -612543,7 +612877,7 @@ index 1b2a021a4..6d5811ad5 100644
      val seekBarLabel = stringResource(R.string.cd_seek_bar)
      val progress = if (duration > 0) {
          (currentPosition.toFloat() / duration.toFloat()).coerceIn(0f, 1f)
-@@ -3938,20 +4260,29 @@ private fun ProgressBar(
+@@ -3938,20 +4276,29 @@ private fun ProgressBar(
              },
          contentAlignment = Alignment.Center
      ) {
@@ -612579,7 +612913,7 @@ index 1b2a021a4..6d5811ad5 100644
                  )
                  // Chapter marks, drawn over the fill.
                  .drawBehind {
-@@ -3969,6 +4300,18 @@ private fun ProgressBar(
+@@ -3969,6 +4316,18 @@ private fun ProgressBar(
                      }
                  }
          )
@@ -612598,7 +612932,7 @@ index 1b2a021a4..6d5811ad5 100644
      }
  }
  
-@@ -3994,7 +4337,9 @@ private fun SeekOverlay(
+@@ -3994,7 +4353,9 @@ private fun SeekOverlay(
      bufferedPosition: Long = 0L,
      chapters: List<PlayerChapter> = emptyList(),
      showRemaining: Boolean = false,
@@ -612609,7 +612943,7 @@ index 1b2a021a4..6d5811ad5 100644
  ) {
      Column(
          modifier = Modifier
-@@ -4002,16 +4347,32 @@ private fun SeekOverlay(
+@@ -4002,16 +4363,35 @@ private fun SeekOverlay(
              .padding(horizontal = NuvioTheme.spacing.xxl, vertical = NuvioTheme.spacing.xl)
      ) {
          CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
@@ -612632,13 +612966,16 @@ index 1b2a021a4..6d5811ad5 100644
 +                    bufferedPosition = bufferedPosition,
 +                    chapters = chapters
 +                )
-+                // Live TV fork: this overlay only shows while seeking.
++                // Live TV fork: this overlay only shows while seeking. When both systems are on,
++                // the seek-bar preview's frame wins and Seek Thumbnails only fill the gap, so
++                // the two bubbles never render together.
++                val previewFrame = previewController?.frame
 +                com.nuvio.tv.livetv.thumbs.SeekThumbAbove(
 +                    owner = com.nuvio.tv.livetv.thumbs.SeekThumbs.Owner.MAIN,
 +                    positionMs = currentPosition,
 +                    fraction = if (duration > 0) currentPosition.toFloat() / duration else 0f,
 +                    timeLabel = com.nuvio.tv.livetv.thumbs.seekThumbTime(currentPosition),
-+                    visible = thumbVisible && duration > 0,
++                    visible = thumbVisible && duration > 0 && previewFrame == null,
 +                    modifier = Modifier.align(Alignment.TopStart)
 +                )
 +                SeekPreviewThumbnail(
@@ -612651,7 +612988,7 @@ index 1b2a021a4..6d5811ad5 100644
  
              Spacer(modifier = Modifier.height(NuvioTheme.spacing.md))
  
-@@ -4039,6 +4400,13 @@ private fun SeekOverlay(
+@@ -4039,6 +4419,16 @@ private fun SeekOverlay(
  private fun SeekOverlayHost(viewModel: PlayerViewModel, chapters: List<PlayerChapter>) {
      val playbackTimeline by viewModel.playbackTimeline.collectAsState()
      val uiState by viewModel.uiState.collectAsState()
@@ -612662,20 +612999,24 @@ index 1b2a021a4..6d5811ad5 100644
 +        playbackTimeline.isLive,
 +        enabled = seekPreviewEnabled
 +    )
++    // Nuvio fork: this overlay only composes while the quick-seek UI is up, so "thumbVisible"
++    // is just the Seek Thumbnails setting — SeekThumbAbove hides itself when it is off.
++    val seekThumbSettings by com.nuvio.tv.livetv.thumbs.SeekThumbSettings.values.collectAsState()
  
      SeekOverlay(
          currentPosition = playbackTimeline.currentPosition,
-@@ -4046,7 +4414,8 @@ private fun SeekOverlayHost(viewModel: PlayerViewModel, chapters: List<PlayerCha
+@@ -4046,7 +4436,9 @@ private fun SeekOverlayHost(viewModel: PlayerViewModel, chapters: List<PlayerCha
          bufferedPosition = playbackTimeline.bufferedPosition,
          chapters = chapters,
          showRemaining = uiState.showRemainingDuration,
 -        preview = { com.nuvio.tv.ui.screens.player.seekpreview.SeekPreviewThumbnailHost(viewModel = viewModel) } // Nuvio fork: seek previews
++        thumbVisible = seekThumbSettings.enabled,
 +        previewController = previewController,
 +        scrubbing = scrubPosition != null
      )
  }
  
-@@ -4274,13 +4643,18 @@ private fun SubtitleDelayOverlay(
+@@ -4274,13 +4666,18 @@ private fun SubtitleDelayOverlay(
  ) {
      val fraction = ((subtitleDelayMs - SUBTITLE_DELAY_MIN_MS).toFloat() /
          (SUBTITLE_DELAY_MAX_MS - SUBTITLE_DELAY_MIN_MS).toFloat()).coerceIn(0f, 1f)
@@ -612697,7 +613038,7 @@ index 1b2a021a4..6d5811ad5 100644
              .padding(horizontal = 26.dp, vertical = 20.dp)
      ) {
          Row(
-@@ -4653,20 +5027,27 @@ internal fun PlayerOverlayButton(
+@@ -4653,20 +5050,27 @@ internal fun PlayerOverlayButton(
      modifier: Modifier = Modifier,
      enabled: Boolean = true
  ) {
@@ -612732,7 +613073,7 @@ index 1b2a021a4..6d5811ad5 100644
                  border = NuvioTheme.focusRing.border(NuvioTheme.spacing.xxs),
                  shape = shape
              )
-@@ -4675,7 +5056,7 @@ internal fun PlayerOverlayButton(
+@@ -4675,7 +5079,7 @@ internal fun PlayerOverlayButton(
              horizontal = NuvioTheme.spacing.lg,
              vertical = 14.dp
          ),
@@ -612741,7 +613082,7 @@ index 1b2a021a4..6d5811ad5 100644
      ) {
          Text(
              text = text,
-@@ -4702,11 +5083,52 @@ private fun SpeedSelectionDialog(
+@@ -4702,11 +5106,52 @@ private fun SpeedSelectionDialog(
      val speedFocusRequesters = remember {
          PLAYBACK_SPEEDS.map { FocusRequester() }
      }
@@ -612794,7 +613135,7 @@ index 1b2a021a4..6d5811ad5 100644
      Dialog(onDismissRequest = onDismiss) {
          Box(
              modifier = Modifier
-@@ -4879,14 +5301,15 @@ internal fun DialogButton(
+@@ -4879,14 +5324,15 @@ internal fun DialogButton(
      Button(
          onClick = onClick,
          enabled = enabled,
@@ -636632,10 +636973,10 @@ index 86279a489..6be6b2ed7 100644
          }
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/LiveTvSettingsContent.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LiveTvSettingsContent.kt
 new file mode 100644
-index 000000000..89150cd9d
+index 000000000..cd0aa9c21
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/LiveTvSettingsContent.kt
-@@ -0,0 +1,3240 @@
+@@ -0,0 +1,3264 @@
 +package com.nuvio.tv.ui.screens.settings
 +
 +import android.content.Context
@@ -636964,7 +637305,12 @@ index 000000000..89150cd9d
 +internal fun LiveTvSettingsContent(
 +    viewModel: LiveTvSettingsViewModel = hiltViewModel(),
 +    initialFocusRequester: FocusRequester? = null,
-+    page: LiveTvPage = LiveTvPage.ALL
++    page: LiveTvPage = LiveTvPage.ALL,
++    // Embedded in the classic pane's "IPTV V2 settings" section: no header of its own (the
++    // host section names it) and no copy of the classic-engine section (the host IS that
++    // pane), so the two panels cannot nest each other. The host gives the panel a bounded
++    // box; the list below wraps its content inside it instead of stretching.
++    embedded: Boolean = false
 +) {
 +    val context = LocalContext.current
 +    // HUB: one Live TV page with its own row of tabs; the tab picked is the page shown.
@@ -637012,10 +637358,11 @@ index 000000000..89150cd9d
 +    val hasPin = s.parentalPin.length >= 4
 +
 +    Column(
-+        modifier = Modifier.fillMaxSize(),
++        // Embedded: the host box bounds the height, so wrap content rather than fill it.
++        modifier = if (embedded) Modifier.fillMaxWidth() else Modifier.fillMaxSize(),
 +        verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.md)
 +    ) {
-+        SettingsDetailHeader(
++        if (!embedded) SettingsDetailHeader(
 +            title = context.getString(page.title),
 +            subtitle = if (status.loading && !flat) (status.message ?: context.getString(R.string.iptv_settings_updating)) else context.getString(page.subtitle)
 +        )
@@ -637040,7 +637387,10 @@ index 000000000..89150cd9d
 +            state = listState,
 +            modifier = Modifier
 +                .fillMaxWidth()
-+                .weight(1f)
++                // fill = false when embedded: inside the classic pane's bounded box the
++                // list takes its content's height instead of stretching to whatever is
++                // left of the box, so a short tab does not leave a tall blank panel.
++                .weight(1f, fill = !embedded)
 +                .onPreviewKeyEvent { e ->
 +                    // Going up onto the first rows of a section: bring its heading into view too
 +                    // (it was left cut off at the top, as if behind the tabs).
@@ -638368,6 +638718,21 @@ index 000000000..89150cd9d
 +                            onClick = { dialog = LiveDialog.ButtonTester }
 +                        )
 +                    }
++                }
++            }
++
++            // ------------------------------------------------------------ Classic IPTV engine
++            // The classic TV Channels settings, embedded so every live-TV setting stays in
++            // one panel: Settings keeps only the active engine's category on the rail, and
++            // this is the one for IPTV V2. The pane renders here without its own scrolling
++            // list (this one scrolls it) and drops its own copy of the V2 embed while
++            // embedded, so the two panels cannot nest each other.
++            if (show(LiveTvPage.MAIN) && !embedded) item(key = "classic_engine") {
++                SettingsGroupCard(
++                    title = "Classic IPTV engine (legacy settings)",
++                    subtitle = "The TV Channels screen's settings: sources, EPG, playback and parental controls, plus the engine switch"
++                ) {
++                    TvChannelsSettingsPane(initialFocusRequester = null, embedded = true)
 +                }
 +            }
 +        }
@@ -644211,7 +644576,7 @@ index ae70ffa28..2e9c84d62 100644
      isSelected: Boolean,
      isTransparent: Boolean = false,
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt
-index 1e92634fe..9644b6fa0 100644
+index 1e92634fe..2dc5e40e7 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SettingsScreen.kt
 @@ -3,6 +3,8 @@
@@ -644248,7 +644613,35 @@ index 1e92634fe..9644b6fa0 100644
  import androidx.compose.material.icons.filled.Sync
  import androidx.compose.material.icons.filled.Tune
  import androidx.compose.runtime.Composable
-@@ -170,17 +181,29 @@ private fun settingsSectionSpec(category: SettingsCategory): SettingsSectionSpec
+@@ -88,6 +99,7 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
+ import androidx.compose.ui.input.key.type
+ import androidx.compose.ui.layout.LayoutCoordinates
+ import androidx.compose.ui.layout.onGloballyPositioned
++import androidx.compose.ui.platform.LocalContext
+ import androidx.compose.ui.platform.LocalDensity
+ import androidx.compose.ui.platform.LocalFocusManager
+ import androidx.compose.ui.unit.IntOffset
+@@ -98,7 +110,10 @@ import androidx.tv.material3.ExperimentalTvMaterial3Api
+ import com.nuvio.tv.BuildConfig
+ import com.nuvio.tv.R
+ import com.nuvio.tv.core.build.AppFeaturePolicy
++import com.nuvio.tv.data.local.DeviceUiPreferenceStore
++import com.nuvio.tv.domain.model.DeviceUiPreferences
+ import com.nuvio.tv.domain.model.ExperienceMode
++import com.nuvio.tv.domain.model.IptvEngine
+ import com.nuvio.tv.domain.model.SettingsUiStyle
+ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.delay
+@@ -165,22 +180,37 @@ private fun settingsSectionSpec(category: SettingsCategory): SettingsSectionSpec
+     SettingsCategory.APPEARANCE -> SettingsSectionSpec(category, stringResource(R.string.appearance_title), Icons.Default.Palette, destination = SettingsSectionDestination.Inline)
+     SettingsCategory.LAYOUT -> SettingsSectionSpec(category, stringResource(R.string.settings_layout), Icons.Default.GridView, destination = SettingsSectionDestination.Inline)
+     SettingsCategory.CONTENT_DISCOVERY -> SettingsSectionSpec(category, stringResource(R.string.settings_content_discovery), Icons.Default.Explore, destination = SettingsSectionDestination.Inline)
+-    SettingsCategory.TV_CHANNELS -> SettingsSectionSpec(category, stringResource(R.string.settings_tv_channels), Icons.Rounded.Tv, destination = SettingsSectionDestination.Inline)
++    // The rail shows one live-TV category at a time (chosen by the IPTV engine in
++    // SettingsScreen), so both engines' entries read as the same "Live TV" panel instead
++    // of the classic pane's old "Live TV Channels".
++    SettingsCategory.TV_CHANNELS -> SettingsSectionSpec(category, "Live TV", Icons.Rounded.Tv, destination = SettingsSectionDestination.Inline)
+     SettingsCategory.JELLYFIN -> SettingsSectionSpec(category, "Jellyfin", Icons.Rounded.VideoLibrary, destination = SettingsSectionDestination.Inline)
      SettingsCategory.YOUTUBE -> SettingsSectionSpec(category, "YouTube", Icons.Rounded.SmartDisplay, destination = SettingsSectionDestination.Inline) // YouTube fork
      SettingsCategory.PLAYBACK -> SettingsSectionSpec(category, stringResource(R.string.settings_playback), Icons.Rounded.PlayArrow, destination = SettingsSectionDestination.Inline)
      SettingsCategory.FEATURES -> SettingsSectionSpec(category, "Features", Icons.Default.Tune, destination = SettingsSectionDestination.Inline)
@@ -644278,7 +644671,7 @@ index 1e92634fe..9644b6fa0 100644
      onNavigateToAddons: () -> Unit = {},
      onNavigateToPlugins: () -> Unit = {},
      onNavigateToAuthQrSignIn: () -> Unit = {},
-@@ -188,6 +211,8 @@ fun SettingsScreen(
+@@ -188,6 +218,8 @@ fun SettingsScreen(
      onOpenDetail: (String, String, String?) -> Unit = { _, _, _ -> },
      onNavigateToSupportersContributors: () -> Unit = {},
      onNavigateToLicensesAttributions: () -> Unit = {},
@@ -644287,7 +644680,38 @@ index 1e92634fe..9644b6fa0 100644
      onNavigateToWatchParty: () -> Unit = {},
      profileViewModel: ProfileSettingsViewModel = hiltViewModel(),
      experienceModeViewModel: ExperienceModeSettingsViewModel = hiltViewModel(),
-@@ -246,9 +271,18 @@ fun SettingsScreen(
+@@ -214,13 +246,29 @@ fun SettingsScreen(
+ 
+     val isEssentialMode = loadedExperienceMode == ExperienceMode.ESSENTIAL
+ 
+-    val visibleCategories = remember(isPrimaryProfileActive, isEssentialMode, isWatchPartyAvailable) {
++    // Which IPTV engine is active, read the same way NuvioNavHost reads it for the TV
++    // Channels entry. Settings keeps ONE live-TV category on the rail — the one for this
++    // engine — and the other engine's settings ride along inside that panel instead of
++    // sitting beside it as a second, overlapping entry.
++    val prefsContext = LocalContext.current
++    val iptvEngine = remember(prefsContext) {
++        DeviceUiPreferenceStore.flow(prefsContext)
++    }.collectAsStateWithLifecycle(initialValue = DeviceUiPreferences()).value.iptvEngine
++
++    val visibleCategories = remember(isPrimaryProfileActive, isEssentialMode, isWatchPartyAvailable, iptvEngine) {
+         visibleSettingsCategories(
+             isPrimaryProfile = isPrimaryProfileActive,
+             isEssentialMode = isEssentialMode,
+             isDebugBuild = BuildConfig.IS_DEBUG_BUILD,
+             isWatchPartyAvailable = isWatchPartyAvailable
+         )
++            .filter { category ->
++                when (category) {
++                    SettingsCategory.TV_CHANNELS -> iptvEngine == IptvEngine.CLASSIC
++                    SettingsCategory.LIVE_TV -> iptvEngine == IptvEngine.V2
++                    else -> true
++                }
++            }
+     }
+     val visibleSections = visibleCategories.map { category -> settingsSectionSpec(category) }
+ 
+@@ -246,9 +294,18 @@ fun SettingsScreen(
              SettingsCategory.JELLYFIN to FocusRequester(),
              SettingsCategory.YOUTUBE to FocusRequester(),
              SettingsCategory.FEATURES to FocusRequester(),
@@ -644306,7 +644730,7 @@ index 1e92634fe..9644b6fa0 100644
              SettingsCategory.ADVANCED to FocusRequester(),
              SettingsCategory.ABOUT to FocusRequester(),
              SettingsCategory.ACCOUNT to FocusRequester()
-@@ -265,6 +299,10 @@ fun SettingsScreen(
+@@ -265,6 +322,10 @@ fun SettingsScreen(
      var integrationHubReturnSection by remember { mutableStateOf(IntegrationSettingsSection.Hub) }
      var pendingContentFocusCategory by remember { mutableStateOf<SettingsCategory?>(null) }
      var pendingContentFocusRequestId by remember { mutableLongStateOf(0L) }
@@ -644317,7 +644741,7 @@ index 1e92634fe..9644b6fa0 100644
      // Saveable so it survives a trip out to one of the screens a category opens. The pane bounces
      // focus back to the rail whenever it gains focus while this is false, so a plain remember made
      // every return from those screens land on the rail rather than where the user had been.
-@@ -381,6 +419,36 @@ fun SettingsScreen(
+@@ -381,9 +442,53 @@ fun SettingsScreen(
  
      val focusManager = LocalFocusManager.current
  
@@ -644353,8 +644777,26 @@ index 1e92634fe..9644b6fa0 100644
 +
      LaunchedEffect(visibleSections) {
          if (visibleSections.none { it.category == selectedCategory }) {
-             selectedCategory = visibleSections.firstOrNull()?.category ?: SettingsCategory.APPEARANCE
-@@ -425,16 +493,27 @@ fun SettingsScreen(
+-            selectedCategory = visibleSections.firstOrNull()?.category ?: SettingsCategory.APPEARANCE
++            // The rail shrank under the selection. When that was an engine flip (switched
++            // from the engine row inside one of the live-TV panels), follow it to the other
++            // engine's panel rather than falling back to the top of the list.
++            val engineLiveCategory = when (iptvEngine) {
++                IptvEngine.V2 -> SettingsCategory.LIVE_TV
++                IptvEngine.CLASSIC -> SettingsCategory.TV_CHANNELS
++            }
++            selectedCategory = if (
++                selectedCategory == SettingsCategory.TV_CHANNELS ||
++                selectedCategory == SettingsCategory.LIVE_TV
++            ) {
++                engineLiveCategory
++            } else {
++                visibleSections.firstOrNull()?.category ?: SettingsCategory.APPEARANCE
++            }
+         }
+     }
+ 
+@@ -425,16 +530,27 @@ fun SettingsScreen(
          modifier = Modifier
              .fillMaxSize()
              .background(NuvioTheme.colors.Background)
@@ -644388,7 +644830,7 @@ index 1e92634fe..9644b6fa0 100644
          ) {
  
              val onSectionClick: (SettingsSectionSpec) -> Unit = { section ->
-@@ -446,6 +525,7 @@ fun SettingsScreen(
+@@ -446,6 +562,7 @@ fun SettingsScreen(
                      allowDetailAutofocus = false
                      when (section.category) {
                          SettingsCategory.ACCOUNT -> onNavigateToAuthQrSignIn()
@@ -644396,7 +644838,7 @@ index 1e92634fe..9644b6fa0 100644
                          else -> Unit
                      }
                  } else {
-@@ -453,6 +533,7 @@ fun SettingsScreen(
+@@ -453,6 +570,7 @@ fun SettingsScreen(
                          integrationSection = IntegrationSettingsSection.Hub
                          integrationHubReturnSection = IntegrationSettingsSection.Hub
                      }
@@ -644404,7 +644846,7 @@ index 1e92634fe..9644b6fa0 100644
                      allowDetailAutofocus = true
                      selectedCategory = section.category
                      pendingContentFocusCategory = section.category
-@@ -570,6 +651,16 @@ fun SettingsScreen(
+@@ -570,6 +688,16 @@ fun SettingsScreen(
                              horizontalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.sm, Alignment.CenterHorizontally),
                              contentPadding = PaddingValues(horizontal = NuvioTheme.spacing.md, vertical = NuvioTheme.spacing.xs)
                          ) {
@@ -644421,7 +644863,7 @@ index 1e92634fe..9644b6fa0 100644
                              itemsIndexed(
                                  items = visibleSections,
                                  key = { _, section -> section.category }
-@@ -653,8 +744,11 @@ fun SettingsScreen(
+@@ -653,8 +781,11 @@ fun SettingsScreen(
                          ) { animatedCategory ->
                              SettingsDetailPane(
                                  selectedCategory = animatedCategory,
@@ -644433,7 +644875,7 @@ index 1e92634fe..9644b6fa0 100644
                                  contentFocusRequesters = contentFocusRequesters,
                                  experienceModeViewModel = experienceModeViewModel,
                                  integrationSection = integrationSection,
-@@ -678,7 +772,8 @@ fun SettingsScreen(
+@@ -678,7 +809,8 @@ fun SettingsScreen(
                                  onNavigateToAuthQrSignIn = onNavigateToAuthQrSignIn,
                                  onNavigateToSupportersContributors = onNavigateToSupportersContributors,
                                  onNavigateToLicensesAttributions = onNavigateToLicensesAttributions,
@@ -644443,7 +644885,7 @@ index 1e92634fe..9644b6fa0 100644
                              )
                          }
                      }
-@@ -690,7 +785,7 @@ fun SettingsScreen(
+@@ -690,7 +822,7 @@ fun SettingsScreen(
              ) {
                  Box(
                      modifier = Modifier
@@ -644452,7 +644894,7 @@ index 1e92634fe..9644b6fa0 100644
                          .fillMaxHeight()
                  ) {
                      LazyColumn(
-@@ -748,6 +843,19 @@ fun SettingsScreen(
+@@ -748,6 +880,19 @@ fun SettingsScreen(
                              },
                          verticalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterVertically)
                      ) {
@@ -644472,7 +644914,7 @@ index 1e92634fe..9644b6fa0 100644
                          itemsIndexed(
                              items = visibleSections,
                              key = { _, section -> section.category }
-@@ -815,8 +923,14 @@ fun SettingsScreen(
+@@ -815,8 +960,14 @@ fun SettingsScreen(
                  ) {
                      SettingsDetailPane(
                          selectedCategory = selectedCategory,
@@ -644487,7 +644929,7 @@ index 1e92634fe..9644b6fa0 100644
                          contentFocusRequesters = contentFocusRequesters,
                          experienceModeViewModel = experienceModeViewModel,
                          integrationSection = integrationSection,
-@@ -840,12 +954,21 @@ fun SettingsScreen(
+@@ -840,12 +991,21 @@ fun SettingsScreen(
                          onNavigateToAuthQrSignIn = onNavigateToAuthQrSignIn,
                          onNavigateToSupportersContributors = onNavigateToSupportersContributors,
                          onNavigateToLicensesAttributions = onNavigateToLicensesAttributions,
@@ -644510,7 +644952,7 @@ index 1e92634fe..9644b6fa0 100644
      }
  }
  
-@@ -854,6 +977,7 @@ private fun SettingsDetailPane(
+@@ -854,6 +1014,7 @@ private fun SettingsDetailPane(
      selectedCategory: SettingsCategory,
      isEssentialMode: Boolean,
      allowDetailAutofocus: Boolean,
@@ -644518,7 +644960,7 @@ index 1e92634fe..9644b6fa0 100644
      contentFocusRequesters: Map<SettingsCategory, FocusRequester>,
      experienceModeViewModel: ExperienceModeSettingsViewModel,
      integrationSection: IntegrationSettingsSection,
-@@ -866,15 +990,25 @@ private fun SettingsDetailPane(
+@@ -866,15 +1027,25 @@ private fun SettingsDetailPane(
      integrationAnimeSkipFocusRequester: FocusRequester,
      integrationTvdbFocusRequester: FocusRequester,
      onNavigateToManageProfiles: () -> Unit,
@@ -644545,7 +644987,7 @@ index 1e92634fe..9644b6fa0 100644
          SettingsCategory.EXPERIENCE -> EssentialAdvancedSettingsContent(
              experienceModeViewModel = experienceModeViewModel,
              initialFocusRequester = if (allowDetailAutofocus) {
-@@ -929,9 +1063,24 @@ private fun SettingsDetailPane(
+@@ -929,9 +1100,24 @@ private fun SettingsDetailPane(
                      contentFocusRequesters[SettingsCategory.PLAYBACK]
                  } else {
                      null
@@ -644571,7 +645013,7 @@ index 1e92634fe..9644b6fa0 100644
          SettingsCategory.ADVANCED -> if (isEssentialMode) {
              EssentialAdvancedSettingsContent(
                  experienceModeViewModel = experienceModeViewModel,
-@@ -1009,6 +1158,15 @@ private fun SettingsDetailPane(
+@@ -1009,6 +1195,15 @@ private fun SettingsDetailPane(
                  null
              }
          )
@@ -644587,7 +645029,7 @@ index 1e92634fe..9644b6fa0 100644
          SettingsCategory.FEATURES -> ForkFeaturesPane(
              initialFocusRequester = if (allowDetailAutofocus) {
                  contentFocusRequesters[SettingsCategory.FEATURES]
-@@ -1032,6 +1190,44 @@ private fun SettingsDetailPane(
+@@ -1032,6 +1227,44 @@ private fun SettingsDetailPane(
              }
          )
          SettingsCategory.DEBUG -> DebugSettingsContent()
@@ -644632,7 +645074,7 @@ index 1e92634fe..9644b6fa0 100644
      }
  }
  
-@@ -1093,7 +1289,7 @@ private fun AccountSettingsInline(
+@@ -1093,7 +1326,7 @@ private fun AccountSettingsInline(
          SettingsGroupCard(
              modifier = Modifier
                  .fillMaxWidth()
@@ -644641,7 +645083,7 @@ index 1e92634fe..9644b6fa0 100644
          ) {
              com.nuvio.tv.ui.screens.account.AccountSettingsContent(
                  uiState = accountUiState,
-@@ -1165,13 +1361,13 @@ private fun IntegrationSettingsContent(
+@@ -1165,13 +1398,13 @@ private fun IntegrationSettingsContent(
                  SettingsGroupCard(
                      modifier = Modifier
                          .fillMaxWidth()
@@ -648393,10 +648835,29 @@ index 5d45aebbe..b0ae60205 100644
  
      private fun applyAuthState(authState: TraktAuthState) {
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvChannelsSettingsPane.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvChannelsSettingsPane.kt
-index 4729d247d..9880868a6 100644
+index 4729d247d..99e717f38 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvChannelsSettingsPane.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvChannelsSettingsPane.kt
-@@ -19,6 +19,10 @@ import androidx.compose.material.icons.filled.Sync
+@@ -4,14 +4,18 @@ package com.nuvio.tv.ui.screens.settings
+ 
+ import android.widget.Toast
+ import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.heightIn
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.lazy.LazyColumn
+ import androidx.compose.foundation.lazy.items
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.filled.CheckCircle
++import androidx.compose.material.icons.filled.ExpandLess
++import androidx.compose.material.icons.filled.ExpandMore
+ import androidx.compose.material.icons.filled.Extension
+ import androidx.compose.material.icons.filled.Refresh
+ import androidx.compose.material.icons.filled.Schedule
+@@ -19,6 +23,10 @@ import androidx.compose.material.icons.filled.Sync
  import androidx.compose.material.icons.filled.Tv
  import androidx.compose.runtime.Composable
  import androidx.compose.runtime.getValue
@@ -648407,7 +648868,7 @@ index 4729d247d..9880868a6 100644
  import androidx.compose.ui.Modifier
  import androidx.compose.ui.focus.FocusRequester
  import androidx.compose.ui.focus.focusRequester
-@@ -35,6 +39,7 @@ import java.text.SimpleDateFormat
+@@ -35,12 +43,64 @@ import java.text.SimpleDateFormat
  import java.util.Date
  import java.util.Locale
  import java.util.TimeZone
@@ -648415,63 +648876,550 @@ index 4729d247d..9880868a6 100644
  
  @Composable
  internal fun TvChannelsSettingsPane(
-@@ -70,6 +75,56 @@ internal fun TvChannelsSettingsPane(
-             )
-         }
- 
-+        // Live TV V2: which IPTV implementation the TV Channels entry opens. The choice is
-+        // device-wide (like the interface experience), so both engines stay available.
-+        item {
-+            val devicePrefs = remember { com.nuvio.tv.data.local.DeviceUiPreferenceStore.flow(context) }
-+                .collectAsStateWithLifecycle(initialValue = com.nuvio.tv.domain.model.DeviceUiPreferences())
-+            val scope = rememberCoroutineScope()
-+            var engineOpen by remember { mutableStateOf(false) }
-+            SettingsGroupCard(
-+                title = "IPTV engine",
-+                subtitle = "IPTV V2 is the full guide (EPG grid, catch-up, recordings, sports, multiview) with the VPN and addon channels; Classic is the TV Channels screen."
-+            ) {
-+                SettingsActionRow(
-+                    title = "TV Channels engine",
-+                    subtitle = "Switches what the TV Channels entry opens",
-+                    value = when (devicePrefs.value.iptvEngine) {
-+                        com.nuvio.tv.domain.model.IptvEngine.CLASSIC -> "Classic (TV Channels)"
-+                        com.nuvio.tv.domain.model.IptvEngine.V2 -> "IPTV V2 (guide)"
-+                    },
-+                    onClick = { engineOpen = true }
+     initialFocusRequester: FocusRequester?,
+     viewModel: TvChannelsSettingsViewModel = hiltViewModel(),
+-    modifier: Modifier = Modifier
++    modifier: Modifier = Modifier,
++    // Embedded in the IPTV V2 panel ("Classic IPTV engine" section): the same groups
++    // without their own scrolling list — the host's list scrolls them, so this pane can
++    // sit inside another settings list — and without this pane's copy of the V2 embed,
++    // so the two panels cannot nest each other.
++    embedded: Boolean = false
++) {
++    if (embedded) {
++        Column(
++            modifier = modifier.fillMaxWidth(),
++            verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.lg)
++        ) {
++            TvChannelsSettingsGroups(
++                embedded = true,
++                initialFocusRequester = initialFocusRequester,
++                viewModel = viewModel
++            )
++        }
++    } else {
++        LazyColumn(
++            modifier = modifier
++                .fillMaxSize()
++                .padding(end = NuvioTheme.spacing.md),
++            verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.lg)
++        ) {
++            // Cabeçalho da Seção
++            item(key = "tv_channels_header") {
++                SettingsDetailHeader(
++                    title = stringResource(R.string.settings_tv_channels),
++                    subtitle = stringResource(R.string.settings_tv_channels_subtitle)
 +                )
 +            }
-+            if (engineOpen) {
-+                SettingsSingleChoiceDialog(
-+                    title = "TV Channels engine",
-+                    options = listOf(
-+                        SettingsPickerOption(
-+                            com.nuvio.tv.domain.model.IptvEngine.CLASSIC,
-+                            "Classic (TV Channels)",
-+                            "The original channel screen, unchanged"
-+                        ),
-+                        SettingsPickerOption(
-+                            com.nuvio.tv.domain.model.IptvEngine.V2,
-+                            "IPTV V2 (guide)",
-+                            "The TiviMate-style guide with everything that comes with it; addon channels are merged into its channel list"
-+                        )
-+                    ),
-+                    selectedValue = devicePrefs.value.iptvEngine,
-+                    onOptionSelected = { value ->
-+                        engineOpen = false
-+                        scope.launch {
-+                            com.nuvio.tv.data.local.DeviceUiPreferenceStore.update(context) {
-+                                it.copy(iptvEngine = value)
-+                            }
-+                        }
-+                    },
-+                    onDismiss = { engineOpen = false }
-+                )
++
++            item(key = "tv_channels_groups") {
++                Column(verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.lg)) {
++                    TvChannelsSettingsGroups(
++                        embedded = false,
++                        initialFocusRequester = initialFocusRequester,
++                        viewModel = viewModel
++                    )
++                }
 +            }
 +        }
++    }
++}
 +
-         // Grupo 1: Addons de Canais de TV
-         item {
-             SettingsGroupCard(
++/** The groups of [TvChannelsSettingsPane], shared by its own list and the IPTV V2 embed. */
++@Composable
++private fun TvChannelsSettingsGroups(
++    embedded: Boolean,
++    initialFocusRequester: FocusRequester?,
++    viewModel: TvChannelsSettingsViewModel
+ ) {
+     val channelsState by viewModel.channelsUiState.collectAsStateWithLifecycle()
+     val epgState by viewModel.epgUiState.collectAsStateWithLifecycle()
+@@ -56,230 +116,284 @@ internal fun TvChannelsSettingsPane(
+         neverSyncedText
+     }
+ 
+-    LazyColumn(
+-        modifier = modifier
+-            .fillMaxSize()
+-            .padding(end = NuvioTheme.spacing.md),
+-        verticalArrangement = Arrangement.spacedBy(NuvioTheme.spacing.lg)
++    // Live TV V2: which IPTV implementation the TV Channels entry opens. The choice is
++    // device-wide (like the interface experience), so both engines stay available.
++    val devicePrefs = remember { com.nuvio.tv.data.local.DeviceUiPreferenceStore.flow(context) }
++        .collectAsStateWithLifecycle(initialValue = com.nuvio.tv.domain.model.DeviceUiPreferences())
++    val scope = rememberCoroutineScope()
++    var engineOpen by remember { mutableStateOf(false) }
++    SettingsGroupCard(
++        title = "IPTV engine",
++        subtitle = "IPTV V2 is the full guide (EPG grid, catch-up, recordings, sports, multiview) with the VPN and addon channels; Classic is the TV Channels screen."
+     ) {
+-        // Cabeçalho da Seção
+-        item {
+-            SettingsDetailHeader(
+-                title = stringResource(R.string.settings_tv_channels),
+-                subtitle = stringResource(R.string.settings_tv_channels_subtitle)
+-            )
+-        }
++        SettingsActionRow(
++            title = "TV Channels engine",
++            subtitle = "Switches what the TV Channels entry opens",
++            value = when (devicePrefs.value.iptvEngine) {
++                com.nuvio.tv.domain.model.IptvEngine.CLASSIC -> "Classic (TV Channels)"
++                com.nuvio.tv.domain.model.IptvEngine.V2 -> "IPTV V2 (guide)"
++            },
++            onClick = { engineOpen = true }
++        )
++    }
++    if (engineOpen) {
++        SettingsSingleChoiceDialog(
++            title = "TV Channels engine",
++            options = listOf(
++                SettingsPickerOption(
++                    com.nuvio.tv.domain.model.IptvEngine.CLASSIC,
++                    "Classic (TV Channels)",
++                    "The original channel screen, unchanged"
++                ),
++                SettingsPickerOption(
++                    com.nuvio.tv.domain.model.IptvEngine.V2,
++                    "IPTV V2 (guide)",
++                    "The TiviMate-style guide with everything that comes with it; addon channels are merged into its channel list"
++                )
++            ),
++            selectedValue = devicePrefs.value.iptvEngine,
++            onOptionSelected = { value ->
++                engineOpen = false
++                scope.launch {
++                    com.nuvio.tv.data.local.DeviceUiPreferenceStore.update(context) {
++                        it.copy(iptvEngine = value)
++                    }
++                }
++            },
++            onDismiss = { engineOpen = false }
++        )
++    }
+ 
+-        // Grupo 1: Addons de Canais de TV
+-        item {
+-            SettingsGroupCard(
+-                title = stringResource(R.string.settings_tv_channels_addons),
+-                subtitle = stringResource(R.string.settings_tv_channels_addons_subtitle)
+-            ) {
+-                if (channelsState.availableAddons.isEmpty()) {
+-                    SettingsActionRow(
+-                        title = stringResource(R.string.settings_tv_channels_no_addons),
+-                        subtitle = stringResource(R.string.settings_tv_channels_no_addons_subtitle),
+-                        onClick = {},
+-                        enabled = false,
+-                        modifier = if (initialFocusRequester != null) {
+-                            Modifier.focusRequester(initialFocusRequester)
+-                        } else {
+-                            Modifier
+-                        }
+-                    )
++    // Grupo 1: Addons de Canais de TV
++    SettingsGroupCard(
++        title = stringResource(R.string.settings_tv_channels_addons),
++        subtitle = stringResource(R.string.settings_tv_channels_addons_subtitle)
++    ) {
++        if (channelsState.availableAddons.isEmpty()) {
++            SettingsActionRow(
++                title = stringResource(R.string.settings_tv_channels_no_addons),
++                subtitle = stringResource(R.string.settings_tv_channels_no_addons_subtitle),
++                onClick = {},
++                enabled = false,
++                modifier = if (initialFocusRequester != null) {
++                    Modifier.focusRequester(initialFocusRequester)
+                 } else {
+-                    channelsState.availableAddons.forEachIndexed { index, addon ->
+-                        val isFirst = index == 0
+-                        SettingsToggleRow(
+-                            title = addon.addonName,
+-                            subtitle = if (addon.catalogCount > 0) {
+-                                stringResource(R.string.settings_tv_channels_catalogs_available, addon.catalogCount)
+-                            } else addon.manifestUrl,
+-                            checked = addon.isSelected,
+-                            onToggle = {
+-                                viewModel.toggleAddonSelection(addon.manifestUrl)
+-                            },
+-                            modifier = if (isFirst && initialFocusRequester != null) {
+-                                Modifier.focusRequester(initialFocusRequester)
+-                            } else {
+-                                Modifier
+-                            }
+-                        )
++                    Modifier
++                }
++            )
++        } else {
++            channelsState.availableAddons.forEachIndexed { index, addon ->
++                val isFirst = index == 0
++                SettingsToggleRow(
++                    title = addon.addonName,
++                    subtitle = if (addon.catalogCount > 0) {
++                        stringResource(R.string.settings_tv_channels_catalogs_available, addon.catalogCount)
++                    } else addon.manifestUrl,
++                    checked = addon.isSelected,
++                    onToggle = {
++                        viewModel.toggleAddonSelection(addon.manifestUrl)
++                    },
++                    modifier = if (isFirst && initialFocusRequester != null) {
++                        Modifier.focusRequester(initialFocusRequester)
++                    } else {
++                        Modifier
+                     }
++                )
++            }
+ 
+-                    val allAddonsEnabledToast = stringResource(R.string.settings_tv_channels_toast_all_addons_enabled)
+-                    SettingsActionRow(
+-                        title = stringResource(R.string.tv_channels_select_all),
+-                        subtitle = stringResource(R.string.settings_tv_channels_activate_all_addons_sub),
+-                        leadingIcon = Icons.Default.CheckCircle,
+-                        onClick = {
+-                            viewModel.selectAllAddons()
+-                            Toast.makeText(context, allAddonsEnabledToast, Toast.LENGTH_SHORT).show()
+-                        }
+-                    )
++            val allAddonsEnabledToast = stringResource(R.string.settings_tv_channels_toast_all_addons_enabled)
++            SettingsActionRow(
++                title = stringResource(R.string.tv_channels_select_all),
++                subtitle = stringResource(R.string.settings_tv_channels_activate_all_addons_sub),
++                leadingIcon = Icons.Default.CheckCircle,
++                onClick = {
++                    viewModel.selectAllAddons()
++                    Toast.makeText(context, allAddonsEnabledToast, Toast.LENGTH_SHORT).show()
++                }
++            )
+ 
+-                    val addonsDisabledToast = stringResource(R.string.settings_tv_channels_toast_addons_disabled)
+-                    SettingsActionRow(
+-                        title = stringResource(R.string.tv_channels_clear_all),
+-                        subtitle = stringResource(R.string.settings_tv_channels_deactivate_all_addons_sub),
+-                        leadingIcon = Icons.Default.Extension,
+-                        onClick = {
+-                            viewModel.deselectAllAddons()
+-                            Toast.makeText(context, addonsDisabledToast, Toast.LENGTH_SHORT).show()
+-                        }
+-                    )
++            val addonsDisabledToast = stringResource(R.string.settings_tv_channels_toast_addons_disabled)
++            SettingsActionRow(
++                title = stringResource(R.string.tv_channels_clear_all),
++                subtitle = stringResource(R.string.settings_tv_channels_deactivate_all_addons_sub),
++                leadingIcon = Icons.Default.Extension,
++                onClick = {
++                    viewModel.deselectAllAddons()
++                    Toast.makeText(context, addonsDisabledToast, Toast.LENGTH_SHORT).show()
+                 }
+-            }
++            )
+         }
++    }
+ 
+-        item { TvIptvSettingsGroup() }
++    TvIptvSettingsGroup()
+ 
+-        item { TvLiveNetflixSettingsGroup() }
++    TvLiveNetflixSettingsGroup()
+ 
+-        item { TvLiveRemindersGroup() }
+-        item { ForkSportsSettingsGroup() }
+-        item { ForkParentalPinGroup(onUnlockAdult = { viewModel.setHideAdultChannels(false) }) }
++    TvLiveRemindersGroup()
++    ForkSportsSettingsGroup()
++    ForkParentalPinGroup(onUnlockAdult = { viewModel.setHideAdultChannels(false) })
+ 
+-        // Grupo 2: Reprodução e Controle Parental
+-        item {
+-            SettingsGroupCard(
+-                title = stringResource(R.string.settings_tv_channels_playback_parental),
+-                subtitle = stringResource(R.string.settings_tv_channels_playback_parental_sub)
+-            ) {
+-                val adultHiddenMsg = stringResource(R.string.settings_tv_channels_toast_adult_hidden)
+-                val adultVisibleMsg = stringResource(R.string.settings_tv_channels_toast_adult_visible)
+-                SettingsToggleRow(
+-                    title = stringResource(R.string.settings_tv_channels_hide_adult),
+-                    subtitle = stringResource(R.string.settings_tv_channels_hide_adult_sub),
+-                    checked = channelsState.hideAdultChannels,
+-                    onToggle = {
+-                        val newValue = !channelsState.hideAdultChannels
+-                        if (!newValue && com.nuvio.tv.forklivetv.ForkSportsPrefs.hasPin(context)) {
+-                            Toast.makeText(context, "Enter the PIN under Parental PIN to show adult channels", Toast.LENGTH_SHORT).show()
+-                        } else {
+-                            viewModel.setHideAdultChannels(newValue)
+-                            Toast.makeText(
+-                                context,
+-                                if (newValue) adultHiddenMsg else adultVisibleMsg,
+-                                Toast.LENGTH_SHORT
+-                            ).show()
+-                        }
+-                    }
+-                )
++    // Grupo 2: Reprodução e Controle Parental
++    SettingsGroupCard(
++        title = stringResource(R.string.settings_tv_channels_playback_parental),
++        subtitle = stringResource(R.string.settings_tv_channels_playback_parental_sub)
++    ) {
++        val adultHiddenMsg = stringResource(R.string.settings_tv_channels_toast_adult_hidden)
++        val adultVisibleMsg = stringResource(R.string.settings_tv_channels_toast_adult_visible)
++        SettingsToggleRow(
++            title = stringResource(R.string.settings_tv_channels_hide_adult),
++            subtitle = stringResource(R.string.settings_tv_channels_hide_adult_sub),
++            checked = channelsState.hideAdultChannels,
++            onToggle = {
++                val newValue = !channelsState.hideAdultChannels
++                if (!newValue && com.nuvio.tv.forklivetv.ForkSportsPrefs.hasPin(context)) {
++                    Toast.makeText(context, "Enter the PIN under Parental PIN to show adult channels", Toast.LENGTH_SHORT).show()
++                } else {
++                    viewModel.setHideAdultChannels(newValue)
++                    Toast.makeText(
++                        context,
++                        if (newValue) adultHiddenMsg else adultVisibleMsg,
++                        Toast.LENGTH_SHORT
++                    ).show()
++                }
++            }
++        )
+ 
+-                val autoplayEnabledMsg = stringResource(R.string.settings_tv_channels_toast_autoplay_enabled)
+-                val autoplayDisabledMsg = stringResource(R.string.settings_tv_channels_toast_autoplay_disabled)
+-                SettingsToggleRow(
+-                    title = stringResource(R.string.settings_tv_channels_autoplay),
+-                    subtitle = stringResource(R.string.settings_tv_channels_autoplay_sub),
+-                    checked = channelsState.channelAutoplay,
+-                    onToggle = {
+-                        val newValue = !channelsState.channelAutoplay
+-                        viewModel.setChannelAutoplay(newValue)
+-                        Toast.makeText(
+-                            context,
+-                            if (newValue) autoplayEnabledMsg else autoplayDisabledMsg,
+-                            Toast.LENGTH_SHORT
+-                        ).show()
+-                    }
+-                )
++        val autoplayEnabledMsg = stringResource(R.string.settings_tv_channels_toast_autoplay_enabled)
++        val autoplayDisabledMsg = stringResource(R.string.settings_tv_channels_toast_autoplay_disabled)
++        SettingsToggleRow(
++            title = stringResource(R.string.settings_tv_channels_autoplay),
++            subtitle = stringResource(R.string.settings_tv_channels_autoplay_sub),
++            checked = channelsState.channelAutoplay,
++            onToggle = {
++                val newValue = !channelsState.channelAutoplay
++                viewModel.setChannelAutoplay(newValue)
++                Toast.makeText(
++                    context,
++                    if (newValue) autoplayEnabledMsg else autoplayDisabledMsg,
++                    Toast.LENGTH_SHORT
++                ).show()
+             }
+-        }
++        )
++    }
+ 
+-        // Grupo 3: Guia de Programação (EPG)
+-        item {
+-            SettingsGroupCard(
+-                title = stringResource(R.string.settings_tv_channels_epg),
+-                subtitle = stringResource(R.string.settings_tv_channels_epg_subtitle)
+-            ) {
+-                // Status da Sincronização
+-                val lastSyncFormatted = stringResource(R.string.settings_tv_channels_last_sync, lastSyncText)
+-                val syncingText = stringResource(R.string.settings_tv_channels_syncing)
+-                val programsCountText = stringResource(R.string.settings_tv_channels_programs_count, epgState.totalProgramsLoaded)
+-                SettingsActionRow(
+-                    title = stringResource(R.string.settings_tv_channels_epg_status),
+-                    subtitle = lastSyncFormatted,
+-                    value = if (epgState.isLoading) syncingText else programsCountText,
+-                    leadingIcon = Icons.Default.Schedule,
+-                    onClick = {}
+-                )
++    // Grupo 3: Guia de Programação (EPG)
++    SettingsGroupCard(
++        title = stringResource(R.string.settings_tv_channels_epg),
++        subtitle = stringResource(R.string.settings_tv_channels_epg_subtitle)
++    ) {
++        // Status da Sincronização
++        val lastSyncFormatted = stringResource(R.string.settings_tv_channels_last_sync, lastSyncText)
++        val syncingText = stringResource(R.string.settings_tv_channels_syncing)
++        val programsCountText = stringResource(R.string.settings_tv_channels_programs_count, epgState.totalProgramsLoaded)
++        SettingsActionRow(
++            title = stringResource(R.string.settings_tv_channels_epg_status),
++            subtitle = lastSyncFormatted,
++            value = if (epgState.isLoading) syncingText else programsCountText,
++            leadingIcon = Icons.Default.Schedule,
++            onClick = {}
++        )
+ 
+-                // Botão Sincronizar Agora
+-                val syncDownloadingText = stringResource(R.string.settings_tv_channels_sync_downloading)
+-                val syncSubText = stringResource(R.string.settings_tv_channels_sync_sub)
+-                val syncStartedToast = stringResource(R.string.settings_tv_channels_toast_sync_started)
+-                SettingsActionRow(
+-                    title = stringResource(R.string.settings_tv_channels_sync_now),
+-                    subtitle = if (epgState.isLoading) syncDownloadingText else syncSubText,
+-                    leadingIcon = Icons.Default.Sync,
+-                    enabled = !epgState.isLoading,
+-                    onClick = {
+-                        viewModel.syncEpgNow()
+-                        Toast.makeText(context, syncStartedToast, Toast.LENGTH_SHORT).show()
+-                    }
+-                )
++        // Botão Sincronizar Agora
++        val syncDownloadingText = stringResource(R.string.settings_tv_channels_sync_downloading)
++        val syncSubText = stringResource(R.string.settings_tv_channels_sync_sub)
++        val syncStartedToast = stringResource(R.string.settings_tv_channels_toast_sync_started)
++        SettingsActionRow(
++            title = stringResource(R.string.settings_tv_channels_sync_now),
++            subtitle = if (epgState.isLoading) syncDownloadingText else syncSubText,
++            leadingIcon = Icons.Default.Sync,
++            enabled = !epgState.isLoading,
++            onClick = {
++                viewModel.syncEpgNow()
++                Toast.makeText(context, syncStartedToast, Toast.LENGTH_SHORT).show()
++            }
++        )
+ 
+-                // Fontes de XMLTV com interruptores para ativar/desativar
+-                epgState.epgSources.forEach { source ->
+-                    SettingsToggleRow(
+-                        title = source.name,
+-                        subtitle = source.url,
+-                        checked = source.isEnabled,
+-                        onToggle = {
+-                            viewModel.toggleEpgSource(source.id)
+-                        }
+-                    )
++        // Fontes de XMLTV com interruptores para ativar/desativar
++        epgState.epgSources.forEach { source ->
++            SettingsToggleRow(
++                title = source.name,
++                subtitle = source.url,
++                checked = source.isEnabled,
++                onToggle = {
++                    viewModel.toggleEpgSource(source.id)
+                 }
++            )
++        }
+ 
+-                val allEpgEnabledToast = stringResource(R.string.settings_tv_channels_toast_all_epg_enabled)
+-                SettingsActionRow(
+-                    title = stringResource(R.string.settings_tv_channels_enable_all_epg),
+-                    subtitle = stringResource(R.string.settings_tv_channels_enable_all_epg_sub),
+-                    leadingIcon = Icons.Default.CheckCircle,
+-                    onClick = {
+-                        viewModel.selectAllEpgSources()
+-                        Toast.makeText(context, allEpgEnabledToast, Toast.LENGTH_SHORT).show()
+-                    }
+-                )
++        val allEpgEnabledToast = stringResource(R.string.settings_tv_channels_toast_all_epg_enabled)
++        SettingsActionRow(
++            title = stringResource(R.string.settings_tv_channels_enable_all_epg),
++            subtitle = stringResource(R.string.settings_tv_channels_enable_all_epg_sub),
++            leadingIcon = Icons.Default.CheckCircle,
++            onClick = {
++                viewModel.selectAllEpgSources()
++                Toast.makeText(context, allEpgEnabledToast, Toast.LENGTH_SHORT).show()
++            }
++        )
+ 
+-                val allEpgDisabledToast = stringResource(R.string.settings_tv_channels_toast_all_epg_disabled)
+-                SettingsActionRow(
+-                    title = stringResource(R.string.settings_tv_channels_disable_all_epg),
+-                    subtitle = stringResource(R.string.settings_tv_channels_disable_all_epg_sub),
+-                    leadingIcon = Icons.Default.Extension,
+-                    onClick = {
+-                        viewModel.deselectAllEpgSources()
+-                        Toast.makeText(context, allEpgDisabledToast, Toast.LENGTH_SHORT).show()
+-                    }
+-                )
++        val allEpgDisabledToast = stringResource(R.string.settings_tv_channels_toast_all_epg_disabled)
++        SettingsActionRow(
++            title = stringResource(R.string.settings_tv_channels_disable_all_epg),
++            subtitle = stringResource(R.string.settings_tv_channels_disable_all_epg_sub),
++            leadingIcon = Icons.Default.Extension,
++            onClick = {
++                viewModel.deselectAllEpgSources()
++                Toast.makeText(context, allEpgDisabledToast, Toast.LENGTH_SHORT).show()
+             }
+-        }
++        )
++    }
+ 
+-        // Grupo 4: Ações Rápidas e Manutenção
+-        item {
+-            SettingsGroupCard(
+-                title = stringResource(R.string.settings_tv_channels_maintenance),
+-                subtitle = stringResource(R.string.settings_tv_channels_maintenance_sub)
+-            ) {
+-                val reloadingToast = stringResource(R.string.settings_tv_channels_toast_reloading)
+-                SettingsActionRow(
+-                    title = stringResource(R.string.settings_tv_channels_reload_all),
+-                    subtitle = stringResource(R.string.settings_tv_channels_reload_all_subtitle),
+-                    leadingIcon = Icons.Default.Refresh,
+-                    onClick = {
+-                        viewModel.reloadAll()
+-                        Toast.makeText(context, reloadingToast, Toast.LENGTH_SHORT).show()
+-                    }
+-                )
++    // Grupo 4: Ações Rápidas e Manutenção
++    SettingsGroupCard(
++        title = stringResource(R.string.settings_tv_channels_maintenance),
++        subtitle = stringResource(R.string.settings_tv_channels_maintenance_sub)
++    ) {
++        val reloadingToast = stringResource(R.string.settings_tv_channels_toast_reloading)
++        SettingsActionRow(
++            title = stringResource(R.string.settings_tv_channels_reload_all),
++            subtitle = stringResource(R.string.settings_tv_channels_reload_all_subtitle),
++            leadingIcon = Icons.Default.Refresh,
++            onClick = {
++                viewModel.reloadAll()
++                Toast.makeText(context, reloadingToast, Toast.LENGTH_SHORT).show()
++            }
++        )
+ 
+-                SettingsActionRow(
+-                    title = stringResource(R.string.settings_tv_channels_channels_loaded),
+-                    subtitle = stringResource(R.string.settings_tv_channels_channels_loaded_sub),
+-                    value = stringResource(R.string.settings_tv_channels_channels_count, channelsState.totalChannelsCount),
+-                    leadingIcon = Icons.Default.Tv,
+-                    onClick = {}
+-                )
++        SettingsActionRow(
++            title = stringResource(R.string.settings_tv_channels_channels_loaded),
++            subtitle = stringResource(R.string.settings_tv_channels_channels_loaded_sub),
++            value = stringResource(R.string.settings_tv_channels_channels_count, channelsState.totalChannelsCount),
++            leadingIcon = Icons.Default.Tv,
++            onClick = {}
++        )
++    }
++
++    // IPTV V2's own settings, embedded so the V2 panel stays reachable while the classic
++    // engine is the one Settings shows (the rail keeps a single live-TV category). Folded
++    // by default; the V2 panel keeps its own tabs and its own scrolling list, so it is
++    // given a bounded box to live in — a lazy list cannot size itself inside this pane's
++    // list items, and this box is what its list scrolls within.
++    if (!embedded) {
++        SettingsGroupCard(
++            title = "IPTV V2 settings",
++            subtitle = "The guide engine's settings: playlists, guides, playback and parental controls"
++        ) {
++            var v2Open by remember { mutableStateOf(false) }
++            SettingsActionRow(
++                title = if (v2Open) "Hide IPTV V2 settings" else "Show IPTV V2 settings",
++                subtitle = "IPTV V2 (guide) settings, kept reachable from this panel",
++                trailingIcon = if (v2Open) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
++                onClick = { v2Open = !v2Open }
++            )
++            if (v2Open) {
++                Box(
++                    modifier = Modifier
++                        .fillMaxWidth()
++                        .heightIn(max = 520.dp)
++                ) {
++                    LiveTvSettingsContent(page = LiveTvPage.HUB, embedded = true)
++                }
+             }
+         }
+     }
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvForkPlayerSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvForkPlayerSettings.kt
 index ccbb22b67..ae22c82bf 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/TvForkPlayerSettings.kt
