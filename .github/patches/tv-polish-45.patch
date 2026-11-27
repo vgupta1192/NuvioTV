@@ -1,8 +1,8 @@
 diff --git a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
-index bc4d2ebf8..2023bf097 100644
+index 9673f96472..a7a262ca1b 100644
 --- a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
 +++ b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
-@@ -118,7 +118,6 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+@@ -134,7 +134,6 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
              android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
                  androidTvChannelSyncService.start()
                  releaseReminderCoordinator.start() // deliver + schedule "Remind me" notifications
@@ -11,10 +11,10 @@ index bc4d2ebf8..2023bf097 100644
              false
          }
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt
-index ade58c9f9..37ff8a963 100644
+index 90e56ceb0a..21a74bdf71 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioExoPlayerPerformanceHelper.kt
-@@ -102,7 +102,7 @@ object NuvioExoPlayerPerformanceHelper {
+@@ -100,7 +100,7 @@ object NuvioExoPlayerPerformanceHelper {
          
          minBufferMs = if (customBuffers) bufferSettings.minBufferMs else DEFAULT_NUVIO_MIN_BUFFER_MS
          maxBufferMs = if (customBuffers) bufferSettings.maxBufferMs else DEFAULT_NUVIO_MAX_BUFFER_MS
@@ -23,7 +23,7 @@ index ade58c9f9..37ff8a963 100644
          bufferForPlaybackAfterRebufferMs = if (customBuffers) bufferSettings.bufferForPlaybackAfterRebufferMs else 3_000
          backBufferMs = if (customBuffers) bufferSettings.backBufferDurationMs else DEFAULT_NUVIO_BACK_BUFFER_MS
  
-@@ -323,7 +323,7 @@ object NuvioExoPlayerPerformanceHelper {
+@@ -313,7 +313,7 @@ object NuvioExoPlayerPerformanceHelper {
                  .setBufferDurationsMs(
                      DefaultLoadControl.DEFAULT_MIN_BUFFER_MS,
                      70_000,
@@ -33,56 +33,41 @@ index ade58c9f9..37ff8a963 100644
                  )
                  .build()
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt
-index dae73d236..a65850288 100644
+index c1b50cd9e0..20ac348107 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt
-@@ -75,21 +75,10 @@ internal fun PlayerRuntimeController.autoSyncExtractorsFactory(
+@@ -45,22 +45,13 @@ internal fun PlayerRuntimeController.autoSyncExtractorsFactory(
      url: String,
      headers: Map<String, String>,
  ): ExtractorsFactory {
--    // Nuvio fork: Performance mode keeps every fork-only extra off the demux path (frame drops).
--    PlayerEffects.ensureLoaded(context)
--    if (PlayerEffects.performance.value) {
--        LocalPreviewSources.unregister(this)
--        return delegate
--    }
--    // Audio is copied too, for the audio sync fallback (idle unless it is listening).
++    // Nuvio fork: no audio or video-keyframe copying (extra decoders and demux load cost dropped
++    // frames on weak TVs); the extractors reach the player as in upstream.
++    com.nuvio.tv.ui.screens.player.seekpreview.local.LocalPreviewSources.unregister(this)
+     AutoSyncPreferences.ensureLoaded(context)
+     if (!AutoSyncPreferences.isEnabled(context)) return delegate
+     AudioSyncFallback.initialize(context)
 -    // Video keyframes are copied too, for on-device seek previews (idle once all are made).
--    val tapped = LocalPreviewSources.register(
+-    val tapped = com.nuvio.tv.ui.screens.player.seekpreview.local.LocalPreviewSources.register(
 -        owner = this,
 -        context = context,
 -        sourceKey = url,
--        factory = AudioSyncTaps.wrapExtractors(delegate, url),
+-        factory = delegate,
 -        headers = headers,
 -    )
-+    // Nuvio fork: no audio or video-keyframe copying (extra decoders and demux load cost dropped
-+    // frames on weak TVs); the extractors reach the player as in upstream.
-+    LocalPreviewSources.unregister(this)
-+    val tapped = delegate
-     AutoSyncPreferences.ensureLoaded(context)
-     if (!AutoSyncPreferences.isEnabled(context)) return tapped
-     val factory = AutoSyncExtractorsFactory(delegate = tapped, sourceKey = url)
-diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
-index 0929d51a5..90de368ae 100644
---- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
-+++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
-@@ -2303,9 +2303,8 @@ private class SubtitleOffsetRenderersFactory(
-         )
-         playbackSpeedAwareAudioSink.setInitialPlaybackSpeed(playbackSpeedProvider())
-         onPlaybackSpeedAwareAudioSinkCreated(playbackSpeedAwareAudioSink)
--        // Nuvio fork: no PCM tap in Performance mode (the audio thread stays as upstream's).
--        if (PlayerEffects.performance.value) return playbackSpeedAwareAudioSink
--        return com.nuvio.tv.ui.screens.player.audiosync.AudioSyncTaps.wrapAudioSink(playbackSpeedAwareAudioSink) // AutoSync hook: audio sync fallback hears the playing audio
-+        // Nuvio fork: no PCM tap; the audio thread stays as upstream's.
-+        return playbackSpeedAwareAudioSink
-     }
- 
-     override fun buildAudioRenderers(
+-    val audioDelegate = if (AudioSyncSettings.fallbackEnabled.value) {
+-        AudioSyncTaps.wrapExtractors(tapped, url)
+-    } else {
+-        tapped
+-    }
++    val factory = AutoSyncExtractorsFactory(delegate = delegate, sourceKey = url)
+     val factory = AutoSyncExtractorsFactory(delegate = audioDelegate, sourceKey = url)
+     prefetchAutoSyncIndex(url, headers)
+     return factory
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerMetadata.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerMetadata.kt
-index b7e72ae4e..329acdc65 100644
+index c97c5a1479..20916864bd 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerMetadata.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerMetadata.kt
-@@ -400,11 +400,7 @@ internal fun PlayerRuntimeController.evaluatePostPlayOverlayVisibility(positionM
+@@ -403,11 +403,7 @@ internal fun PlayerRuntimeController.evaluatePostPlayOverlayVisibility(positionM
          )
          val shouldPreloadByEnd = effectiveDuration > 0L &&
              (effectiveDuration - positionMs) <= preloadLeadMs
@@ -96,19 +81,21 @@ index b7e72ae4e..329acdc65 100644
          }
      }
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
-index ac5a6d329..b8fa2f184 100644
+index caf4a09f8e..602ba291f6 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
-@@ -1856,41 +1856,12 @@ internal fun PlayerRuntimeController.preloadNextEpisodeSources() {
+@@ -2062,7 +2062,6 @@ internal fun PlayerRuntimeController.preloadNextEpisodeSources() {
      nextEpisodePreloadJob?.cancel()
      nextEpisodePreloadJob = scope.launch {
          Log.d(PlayerRuntimeController.TAG, "Preloading sources for next episode: S${nextVideo.season}E${nextVideo.episode}")
 -        var warmed = false
-         streamRepository.getStreamsFromAllAddons(
-             type = type,
-             videoId = nextVideo.id,
-             season = nextVideo.season,
-             episode = nextVideo.episode
+         // The plugin-only modes continue a plugin series. After an addon stream they would
+         // narrow the search and keep it from being reused by the episode picker.
+         val continuingPlugin = scraperIdFromPluginBingeGroup(currentStreamBingeGroup) != null
+@@ -2075,22 +2074,7 @@ internal fun PlayerRuntimeController.preloadNextEpisodeSources() {
+             preferredPluginOnly = continuingPlugin,
+             continuePluginOnly = continuingPlugin,
+             contentId = contentId
 -        ).collect { result ->
 -            // Results are cached by StreamSearchSessionCache. Warm the first direct links once.
 -            if (!warmed && result is NetworkResult.Success) {
@@ -125,28 +112,15 @@ index ac5a6d329..b8fa2f184 100644
 -                }
 -            }
 -        }
--    }
--}
--
--/** Nuvio fork: tiny Range request so DNS, TLS and redirects are warm before autoplay. */
--private fun PlayerRuntimeController.warmStreamLink(url: String) {
--    scope.launch(kotlinx.coroutines.Dispatchers.IO) {
--        runCatching {
--            val request = okhttp3.Request.Builder()
--                .url(url)
--                .header("Range", "bytes=0-0")
--                .build()
--            PlayerPlaybackNetworking.playbackHttpClient.newCall(request).execute().close()
--        }
 +        ).collect { /* cached by StreamSearchSessionCache */ }
      }
  }
  
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
-index bd7f842c5..425f62a90 100644
+index 0d82ef6bff..cbd02e90eb 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
-@@ -2576,9 +2576,6 @@ private fun ExoPlayerSurface(
+@@ -2689,9 +2689,6 @@ private fun ExoPlayerSurface(
                  applyRect(it)
                  CustomStretchMemory.put(memoryKey, it)
              }
@@ -156,34 +130,3 @@ index bd7f842c5..425f62a90 100644
              delay(tracker.nextIntervalMs)
          }
      }
-diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSyncSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSyncSettings.kt
-index f954872c8..b0f65d5f8 100644
---- a/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSyncSettings.kt
-+++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSyncSettings.kt
-@@ -9,7 +9,7 @@ import kotlinx.coroutines.flow.asStateFlow
-  * platform, so Nuvio's own player settings are left untouched.
-  */
- internal object AudioSyncSettings {
--    private val _fallbackEnabled = MutableStateFlow(true)
-+    private val _fallbackEnabled = MutableStateFlow(false)
- 
-     /** Sync to the audio when AutoSync keeps a subtitle's original timing. */
-     val fallbackEnabled: StateFlow<Boolean> = _fallbackEnabled.asStateFlow()
-@@ -28,14 +28,14 @@ internal object AudioSyncSettings {
- 
-     fun installPersistence(load: (key: String) -> Boolean?, save: (key: String, value: Boolean) -> Unit) {
-         this.save = save
--        _fallbackEnabled.value = load(FALLBACK_ENABLED) ?: true
-+        // Nuvio fork: the audio sync fallback stays off (it decodes audio next to playback).
-+        _fallbackEnabled.value = false
-         _samplingOnMobileData.value = load(SAMPLING_ON_MOBILE_DATA) ?: false
-         _showStatistics.value = load(SHOW_STATISTICS) ?: false
-     }
- 
-     fun setFallbackEnabled(enabled: Boolean) {
--        _fallbackEnabled.value = enabled
--        save(FALLBACK_ENABLED, enabled)
-+        _fallbackEnabled.value = false
-     }
- 
-     fun setSamplingOnMobileData(enabled: Boolean) {

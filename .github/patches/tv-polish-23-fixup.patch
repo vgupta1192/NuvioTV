@@ -1,0 +1,111 @@
+diff --git a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
+index 60844db902..8ff7859c3a 100644
+--- a/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
++++ b/app/src/main/java/com/nuvio/tv/NuvioApplication.kt
+@@ -127,6 +127,7 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+             android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                 androidTvChannelSyncService.start()
+                 releaseReminderCoordinator.start() // deliver + schedule "Remind me" notifications
++                com.nuvio.tv.ui.screens.player.ForkPlayerWarmup.start()
+             }, 2_500)
+             false
+         }
+@@ -219,12 +220,15 @@ class NuvioApplication : Application(), SingletonImageLoader.Factory {
+                     totalRamMb <= 3072 -> 0.20
+                     else -> 0.25
+                 }
++                val lowRamMode = com.nuvio.tv.data.repository.ForkTvLowRam.active(this@NuvioApplication)
+                 // maxSizePercent takes the share of largeMemoryClass under largeHeap (512 MB on
+                 // 1 GB TVs, ~77 MB of bitmaps), so when MemoryBudget sizes from a smaller heap on
+                 // such a TV the cache takes its share from that heap too.
+                 val budgetHeapBytes = MemoryBudget.heapMb * 1024L * 1024L
+                 val builder = MemoryCache.Builder()
+-                if (budgetHeapBytes < Runtime.getRuntime().maxMemory()) {
++                if (lowRamMode) {
++                    builder.maxSizePercent(context, com.nuvio.tv.data.repository.ForkTvLowRam.IMAGE_CACHE_PERCENT)
++                } else if (budgetHeapBytes < Runtime.getRuntime().maxMemory()) {
+                     builder.maxSizeBytes((budgetHeapBytes * cachePercent).toLong())
+                 } else {
+                     builder.maxSizePercent(context, cachePercent)
+diff --git a/app/src/main/java/com/nuvio/tv/ui/components/ContentCard.kt b/app/src/main/java/com/nuvio/tv/ui/components/ContentCard.kt
+index 9dab4f1c31..a3b19fda8f 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/components/ContentCard.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/components/ContentCard.kt
+@@ -248,14 +248,15 @@ fun ContentCard(
+         } else {
+             baseCardWidth
+         }
+-        val requestWidthPx = remember(imageRequestCardWidth, density) {
+-            with(density) { imageRequestCardWidth.roundToPx() }.coerceAtLeast(1)
++        val decodeScale = remember(context) { com.nuvio.tv.data.repository.ForkTvLowRam.decodeScale(context) }
++        val requestWidthPx = remember(imageRequestCardWidth, density, decodeScale) {
++            (with(density) { imageRequestCardWidth.roundToPx() } * decodeScale).toInt().coerceAtLeast(1)
+         }
+-        val logoRequestWidthPx = remember(maxRequestCardWidth, density) {
+-            with(density) { maxRequestCardWidth.roundToPx() }.coerceAtLeast(1)
++        val logoRequestWidthPx = remember(maxRequestCardWidth, density, decodeScale) {
++            (with(density) { maxRequestCardWidth.roundToPx() } * decodeScale).toInt().coerceAtLeast(1)
+         }
+-        val requestHeightPx = remember(baseCardHeight, density) {
+-            with(density) { baseCardHeight.roundToPx() }.coerceAtLeast(1)
++        val requestHeightPx = remember(baseCardHeight, density, decodeScale) {
++            (with(density) { baseCardHeight.roundToPx() } * decodeScale).toInt().coerceAtLeast(1)
+         }
+ 
+         val alwaysBackdropWithLogo = LocalAlwaysBackdropWithLogo.current
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt
+index 6735fc4534..84dd0fe035 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt
+@@ -257,6 +257,10 @@ class MetaDetailsViewModel @Inject constructor(
+         simklSyncRepository.state.value.snapshot.rewatchRuns
+             .firstOrNull { run -> run.matches(contentId) }
+ 
++    /** Fork: kids mode check for the profile in use. */
++    fun kidsAllows(context: android.content.Context, rating: String?): Boolean =
++        com.nuvio.tv.data.repository.ForkTvKids.allows(context, profileManager.activeProfileId.value, rating)
++
+     private fun observeHideUnreleasedContent() {
+         viewModelScope.launch {
+             layoutPreferenceDataStore.hideUnreleasedContent
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/ForkPlayerWarmup.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/ForkPlayerWarmup.kt
+new file mode 100644
+index 0000000000..f4926ea784
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/ForkPlayerWarmup.kt
+@@ -0,0 +1,35 @@
++package com.nuvio.tv.ui.screens.player
++
++import androidx.annotation.OptIn
++import androidx.media3.common.util.UnstableApi
++import androidx.media3.exoplayer.mediacodec.MediaCodecUtil
++
++/**
++ * Nuvio fork: query the device codec list once, in the background, after app start.
++ * Media3 keeps the result in a static cache, so the first player start skips the slow codec scan.
++ * This does not keep a player alive: no ExoPlayer, surface or audio session is created here.
++ */
++internal object ForkPlayerWarmup {
++    private val mimeTypes = listOf(
++        "video/avc",
++        "video/hevc",
++        "video/x-vnd.on2.vp9",
++        "video/av01",
++        "audio/mp4a-latm",
++        "audio/ac3",
++        "audio/eac3",
++    )
++
++    @OptIn(UnstableApi::class)
++    fun start() {
++        Thread({
++            mimeTypes.forEach { mime ->
++                runCatching { MediaCodecUtil.getDecoderInfos(mime, false, false) }
++            }
++        }, "fork-codec-warmup").apply {
++            priority = Thread.MIN_PRIORITY
++            isDaemon = true
++            start()
++        }
++    }
++}

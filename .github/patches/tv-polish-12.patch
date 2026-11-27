@@ -1,17 +1,17 @@
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamComponents.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamComponents.kt
-index a433513db..81973393a 100644
+index ca4653ae0b..9a7805be80 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamComponents.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamComponents.kt
-@@ -264,6 +264,8 @@ internal fun AddonFilterChips(
+@@ -279,6 +279,8 @@ internal fun AddonFilterChips(
      externalFocusRequesters: List<FocusRequester>? = null,
      externalOrderedNames: List<String>? = null,
      onUpKey: (() -> Unit)? = null,
 +    /** Links each source returned; shown on its chip, with the total on All. Empty hides the numbers. */
 +    streamCounts: Map<String, Int> = emptyMap(),
+     onFocusIndexChanged: (Int) -> Unit = {},
+     chipListState: LazyListState = rememberLazyListState(),
      debugTag: String = "AddonFilterChips"
- ) {
-     val isRtl = androidx.compose.ui.platform.LocalLayoutDirection.current == androidx.compose.ui.unit.LayoutDirection.Rtl
-@@ -445,7 +447,8 @@ internal fun AddonFilterChips(
+@@ -464,7 +466,8 @@ internal fun AddonFilterChips(
              val isAllSelected = selectedAddon == null && !refreshHasFocus
              val allChipIndex = if (hasRefresh) 1 else 0
              SourceStatusFilterChip(
@@ -21,7 +21,7 @@ index a433513db..81973393a 100644
                  isSelected = isAllSelected,
                  status = SourceChipStatus.SUCCESS,
                  isSelectable = true,
-@@ -467,7 +470,8 @@ internal fun AddonFilterChips(
+@@ -487,7 +490,8 @@ internal fun AddonFilterChips(
              val isSelectable = addon in addons && chipStatus == SourceChipStatus.SUCCESS
              val requesterIdx = if (hasRefresh) i + 2 else i + 1
              SourceStatusFilterChip(
@@ -32,10 +32,10 @@ index a433513db..81973393a 100644
                  status = chipStatus,
                  isSelectable = isSelectable,
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreen.kt
-index aec50ddae..8227a1a24 100644
+index f092b638e0..6cd0405c37 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreen.kt
-@@ -496,6 +496,9 @@ fun StreamScreen(
+@@ -532,6 +532,9 @@ fun StreamScreen(
                      streamsInput = searchedStreams,
                      availableAddons = uiState.availableAddons,
                      sourceChips = uiState.sourceChips,
@@ -45,7 +45,7 @@ index aec50ddae..8227a1a24 100644
                      selectedAddonFilter = uiState.selectedAddonFilter,
                      showFileSizeBadges = streamBadgeSettings.showFileSizeBadges,
                      showAddonLogo = streamBadgeSettings.showAddonLogo,
-@@ -807,6 +810,7 @@ private fun RightStreamSection(
+@@ -856,6 +859,7 @@ private fun RightStreamSection(
      streamsInput: List<Stream>,
      availableAddons: List<String>,
      sourceChips: List<SourceChipItem>,
@@ -53,19 +53,19 @@ index aec50ddae..8227a1a24 100644
      selectedAddonFilter: String?,
      showFileSizeBadges: Boolean,
      showAddonLogo: Boolean,
-@@ -987,6 +991,7 @@ private fun RightStreamSection(
+@@ -1038,6 +1042,7 @@ private fun RightStreamSection(
                              onAddonSelected = { onAddonFilterSelected(it) },
                              externalFocusRequesters = chipFocusRequesters,
                              externalOrderedNames = orderedAddonNames,
 +                            streamCounts = streamCounts,
+                             chipListState = chipListState,
                              debugTag = "StreamScreen"
                          )
-                     }
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
-index 16abba2ce..8c58b4a53 100644
+index 52ae3e86f3..1c6f98eed3 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
-@@ -77,6 +77,8 @@ import javax.inject.Inject
+@@ -79,6 +79,8 @@ import javax.inject.Inject
  private const val TAG = "StreamScreenViewModel"
  private const val DIRECT_AUTOPLAY_HARD_TIMEOUT_MS = 60_000L
  private const val STREAM_FILTER_PAGE_SIZE = 100
@@ -74,17 +74,17 @@ index 16abba2ce..8c58b4a53 100644
  
  @HiltViewModel
  class StreamScreenViewModel @Inject constructor(
-@@ -114,6 +116,9 @@ class StreamScreenViewModel @Inject constructor(
+@@ -121,6 +123,9 @@ class StreamScreenViewModel @Inject constructor(
      private var streamLoadJob: Job? = null
      private var streamLoadScope: kotlinx.coroutines.CoroutineScope? = null
      private var streamLoadCompleted = false
 +    // Nuvio fork (stream auto refresh): ordering of the last load, reused when a refresh adds links.
 +    private var orderStreamGroups: ((List<AddonStreams>) -> List<AddonStreams>)? = null
 +    private var autoRefreshPaused = false
+     private val usenetPrefetchOwner = Any()
+     private var usenetSelectionStarted = false
      private var sourceChipErrorDismissJob: Job? = null
-     private var pendingCacheSaveJob: Job? = null
-     private var streamBadgePresentationJob: Job? = null
-@@ -315,6 +320,86 @@ class StreamScreenViewModel @Inject constructor(
+@@ -338,6 +343,86 @@ class StreamScreenViewModel @Inject constructor(
          }
          loadMissingMetaDetailsIfNeeded()
          loadStreams()
@@ -171,42 +171,42 @@ index 16abba2ce..8c58b4a53 100644
      }
  
      private fun SavedStateHandle.getOptionalString(key: String): String? {
-@@ -364,6 +449,7 @@ class StreamScreenViewModel @Inject constructor(
+@@ -388,6 +473,7 @@ class StreamScreenViewModel @Inject constructor(
              StreamScreenEvent.OnBackPress -> { /* Handle in screen */ }
              StreamScreenEvent.OnResume -> {
                  hostInForeground.value = true
 +                autoRefreshPaused = false
+                 usenetSelectionStarted = false
+                 prefetchTopUsenet()
                  if (!externalPlaybackTracker.isTracking) {
-                     streamRepository.setLocalPluginSearchPaused(false)
-                 }
-@@ -377,6 +463,7 @@ class StreamScreenViewModel @Inject constructor(
+@@ -403,6 +489,7 @@ class StreamScreenViewModel @Inject constructor(
      }
  
      fun cancelStreamsLoad() {
 +        autoRefreshPaused = true
+         if (!usenetSelectionStarted) com.nuvio.tv.core.usenet.UsenetSidecar.peek()?.cancelPrefetch(usenetPrefetchOwner)
          streamLoadScope?.cancel()
          streamLoadScope = null
-         streamLoadJob = null
-@@ -528,6 +615,9 @@ class StreamScreenViewModel @Inject constructor(
+@@ -584,6 +671,9 @@ class StreamScreenViewModel @Inject constructor(
                  addonRepository.getInstalledAddons().first().enabledAddons()
              }
              val installedAddonOrder = installedAddons.map { it.displayName }
 +            orderStreamGroups = { groups ->
 +                StreamAutoPlaySelector.orderAddonStreams(groups, installedAddonOrder, preferredServerNames)
 +            }
-             val directDebridSourceNames = emptyList<String>()
-             val directDebridAvailable = false
-             val persistedBingeGroup = if (playerSettings.streamAutoPlayPreferBingeGroupForNextEpisode &&
-@@ -1485,6 +1575,7 @@ class StreamScreenViewModel @Inject constructor(
+             val usenetAddonsAbove = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                 runCatching { usenetSourceSettings.read().addonsAbove }.getOrNull()
+             }
+@@ -1794,6 +1884,7 @@ class StreamScreenViewModel @Inject constructor(
      }
  
-     fun onInternalPlayerLaunching() {
+     fun onInternalPlayerLaunching(playbackInfo: StreamPlaybackInfo) {
 +        autoRefreshPaused = true
-         streamRepository.setLocalPluginSearchPaused(true)
-         updateUiStateIfChanged {
-             it.copy(showDirectAutoPlayOverlay = false, directAutoPlayMessage = null)
+         pendingUsenetPlayback.handoff(playbackInfo.url)
+         usenetSelectionStarted = true
+         com.nuvio.tv.core.usenet.UsenetSidecar.peek()?.cancelPrefetch(usenetPrefetchOwner)
 diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeAccountViewModel.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeAccountViewModel.kt
-index 2e76db887..760e19a4e 100644
+index 2e76db8871..760e19a4ed 100644
 --- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeAccountViewModel.kt
 +++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeAccountViewModel.kt
 @@ -83,9 +83,10 @@ class YouTubeAccountViewModel @Inject constructor(
@@ -249,7 +249,7 @@ index 2e76db887..760e19a4e 100644
          Schedulers.io().scheduleDirect {
              runCatching { signInService.selectedAccount?.let(signInService::removeAccount) }
 diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt
-index d17985b9c..2b4723918 100644
+index d17985b9c7..2b47239181 100644
 --- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeScreen.kt
 @@ -116,8 +116,24 @@ fun YouTubeScreen(
@@ -374,7 +374,7 @@ index d17985b9c..2b4723918 100644
              AccountRow("Sign out of ${account.accountName ?: "this account"}", null, null, Modifier) { onSignOut() }
          }
 diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeSettings.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeSettings.kt
-index 299860199..d808fb7bd 100644
+index 2998601994..d808fb7bdc 100644
 --- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeSettings.kt
 +++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeSettings.kt
 @@ -158,6 +158,16 @@ object YouTubeSettings {
@@ -396,7 +396,7 @@ index 299860199..d808fb7bd 100644
  
 diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeShortsPlayer.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeShortsPlayer.kt
 new file mode 100644
-index 000000000..1944fcb60
+index 0000000000..1944fcb60d
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeShortsPlayer.kt
 @@ -0,0 +1,418 @@
@@ -819,7 +819,7 @@ index 000000000..1944fcb60
 +    Key.MediaPlayPause, Key.MediaPlay, Key.MediaPause
 +)
 diff --git a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
-index 300390563..d4b3e8432 100644
+index 300390563b..d4b3e8432c 100644
 --- a/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
 +++ b/app/src/main/java/com/nuvio/tv/youtube/YouTubeViewModel.kt
 @@ -44,7 +44,10 @@ data class YtItem(
@@ -845,7 +845,7 @@ index 300390563..d4b3e8432 100644
      private fun friendlyReason(reason: String?): String {
          val r = reason.orEmpty().lowercase()
 diff --git a/mediaservicecore/youtubeapi/src/main/java/com/liskovsoft/googlecommon/common/models/auth/info/AccountInt.java b/mediaservicecore/youtubeapi/src/main/java/com/liskovsoft/googlecommon/common/models/auth/info/AccountInt.java
-index 10d779e2a..def30925b 100644
+index 10d779e2a0..def30925b9 100644
 --- a/mediaservicecore/youtubeapi/src/main/java/com/liskovsoft/googlecommon/common/models/auth/info/AccountInt.java
 +++ b/mediaservicecore/youtubeapi/src/main/java/com/liskovsoft/googlecommon/common/models/auth/info/AccountInt.java
 @@ -68,6 +68,6 @@ public class AccountInt {
@@ -857,7 +857,7 @@ index 10d779e2a..def30925b 100644
      }
  }
 diff --git a/mediaservicecore/youtubeapi/src/main/java/com/liskovsoft/googlecommon/service/oauth/YouTubeAccount.java b/mediaservicecore/youtubeapi/src/main/java/com/liskovsoft/googlecommon/service/oauth/YouTubeAccount.java
-index b34189e27..534963e08 100644
+index b34189e27d..534963e083 100644
 --- a/mediaservicecore/youtubeapi/src/main/java/com/liskovsoft/googlecommon/service/oauth/YouTubeAccount.java
 +++ b/mediaservicecore/youtubeapi/src/main/java/com/liskovsoft/googlecommon/service/oauth/YouTubeAccount.java
 @@ -113,6 +113,10 @@ public class YouTubeAccount implements Account {
@@ -872,7 +872,7 @@ index b34189e27..534963e08 100644
              boolean pageIdEquals = Helpers.equals(pageId, getPageIdToken());
              boolean nameEquals = Helpers.equals(name, getName());
 diff --git a/mediaservicecore/youtubeapi/src/main/java/com/liskovsoft/youtubeapi/auth/V2/AuthApiHelper.java b/mediaservicecore/youtubeapi/src/main/java/com/liskovsoft/youtubeapi/auth/V2/AuthApiHelper.java
-index 89a9f63eb..fa89aeba9 100644
+index 89a9f63eb1..fa89aeba93 100644
 --- a/mediaservicecore/youtubeapi/src/main/java/com/liskovsoft/youtubeapi/auth/V2/AuthApiHelper.java
 +++ b/mediaservicecore/youtubeapi/src/main/java/com/liskovsoft/youtubeapi/auth/V2/AuthApiHelper.java
 @@ -13,7 +13,7 @@ public class AuthApiHelper {
@@ -885,7 +885,7 @@ index 89a9f63eb..fa89aeba9 100644
  
      public static String getUserCodeQuery(String clientId) {
 diff --git a/mediaservicecore/youtubeapi/src/main/java/com/liskovsoft/youtubeapi/service/YouTubeSignInService.java b/mediaservicecore/youtubeapi/src/main/java/com/liskovsoft/youtubeapi/service/YouTubeSignInService.java
-index 1f38ff190..2ba234bac 100644
+index 1f38ff190f..2ba234bac8 100644
 --- a/mediaservicecore/youtubeapi/src/main/java/com/liskovsoft/youtubeapi/service/YouTubeSignInService.java
 +++ b/mediaservicecore/youtubeapi/src/main/java/com/liskovsoft/youtubeapi/service/YouTubeSignInService.java
 @@ -93,6 +93,11 @@ public class YouTubeSignInService implements SignInService {
@@ -901,7 +901,7 @@ index 1f38ff190..2ba234bac 100644
          mCachedAuthorizationHeader = null;
          mCacheUpdateTime = 0;
 diff --git a/mediaservicecore/youtubeapi/src/main/java/com/liskovsoft/youtubeapi/service/internal/YouTubeAccountManager.java b/mediaservicecore/youtubeapi/src/main/java/com/liskovsoft/youtubeapi/service/internal/YouTubeAccountManager.java
-index f7cf6b75b..f4c79a9ba 100644
+index f7cf6b75b7..f4c79a9bae 100644
 --- a/mediaservicecore/youtubeapi/src/main/java/com/liskovsoft/youtubeapi/service/internal/YouTubeAccountManager.java
 +++ b/mediaservicecore/youtubeapi/src/main/java/com/liskovsoft/youtubeapi/service/internal/YouTubeAccountManager.java
 @@ -275,8 +275,11 @@ public class YouTubeAccountManager {

@@ -1,8 +1,8 @@
 diff --git a/app/src/main/java/com/nuvio/tv/core/di/NetworkModule.kt b/app/src/main/java/com/nuvio/tv/core/di/NetworkModule.kt
-index 54557fb26..e817ac31a 100644
+index 322f881016..229f483c43 100644
 --- a/app/src/main/java/com/nuvio/tv/core/di/NetworkModule.kt
 +++ b/app/src/main/java/com/nuvio/tv/core/di/NetworkModule.kt
-@@ -45,17 +45,13 @@ import retrofit2.converter.moshi.MoshiConverterFactory
+@@ -46,17 +46,13 @@ import retrofit2.converter.moshi.MoshiConverterFactory
  import com.nuvio.tv.core.network.IPv4FirstDns
  import com.nuvio.tv.core.network.AddonHostGuard
  import com.nuvio.tv.core.network.AddonHostGuardInterceptor
@@ -21,7 +21,7 @@ index 54557fb26..e817ac31a 100644
  
  private object TraktHttpTrace {
      private val requestCounter = AtomicLong(0L)
-@@ -152,8 +148,12 @@ object NetworkModule {
+@@ -153,8 +149,12 @@ object NetworkModule {
      fun provideAddonHostGuard(): AddonHostGuard = AddonHostGuard()
  
      /**
@@ -36,7 +36,7 @@ index 54557fb26..e817ac31a 100644
       *
       * Do not use for first-party endpoints.
       *
-@@ -166,6 +166,13 @@ object NetworkModule {
+@@ -167,6 +167,13 @@ object NetworkModule {
       * player traffic (ExoPlayer HttpDataSource, covered by ParallelRangeRateGate and the
       * long-Retry-After next-source switch in PlayerMediaSourceFactory). See
       * [AddonHostGuard]'s KDoc for how the three layers divide the work.
@@ -50,7 +50,7 @@ index 54557fb26..e817ac31a 100644
       */
      @Provides
      @Singleton
-@@ -173,26 +180,19 @@ object NetworkModule {
+@@ -174,16 +181,9 @@ object NetworkModule {
      fun provideAddonPermissiveOkHttpClient(
          @ApplicationContext context: Context,
          okHttpClient: OkHttpClient,
@@ -67,6 +67,11 @@ index 54557fb26..e817ac31a 100644
 -            init(null, arrayOf<TrustManager>(trustAllManager), SecureRandom())
 -        }
          return okHttpClient.newBuilder()
+             .apply {
+                 // Configured add-ons can encode NNTP credentials in any URL path segment.
+@@ -191,14 +191,14 @@ object NetworkModule {
+             }
+             .addInterceptor(SentryNetworkBreadcrumbInterceptor(hostOnly = true))
              .cache(Cache(File(context.cacheDir, "addon_http_cache"), 50L * 1024 * 1024))
 -            .sslSocketFactory(sslContext.socketFactory, trustAllManager)
 -            .hostnameVerifier { _, _ -> true }
@@ -81,10 +86,10 @@ index 54557fb26..e817ac31a 100644
 +            // blocked calls never reach the network (and never reach TLS). Only addon
 +            // hosts ride this client, so no extra host predicate is needed.
              .addInterceptor(AddonHostGuardInterceptor(addonHostGuard))
-             .build()
-     }
+             // Nuvio fork: catalog JSON without its own cache lifetime is reused for 60 s (Home re-entry, Search).
+             .addNetworkInterceptor { chain ->
 diff --git a/app/src/main/java/com/nuvio/tv/core/network/AddonHostGuard.kt b/app/src/main/java/com/nuvio/tv/core/network/AddonHostGuard.kt
-index 60a7f1c94..66ec6cced 100644
+index 60a7f1c94f..66ec6ccede 100644
 --- a/app/src/main/java/com/nuvio/tv/core/network/AddonHostGuard.kt
 +++ b/app/src/main/java/com/nuvio/tv/core/network/AddonHostGuard.kt
 @@ -2,6 +2,12 @@ package com.nuvio.tv.core.network
@@ -259,7 +264,7 @@ index 60a7f1c94..66ec6cced 100644
              ) {
                  guard.onNetworkFailure(host, probe)
 diff --git a/app/src/main/java/com/nuvio/tv/core/network/NetworkResult.kt b/app/src/main/java/com/nuvio/tv/core/network/NetworkResult.kt
-index 1ffb831fb..4dc24bf5c 100644
+index 1ffb831fb8..4dc24bf5c6 100644
 --- a/app/src/main/java/com/nuvio/tv/core/network/NetworkResult.kt
 +++ b/app/src/main/java/com/nuvio/tv/core/network/NetworkResult.kt
 @@ -2,7 +2,17 @@ package com.nuvio.tv.core.network
@@ -282,7 +287,7 @@ index 1ffb831fb..4dc24bf5c 100644
  
      companion object {
 diff --git a/app/src/main/java/com/nuvio/tv/core/network/SafeApiCall.kt b/app/src/main/java/com/nuvio/tv/core/network/SafeApiCall.kt
-index a853bc8bc..81af05578 100644
+index a853bc8bc6..81af055784 100644
 --- a/app/src/main/java/com/nuvio/tv/core/network/SafeApiCall.kt
 +++ b/app/src/main/java/com/nuvio/tv/core/network/SafeApiCall.kt
 @@ -2,6 +2,7 @@ package com.nuvio.tv.core.network
@@ -310,7 +315,7 @@ index a853bc8bc..81af05578 100644
  }
 diff --git a/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertFailure.kt b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertFailure.kt
 new file mode 100644
-index 000000000..11a4aea71
+index 0000000000..11a4aea710
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertFailure.kt
 @@ -0,0 +1,44 @@
@@ -360,7 +365,7 @@ index 000000000..11a4aea71
 +private const val MAX_WALKED = 32
 diff --git a/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertPinKeeper.kt b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertPinKeeper.kt
 new file mode 100644
-index 000000000..4a1d234ca
+index 0000000000..4a1d234ca8
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertPinKeeper.kt
 @@ -0,0 +1,84 @@
@@ -450,7 +455,7 @@ index 000000000..4a1d234ca
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertPinStore.kt b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertPinStore.kt
 new file mode 100644
-index 000000000..50b82fe44
+index 0000000000..50b82fe447
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertPinStore.kt
 @@ -0,0 +1,123 @@
@@ -579,7 +584,7 @@ index 000000000..50b82fe44
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertPins.kt b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertPins.kt
 new file mode 100644
-index 000000000..0dae72191
+index 0000000000..0dae721917
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertPins.kt
 @@ -0,0 +1,93 @@
@@ -678,7 +683,7 @@ index 000000000..0dae72191
 +    MessageDigest.getInstance("SHA-256").digest(cert.encoded).joinToString("") { "%02X".format(it) }
 diff --git a/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertProbe.kt b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertProbe.kt
 new file mode 100644
-index 000000000..a6e7ada36
+index 0000000000..a6e7ada360
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertProbe.kt
 @@ -0,0 +1,193 @@
@@ -877,7 +882,7 @@ index 000000000..a6e7ada36
 +}.getOrNull()
 diff --git a/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertTrustAction.kt b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertTrustAction.kt
 new file mode 100644
-index 000000000..2afbfd436
+index 0000000000..2afbfd4366
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonCertTrustAction.kt
 @@ -0,0 +1,53 @@
@@ -936,7 +941,7 @@ index 000000000..2afbfd436
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/core/network/tls/AddonTlsTrust.kt b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonTlsTrust.kt
 new file mode 100644
-index 000000000..2bd6727d9
+index 0000000000..2bd6727d97
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/network/tls/AddonTlsTrust.kt
 @@ -0,0 +1,136 @@
@@ -1078,7 +1083,7 @@ index 000000000..2bd6727d9
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonCertificatePanel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonCertificatePanel.kt
 new file mode 100644
-index 000000000..d32559e2d
+index 0000000000..d32559e2db
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonCertificatePanel.kt
 @@ -0,0 +1,276 @@
@@ -1359,41 +1364,41 @@ index 000000000..d32559e2d
 +    return requester
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerScreen.kt
-index df07d97e0..2c71eccf5 100644
+index 5063a90beb..ee1dd60e18 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerScreen.kt
-@@ -108,6 +108,8 @@ import androidx.tv.material3.SwitchDefaults
+@@ -102,6 +102,8 @@ import androidx.tv.material3.SwitchDefaults
  import androidx.tv.material3.Text
  import com.nuvio.tv.domain.model.Addon
  import com.nuvio.tv.domain.model.ExperienceMode
 +import com.nuvio.tv.core.network.addonGuardKeyOf
 +import com.nuvio.tv.core.network.tls.addonServerLabel
- import com.nuvio.tv.ui.components.LoadingIndicator
- import com.nuvio.tv.ui.components.NuvioDialog
- import com.nuvio.tv.ui.util.contentTextDirection
-@@ -569,6 +571,11 @@ fun AddonManagerScreen(
-                     key = { _, addon -> addon.baseUrl }
-                 ) { index, addon ->
-                     val bringIntoViewRequester = remember { BringIntoViewRequester() }
-+                    // Nuvio-KE TLS port: the row shows the Certificate action while its server's
-+                    // last failure was its certificate or while the device holds a pin for it.
-+                    val certificateKey = addonGuardKeyOf(addon.baseUrl)
-+                    val certificatePaused = certificateKey?.let { it in uiState.certificateFailureKeys } == true
-+                    val certificatePinned = certificateKey?.let { it in uiState.pinnedServerKeys } == true
-                     AddonCard(
-                         modifier = Modifier.bringIntoViewRequester(bringIntoViewRequester),
-                         addon = addon,
-@@ -592,6 +599,9 @@ fun AddonManagerScreen(
-                         onEnabledChange = { enabled -> viewModel.setAddonEnabled(addon.baseUrl, enabled) },
-                         isReadOnly = viewModel.isReadOnly,
-                         showReorder = !isEssential,
-+                        certificatePaused = certificatePaused,
-+                        showCertificateAction = (certificatePaused || certificatePinned) && !viewModel.isReadOnly,
-+                        onReviewCertificate = { viewModel.reviewCertificate(addon) },
-                         toggleFocusRequester = if (index == 0) firstAddonToggleFocusRequester else null
-                     )
-                 }
-@@ -650,6 +660,19 @@ fun AddonManagerScreen(
+ import com.nuvio.tv.ui.components.TvReorderList
+ import com.nuvio.tv.ui.screens.settings.SettingsVerticalScrollIndicators
+ import com.nuvio.tv.ui.components.TrackingAddonConsentDialog
+@@ -763,6 +765,11 @@ fun AddonManagerScreen(
+                 )
+             } else {
+                 val addon = addonsByUrl.getValue(key)
++                // Nuvio-KE TLS port: the row shows the Certificate action while its server's
++                // last failure was its certificate or while the device holds a pin for it.
++                val certificateKey = addonGuardKeyOf(addon.baseUrl)
++                val certificatePaused = certificateKey?.let { it in uiState.certificateFailureKeys } == true
++                val certificatePinned = certificateKey?.let { it in uiState.pinnedServerKeys } == true
+                 AddonCard(
+                     addon = addon,
+                     isMoving = isMoving,
+@@ -777,6 +784,9 @@ fun AddonManagerScreen(
+                     onEnabledChange = { enabled -> viewModel.setAddonEnabled(key, enabled) },
+                     isReadOnly = viewModel.isReadOnly,
+                     showReorder = !isEssential,
++                    certificatePaused = certificatePaused,
++                    showCertificateAction = (certificatePaused || certificatePinned) && !viewModel.isReadOnly,
++                    onReviewCertificate = { viewModel.reviewCertificate(addon) },
+                     toggleFocusRequester = toggleFocusRequester,
+                     removeFocusRequester = if (viewModel.isReadOnly) null else removeFocusRequesterFor(key)
+                 )
+@@ -873,6 +883,19 @@ fun AddonManagerScreen(
              }
          }
  
@@ -1413,37 +1418,37 @@ index df07d97e0..2c71eccf5 100644
          AddonMessageOverlay(
              message = uiState.transientMessage,
              isError = uiState.transientMessageIsError
-@@ -1380,6 +1403,9 @@ private fun AddonCard(
+@@ -1617,6 +1640,9 @@ private fun AddonCard(
      onEnabledChange: (Boolean) -> Unit,
      isReadOnly: Boolean = false,
      showReorder: Boolean = true,
 +    certificatePaused: Boolean = false,
 +    showCertificateAction: Boolean = false,
 +    onReviewCertificate: () -> Unit = {},
-     toggleFocusRequester: FocusRequester? = null
+     toggleFocusRequester: FocusRequester? = null,
+     removeFocusRequester: FocusRequester? = null
  ) {
-     if (isReadOnly) {
-@@ -1427,6 +1453,9 @@ private fun AddonCard(
+@@ -1681,6 +1707,9 @@ private fun AddonCard(
                  onRemove = onRemove,
                  onEnabledChange = onEnabledChange,
                  showReorder = showReorder,
 +                certificatePaused = certificatePaused,
 +                showCertificateAction = showCertificateAction,
 +                onReviewCertificate = onReviewCertificate,
-                 toggleFocusRequester = effectiveToggleFocusRequester
+                 toggleFocusRequester = effectiveToggleFocusRequester,
+                 removeFocusRequester = removeFocusRequester
              )
-         }
-@@ -1445,6 +1474,9 @@ private fun AddonCardContent(
+@@ -1701,6 +1730,9 @@ private fun AddonCardContent(
      onRemove: () -> Unit = {},
      onEnabledChange: (Boolean) -> Unit = {},
      showReorder: Boolean = true,
 +    certificatePaused: Boolean = false,
 +    showCertificateAction: Boolean = false,
 +    onReviewCertificate: () -> Unit = {},
-     toggleFocusRequester: FocusRequester? = null
+     toggleFocusRequester: FocusRequester? = null,
+     removeFocusRequester: FocusRequester? = null
  ) {
-     Column(modifier = Modifier.padding(20.dp)) {
-@@ -1477,6 +1509,14 @@ private fun AddonCardContent(
+@@ -1734,6 +1766,14 @@ private fun AddonCardContent(
                              color = NuvioTheme.colors.TextSecondary
                          )
                      }
@@ -1458,9 +1463,9 @@ index df07d97e0..2c71eccf5 100644
                  }
              }
              if (!isReadOnly) {
-@@ -1553,6 +1593,22 @@ private fun AddonCardContent(
-                             Icon(imageVector = Icons.Default.ArrowDownward, contentDescription = stringResource(R.string.cd_move_down))
-                         }
+@@ -1758,6 +1798,22 @@ private fun AddonCardContent(
+                     } else {
+                         Modifier
                      }
 +                    if (showCertificateAction) {
 +                        // Nuvio-KE TLS port: opens the certificate probe + consent panel.
@@ -1480,46 +1485,17 @@ index df07d97e0..2c71eccf5 100644
 +                    }
                      Button(
                          onClick = onRemove,
-                         modifier = Modifier.semantics { role = Role.Button },
-@@ -1581,6 +1637,20 @@ private fun AddonCardContent(
-             )
-         }
- 
-+        if (certificatePaused) {
-+            // Nuvio-KE TLS port: the why-line replaces nothing here — it explains the paused
-+            // state under the description, with the server label (host, or host:port).
-+            Spacer(modifier = Modifier.height(NuvioTheme.spacing.sm))
-+            Text(
-+                text = stringResource(
-+                    R.string.addon_cert_row_line,
-+                    addonServerLabel(addon.baseUrl).orEmpty()
-+                ),
-+                style = MaterialTheme.typography.bodySmall,
-+                color = NuvioTheme.colors.TextSecondary
-+            )
-+        }
-+
-         Spacer(modifier = Modifier.height(NuvioTheme.spacing.sm))
-         Text(
-             text = addon.baseUrl,
+                         enabled = actionsEnabled && !isMoving,
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerUiState.kt b/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerUiState.kt
-index e0c5853b1..c662210d0 100644
+index 985bd6c8cc..2f2176a9cb 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerUiState.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerUiState.kt
-@@ -1,6 +1,7 @@
- package com.nuvio.tv.ui.screens.addon
- 
- import android.graphics.Bitmap
-+import com.nuvio.tv.core.network.tls.AddonCertProbeResult
- import com.nuvio.tv.domain.model.Addon
- 
- data class AddonManagerUiState(
-@@ -16,7 +17,36 @@ data class AddonManagerUiState(
-     val qrCodeBitmap: Bitmap? = null,
-     val serverUrl: String? = null,
-     // Pending change from phone
--    val pendingChange: PendingChangeInfo? = null
-+    val pendingChange: PendingChangeInfo? = null,
+@@ -23,7 +23,14 @@ data class AddonManagerUiState(
+     val pendingChange: PendingChangeInfo? = null,
+     /** Null when built-in Usenet has no provider or indexer yet. */
+     val builtInUsenet: BuiltInUsenetRow? = null,
+-    internal val draftUsenetIndex: Int? = null
++    internal val draftUsenetIndex: Int? = null,
 +    // Nuvio-KE TLS port: `host:port` keys whose last addon call failed on its certificate
 +    // (the row shows the Certificate action and the paused why-line), and keys the device
 +    // holds a trusted pin for (the Certificate action also offers Forget).
@@ -1527,8 +1503,13 @@ index e0c5853b1..c662210d0 100644
 +    val pinnedServerKeys: Set<String> = emptySet(),
 +    /** The open certificate panel (consent / changed / pinned), or null. */
 +    val certificatePanel: AddonCertificatePanelState? = null
-+)
-+
+ ) {
+     internal val addonOrderKeys: List<String>
+         get() = installedAddons.mapTo(mutableListOf()) { it.baseUrl }.apply {
+@@ -36,6 +43,28 @@ data class AddonManagerUiState(
+ 
+ data class BuiltInUsenetRow(val enabled: Boolean, val addonsAbove: List<String>?, val firstUseAccepted: Boolean)
+ 
 +/**
 + * A certificate panel waiting for the user. [probed]: the probe's verdict (an untrusted
 + * certificate for first-trust or changed consent; null with [pinned] when the server verifies
@@ -1549,11 +1530,13 @@ index e0c5853b1..c662210d0 100644
 +    val port: Int,
 +    val sha256: String,
 +    val trustedAtMs: Long
- )
- 
++)
++
  data class PendingChangeInfo(
+     val changeId: String,
+     val proposedUrls: List<String>,
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerViewModel.kt
-index 3fda3b3b0..3d94395f7 100644
+index 7ae2f36a2c..e02cac30b0 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerViewModel.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/addon/AddonManagerViewModel.kt
 @@ -10,6 +10,15 @@ import com.nuvio.tv.core.sync.StartupSyncService
@@ -1572,17 +1555,23 @@ index 3fda3b3b0..3d94395f7 100644
  import com.nuvio.tv.core.qr.QrCodeGenerator
  import com.nuvio.tv.core.server.AddonConfigServer
  import com.nuvio.tv.core.server.AddonInfo
-@@ -48,7 +57,9 @@ import com.nuvio.tv.domain.model.enabledAddons
+@@ -51,9 +60,15 @@ import com.nuvio.tv.domain.model.TmdbCollectionSourceType
+ import com.nuvio.tv.domain.model.TraktCollectionSource
+ import com.nuvio.tv.domain.model.enabledAddons
  import com.nuvio.tv.domain.repository.AddonRepository
++import com.nuvio.tv.core.network.AddonHostGuard
++import com.nuvio.tv.core.network.tls.AddonCertProbe
++import com.nuvio.tv.core.network.tls.AddonCertTrustAction
++import com.nuvio.tv.core.network.tls.AddonCertPinKeeper
  import dagger.hilt.android.lifecycle.HiltViewModel
  import dagger.hilt.android.qualifiers.ApplicationContext
+ import kotlinx.coroutines.CancellationException
 +import kotlinx.coroutines.CompletableDeferred
- import kotlinx.coroutines.Dispatchers
 +import kotlinx.coroutines.Job
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.NonCancellable
  import kotlinx.coroutines.delay
- import kotlinx.coroutines.flow.MutableStateFlow
- import kotlinx.coroutines.flow.StateFlow
-@@ -73,6 +84,10 @@ class AddonManagerViewModel @Inject constructor(
+@@ -86,6 +101,10 @@ class AddonManagerViewModel @Inject constructor(
      private val profileManager: ProfileManager,
      private val tmdbCollectionSourceResolver: TmdbCollectionSourceResolver,
      private val traktPublicListSourceResolver: TraktPublicListSourceResolver,
@@ -1590,27 +1579,25 @@ index 3fda3b3b0..3d94395f7 100644
 +    private val certProbe: AddonCertProbe,
 +    private val certTrustAction: AddonCertTrustAction,
 +    private val certPinKeeper: AddonCertPinKeeper,
+     private val usenetSourceSettings: UsenetSourceSettings,
+     private val trackingAddonConsentController: TrackingAddonConsentController,
      @ApplicationContext private val context: Context
- ) : ViewModel() {
- 
-@@ -99,13 +114,35 @@ class AddonManagerViewModel @Inject constructor(
-     private var followAddonsOrderEnabled: Boolean = false
-     private var currentCollections: List<Collection> = emptyList()
- 
-+    /** A certificate review (probe + consent panel) in progress; install and review share it. */
+@@ -117,6 +136,8 @@ class AddonManagerViewModel @Inject constructor(
+     private var addonDraftOrder: List<String>? = null
+     private var addonMoveBaseline: List<String>? = null
+     private var pendingAddonOrder: List<String>? = null
 +    private var certificateJob: Job? = null
-+
-+    /** The open certificate panel's answer: true = Trust. */
 +    private var certificateDecision: CompletableDeferred<Boolean>? = null
-+
+     private var addonPersistGeneration: Int = 0
+ 
      init {
-         observeInstalledAddons()
+@@ -124,6 +145,22 @@ class AddonManagerViewModel @Inject constructor(
+         observeBuiltInUsenet()
          observeCatalogPreferences()
          observeCollections()
 +        observeCertificateFlags()
-         loadLogoBytes()
-     }
- 
++    }
++
 +    /** Nuvio-KE TLS port: the Addons rows read the certificate-failure flags and the device's pins. */
 +    private fun observeCertificateFlags() {
 +        viewModelScope.launch {
@@ -1624,42 +1611,10 @@ index 3fda3b3b0..3d94395f7 100644
 +                _uiState.update { it.copy(pinnedServerKeys = keys) }
 +            }
 +        }
-+    }
-+
-     fun requestAddonSyncNow() {
-         startupSyncService.requestAddonSyncNow()
      }
-@@ -152,13 +189,26 @@ class AddonManagerViewModel @Inject constructor(
-             return
-         }
  
--        viewModelScope.launch {
-+        if (certificateJob?.isActive == true) return
-+        certificateJob = viewModelScope.launch {
-             _uiState.update { it.copy(isInstalling = true, error = null, transientMessage = null) }
- 
--            when (val result = addonRepository.fetchAddon(normalizedUrl)) {
-+            var result = addonRepository.fetchAddon(normalizedUrl)
-+            // Nuvio-KE TLS port: the install failed on the addon server's certificate. Probe it,
-+            // ask on the consent panel, and retry once when the user trusted it.
-+            if (result is NetworkResult.Error && result.certificate) {
-+                val trusted = resolveCertificate(normalizedUrl, addonName = null)
-+                if (!trusted) {
-+                    _uiState.update { it.copy(isInstalling = false) }
-+                    return@launch
-+                }
-+                result = addonRepository.fetchAddon(normalizedUrl)
-+            }
-+
-+            when (val outcome = result) {
-                 is NetworkResult.Success -> {
-                     addonRepository.addAddon(normalizedUrl)
--                    val addonName = result.data.displayName.ifBlank { result.data.baseUrl }
-+                    val addonName = outcome.data.displayName.ifBlank { outcome.data.baseUrl }
-                     _uiState.update {
-                         it.copy(
-                             isInstalling = false,
-@@ -169,7 +219,7 @@ class AddonManagerViewModel @Inject constructor(
+     fun requestAddonSyncNow() {
+@@ -190,7 +227,7 @@ class AddonManagerViewModel @Inject constructor(
                      }
                  }
                  is NetworkResult.Error -> {
@@ -1668,7 +1623,7 @@ index 3fda3b3b0..3d94395f7 100644
                      _uiState.update {
                          it.copy(
                              isInstalling = false,
-@@ -186,6 +236,107 @@ class AddonManagerViewModel @Inject constructor(
+@@ -207,6 +244,107 @@ class AddonManagerViewModel @Inject constructor(
          }
      }
  
@@ -1777,10 +1732,10 @@ index 3fda3b3b0..3d94395f7 100644
          var trimmed = input.trim()
          if (trimmed.startsWith("stremio://")) {
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index f26eb57e5..15f4ab9cf 100644
+index 1bd45c9c93..6f0047327a 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
-@@ -1787,6 +1787,38 @@
+@@ -1904,6 +1904,38 @@
      <string name="addon_delete_confirm_message">Are you sure you want to delete it?</string>
      <string name="addon_delete_no">No</string>
      <string name="addon_delete_yes">Yes</string>

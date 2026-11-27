@@ -1,6 +1,6 @@
 diff --git a/app/src/main/java/com/nuvio/tv/core/connection/ConnectionSpeed.kt b/app/src/main/java/com/nuvio/tv/core/connection/ConnectionSpeed.kt
 new file mode 100644
-index 000000000..af2d72264
+index 0000000000..af2d72264a
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/connection/ConnectionSpeed.kt
 @@ -0,0 +1,319 @@
@@ -325,7 +325,7 @@ index 000000000..af2d72264
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/core/connection/PlaybackThroughput.kt b/app/src/main/java/com/nuvio/tv/core/connection/PlaybackThroughput.kt
 new file mode 100644
-index 000000000..3a26f4d3a
+index 0000000000..3a26f4d3a2
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/connection/PlaybackThroughput.kt
 @@ -0,0 +1,75 @@
@@ -406,7 +406,7 @@ index 000000000..3a26f4d3a
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/core/connection/StreamConnectionFit.kt b/app/src/main/java/com/nuvio/tv/core/connection/StreamConnectionFit.kt
 new file mode 100644
-index 000000000..25f95c00d
+index 0000000000..25f95c00d6
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/connection/StreamConnectionFit.kt
 @@ -0,0 +1,103 @@
@@ -514,10 +514,10 @@ index 000000000..25f95c00d
 +    return mbps.takeIf { it in MIN_PLAUSIBLE_MBPS..MAX_PLAUSIBLE_MBPS }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioMpvSurfaceView.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioMpvSurfaceView.kt
-index 8668f5403..06507324c 100644
+index c6fd555b40..e25f7d8189 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioMpvSurfaceView.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/NuvioMpvSurfaceView.kt
-@@ -191,6 +191,19 @@ class NuvioMpvSurfaceView @JvmOverloads constructor(
+@@ -227,6 +227,19 @@ class NuvioMpvSurfaceView @JvmOverloads constructor(
          return mpv.getPropertyDouble("demuxer-cache-duration") ?: 0.0
      }
  
@@ -538,33 +538,35 @@ index 8668f5403..06507324c 100644
          if (!initialized) return false
          return mpv.getPropertyBoolean("core-idle") == true
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt
-index b083fd5d9..3bb53b6b4 100644
+index beda4d4f5c..b85804c852 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt
-@@ -182,17 +182,19 @@ internal class PlayerMediaSourceFactory(private val context: Context) {
+@@ -223,18 +223,20 @@ internal class PlayerMediaSourceFactory(private val context: Context) {
          )
          val isHls = resolvedMimeType == MimeTypes.APPLICATION_M3U8
          val isDash = resolvedMimeType == MimeTypes.APPLICATION_MPD
 -        val httpDataSourceFactory = if (isHls || isDash) {
--            DefaultDataSource.Factory(
+-            val adaptiveFactory = DefaultDataSource.Factory(
 -                context,
 -                PlayerPlaybackNetworking.createHttpDataSourceFactory(
 -                    sanitizedHeaders,
 -                    useLongReadTimeout = isLoopbackUrl(url),
 -                ),
 -            )
+-            if (isHls) HlsParameterSetInitDataSource.Factory(adaptiveFactory) else adaptiveFactory
 -        } else {
 -            PlayerPlaybackNetworking.createDataSourceFactory(context, sanitizedHeaders)
 -        }
 +        val httpDataSourceFactory = com.nuvio.tv.core.connection.PlaybackThroughput.countingNetworkBytes( // Nuvio fork: connection-speed learning
 +            if (isHls || isDash) {
-+                DefaultDataSource.Factory(
++                val adaptiveFactory = DefaultDataSource.Factory(
 +                    context,
 +                    PlayerPlaybackNetworking.createHttpDataSourceFactory(
 +                        sanitizedHeaders,
 +                        useLongReadTimeout = isLoopbackUrl(url),
 +                    ),
 +                )
++                if (isHls) HlsParameterSetInitDataSource.Factory(adaptiveFactory) else adaptiveFactory
 +            } else {
 +                PlayerPlaybackNetworking.createDataSourceFactory(context, sanitizedHeaders)
 +            }
@@ -572,7 +574,7 @@ index b083fd5d9..3bb53b6b4 100644
  
          val mediaItemBuilder = MediaItem.Builder().setUri(url)
          resolvedMimeType?.let(mediaItemBuilder::setMimeType)
-@@ -229,6 +231,7 @@ internal class PlayerMediaSourceFactory(private val context: Context) {
+@@ -275,6 +277,7 @@ internal class PlayerMediaSourceFactory(private val context: Context) {
                  if (sanitizedHeaders.none { it.key.equals("User-Agent", ignoreCase = true) }) {
                      setUserAgent(DEFAULT_USER_AGENT)
                  }
@@ -581,30 +583,30 @@ index b083fd5d9..3bb53b6b4 100644
              val sessionChunkBytes = parallelChunkSizeKb
                  .coerceAtMost(com.nuvio.tv.ui.screens.settings.MemoryBudget.tierMaxChunkMb * 1024)
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerLifecycle.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerLifecycle.kt
-index 25df39cf9..faac33069 100644
+index d67f9c855c..864de92f84 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerLifecycle.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerLifecycle.kt
-@@ -15,6 +15,7 @@ internal fun PlayerRuntimeController.releasePlayer(
-     keepTorrentStream: Boolean = false
+@@ -16,6 +16,7 @@ internal fun PlayerRuntimeController.releasePlayer(
  ) {
+     if (flushPlaybackState) cancelStreamFallback()
      logScrobbleDiagnostic("release_player", "flushPlaybackState=$flushPlaybackState")
 +    com.nuvio.tv.core.connection.PlaybackThroughput.finish() // Nuvio fork: connection-speed learning
  
      // Preserve current subtitle selection across any rebuild. When the user explicitly
      // selected a track, persistedTrackPreference was nulled and the choice lives only
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
-index 66fbc7b78..f06624472 100644
+index fb86104748..6fa516a814 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
-@@ -423,6 +423,7 @@ internal fun PlayerRuntimeController.startProgressUpdates() {
-                         )
-                     }
+@@ -455,6 +455,7 @@ internal fun PlayerRuntimeController.startProgressUpdates() {
+                     // session in sync with the state sampled by this existing progress tick.
+                     refreshMpvMediaSession()
                      updateMpvTracksOnTick()
 +                    mpvView?.sampleThroughput(context, currentStreamUrl) // Nuvio fork: connection-speed learning
+                     recomputeChapterSkipIntervalsIfNeeded()
                      updateActiveSkipInterval(pos)
                      if (!_playbackTimeline.value.isLive) {
-                         evaluatePostPlayOverlayVisibility(
-@@ -455,6 +456,8 @@ internal fun PlayerRuntimeController.startProgressUpdates() {
+@@ -488,6 +489,8 @@ internal fun PlayerRuntimeController.startProgressUpdates() {
                      playerReportsLive = player.isCurrentMediaItemLive,
                      isPlaying = player.isPlaying
                  )
@@ -615,7 +617,7 @@ index 66fbc7b78..f06624472 100644
                      hasRenderedFirstFrame = hasRenderedFirstFrame,
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/ConnectionSpeedSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ConnectionSpeedSettingsItems.kt
 new file mode 100644
-index 000000000..b5cfacb45
+index 0000000000..b5cfacb451
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/ConnectionSpeedSettingsItems.kt
 @@ -0,0 +1,36 @@
@@ -656,10 +658,10 @@ index 000000000..b5cfacb45
 +    )
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackAutoPlaySettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackAutoPlaySettings.kt
-index 5e71ec9ce..2ef0dd10c 100644
+index 7550d2187a..c6ce36adb8 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackAutoPlaySettings.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackAutoPlaySettings.kt
-@@ -181,6 +181,7 @@ internal fun PlaybackStreamSelectionSection(
+@@ -228,6 +228,7 @@ internal fun PlaybackStreamSelectionSection(
              onClick = { onOpenDialog(PlaybackDialog.REUSE_LAST_LINK_CACHE) }
          )
      }
@@ -668,10 +670,10 @@ index 5e71ec9ce..2ef0dd10c 100644
  
  @Composable
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
-index 071b53151..2925738ea 100644
+index d66736a1c2..b5ae48854c 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
-@@ -540,12 +540,23 @@ class StreamScreenViewModel @Inject constructor(
+@@ -601,12 +601,23 @@ class StreamScreenViewModel @Inject constructor(
                  contentId?.let { bingeGroupCacheDataStore.getInfoHash(it) }
              } else null
  
@@ -689,7 +691,7 @@ index 071b53151..2925738ea 100644
 +                }
 +                val addonOrderedStreams = StreamAutoPlaySelector.orderAddonStreams(
                      addonStreamGroups,
-                     installedAddonOrder,
+                     sourceOrder,
                      preferredServerNames
                  )
 +                val orderedAddonStreams = connectionFit?.applyToGroups(addonOrderedStreams) ?: addonOrderedStreams
@@ -698,7 +700,7 @@ index 071b53151..2925738ea 100644
                  // don't vanish when repository emits fresh (badge-less) streams.
 diff --git a/app/src/main/res/values/connection_fit_strings.xml b/app/src/main/res/values/connection_fit_strings.xml
 new file mode 100644
-index 000000000..6784b91b6
+index 0000000000..6784b91b61
 --- /dev/null
 +++ b/app/src/main/res/values/connection_fit_strings.xml
 @@ -0,0 +1,7 @@

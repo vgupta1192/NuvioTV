@@ -1,5 +1,5 @@
 diff --git a/app/src/main/java/com/nuvio/tv/data/remote/api/ParentalGuideApi.kt b/app/src/main/java/com/nuvio/tv/data/remote/api/ParentalGuideApi.kt
-index a7fd68a8c..304cb7402 100644
+index a7fd68a8c3..304cb74020 100644
 --- a/app/src/main/java/com/nuvio/tv/data/remote/api/ParentalGuideApi.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/remote/api/ParentalGuideApi.kt
 @@ -28,8 +28,9 @@ data class ImdbApiParentsGuideCategory(
@@ -16,7 +16,7 @@ index a7fd68a8c..304cb7402 100644
  @JsonClass(generateAdapter = true)
 diff --git a/app/src/main/java/com/nuvio/tv/data/repository/HostOutage.kt b/app/src/main/java/com/nuvio/tv/data/repository/HostOutage.kt
 new file mode 100644
-index 000000000..8d78fa4c2
+index 0000000000..8d78fa4c2a
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/data/repository/HostOutage.kt
 @@ -0,0 +1,36 @@
@@ -57,7 +57,7 @@ index 000000000..8d78fa4c2
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/data/repository/ImdbEpisodeRatingsRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/ImdbEpisodeRatingsRepository.kt
-index cfd52b4a7..1c995a362 100644
+index e830ba7433..ae6d4f0401 100644
 --- a/app/src/main/java/com/nuvio/tv/data/repository/ImdbEpisodeRatingsRepository.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/repository/ImdbEpisodeRatingsRepository.kt
 @@ -1,8 +1,10 @@
@@ -72,24 +72,24 @@ index cfd52b4a7..1c995a362 100644
  import kotlinx.coroutines.Dispatchers
  import kotlinx.coroutines.SupervisorJob
 @@ -29,6 +31,8 @@ class ImdbEpisodeRatingsRepository @Inject constructor(
-     private val inFlight = mutableMapOf<String, kotlinx.coroutines.Deferred<Map<Pair<Int, Int>, Double>>>()
+     private val inFlight = mutableMapOf<String, kotlinx.coroutines.Deferred<List<ExternalEpisodeRating>>>()
      private val inFlightMutex = Mutex()
      private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 +    internal var primaryConfigured = BuildConfig.IMDB_TAPFRAME_API_BASE_URL.isNotBlank()
 +    internal val primaryOutage = HostOutage()
  
-     suspend fun getEpisodeRatings(
+     internal suspend fun getEpisodeRatings(
          imdbId: String?,
-@@ -81,20 +85,27 @@ class ImdbEpisodeRatingsRepository @Inject constructor(
+@@ -89,20 +93,27 @@ class ImdbEpisodeRatingsRepository @Inject constructor(
          imdbId: String?,
          tmdbId: Int?
-     ): Map<Pair<Int, Int>, Double> {
+     ): List<ExternalEpisodeRating> {
 -        if (!imdbId.isNullOrBlank()) {
 -            val primary = fetchFromImdbTapframe(imdbId)
 +        var primaryUnreachable = false
 +        if (!imdbId.isNullOrBlank() && primaryConfigured && !primaryOutage.isDown()) {
 +            val primary = fetchFromImdbTapframe(imdbId) { primaryUnreachable = true }
-             if (primary.isNotEmpty()) return primary
+             if (primary.any { it.rating != null }) return primary
 -            Log.w(tag, "Primary episode ratings empty for imdbId=$imdbId, trying fallback.")
 +            if (!primaryUnreachable) Log.w(tag, "Primary episode ratings empty for imdbId=$imdbId, trying fallback.")
          }
@@ -97,26 +97,26 @@ index cfd52b4a7..1c995a362 100644
          if (tmdbId != null && tmdbId > 0) {
 -            return fetchFromSeriesGraph(tmdbId)
 +            val fallback = fetchFromSeriesGraph(tmdbId)
-+            if (primaryUnreachable) primaryOutage.markDown(networkUp = fallback.isNotEmpty(), tag = tag)
++            if (primaryUnreachable) primaryOutage.markDown(networkUp = fallback.any { it.rating != null }, tag = tag)
 +            return fallback
          }
  
 +        if (primaryUnreachable) primaryOutage.markDown(networkUp = false, tag = tag)
-         return emptyMap()
+         return emptyList()
      }
  
--    private suspend fun fetchFromImdbTapframe(imdbId: String): Map<Pair<Int, Int>, Double> {
+-    private suspend fun fetchFromImdbTapframe(imdbId: String): List<ExternalEpisodeRating> {
 +    private suspend fun fetchFromImdbTapframe(
 +        imdbId: String,
 +        onUnreachable: () -> Unit
-+    ): Map<Pair<Int, Int>, Double> {
++    ): List<ExternalEpisodeRating> {
          return try {
              val response = imdbTapframeApi.getSeasonRatings(imdbId)
              if (!response.isSuccessful) {
-@@ -102,8 +113,14 @@ class ImdbEpisodeRatingsRepository @Inject constructor(
-                 return emptyMap()
+@@ -110,8 +121,14 @@ class ImdbEpisodeRatingsRepository @Inject constructor(
+                 return emptyList()
              }
-             toRatingsMap(response.body().orEmpty())
+             toEpisodeRatings(response.body().orEmpty())
 +        } catch (e: CancellationException) {
 +            throw e
          } catch (e: Exception) {
@@ -126,11 +126,11 @@ index cfd52b4a7..1c995a362 100644
 +            } else {
 +                Log.w(tag, "Error fetching primary season ratings for imdbId=$imdbId", e)
 +            }
-             emptyMap()
+             emptyList()
          }
      }
 diff --git a/app/src/main/java/com/nuvio/tv/data/repository/ParentalGuideRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/ParentalGuideRepository.kt
-index 14ad4d912..f26813b4c 100644
+index 14ad4d912d..f26813b4ca 100644
 --- a/app/src/main/java/com/nuvio/tv/data/repository/ParentalGuideRepository.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/repository/ParentalGuideRepository.kt
 @@ -70,16 +70,16 @@ class ParentalGuideRepository @Inject constructor(
@@ -156,7 +156,7 @@ index 14ad4d912..f26813b4c 100644
      }
  }
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/cast/CastDetailScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/cast/CastDetailScreen.kt
-index 99f0a3d71..cd1a57a6c 100644
+index c21ab9ac30..585c39f14d 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/cast/CastDetailScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/cast/CastDetailScreen.kt
 @@ -20,10 +20,12 @@ import androidx.compose.foundation.layout.Column
@@ -172,7 +172,7 @@ index 99f0a3d71..cd1a57a6c 100644
  import androidx.compose.foundation.layout.padding
  import androidx.compose.foundation.layout.size
  import androidx.compose.foundation.layout.width
-@@ -265,7 +267,7 @@ private fun CastDetailContent(
+@@ -291,7 +293,7 @@ private fun CastDetailContent(
                              onBiographyExpandedChange(!isBiographyExpanded)
                          }
                      },
@@ -181,7 +181,7 @@ index 99f0a3d71..cd1a57a6c 100644
                  )
  
                  AnimatedVisibility(
-@@ -344,8 +346,8 @@ private fun HeroSection(
+@@ -383,8 +385,8 @@ private fun HeroSection(
          Card(
              onClick = onPortraitClick,
              modifier = Modifier
@@ -193,7 +193,7 @@ index 99f0a3d71..cd1a57a6c 100644
                  .focusProperties {
                      canFocus = isBiographyExpanded || isBiographyTruncated
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/CompanyLogosSection.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/CompanyLogosSection.kt
-index 57aaf671b..16e063019 100644
+index 57aaf671b6..16e0630194 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/CompanyLogosSection.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/CompanyLogosSection.kt
 @@ -48,6 +48,7 @@ import androidx.compose.ui.layout.ContentScale
@@ -249,10 +249,10 @@ index 57aaf671b..16e063019 100644
 +internal fun companyRowRevealOverflowPx(rowTopPx: Float, rowHeightPx: Int, windowHeightPx: Int, paddingPx: Float): Float =
 +    (rowTopPx + rowHeightPx - windowHeightPx + paddingPx).coerceAtLeast(0f)
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt
-index 3914eba15..bcc2b31af 100644
+index 2c9c93dca9..e22587f5e7 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsViewModel.kt
-@@ -2227,10 +2227,10 @@ class MetaDetailsViewModel @Inject constructor(
+@@ -2394,10 +2394,10 @@ class MetaDetailsViewModel @Inject constructor(
                  }
                  pendingDefaultLibraryToggle = null
                  _uiState.update { it.copy(defaultLibraryTogglePending = false) }
@@ -266,7 +266,7 @@ index 3914eba15..bcc2b31af 100644
                  }
                  showMessage(message)
              }.onFailure { error ->
-@@ -2408,7 +2408,11 @@ class MetaDetailsViewModel @Inject constructor(
+@@ -2575,7 +2575,11 @@ class MetaDetailsViewModel @Inject constructor(
                              removalConfirmations = emptyList()
                          )
                      }

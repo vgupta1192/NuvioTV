@@ -1,5 +1,5 @@
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt
-index e360c87d8..ccbdd70fa 100644
+index e360c87d87..ccbdd70fa7 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/SyncedSubtitles.kt
 @@ -103,6 +103,18 @@ object SyncedSubtitles {
@@ -22,40 +22,41 @@ index e360c87d8..ccbdd70fa 100644
      fun debug(tag: String, body: String) {
          scope.launch {
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSubtitleSyncController.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSubtitleSyncController.kt
-index 596735fdd..4f1fbe49d 100644
+index 8c8e083e49..f220bb055f 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSubtitleSyncController.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSubtitleSyncController.kt
-@@ -51,6 +51,8 @@ internal class AudioSubtitleSyncController(
+@@ -50,6 +50,8 @@ internal class AudioSubtitleSyncController(
      private val onStatus: (AudioSyncStatus) -> Unit = {},
      /** Asks for the subtitle [url] to be shown instead of the current one (it fits the audio). */
-     private val requestSwitch: (url: String) -> Unit = SubtitleSyncStatus::requestSubtitleSwitch,
+     private val requestSwitch: (url: String) -> Unit,
 +    /** The audio could not be matched in time (see [maybeGiveUp]). */
 +    private val onGaveUp: () -> Unit = {},
  ) : AudioSampleSink, PlaybackPcmListener {
      private val appContext = context.applicationContext
-     private val lowMemoryTv by lazy { SpotConnections.isLowMemoryTv(appContext) }
-@@ -673,6 +675,7 @@ internal class AudioSubtitleSyncController(
+     private val timeline = SpeechTimeline()
+@@ -677,6 +679,8 @@ internal class AudioSubtitleSyncController(
          gaveUpKey = current.key
          SyncLog.i("no audio match for ${current.key} after ${(heardMs / 1_000).toInt()}s of audio; keeping its own timing")
          notify(AudioSyncStatus.Withdrawn)
++        onGaveUp()
 +        onGaveUp()
      }
  
      fun onAudioTrackSelected(format: Format?) {
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSyncFallback.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSyncFallback.kt
-index 650e486dc..d45b40420 100644
+index 2c29c415ff..738f093e18 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSyncFallback.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/audiosync/AudioSyncFallback.kt
-@@ -17,6 +17,8 @@ import com.nuvio.tv.R
+@@ -17,6 +17,8 @@ import androidx.media3.extractor.ExtractorsFactory
+ import androidx.media3.extractor.text.CuesWithTiming
  import com.nuvio.tv.domain.model.Subtitle
  import com.nuvio.tv.ui.screens.player.PlayerPlaybackNetworking
- import com.nuvio.tv.ui.screens.player.PlayerRuntimeController
 +import com.nuvio.tv.ui.screens.player.SyncedSubtitles
 +import com.nuvio.tv.ui.screens.player.restoreSyncedSubtitle
- import com.nuvio.tv.ui.screens.player.autosync.AutomaticSubtitleSync
- import com.nuvio.tv.ui.screens.player.autosync.AutoSyncSyncedSubtitle
- import com.nuvio.tv.ui.screens.player.autosync.bubble.AutoSyncBubbleKind
-@@ -63,8 +65,19 @@ internal class AudioSyncFallback private constructor(
+ import com.nuvio.tv.ui.screens.player.PlayerRuntimeController
+ import com.nuvio.tv.ui.screens.player.PlayerSubtitleUtils
+ import com.nuvio.tv.ui.screens.player.buildAddonSubtitleTrackId
+@@ -81,8 +83,19 @@ internal class AudioSyncFallback private constructor(
          manualDelayMs = { 0 },
          onStatus = ::onStatus,
          requestSwitch = ::replaceSubtitle,
@@ -72,6 +73,6 @@ index 650e486dc..d45b40420 100644
 +        }
 +    }
 +
-     /** The subtitle being synced, with its original cues and the sidecar attachment it lives in. */
-     private class Target(val url: String, val cues: List<CuesWithTiming>, val generation: Long)
- 
+     /**
+      * The subtitle being synced, with its original cues and the sidecar attachment it lives in
+      * (ExoPlayer), or the retimed copy mpv shows for it ([mpvTrackId], null while the original shows).

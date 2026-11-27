@@ -1,15 +1,15 @@
 diff --git a/app/build.gradle.kts b/app/build.gradle.kts
-index 38eb21f6a..71784b3ed 100644
+index b8e83f26d4..0edf321726 100644
 --- a/app/build.gradle.kts
 +++ b/app/build.gradle.kts
-@@ -609,3 +609,4 @@ dependencies {
- }
- 
- apply(from = "autosync.gradle") // AutoSync: audio subtitle sync fallback (sherpa-onnx)
+@@ -666,3 +666,4 @@ dependencies {
+ extra["usenetSdkDirectory"] = android.sdkDirectory.absolutePath
+ extra["usenetNdkVersion"] = android.ndkVersion
+ apply(from = rootProject.file("native/usenet/android.gradle.kts"))
 +apply(from = "seekpreview.gradle") // Nuvio fork: seek previews (Seekr client)
 diff --git a/app/seekpreview.gradle b/app/seekpreview.gradle
 new file mode 100644
-index 000000000..66175e8df
+index 0000000000..66175e8df2
 --- /dev/null
 +++ b/app/seekpreview.gradle
 @@ -0,0 +1,4 @@
@@ -18,41 +18,46 @@ index 000000000..66175e8df
 +    implementation "tv.seekr:seekr-compose:0.2.0"
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt
-index 148106e67..659687e90 100644
+index e80c1050cc..7ce513f819 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerAutomaticSubtitleSync.kt
-@@ -74,7 +74,13 @@ internal fun PlayerRuntimeController.autoSyncExtractorsFactory(
-     headers: Map<String, String>,
- ): ExtractorsFactory {
-     // Audio is copied too, for the audio sync fallback (idle unless it is listening).
--    val tapped = AudioSyncTaps.wrapExtractors(delegate, url)
+@@ -48,10 +48,17 @@ internal fun PlayerRuntimeController.autoSyncExtractorsFactory(
+     AutoSyncPreferences.ensureLoaded(context)
+     if (!AutoSyncPreferences.isEnabled(context)) return delegate
+     AudioSyncFallback.initialize(context)
 +    // Video keyframes are copied too, for on-device seek previews (idle once all are made).
 +    val tapped = com.nuvio.tv.ui.screens.player.seekpreview.local.LocalPreviewSources.register(
 +        owner = this,
 +        context = context,
 +        sourceKey = url,
-+        factory = AudioSyncTaps.wrapExtractors(delegate, url),
++        factory = delegate,
 +    )
-     AutoSyncPreferences.ensureLoaded(context)
-     if (!AutoSyncPreferences.isEnabled(context)) return tapped
-     val factory = AutoSyncExtractorsFactory(delegate = tapped, sourceKey = url)
+     val audioDelegate = if (AudioSyncSettings.fallbackEnabled.value) {
+-        AudioSyncTaps.wrapExtractors(delegate, url)
++        AudioSyncTaps.wrapExtractors(tapped, url)
+     } else {
+-        delegate
++        tapped
+     }
+     val factory = AutoSyncExtractorsFactory(delegate = audioDelegate, sourceKey = url)
+     prefetchAutoSyncIndex(url, headers)
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerLifecycle.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerLifecycle.kt
-index 5ed04ff33..484b5e337 100644
+index 7340ac51be..d67f9c855c 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerLifecycle.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerLifecycle.kt
-@@ -51,6 +51,7 @@ internal fun PlayerRuntimeController.releasePlayer(
+@@ -79,6 +79,7 @@ internal fun PlayerRuntimeController.releasePlayer(
      hideSubtitleDelayOverlayJob?.cancel()
      subtitleAutoSyncLoadJob?.cancel()
      cancelAutomaticSubtitleSync() // AutoSync hook
 +    com.nuvio.tv.ui.screens.player.seekpreview.local.LocalPreviewSources.unregister(this) // Nuvio fork: on-device seek previews
+     com.nuvio.tv.ui.screens.player.audiosync.AudioSyncFallback.release(this)
      stopSidecarAddonSubtitle(clearView = true)
      subtitleTimingRefreshJob?.cancel()
-     subtitleTimingRefreshJob = null
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
-index 9b1c0ed34..9e5024674 100644
+index dbd6e00d92..fb86104748 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
-@@ -1325,7 +1325,7 @@ fun PlayerRuntimeController.onEvent(event: PlayerEvent) {
+@@ -1755,7 +1755,7 @@ fun PlayerRuntimeController.onEvent(
                      updatePlaybackTimeline(currentPosition = currentPlaybackPositionMs() ?: 0L)
                      return
                  }
@@ -62,10 +67,10 @@ index 9b1c0ed34..9e5024674 100644
                  pendingPreviewSeekPosition = null
                  scheduleProgressSyncAfterSeek()
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
-index 11b8346e9..b26eb8536 100644
+index 898ee2d7dd..fae4c1c772 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerScreen.kt
-@@ -344,6 +344,7 @@ fun PlayerScreen(
+@@ -359,6 +359,7 @@ fun PlayerScreen(
  
      val handleBackPress = handleBackPress@{
          if (externalHandoffInProgress) return@handleBackPress
@@ -73,7 +78,7 @@ index 11b8346e9..b26eb8536 100644
          if (postPlayRecommendationState.canReturnToPlayer && !uiState.playbackEnded) {
              returnToPlayerFromPostPlay()
              viewModel.hideControls()
-@@ -559,6 +560,7 @@ fun PlayerScreen(
+@@ -590,6 +591,7 @@ fun PlayerScreen(
          if (shouldConfirmNextEpisodeOnEnd || postPlayRecommendationState.isVisible) return@LaunchedEffect
          if (uiState.error != null) return@LaunchedEffect
          if (uiState.showPartyPanel) return@LaunchedEffect
@@ -81,7 +86,7 @@ index 11b8346e9..b26eb8536 100644
          if (uiState.showControls && !uiState.showEpisodesPanel && !uiState.showSourcesPanel && !uiState.showChaptersPanel &&
              !uiState.showAudioOverlay && !uiState.showSubtitleOverlay &&
              !uiState.showSubtitleStylePanel && !uiState.showSubtitleDelayOverlay &&
-@@ -1735,6 +1737,8 @@ fun PlayerScreen(
+@@ -1850,6 +1852,8 @@ fun PlayerScreen(
              )
          }
  
@@ -90,7 +95,7 @@ index 11b8346e9..b26eb8536 100644
          AnimatedVisibility(
              visible = seekOverlayVisible,
              enter = fadeIn(animationSpec = tween(150)),
-@@ -2874,6 +2878,7 @@ private fun PlayerControlsOverlay(
+@@ -3063,6 +3067,7 @@ private fun PlayerControlsOverlay(
                                  }
                              }
                      ) {
@@ -98,7 +103,7 @@ index 11b8346e9..b26eb8536 100644
                          PlayerControlsProgressBarHost(
                              viewModel = viewModel,
                              chapters = uiState.chapters,
-@@ -3067,6 +3072,16 @@ private fun PlayerControlsOverlay(
+@@ -3269,6 +3274,16 @@ private fun PlayerControlsOverlay(
                                  onDownKey = onHideControls,
                                  onFocused = onResetHideTimer
                              )
@@ -115,39 +120,39 @@ index 11b8346e9..b26eb8536 100644
                              if (uiState.playbackIssueReportsEnabled) {
                                  ReportControlButton(
                                      reportId = uiState.playbackIssueReportId,
-@@ -3490,7 +3505,8 @@ private fun SeekOverlay(
-     currentPosition: Long,
+@@ -3701,7 +3716,8 @@ private fun SeekOverlay(
      duration: Long,
      bufferedPosition: Long = 0L,
--    chapters: List<PlayerChapter> = emptyList()
-+    chapters: List<PlayerChapter> = emptyList(),
+     chapters: List<PlayerChapter> = emptyList(),
+-    showChapterTitle: Boolean = true
++    showChapterTitle: Boolean = true,
 +    preview: @Composable () -> Unit = {} // Nuvio fork: seek previews
  ) {
      Column(
          modifier = Modifier
-@@ -3498,6 +3514,7 @@ private fun SeekOverlay(
+@@ -3709,6 +3725,7 @@ private fun SeekOverlay(
              .padding(horizontal = NuvioTheme.spacing.xxl, vertical = NuvioTheme.spacing.xl)
      ) {
          CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
 +            preview() // Nuvio fork: seek previews
-             ChapterTitle(chapters = chapters, positionMs = currentPosition)
-             ProgressBar(
-                 currentPosition = currentPosition,
-@@ -3533,7 +3550,8 @@ private fun SeekOverlayHost(viewModel: PlayerViewModel, chapters: List<PlayerCha
-         currentPosition = playbackTimeline.currentPosition,
+             if (showChapterTitle) {
+                 ChapterTitle(chapters = chapters, positionMs = currentPosition)
+             }
+@@ -3751,7 +3768,8 @@ private fun SeekOverlayHost(
          duration = playbackTimeline.duration,
          bufferedPosition = playbackTimeline.bufferedPosition,
--        chapters = chapters
-+        chapters = chapters,
+         chapters = chapters,
+-        showChapterTitle = showChapterTitle
++        showChapterTitle = showChapterTitle,
 +        preview = { com.nuvio.tv.ui.screens.player.seekpreview.SeekPreviewThumbnailHost(viewModel = viewModel) } // Nuvio fork: seek previews
      )
  }
  
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerViewModel.kt
-index e0066e8c0..d6106653b 100644
+index 7e0ad0961a..d97562665b 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerViewModel.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerViewModel.kt
-@@ -203,6 +203,9 @@ class PlayerViewModel @Inject constructor(
+@@ -208,6 +208,9 @@ class PlayerViewModel @Inject constructor(
          scope = viewModelScope
      )
  
@@ -157,7 +162,7 @@ index e0066e8c0..d6106653b 100644
      val uiState: StateFlow<PlayerUiState>
          get() = controller.uiState
  
-@@ -289,7 +292,7 @@ class PlayerViewModel @Inject constructor(
+@@ -301,7 +304,7 @@ class PlayerViewModel @Inject constructor(
      }
  
      fun onEvent(event: PlayerEvent) {
@@ -168,7 +173,7 @@ index e0066e8c0..d6106653b 100644
      fun playerMediaInfo(): PlayerMediaInfo = controller.playerMediaInfo()
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/SeekPreviewForkHooks.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/SeekPreviewForkHooks.kt
 new file mode 100644
-index 000000000..b1d8f4acb
+index 0000000000..b1d8f4acbd
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/SeekPreviewForkHooks.kt
 @@ -0,0 +1,31 @@
@@ -205,7 +210,7 @@ index 000000000..b1d8f4acb
 +    get() = Icons.Default.Tune
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/BoundedSeekrTrack.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/BoundedSeekrTrack.kt
 new file mode 100644
-index 000000000..1f383932a
+index 0000000000..1f383932ad
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/BoundedSeekrTrack.kt
 @@ -0,0 +1,178 @@
@@ -389,7 +394,7 @@ index 000000000..1f383932a
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewCueGrid.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewCueGrid.kt
 new file mode 100644
-index 000000000..b5c42fb3f
+index 0000000000..b5c42fb3f4
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewCueGrid.kt
 @@ -0,0 +1,169 @@
@@ -564,7 +569,7 @@ index 000000000..b5c42fb3f
 +internal const val SEEK_PREVIEW_KEYFRAME_SNAP_MS = 1_500L
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewFilmstrip.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewFilmstrip.kt
 new file mode 100644
-index 000000000..2d1d3c230
+index 0000000000..2d1d3c2307
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewFilmstrip.kt
 @@ -0,0 +1,174 @@
@@ -744,7 +749,7 @@ index 000000000..2d1d3c230
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewPlayerHooks.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewPlayerHooks.kt
 new file mode 100644
-index 000000000..2fc030c56
+index 0000000000..2fc030c566
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewPlayerHooks.kt
 @@ -0,0 +1,158 @@
@@ -908,7 +913,7 @@ index 000000000..2fc030c56
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewState.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewState.kt
 new file mode 100644
-index 000000000..164a0394a
+index 0000000000..164a0394a7
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewState.kt
 @@ -0,0 +1,342 @@
@@ -1256,7 +1261,7 @@ index 000000000..164a0394a
 +private const val SCRUB_STEP_MIN_MS = 6_000L
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewSyncConfig.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewSyncConfig.kt
 new file mode 100644
-index 000000000..9003de675
+index 0000000000..9003de675c
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewSyncConfig.kt
 @@ -0,0 +1,35 @@
@@ -1297,7 +1302,7 @@ index 000000000..9003de675
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewSyncOverlay.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewSyncOverlay.kt
 new file mode 100644
-index 000000000..26b9a9bf1
+index 0000000000..26b9a9bf1e
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewSyncOverlay.kt
 @@ -0,0 +1,272 @@
@@ -1575,7 +1580,7 @@ index 000000000..26b9a9bf1
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewThumbnailHost.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewThumbnailHost.kt
 new file mode 100644
-index 000000000..2e74a5960
+index 0000000000..2e74a5960c
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewThumbnailHost.kt
 @@ -0,0 +1,219 @@
@@ -1800,7 +1805,7 @@ index 000000000..2e74a5960
 +private val NoRevision: StateFlow<Int> = MutableStateFlow(0)
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewTrack.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewTrack.kt
 new file mode 100644
-index 000000000..01157574f
+index 0000000000..01157574f2
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekPreviewTrack.kt
 @@ -0,0 +1,119 @@
@@ -1925,7 +1930,7 @@ index 000000000..01157574f
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekrContentMapping.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekrContentMapping.kt
 new file mode 100644
-index 000000000..280bd642b
+index 0000000000..280bd642b1
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekrContentMapping.kt
 @@ -0,0 +1,37 @@
@@ -1968,7 +1973,7 @@ index 000000000..280bd642b
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekrKeyPreferences.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekrKeyPreferences.kt
 new file mode 100644
-index 000000000..9dcaac47e
+index 0000000000..9dcaac47e7
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/SeekrKeyPreferences.kt
 @@ -0,0 +1,72 @@
@@ -2046,7 +2051,7 @@ index 000000000..9dcaac47e
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/KeyframeThumbnailDecoder.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/KeyframeThumbnailDecoder.kt
 new file mode 100644
-index 000000000..6f7c34f80
+index 0000000000..6f7c34f805
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/KeyframeThumbnailDecoder.kt
 @@ -0,0 +1,256 @@
@@ -2308,7 +2313,7 @@ index 000000000..6f7c34f80
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/LocalPreviewSources.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/LocalPreviewSources.kt
 new file mode 100644
-index 000000000..5ea2b41d1
+index 0000000000..5ea2b41d1b
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/LocalPreviewSources.kt
 @@ -0,0 +1,133 @@
@@ -2447,7 +2452,7 @@ index 000000000..5ea2b41d1
 +).joinToString("|")
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/LocalPreviewTrack.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/LocalPreviewTrack.kt
 new file mode 100644
-index 000000000..3a3f7da76
+index 0000000000..3a3f7da769
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/LocalPreviewTrack.kt
 @@ -0,0 +1,655 @@
@@ -3108,7 +3113,7 @@ index 000000000..3a3f7da76
 +private data class CachedFrame(val slot: Int, val keyMs: Long, val bytes: ByteArray, val dark: Boolean)
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/LocalSeekPreviewSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/LocalSeekPreviewSettings.kt
 new file mode 100644
-index 000000000..39cf4578a
+index 0000000000..39cf4578ae
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/LocalSeekPreviewSettings.kt
 @@ -0,0 +1,43 @@
@@ -3157,7 +3162,7 @@ index 000000000..39cf4578a
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/VideoKeyframeTap.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/VideoKeyframeTap.kt
 new file mode 100644
-index 000000000..cbb8b964b
+index 0000000000..cbb8b964bd
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/seekpreview/local/VideoKeyframeTap.kt
 @@ -0,0 +1,250 @@
@@ -3412,20 +3417,20 @@ index 000000000..cbb8b964b
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPlayerSettings.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPlayerSettings.kt
-index c444cab17..32c9777d9 100644
+index c3c18343c6..1ec40a951d 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPlayerSettings.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/PlaybackPlayerSettings.kt
-@@ -169,6 +169,7 @@ internal fun PlaybackPlayerInterfaceSection(
+@@ -187,6 +187,7 @@ internal fun PlaybackPlayerInterfaceSection(
          onToggle = { onUpdate { setParentalGuideEnabled(!settings.parentalGuideEnabled) } },
          enabled = internalPlayer
      )
 +    seekPreviewSettingsRows(enabled = internalPlayer) // Nuvio fork: seek previews
- }
- 
- @Composable
+     // Chapters work on both engines.
+     SettingsToggleRow(
+         title = stringResource(R.string.playback_exo_chapters_title),
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SeekPreviewSettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SeekPreviewSettingsItems.kt
 new file mode 100644
-index 000000000..e80f13523
+index 0000000000..e80f135232
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SeekPreviewSettingsItems.kt
 @@ -0,0 +1,30 @@
@@ -3461,7 +3466,7 @@ index 000000000..e80f13523
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/SeekrKeySettingsItems.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SeekrKeySettingsItems.kt
 new file mode 100644
-index 000000000..155f2e79f
+index 0000000000..155f2e79ff
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/SeekrKeySettingsItems.kt
 @@ -0,0 +1,230 @@
@@ -3697,7 +3702,7 @@ index 000000000..155f2e79f
 +}
 diff --git a/app/src/main/res/values/seek_preview_strings.xml b/app/src/main/res/values/seek_preview_strings.xml
 new file mode 100644
-index 000000000..1aa0732a5
+index 0000000000..1aa0732a50
 --- /dev/null
 +++ b/app/src/main/res/values/seek_preview_strings.xml
 @@ -0,0 +1,11 @@
@@ -3714,7 +3719,7 @@ index 000000000..1aa0732a5
 +</resources>
 diff --git a/app/src/main/res/values/seekr_key_strings.xml b/app/src/main/res/values/seekr_key_strings.xml
 new file mode 100644
-index 000000000..a7d9226a2
+index 0000000000..a7d9226a20
 --- /dev/null
 +++ b/app/src/main/res/values/seekr_key_strings.xml
 @@ -0,0 +1,15 @@

@@ -1,8 +1,8 @@
 diff --git a/app/src/main/java/com/nuvio/tv/core/player/StreamAutoPlaySelector.kt b/app/src/main/java/com/nuvio/tv/core/player/StreamAutoPlaySelector.kt
-index f86a0a1b4..e5dfe2cfb 100644
+index 8e870c083f..a48ede4c03 100644
 --- a/app/src/main/java/com/nuvio/tv/core/player/StreamAutoPlaySelector.kt
 +++ b/app/src/main/java/com/nuvio/tv/core/player/StreamAutoPlaySelector.kt
-@@ -1,9 +1,15 @@
+@@ -1,6 +1,12 @@
  package com.nuvio.tv.core.player
  
 +import android.util.Log
@@ -11,15 +11,12 @@ index f86a0a1b4..e5dfe2cfb 100644
 +import com.nuvio.tv.core.stream.ContentIdentityGuard
 +import com.nuvio.tv.core.stream.ReleaseFactsParser
 +import com.nuvio.tv.core.stream.isOverResolutionCap
++import com.nuvio.tv.domain.model.ReleaseResolution
+ import com.nuvio.tv.core.usenet.BuiltInUsenetService
  import com.nuvio.tv.data.local.StreamAutoPlayMode
  import com.nuvio.tv.data.local.StreamAutoPlaySource
- import com.nuvio.tv.domain.model.AddonStreams
-+import com.nuvio.tv.domain.model.ReleaseResolution
- import com.nuvio.tv.domain.model.Stream
- import com.nuvio.tv.domain.model.StreamDebridCacheState
- 
-@@ -55,8 +61,68 @@ object StreamAutoPlaySelector {
-             (AppFeaturePolicy.inAppTrailerPlaybackEnabled && stream.youTubeIdToResolve() != null)
+@@ -80,6 +86,50 @@ object StreamAutoPlaySelector {
+         return index?.let { playableStreams[it] }
      }
  
 +    /**
@@ -54,8 +51,6 @@ index f86a0a1b4..e5dfe2cfb 100644
 +                identity = identity
 +            )
 +            if (rejection != null) {
-+                // Every rejection is logged so the guard's false-positive rate is measurable
-+                // (KE Spec 65 P3); a screen that re-selects as streams arrive logs it again.
 +                Log.i(
 +                    AUTO_PLAY_IDENTITY_TAG,
 +                    "reject=$rejection addon=${stream.addonName} name=${ContentIdentityGuard.releaseNameOf(stream)}"
@@ -65,30 +60,13 @@ index f86a0a1b4..e5dfe2cfb 100644
 +        }
 +        return true
 +    }
- 
--
++
 +    private const val AUTO_PLAY_IDENTITY_TAG = "AutoPlayIdentity"
 +
-+    /**
-+     * Selects the stream to auto-play, or null for the picker.
-+     *
-+     * Nuvio-KE port (quality-ranked auto-select with pre-play stream checks): [identity] and
-+     * [resolutionCap] carry the pre-selection checks every auto candidate must pass (see
-+     * [passesPreSelectionChecks]); a candidate that fails one is skipped and the next one is
-+     * tried, and when every candidate fails the caller shows the picker. With "Prefer best
-+     * picture" on, the survivors are ordered with KE's full quality ladder
-+     * ([StreamQualityRank.rank]: suspect guard, then resolution -> quality label -> release
-+     * group -> visual/audio formats -> channels -> encode -> size -> container), which also
-+     * drops the shipped default exclusions (CAM/TS/TC/SCR, 3D layouts, AI, AV1, TRaSH LQ
-+     * groups) and falls back to the unfiltered pool when that would empty it (KE's
-+     * `.ifEmpty { streams }`), and demotes fake-quality / implausible-size suspects below the
-+     * rest — for a film ([filmSizeFloors]) under the higher film size floors. This replaces the
-+     * fork's previous single-regex picture-quality score; the toggle itself is unchanged.
-+     */
-     fun selectAutoPlayStream(
-         streams: List<Stream>,
-         mode: StreamAutoPlayMode,
-@@ -67,7 +133,10 @@ object StreamAutoPlaySelector {
+     /**
+      * Filename and info-hash binge matches run as soon as a stream arrives, before a
+      * torrent's debrid check finishes. Addon groups stay an exact string and are not
+@@ -105,7 +155,10 @@ object StreamAutoPlaySelector {
          selectedPlugins: Set<String>,
          preferredBingeGroup: String? = null,
          preferBingeGroupInSelection: Boolean = false,
@@ -100,12 +78,11 @@ index f86a0a1b4..e5dfe2cfb 100644
      ): Stream? {
          if (streams.isEmpty()) return null
  
-@@ -93,25 +162,29 @@ object StreamAutoPlaySelector {
+@@ -132,15 +185,16 @@ object StreamAutoPlaySelector {
+                 selectedPlugins.isEmpty() || stream.addonName in selectedPlugins
              }
          }
-         if (scopedCandidates.isEmpty()) return null
 -        // Nuvio fork: "Prefer best picture" ranks by resolution and codec first; the sort is stable, so ties keep addon order.
-+
 +        // Nuvio-KE port: the gated, playable pool every mode picks from (KE's
 +        // AutoPlaySelection.candidates + isPlayable). The quality rank inside the
 +        // "prefer best picture" branch below is stable, so ties keep addon order.
@@ -123,35 +100,9 @@ index f86a0a1b4..e5dfe2cfb 100644
 -            scopedCandidates
 +            playableCandidates
          }
- 
          // Binge group matching takes priority over mode and source filters — even in MANUAL mode,
          // a persisted binge group should auto-play without showing the picker.
-         // Search ALL streams, not just candidateStreams, since binge group reuse should
--        // not be limited by autoplay source/addon selection filters.
-+        // not be limited by autoplay source/addon selection filters. The pre-selection
-+        // checks still apply (KE gates its binge match too: Spec 65 P5/P3).
-         val targetBingeGroup = preferredBingeGroup?.trim().orEmpty()
-         if (preferBingeGroupInSelection && targetBingeGroup.isNotEmpty()) {
-             val bingeGroupMatch = streams.firstOrNull { stream ->
-                 !stream.isExternal() &&
-+                    passesPreSelectionChecks(stream, identity, resolutionCap) &&
-                     stream.behaviorHints?.bingeGroup == targetBingeGroup &&
-                     isPlayable(stream)
-             }
-@@ -128,10 +201,10 @@ object StreamAutoPlaySelector {
- 
-         return when (mode) {
-             StreamAutoPlayMode.MANUAL -> null
--            StreamAutoPlayMode.FIRST_STREAM -> candidateStreams.firstOrNull { isPlayable(it) }
-+            StreamAutoPlayMode.FIRST_STREAM -> candidateStreams.firstOrNull()
-             StreamAutoPlayMode.REGEX_MATCH -> {
-                 val pattern = regexPattern.trim()
-- 
-+
-                 // Try to compile the user regex
-                 val userRegex = runCatching { Regex(pattern, RegexOption.IGNORE_CASE) }.getOrNull()
-                 if (userRegex == null) return null
-@@ -149,10 +222,8 @@ object StreamAutoPlaySelector {
+@@ -186,10 +240,8 @@ object StreamAutoPlaySelector {
                      Regex("\\b(${exclusionWords.joinToString("|")})\\b", RegexOption.IGNORE_CASE)
                  } else null
  
@@ -163,7 +114,7 @@ index f86a0a1b4..e5dfe2cfb 100644
                      val searchableText = buildString {
                          append(stream.addonName).append(' ')
                          append(stream.name.orEmpty()).append(' ')
-@@ -174,7 +245,7 @@ object StreamAutoPlaySelector {
+@@ -211,7 +263,7 @@ object StreamAutoPlaySelector {
                  }
  
                  if (matchingStreams.isEmpty()) return null
@@ -174,7 +125,7 @@ index f86a0a1b4..e5dfe2cfb 100644
          }
 diff --git a/app/src/main/java/com/nuvio/tv/core/player/StreamQualityRank.kt b/app/src/main/java/com/nuvio/tv/core/player/StreamQualityRank.kt
 new file mode 100644
-index 000000000..d18257ca1
+index 0000000000..d18257ca1b
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/player/StreamQualityRank.kt
 @@ -0,0 +1,71 @@
@@ -251,7 +202,7 @@ index 000000000..d18257ca1
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/core/stream/ContentIdentityGuard.kt b/app/src/main/java/com/nuvio/tv/core/stream/ContentIdentityGuard.kt
 new file mode 100644
-index 000000000..98564aa3c
+index 0000000000..98564aa3c7
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/stream/ContentIdentityGuard.kt
 @@ -0,0 +1,167 @@
@@ -424,7 +375,7 @@ index 000000000..98564aa3c
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/core/stream/ReleaseEditions.kt b/app/src/main/java/com/nuvio/tv/core/stream/ReleaseEditions.kt
 new file mode 100644
-index 000000000..e78d7be84
+index 0000000000..e78d7be844
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/stream/ReleaseEditions.kt
 @@ -0,0 +1,50 @@
@@ -480,7 +431,7 @@ index 000000000..e78d7be84
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/core/stream/ReleaseFactsParser.kt b/app/src/main/java/com/nuvio/tv/core/stream/ReleaseFactsParser.kt
 new file mode 100644
-index 000000000..0e7d1462e
+index 0000000000..0e7d1462eb
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/stream/ReleaseFactsParser.kt
 @@ -0,0 +1,569 @@
@@ -1055,7 +1006,7 @@ index 000000000..0e7d1462e
 +)
 diff --git a/app/src/main/java/com/nuvio/tv/core/stream/ReleaseLanguages.kt b/app/src/main/java/com/nuvio/tv/core/stream/ReleaseLanguages.kt
 new file mode 100644
-index 000000000..a5a64825c
+index 0000000000..a5a64825c5
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/stream/ReleaseLanguages.kt
 @@ -0,0 +1,59 @@
@@ -1120,7 +1071,7 @@ index 000000000..a5a64825c
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/core/stream/ResolutionLimit.kt b/app/src/main/java/com/nuvio/tv/core/stream/ResolutionLimit.kt
 new file mode 100644
-index 000000000..5313e69b2
+index 0000000000..5313e69b2a
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/stream/ResolutionLimit.kt
 @@ -0,0 +1,96 @@
@@ -1222,7 +1173,7 @@ index 000000000..5313e69b2
 +}.getOrNull()
 diff --git a/app/src/main/java/com/nuvio/tv/core/stream/TrashReleaseGroups.kt b/app/src/main/java/com/nuvio/tv/core/stream/TrashReleaseGroups.kt
 new file mode 100644
-index 000000000..fd3926ed9
+index 0000000000..fd3926ed95
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/stream/TrashReleaseGroups.kt
 @@ -0,0 +1,76 @@
@@ -1304,7 +1255,7 @@ index 000000000..fd3926ed9
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/domain/model/ReleaseTags.kt b/app/src/main/java/com/nuvio/tv/domain/model/ReleaseTags.kt
 new file mode 100644
-index 000000000..5e2a6825a
+index 0000000000..5e2a6825af
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/domain/model/ReleaseTags.kt
 @@ -0,0 +1,143 @@
@@ -1452,32 +1403,32 @@ index 000000000..5e2a6825a
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
-index a4ab5add3..4767be392 100644
+index 602ba291f6..ab0de7042b 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
-@@ -1913,6 +1913,21 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
-         try {
-             streamRepository.setLocalPluginSearchPaused(false)
-             val playerSettings = playerSettingsDataStore.playerSettings.first()
-+            // Nuvio-KE port (KE Spec 65 S3/P3): the next episode's identity guards the
-+            // auto-selected stream against release names for another season or episode. A film
-+            // never reaches this path, so the film floors and year check stay off here; the
-+            // release year is not carried per episode, and the guard only reads it for films.
-+            val autoPlayIdentity = com.nuvio.tv.core.stream.ContentIdentity.of(
-+                type = type,
-+                title = state.contentName ?: state.title,
-+                year = null,
-+                season = nextVideo.season,
-+                episode = nextVideo.episode,
-+                videoId = nextVideo.id
-+            )
-+            // Nuvio-KE port (KE Spec 58 F3): the resolution limit defaults to this TV's largest
-+            // display mode; the fork has no user setting for the cap, so KE's default applies.
-+            val resolutionCap = com.nuvio.tv.core.stream.tvMaxResolution(context)
-             val shouldAutoSelectInManualMode =
-                 playerSettings.streamAutoPlayMode == StreamAutoPlayMode.MANUAL &&
-                     (
-@@ -1989,7 +2004,9 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
+@@ -2062,6 +2062,21 @@ internal fun PlayerRuntimeController.preloadNextEpisodeSources() {
+     nextEpisodePreloadJob?.cancel()
+     nextEpisodePreloadJob = scope.launch {
+         Log.d(PlayerRuntimeController.TAG, "Preloading sources for next episode: S${nextVideo.season}E${nextVideo.episode}")
++        // Nuvio-KE port (KE Spec 65 S3/P3): the next episode's identity guards the
++        // auto-selected stream against release names for another season or episode. A film
++        // never reaches this path, so the film floors and year check stay off here; the
++        // release year is not carried per episode, and the guard only reads it for films.
++        val autoPlayIdentity = com.nuvio.tv.core.stream.ContentIdentity.of(
++            type = type,
++            title = state.contentName ?: state.title,
++            year = null,
++            season = nextVideo.season,
++            episode = nextVideo.episode,
++            videoId = nextVideo.id
++        )
++        // Nuvio-KE port (KE Spec 58 F3): the resolution limit defaults to this TV's largest
++        // display mode; the fork has no user setting for the cap, so KE's default applies.
++        val resolutionCap = com.nuvio.tv.core.stream.tvMaxResolution(context)
+         // The plugin-only modes continue a plugin series. After an addon stream they would
+         // narrow the search and keep it from being reused by the episode picker.
+         val continuingPlugin = scraperIdFromPluginBingeGroup(currentStreamBingeGroup) != null
+@@ -2211,7 +2226,9 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
                          null
                      },
                      preferBingeGroupInSelection = playerSettings.streamAutoPlayPreferBingeGroupForNextEpisode,
@@ -1488,7 +1439,7 @@ index a4ab5add3..4767be392 100644
                  )
              }
  
-@@ -2026,7 +2043,9 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
+@@ -2254,7 +2271,9 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
                      selectedPlugins = effectiveSelectedPlugins,
                      preferredBingeGroup = currentStreamBingeGroup,
                      preferBingeGroupInSelection = true,
@@ -1500,7 +1451,7 @@ index a4ab5add3..4767be392 100644
              }
  
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
-index 6b3f7707d..a178e9e4e 100644
+index 86ff09418d..c130a15986 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/stream/StreamScreenViewModel.kt
 @@ -17,6 +17,8 @@ import com.nuvio.tv.core.torrent.TorrentService
@@ -1511,9 +1462,9 @@ index 6b3f7707d..a178e9e4e 100644
 +import com.nuvio.tv.core.stream.tvMaxResolution
  import com.nuvio.tv.core.tracking.TrackingMediaKind
  import com.nuvio.tv.core.tracking.TrackingMediaReference
- import com.nuvio.tv.core.tracking.TrackingScrobbleAction
-@@ -637,6 +639,24 @@ class StreamScreenViewModel @Inject constructor(
-             }
+ import com.nuvio.tv.core.tracking.TrackingScrobbleCoordinator
+@@ -698,6 +700,24 @@ class StreamScreenViewModel @Inject constructor(
+             autoPlayInstalledAddonNames = installedAddonOrder.toSet()
              val directDebridSourceNames = emptyList<String>()
              val directDebridAvailable = false
 +            // Nuvio-KE port (KE Spec 65 S3): what this screen was asked to play. The identity
@@ -1537,19 +1488,7 @@ index 6b3f7707d..a178e9e4e 100644
              val persistedBingeGroup = if (playerSettings.streamAutoPlayPreferBingeGroupForNextEpisode &&
                  playerSettings.streamAutoPlayReuseBingeGroup) {
                  contentId?.let { bingeGroupCacheDataStore.get(it) }
-@@ -729,7 +749,10 @@ class StreamScreenViewModel @Inject constructor(
-                                 stream.infoHash?.equals(persistedInfoHash, ignoreCase = true) == true
-                         }
-                     } else null
--                    // Fall back to binge group alone
-+                    // Fall back to binge group alone. Nuvio-KE port: the exact filename/infoHash
-+                    // match above continues the stream the viewer actually watched, so it is
-+                    // deliberately not second-guessed by the pre-selection checks (KE D2); the
-+                    // fallback pick below is an auto choice and is gated and ranked.
-                     bingeAndFilename ?: bingeAndInfoHash ?: StreamAutoPlaySelector.selectAutoPlayStream(
-                         streams = allStreams,
-                         mode = playerSettings.streamAutoPlayMode,
-@@ -740,7 +763,9 @@ class StreamScreenViewModel @Inject constructor(
+@@ -807,7 +827,9 @@ class StreamScreenViewModel @Inject constructor(
                          selectedPlugins = playerSettings.streamAutoPlaySelectedPlugins,
                          preferredBingeGroup = persistedBingeGroup,
                          preferBingeGroupInSelection = true,
@@ -1560,7 +1499,7 @@ index 6b3f7707d..a178e9e4e 100644
                      )
                  } else null
  
-@@ -763,7 +788,11 @@ class StreamScreenViewModel @Inject constructor(
+@@ -830,7 +852,11 @@ class StreamScreenViewModel @Inject constructor(
                          selectedAddons = playerSettings.streamAutoPlaySelectedAddons,
                          selectedPlugins = playerSettings.streamAutoPlaySelectedPlugins,
                          preferredBingeGroup = persistedBingeGroup,
@@ -1573,7 +1512,7 @@ index 6b3f7707d..a178e9e4e 100644
                      )
                  }
                  if (selectedAutoPlayStream != null) {
-@@ -967,7 +996,9 @@ class StreamScreenViewModel @Inject constructor(
+@@ -1039,7 +1065,9 @@ class StreamScreenViewModel @Inject constructor(
                                      selectedPlugins = playerSettings.streamAutoPlaySelectedPlugins,
                                      preferredBingeGroup = persistedBingeGroup,
                                      preferBingeGroupInSelection = true,

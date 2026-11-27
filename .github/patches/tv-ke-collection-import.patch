@@ -1,5 +1,5 @@
 diff --git a/app/src/main/java/com/nuvio/tv/data/local/CollectionsDataStore.kt b/app/src/main/java/com/nuvio/tv/data/local/CollectionsDataStore.kt
-index 30bfe04fc..5010ad07f 100644
+index 30bfe04fc5..5010ad07f5 100644
 --- a/app/src/main/java/com/nuvio/tv/data/local/CollectionsDataStore.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/local/CollectionsDataStore.kt
 @@ -31,11 +31,22 @@ import java.util.UUID
@@ -247,10 +247,10 @@ index 30bfe04fc..5010ad07f 100644
  
      private fun parseCollections(json: String?): List<Collection> {
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/collection/CollectionManagementScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/collection/CollectionManagementScreen.kt
-index 82e2981f6..f1c1fae8e 100644
+index af635ad88f..398abea372 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/collection/CollectionManagementScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/collection/CollectionManagementScreen.kt
-@@ -68,6 +68,8 @@ import androidx.tv.material3.MaterialTheme
+@@ -72,6 +72,8 @@ import androidx.tv.material3.MaterialTheme
  import androidx.tv.material3.Surface
  import androidx.tv.material3.SurfaceDefaults
  import androidx.tv.material3.Text
@@ -259,7 +259,7 @@ index 82e2981f6..f1c1fae8e 100644
  import com.nuvio.tv.data.local.ValidationResult
  import com.nuvio.tv.domain.model.Collection
  import com.nuvio.tv.ui.components.LoadingIndicator
-@@ -76,6 +78,7 @@ import com.nuvio.tv.ui.util.contentTextDirection
+@@ -83,6 +85,7 @@ import com.nuvio.tv.ui.util.contentTextDirection
  import com.nuvio.tv.R
  import androidx.compose.ui.res.stringResource
  import androidx.compose.ui.text.style.TextDirection
@@ -267,7 +267,7 @@ index 82e2981f6..f1c1fae8e 100644
  import androidx.compose.ui.text.TextStyle
  import kotlinx.coroutines.Dispatchers
  import kotlinx.coroutines.launch
-@@ -551,7 +554,8 @@ private fun ImportContent(
+@@ -658,7 +661,8 @@ internal fun ImportContent(
                  }
              }
  
@@ -277,16 +277,17 @@ index 82e2981f6..f1c1fae8e 100644
              if (validationResult != null && validationResult.valid) {
                  item {
                      Spacer(modifier = Modifier.height(NuvioTheme.spacing.lg))
-@@ -565,6 +569,8 @@ private fun ImportContent(
+@@ -672,6 +676,9 @@ internal fun ImportContent(
                          modifier = Modifier.fillMaxWidth()
                      ) {
                          Column(modifier = Modifier.padding(NuvioTheme.spacing.lg)) {
 +                            val warningCount = validationResult.items.count { it.status == CollectionImportItemStatus.WARNING }
 +                            val skippedCount = validationResult.items.count { it.status == CollectionImportItemStatus.SKIPPED }
++                            val skippedCount = validationResult.items.count { it.status == CollectionImportItemStatus.SKIPPED }
                              Text(
                                  text = stringResource(R.string.collections_valid_json),
                                  style = MaterialTheme.typography.titleMedium,
-@@ -576,6 +582,31 @@ private fun ImportContent(
+@@ -683,6 +690,31 @@ internal fun ImportContent(
                                  style = MaterialTheme.typography.bodyMedium,
                                  color = NuvioTheme.colors.TextSecondary
                              )
@@ -316,9 +317,9 @@ index 82e2981f6..f1c1fae8e 100644
 +                                )
 +                            }
                              Spacer(modifier = Modifier.height(NuvioTheme.spacing.md))
-                             NuvioButton(onClick = onConfirmImport) {
-                                 Text(stringResource(R.string.collections_confirm_import))
-@@ -599,6 +630,53 @@ private fun ImportContent(
+                             NuvioButton(
+                                 onClick = onConfirmImport,
+@@ -708,6 +740,53 @@ internal fun ImportContent(
      }
  }
  
@@ -373,36 +374,10 @@ index 82e2981f6..f1c1fae8e 100644
  @Composable
  private fun CollectionListItem(
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/collection/CollectionManagementViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/collection/CollectionManagementViewModel.kt
-index 9649cda18..c09794c96 100644
+index f0c669a358..c20ff328c0 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/collection/CollectionManagementViewModel.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/collection/CollectionManagementViewModel.kt
-@@ -8,16 +8,25 @@ import com.nuvio.tv.core.sync.CollectionSyncService
- import com.nuvio.tv.data.local.CollectionsDataStore
- import com.nuvio.tv.data.local.ValidationResult
- import com.nuvio.tv.domain.model.Collection
-+import com.nuvio.tv.domain.model.enabledAddons
-+import com.nuvio.tv.domain.repository.AddonRepository
- import dagger.hilt.android.lifecycle.HiltViewModel
- import dagger.hilt.android.qualifiers.ApplicationContext
-+import kotlinx.coroutines.CancellationException
- import kotlinx.coroutines.Dispatchers
-+import kotlinx.coroutines.Job
- import kotlinx.coroutines.flow.MutableStateFlow
- import kotlinx.coroutines.flow.StateFlow
- import kotlinx.coroutines.flow.asStateFlow
- import kotlinx.coroutines.flow.collectLatest
-+import kotlinx.coroutines.flow.first
- import kotlinx.coroutines.flow.update
- import kotlinx.coroutines.launch
- import kotlinx.coroutines.withContext
-+import okhttp3.OkHttpClient
-+import okhttp3.ResponseBody
-+import java.io.IOException
-+import java.util.concurrent.TimeUnit
- import javax.inject.Inject
- 
- enum class ImportMode { PASTE, FILE, URL }
-@@ -41,6 +50,8 @@ data class CollectionManagementUiState(
+@@ -45,6 +45,8 @@ data class CollectionManagementUiState(
  class CollectionManagementViewModel @Inject constructor(
      private val collectionsDataStore: CollectionsDataStore,
      private val collectionSyncService: CollectionSyncService,
@@ -411,7 +386,7 @@ index 9649cda18..c09794c96 100644
      @ApplicationContext private val context: Context
  ) : ViewModel() {
  
-@@ -98,6 +109,7 @@ class CollectionManagementViewModel @Inject constructor(
+@@ -203,6 +205,7 @@ class CollectionManagementViewModel @Inject constructor(
      }
  
      fun showImportDialog() {
@@ -419,7 +394,7 @@ index 9649cda18..c09794c96 100644
          _uiState.update {
              it.copy(
                  showImportDialog = true, importText = "", importError = null,
-@@ -108,6 +120,7 @@ class CollectionManagementViewModel @Inject constructor(
+@@ -213,6 +216,7 @@ class CollectionManagementViewModel @Inject constructor(
      }
  
      fun hideImportDialog() {
@@ -427,7 +402,7 @@ index 9649cda18..c09794c96 100644
          _uiState.update {
              it.copy(
                  showImportDialog = false, importText = "", importError = null,
-@@ -118,7 +131,9 @@ class CollectionManagementViewModel @Inject constructor(
+@@ -223,7 +227,9 @@ class CollectionManagementViewModel @Inject constructor(
      }
  
      fun updateImportText(text: String) {
@@ -438,7 +413,7 @@ index 9649cda18..c09794c96 100644
      }
  
      fun importCollections() {
-@@ -133,25 +148,20 @@ class CollectionManagementViewModel @Inject constructor(
+@@ -238,25 +244,20 @@ class CollectionManagementViewModel @Inject constructor(
              return
          }
          viewModelScope.launch {
@@ -471,7 +446,7 @@ index 9649cda18..c09794c96 100644
          }
      }
  
-@@ -161,8 +171,13 @@ class CollectionManagementViewModel @Inject constructor(
+@@ -266,8 +267,13 @@ class CollectionManagementViewModel @Inject constructor(
          }
      }
  
@@ -487,7 +462,7 @@ index 9649cda18..c09794c96 100644
          _uiState.update {
              if (result.valid) {
                  it.copy(validationResult = result, validatedJson = json, importError = null)
-@@ -173,32 +188,42 @@ class CollectionManagementViewModel @Inject constructor(
+@@ -278,32 +284,42 @@ class CollectionManagementViewModel @Inject constructor(
      }
  
      fun validateCurrentText() {
@@ -540,7 +515,7 @@ index 9649cda18..c09794c96 100644
                      }
                  }
                  if (body == null) {
-@@ -215,6 +240,8 @@ class CollectionManagementViewModel @Inject constructor(
+@@ -320,6 +336,8 @@ class CollectionManagementViewModel @Inject constructor(
                  }
                  _uiState.update { it.copy(importText = body, isLoadingImport = false) }
                  validateJson(body)
@@ -549,7 +524,7 @@ index 9649cda18..c09794c96 100644
              } catch (e: Exception) {
                  _uiState.update {
                      it.copy(
-@@ -241,17 +268,9 @@ class CollectionManagementViewModel @Inject constructor(
+@@ -346,17 +364,9 @@ class CollectionManagementViewModel @Inject constructor(
              return
          }
          viewModelScope.launch {
@@ -570,7 +545,7 @@ index 9649cda18..c09794c96 100644
              collectionSyncService.triggerPush()
              _uiState.update {
                  it.copy(
-@@ -264,7 +283,8 @@ class CollectionManagementViewModel @Inject constructor(
+@@ -369,7 +379,8 @@ class CollectionManagementViewModel @Inject constructor(
      }
  
      fun loadFromFile(context: android.content.Context) {
@@ -580,7 +555,7 @@ index 9649cda18..c09794c96 100644
              _uiState.update { it.copy(isLoadingImport = true, importError = null) }
              try {
                  val content = withContext(Dispatchers.IO) {
-@@ -285,6 +305,8 @@ class CollectionManagementViewModel @Inject constructor(
+@@ -390,6 +401,8 @@ class CollectionManagementViewModel @Inject constructor(
                  }
                  _uiState.update { it.copy(importText = content, isLoadingImport = false) }
                  validateJson(content)
@@ -589,7 +564,7 @@ index 9649cda18..c09794c96 100644
              } catch (e: Exception) {
                  _uiState.update {
                      it.copy(
-@@ -326,4 +348,25 @@ class CollectionManagementViewModel @Inject constructor(
+@@ -431,4 +444,25 @@ class CollectionManagementViewModel @Inject constructor(
          val file = java.io.File(downloadsDir, "nuvio-collections.json")
          return if (file.exists()) file.readText() else null
      }
@@ -615,26 +590,8 @@ index 9649cda18..c09794c96 100644
 +    }
 +    return string()
  }
-diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index d0e9faf93..ed62ea65b 100644
---- a/app/src/main/res/values/strings.xml
-+++ b/app/src/main/res/values/strings.xml
-@@ -2696,6 +2696,13 @@
-     <string name="collections_valid_summary">%1$d collection(s), %2$d folder(s)</string>
-     <string name="collections_confirm_import">Confirm Import</string>
-     <string name="collections_folder_count">%1$d folder(s)</string>
-+    <string name="collections_import_item_label">Item %1$d</string>
-+    <string name="collections_import_status_ok">Ready</string>
-+    <string name="collections_import_status_warning">Warning</string>
-+    <string name="collections_import_status_skipped">Skipped</string>
-+    <string name="collections_import_review_counts">%1$d item(s) with warnings, %2$d skipped</string>
-+    <string name="collections_import_items_note">Skipped items are not imported. Items with warnings import without the broken parts.</string>
-+    <string name="collections_import_missing_addons">Addons not installed: %1$s</string>
- 
-     <!-- Collection Editor -->
-     <string name="collections_editor_row_title">Row Title</string>
 diff --git a/app/src/test/java/com/nuvio/tv/data/local/CollectionsDataStoreSourceMigrationTest.kt b/app/src/test/java/com/nuvio/tv/data/local/CollectionsDataStoreSourceMigrationTest.kt
-index e330cf2bc..c7b01b563 100644
+index e330cf2bce..c7b01b5632 100644
 --- a/app/src/test/java/com/nuvio/tv/data/local/CollectionsDataStoreSourceMigrationTest.kt
 +++ b/app/src/test/java/com/nuvio/tv/data/local/CollectionsDataStoreSourceMigrationTest.kt
 @@ -11,7 +11,6 @@ import com.nuvio.tv.domain.model.TraktCollectionSource

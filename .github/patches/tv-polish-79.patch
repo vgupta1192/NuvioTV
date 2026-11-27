@@ -1,6 +1,6 @@
 diff --git a/app/src/main/java/com/nuvio/tv/core/diagnostics/DebugReport.kt b/app/src/main/java/com/nuvio/tv/core/diagnostics/DebugReport.kt
 new file mode 100644
-index 000000000..16ad44afd
+index 0000000000..16ad44afd8
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/diagnostics/DebugReport.kt
 @@ -0,0 +1,197 @@
@@ -201,70 +201,8 @@ index 000000000..16ad44afd
 +        return out
 +    }
 +}
-diff --git a/app/src/main/java/com/nuvio/tv/core/network/NetworkConnectionKind.kt b/app/src/main/java/com/nuvio/tv/core/network/NetworkConnectionKind.kt
-new file mode 100644
-index 000000000..36a0ff47c
---- /dev/null
-+++ b/app/src/main/java/com/nuvio/tv/core/network/NetworkConnectionKind.kt
-@@ -0,0 +1,35 @@
-+package com.nuvio.tv.core.network
-+
-+internal enum class NetworkConnectionKind { Wifi, Ethernet, Offline }
-+
-+internal enum class NetworkTransport { Wifi, Ethernet, Cellular, Vpn }
-+
-+/**
-+ * Before Android 9 a VPN's capabilities do not include the underlying Wi-Fi or
-+ * Ethernet transport. The active network is then only [NetworkTransport.Vpn],
-+ * which would otherwise look offline. Use another reported network for the label.
-+ * Android 9 and later can put the underlying transport on the VPN itself.
-+ *
-+ * [others] is read only when the active network is a VPN with no physical transport.
-+ */
-+internal fun networkConnectionKind(
-+    active: Set<NetworkTransport>?,
-+    others: () -> List<Set<NetworkTransport>> = { emptyList() },
-+): NetworkConnectionKind {
-+    if (active == null) return NetworkConnectionKind.Offline
-+    physicalConnection(active)?.let { return it }
-+    if (NetworkTransport.Vpn !in active) return NetworkConnectionKind.Offline
-+    val underlying = others().mapNotNull { physicalConnection(it) }
-+    return underlying.firstOrNull { it == NetworkConnectionKind.Ethernet }
-+        ?: underlying.firstOrNull()
-+        ?: NetworkConnectionKind.Offline
-+}
-+
-+private fun physicalConnection(transports: Set<NetworkTransport>): NetworkConnectionKind? {
-+    return when {
-+        NetworkTransport.Ethernet in transports -> NetworkConnectionKind.Ethernet
-+        NetworkTransport.Wifi in transports -> NetworkConnectionKind.Wifi
-+        NetworkTransport.Cellular in transports -> NetworkConnectionKind.Wifi
-+        else -> null
-+    }
-+}
-diff --git a/app/src/main/java/com/nuvio/tv/core/util/AppLogo.kt b/app/src/main/java/com/nuvio/tv/core/util/AppLogo.kt
-new file mode 100644
-index 000000000..6623fe910
---- /dev/null
-+++ b/app/src/main/java/com/nuvio/tv/core/util/AppLogo.kt
-@@ -0,0 +1,15 @@
-+package com.nuvio.tv.core.util
-+
-+import android.content.Context
-+import com.nuvio.tv.R
-+
-+/**
-+ * Raw bytes of the app wordmark image, served to the web-config pages,
-+ * or null when the resource cannot be read.
-+ */
-+fun Context.readAppLogoBytes(): ByteArray? =
-+    try {
-+        resources.openRawResource(R.drawable.app_logo_wordmark).use { it.readBytes() }
-+    } catch (_: Exception) {
-+        null
-+    }
 diff --git a/app/src/main/java/com/nuvio/tv/reshaped/debuglog/DebugLogServer.kt b/app/src/main/java/com/nuvio/tv/reshaped/debuglog/DebugLogServer.kt
-index d3c1b72eb..92023afa7 100644
+index d3c1b72eb7..92023afa7a 100644
 --- a/app/src/main/java/com/nuvio/tv/reshaped/debuglog/DebugLogServer.kt
 +++ b/app/src/main/java/com/nuvio/tv/reshaped/debuglog/DebugLogServer.kt
 @@ -17,6 +17,7 @@ internal class DebugLogServer(
@@ -314,7 +252,7 @@ index d3c1b72eb..92023afa7 100644
                  }
              }
 diff --git a/app/src/main/java/com/nuvio/tv/ui/reshaped/debuglog/DebugLogQrDialog.kt b/app/src/main/java/com/nuvio/tv/ui/reshaped/debuglog/DebugLogQrDialog.kt
-index 7bd23e2ed..861b3e329 100644
+index 7bd23e2ed8..861b3e329d 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/reshaped/debuglog/DebugLogQrDialog.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/reshaped/debuglog/DebugLogQrDialog.kt
 @@ -8,6 +8,9 @@ import androidx.compose.foundation.layout.fillMaxWidth
@@ -346,8 +284,42 @@ index 7bd23e2ed..861b3e329 100644
                          running = server
                          if (server == null) {
                              DebugLogQrState(null, null, context.getString(R.string.error_server_ports_unavailable))
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
+index 4aa9e92c96..5b12de9b95 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
+@@ -2113,6 +2113,15 @@ private fun MetaDetailsContent(
+     val ratedImdbId = remember(meta.id, meta.imdbId) { ratingImdbId(meta.id, meta.imdbId) }
+     val ratingContext = androidx.compose.ui.platform.LocalContext.current
+     var showUserRatingDialog by remember { mutableStateOf(false) }
++    val ratePrompt by com.nuvio.tv.ui.screens.player.MovieRatingPromptBus.request.collectAsStateWithLifecycle()
++    val ratePromptEnabled by ratingViewModel.promptEnabled.collectAsStateWithLifecycle()
++    LaunchedEffect(ratePrompt, ratePromptEnabled, ratedImdbId) {
++        val request = ratePrompt ?: return@LaunchedEffect
++        if (request.contentId == meta.id && ratePromptEnabled && ratedImdbId != null && ratingViewModel.canRate()) {
++            showUserRatingDialog = true
++        }
++        com.nuvio.tv.ui.screens.player.MovieRatingPromptBus.consume()
++    }
+     val seasonPosterStyle = remember(seasonPostersEnabled, meta, seasons) {
+         if (!seasonPostersEnabled) {
+             null
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
+index 7090456022..86b8ce4c53 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
+@@ -988,6 +988,9 @@ internal fun PlayerRuntimeController.handleNaturalPlaybackEnded() {
+     } else {
+         saveWatchProgress(naturalEnd = true)
+     }
++    if (contentType.equals("movie", ignoreCase = true)) {
++        contentId?.let(MovieRatingPromptBus::request)
++    }
+     resetPostPlayStateAfterPlaybackEnded()
+ }
+ 
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginViewModel.kt
-index cd258b36f..c97a69dd6 100644
+index 13c6583e35..999559cb8a 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginViewModel.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/plugin/PluginViewModel.kt
 @@ -4,6 +4,7 @@ import android.content.Context
@@ -358,20 +330,8 @@ index cd258b36f..c97a69dd6 100644
  import com.nuvio.tv.core.plugin.PluginManager
  import com.nuvio.tv.core.plugin.PluginSafety
  import com.nuvio.tv.core.profile.ProfileManager
-@@ -46,10 +47,7 @@ class PluginViewModel @Inject constructor(
-     }
- 
-     private fun loadLogoBytes() {
--        try {
--            val inputStream = context.resources.openRawResource(R.drawable.app_logo_wordmark)
--            logoBytes = inputStream.use { it.readBytes() }
--        } catch (_: Exception) { }
-+        logoBytes = context.readAppLogoBytes()
-     }
- 
-     private fun observePluginData() {
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/AboutScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/AboutScreen.kt
-index 54b2c0a5f..9a669cfef 100644
+index 54b2c0a5fa..9a669cfef2 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/AboutScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/AboutScreen.kt
 @@ -75,6 +75,7 @@ fun AboutSettingsContent(
@@ -407,7 +367,7 @@ index 54b2c0a5f..9a669cfef 100644
  }
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/DebugReportViewModel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/DebugReportViewModel.kt
 new file mode 100644
-index 000000000..f94819053
+index 0000000000..f948190534
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/DebugReportViewModel.kt
 @@ -0,0 +1,34 @@
@@ -446,10 +406,10 @@ index 000000000..f94819053
 +    }.getOrElse { "Debug report unavailable (${it.javaClass.simpleName})." }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
-index 50d47fe04..ffa1e367a 100644
+index 298f047e88..4f1396d9b1 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
-@@ -7,6 +7,9 @@ import com.nuvio.tv.ui.theme.NuvioTheme
+@@ -11,6 +11,9 @@ import com.nuvio.tv.ui.util.keepLtr
  
  import android.net.ConnectivityManager
  import android.net.NetworkCapabilities
@@ -459,52 +419,56 @@ index 50d47fe04..ffa1e367a 100644
  import androidx.compose.animation.AnimatedVisibility
  import androidx.compose.animation.core.LinearEasing
  import androidx.compose.animation.core.RepeatMode
-@@ -92,26 +95,32 @@ private interface ProfileManagerEntryPoint {
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt
+index 68d0823eb5..551e5202eb 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/EpisodesSection.kt
+@@ -655,7 +655,8 @@ fun EpisodesRow(
+             lazyListState.scrollToItem(index, scrollOffset = -offsetPx)
+         }
+         repeat(EPISODE_RESTORE_FOCUS_ATTEMPTS) {
+-            val requester = episodeFocusRequesters[restoreEpisodeId]
++            val requester = dedupedEpisodes.firstOrNull { it.episodeListKey == restoreEpisodeId || it.id == restoreEpisodeId }
++                ?.let { episodeFocusRequesters[it.episodeListKey] }
+             if (requester != null && requester.requestFocusAfterFrames(frames = 1)) {
+                 delay(EPISODE_RESTORE_FALLBACK_MS)
+                 onRestoreFocusHandled()
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
+index 5b12de9b95..8b7312a196 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/detail/MetaDetailsScreen.kt
+@@ -1,6 +1,7 @@
+ package com.nuvio.tv.ui.screens.detail
  
- private enum class NetworkTestState { Idle, TestingLatency, TestingDownload, Done, Error }
- 
--private enum class ConnectionType { WiFi, Ethernet, Offline }
--
--private fun getConnectionType(context: android.content.Context): ConnectionType {
--    val cm = context.getSystemService<ConnectivityManager>() ?: return ConnectionType.Offline
--    val network = cm.activeNetwork ?: return ConnectionType.Offline
--    val caps = cm.getNetworkCapabilities(network) ?: return ConnectionType.Offline
--    return when {
--        caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> ConnectionType.Ethernet
--        caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> ConnectionType.WiFi
--        caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> ConnectionType.WiFi // treat cellular as connected
--        else -> ConnectionType.Offline
--    }
-+private fun getConnectionType(context: android.content.Context): NetworkConnectionKind {
-+    val cm = context.getSystemService<ConnectivityManager>() ?: return NetworkConnectionKind.Offline
-+    return runCatching {
-+        fun transportsOf(network: android.net.Network): Set<NetworkTransport>? {
-+            val caps = cm.getNetworkCapabilities(network) ?: return null
-+            return buildSet {
-+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) add(NetworkTransport.Ethernet)
-+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) add(NetworkTransport.Wifi)
-+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) add(NetworkTransport.Cellular)
-+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) add(NetworkTransport.Vpn)
-+            }
-+        }
-+        val active = cm.activeNetwork
-+        networkConnectionKind(
-+            active = active?.let { transportsOf(it) },
-+            others = { cm.allNetworks.filter { it != active }.mapNotNull { transportsOf(it) } }
-+        )
-+    }.getOrDefault(NetworkConnectionKind.Offline)
- }
- 
- @Composable
--private fun ConnectionStatusBadge(type: ConnectionType) {
-+private fun ConnectionStatusBadge(type: NetworkConnectionKind) {
-     val (icon, label, color) = when (type) {
--        ConnectionType.WiFi -> Triple(Icons.Default.Wifi, stringResource(R.string.network_connection_wifi), NuvioTheme.colors.Success)
--        ConnectionType.Ethernet -> Triple(Icons.Default.Wifi, stringResource(R.string.network_connection_ethernet), NuvioTheme.colors.Success)
--        ConnectionType.Offline -> Triple(Icons.Default.SignalWifiOff, stringResource(R.string.network_connection_offline), NuvioTheme.colors.Error)
-+        NetworkConnectionKind.Wifi -> Triple(Icons.Default.Wifi, stringResource(R.string.network_connection_wifi), NuvioTheme.colors.Success)
-+        NetworkConnectionKind.Ethernet -> Triple(Icons.Default.Wifi, stringResource(R.string.network_connection_ethernet), NuvioTheme.colors.Success)
-+        NetworkConnectionKind.Offline -> Triple(Icons.Default.SignalWifiOff, stringResource(R.string.network_connection_offline), NuvioTheme.colors.Error)
+ import com.nuvio.tv.ui.components.LocalPlaybackAvailability
++import com.nuvio.tv.domain.model.episodeListKey
+ import com.nuvio.tv.ui.navigation.LocalDetailChildClosedEpoch
+ import com.nuvio.tv.ui.navigation.LocalDetailChildOverlayVisible
+ import android.widget.Toast
+@@ -2140,11 +2141,11 @@ private fun MetaDetailsContent(
+     val seasonEpisodeFocusRequesters = remember(selectedSeason, episodesForSeason) {
+         val byEpisodeId = episodeFocusRequestersBySeason.getOrPut(selectedSeason) { mutableMapOf() }
+         episodesForSeason.forEach { episode ->
+-            if (!byEpisodeId.containsKey(episode.id)) {
+-                byEpisodeId[episode.id] = FocusRequester()
++            if (!byEpisodeId.containsKey(episode.episodeListKey)) {
++                byEpisodeId[episode.episodeListKey] = FocusRequester()
+             }
+         }
+-        byEpisodeId.keys.retainAll(episodesForSeason.map { it.id }.toSet())
++        byEpisodeId.keys.retainAll(episodesForSeason.map { it.episodeListKey }.toSet())
+         byEpisodeId
      }
-     Row(
-         modifier = Modifier
+     val seasonDownFocusRequester = remember(selectedSeason, episodesForSeason, seasonEpisodeFocusRequesters, lastFocusedEpisodeIdBySeason[selectedSeason], nextToWatch, defaultSeriesVideo, pendingRestoreType, pendingRestoreEpisodeId) {
+@@ -2157,8 +2158,9 @@ private fun MetaDetailsContent(
+         }
+         val preferredEpisodeId = lastFocusedEpisodeIdBySeason[selectedSeason]
+             ?: nextEpisodeId?.takeIf { episodesForSeason.any { ep -> ep.id == it } }
+-        (preferredEpisodeId?.let { seasonEpisodeFocusRequesters[it] })
+-            ?: episodesForSeason.firstOrNull()?.id?.let { seasonEpisodeFocusRequesters[it] }
++        (preferredEpisodeId?.let { id -> episodesForSeason.firstOrNull { it.episodeListKey == id || it.id == id }?.episodeListKey }
++            ?.let { seasonEpisodeFocusRequesters[it] })
++            ?: episodesForSeason.firstOrNull()?.episodeListKey?.let { seasonEpisodeFocusRequesters[it] }
+     }
+ 
+     val activePeopleTabFocusRequester = visiblePeopleTabItems

@@ -1,5 +1,5 @@
 diff --git a/app/src/main/java/com/nuvio/tv/core/network/StreamSpeedTester.kt b/app/src/main/java/com/nuvio/tv/core/network/StreamSpeedTester.kt
-index 130418f9d..2633f0f7f 100644
+index 130418f9d4..2633f0f7f1 100644
 --- a/app/src/main/java/com/nuvio/tv/core/network/StreamSpeedTester.kt
 +++ b/app/src/main/java/com/nuvio/tv/core/network/StreamSpeedTester.kt
 @@ -13,7 +13,9 @@ import okhttp3.Request
@@ -93,7 +93,7 @@ index 130418f9d..2633f0f7f 100644
              throw e
 diff --git a/app/src/main/java/com/nuvio/tv/core/network/StreamSweepEngine.kt b/app/src/main/java/com/nuvio/tv/core/network/StreamSweepEngine.kt
 new file mode 100644
-index 000000000..f85ba3d87
+index 0000000000..f85ba3d87f
 --- /dev/null
 +++ b/app/src/main/java/com/nuvio/tv/core/network/StreamSweepEngine.kt
 @@ -0,0 +1,592 @@
@@ -690,7 +690,7 @@ index 000000000..f85ba3d87
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt b/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
-index ffa1e367a..662554c98 100644
+index 4f1396d9b1..e41fa7e4e6 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/settings/NetworkSettingsScreen.kt
 @@ -1,4 +1,4 @@
@@ -699,7 +699,7 @@ index ffa1e367a..662554c98 100644
  
  
  package com.nuvio.tv.ui.screens.settings
-@@ -68,6 +68,9 @@ import androidx.tv.material3.MaterialTheme
+@@ -72,6 +72,9 @@ import androidx.tv.material3.MaterialTheme
  import androidx.tv.material3.Text
  import com.nuvio.tv.R
  import com.nuvio.tv.ui.reshaped.debuglog.DebugLogQrDialog
@@ -709,7 +709,7 @@ index ffa1e367a..662554c98 100644
  import com.nuvio.tv.data.local.Dv7HandlingMode
  import com.nuvio.tv.data.local.InternalPlayerEngine
  import com.nuvio.tv.domain.model.ExperienceMode
-@@ -321,6 +324,75 @@ fun AdvancedSettingsContent(
+@@ -334,6 +337,75 @@ fun AdvancedSettingsContent(
          }
      }
  
@@ -785,33 +785,7 @@ index ffa1e367a..662554c98 100644
      fun runSpeedTest() {
          scope.launch {
              connectionType = getConnectionType(context)
-@@ -642,8 +714,23 @@ fun AdvancedSettingsContent(
-                             else -> stringResource(R.string.stream_test_btn_running)
-                         }
-                     } else null,
--                    enabled = hasStream && !isStreamRunning,
--                    onClick = { if (hasStream && !isStreamRunning) runStreamDiagnostics() }
-+                    enabled = hasStream && !isStreamRunning && !deepTestRunning,
-+                    onClick = { if (hasStream && !isStreamRunning && !deepTestRunning) runStreamDiagnostics() }
-+                )
-+                // Deep test: the adaptive sweep (StreamSweepEngine). Gated on an
-+                // open playback session — the sweep hammers the same host the
-+                // player is streaming from, so it must never run concurrently.
-+                val deepGateOpen = hasStream && !isStreamRunning && !deepTestRunning && !playerSessionOpen
-+                SettingsActionRow(
-+                    title = stringResource(R.string.network_sweep_card_title),
-+                    subtitle = when {
-+                        playerSessionOpen -> stringResource(R.string.network_sweep_playback_active)
-+                        hasStream -> stringResource(R.string.network_sweep_card_subtitle)
-+                        else -> stringResource(R.string.stream_test_no_stream)
-+                    },
-+                    value = if (deepTestRunning) stringResource(R.string.network_sweep_btn_running) else null,
-+                    enabled = deepGateOpen,
-+                    onClick = { if (deepGateOpen) runDeepSweep() }
-                 )
-             }
-         }
-@@ -769,6 +856,110 @@ fun AdvancedSettingsContent(
+@@ -800,6 +872,110 @@ fun AdvancedSettingsContent(
              }
          }
  
@@ -922,7 +896,7 @@ index ffa1e367a..662554c98 100644
          item(key = "dx_watch_stats") { DxWatchStatsSettingsCard() } // dx.bi watch stats hook
  
          item(key = "clear_cw_cache") {
-@@ -956,3 +1147,114 @@ private fun StreamTestResultRow(
+@@ -987,3 +1163,114 @@ private fun StreamTestResultRow(
          )
      }
  }
@@ -1037,45 +1011,3 @@ index ffa1e367a..662554c98 100644
 +            stringResource(R.string.network_sweep_verdict_none)
 +    }
 +}
-diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index f26eb57e5..a73b2faaf 100644
---- a/app/src/main/res/values/strings.xml
-+++ b/app/src/main/res/values/strings.xml
-@@ -3483,6 +3483,37 @@
-     <string name="stream_test_video_bitrate">Average Video Bitrate: %1$s</string>
-     <string name="stream_test_error_connection">Connection failed. The last played stream link may have expired or is unreachable. Please play the video again and retry.</string>
- 
-+    <!-- Deep stream sweep (adaptive connection/bitrate climb) -->
-+    <string name="network_sweep_card_title">Run Deep Stream Sweep</string>
-+    <string name="network_sweep_card_subtitle">Adaptive test: climbs chunk size and parallel connections against 2x the last title bitrate. Runs up to 90 s and about 200 MB of data.</string>
-+    <string name="network_sweep_btn_running">Sweeping…</string>
-+    <string name="network_sweep_playback_active">Playback is active. Stop playback to run the sweep.</string>
-+    <string name="network_sweep_section_header">Deep Sweep Results</string>
-+    <string name="network_sweep_target_label">Target: %1$s (2x title bitrate)</string>
-+    <string name="network_sweep_target_unknown">Target: title bitrate unknown</string>
-+    <string name="network_sweep_label_baseline">Single connection (baseline)</string>
-+    <string name="network_sweep_label_chunk_dyn">%1$d connections, %2$d MB chunks</string>
-+    <string name="network_sweep_note_skipped_budget">Skipped: needs %1$d MB, over the %2$d MB memory limit</string>
-+    <string name="network_sweep_note_skipped_cap">Skipped: %1$d MB concurrent transfer, over the %2$d MB cap</string>
-+    <string name="network_sweep_note_rate_limited">Rate-limited by server; rung not measured</string>
-+    <string name="network_sweep_note_no_transfer">No usable transfer; treated as a refusal, not a measurement</string>
-+    <string name="network_sweep_note_failed">Failed: %1$s</string>
-+    <string name="network_sweep_note_above_standard">Requires Performance Mode at runtime</string>
-+    <string name="network_sweep_note_near_budget">Near the safe memory budget (%1$d MB of %2$d MB)</string>
-+    <string name="network_sweep_stopped_budget">Stopped early: transfer budget reached</string>
-+    <string name="network_sweep_stopped_time">Stopped early: time budget reached</string>
-+    <string name="network_sweep_stopped_passes">Stopped early: measurement pass cap reached</string>
-+    <string name="network_sweep_verdict_leave_off">Baseline (%1$s) already sustains 2x the title bitrate — leave parallel connections off.</string>
-+    <string name="network_sweep_verdict_recommend">Recommended: %1$d connections with %2$d MB chunks (%3$s).</string>
-+    <string name="network_sweep_verdict_marginal">Best found: %1$d connections, %2$d MB chunks at %3$s — above the title bitrate (%4$s) but below the 2x target.</string>
-+    <string name="network_sweep_verdict_cannot_sustain">Best found: %1$d connections, %2$d MB chunks at %3$s — below the title bitrate (%4$s); the stream cannot be sustained.</string>
-+    <string name="network_sweep_verdict_fastest_nobitrate">Title bitrate unknown. Fastest measured: %1$d connections, %2$d MB chunks at %3$s.</string>
-+    <string name="network_sweep_verdict_none">Sweep finished without a usable recommendation.</string>
-+    <string name="network_sweep_error_unexpected">Sweep error: %1$s</string>
-+    <string name="network_sweep_apply_title">Apply recommended (%1$d connections)</string>
-+    <string name="network_sweep_apply_subtitle">Enables parallel connections and saves the count. Chunk size stays as configured.</string>
-+    <string name="network_sweep_apply_saved">Recommended setting saved.</string>
-+
-     <string name="random_episode_title">Shuffle</string>
-     <string name="layout_random_episode_sub">Shuffle episodes from any series. Turning this off pauses shuffle.</string>
-     <string name="random_episode_unwatched">Unwatched episodes</string>
