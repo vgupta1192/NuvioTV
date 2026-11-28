@@ -302984,7 +302984,7 @@ index b6bb445e95..9333b0c878 100644
  
  data class TrackingMediaReference(
 diff --git a/app/src/main/java/com/nuvio/tv/core/tracking/TrackingProgressProvider.kt b/app/src/main/java/com/nuvio/tv/core/tracking/TrackingProgressProvider.kt
-index b35171b322..f4a6e10eb2 100644
+index b35171b322..052259f1a0 100644
 --- a/app/src/main/java/com/nuvio/tv/core/tracking/TrackingProgressProvider.kt
 +++ b/app/src/main/java/com/nuvio/tv/core/tracking/TrackingProgressProvider.kt
 @@ -5,6 +5,7 @@ import com.nuvio.tv.domain.model.WatchedItem
@@ -302995,7 +302995,7 @@ index b35171b322..f4a6e10eb2 100644
  import kotlinx.coroutines.flow.flowOf
  
  interface TrackingProgressProvider {
-@@ -56,30 +57,32 @@ interface TrackingProgressProvider {
+@@ -56,30 +57,37 @@ interface TrackingProgressProvider {
      fun normalizeParentContentId(parentContentId: String, videoId: String?): String = parentContentId
      suspend fun prepareNextUpSeed(progress: WatchProgress): WatchProgress
  
@@ -303046,19 +303046,19 @@ index b35171b322..f4a6e10eb2 100644
 +        val episode = requireNotNull(target.episode)
 +        removeProgress(requireNotNull(target.catalog).contentId, requireNotNull(episode.season), episode.number)
 +    }
++    /**
++     * The progress bar a stop of this playback is measured against, when the provider counts a
++     * watch from a different point than the app's own completion bar. Null keeps the app's bar.
++     */
++    suspend fun completionThresholdPercent(contentEndPercent: Double?): Double? = null
  }
  
  @Singleton
-@@ -112,4 +115,9 @@ class TrackingHistoryWriterRegistry @Inject constructor(
+@@ -112,4 +120,4 @@ class TrackingHistoryWriterRegistry @Inject constructor(
          writersById.values.sortedBy { it.providerId.ordinal }
  
      fun writer(id: TrackingProviderId): TrackingHistoryWriter? = writersById[id]
 -}
-+    /**
-+     * While the provider is the progress source, what it reports is what the app shows as watched,
-+     * so the local completion follows its bar instead of deciding against it.
-+     */
-+    suspend fun completionThresholdPercent(contentEndPercent: Double?): Double? = null
 +}
 \ No newline at end of file
 diff --git a/app/src/main/java/com/nuvio/tv/core/tracking/TrackingScrobbleCoordinator.kt b/app/src/main/java/com/nuvio/tv/core/tracking/TrackingScrobbleCoordinator.kt
@@ -445982,7 +445982,7 @@ index 64358f654b..2dc4c286c8 100644
          Uri.parse(this).host ?: substringBefore("://").takeIf { it.isNotBlank() } ?: "unknown"
      }.getOrDefault("unknown")
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSessionMetadata.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSessionMetadata.kt
-index 77db783f2f..9d9d36ced9 100644
+index 77db783f2f..0775a237e4 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSessionMetadata.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSessionMetadata.kt
 @@ -6,8 +6,6 @@ import androidx.media3.common.MediaItem
@@ -445994,13 +445994,20 @@ index 77db783f2f..9d9d36ced9 100644
  
  /**
   * Builds a [MediaMetadata] from the current playback information so that
-@@ -129,17 +127,19 @@ internal fun PlayerRuntimeController.installMpvMediaSession() {
+@@ -118,6 +116,7 @@ internal fun PlayerRuntimeController.installExoMediaSession(player: ExoPlayer) {
+ 
+ /** Creates the foreground-only MediaSession used by Bluetooth and other Android media controls. */
+ internal fun PlayerRuntimeController.installMpvMediaSession() {
++    val controller = this
+     runCatching {
+         if (!isUsingMpvEngine() || isInBackground || mpvView == null || currentStreamUrl.isBlank()) return
+         if (currentMediaSession != null && mpvMediaSessionPlayer != null) {
+@@ -129,17 +128,17 @@ internal fun PlayerRuntimeController.installMpvMediaSession() {
              snapshotProvider = ::mpvMediaSessionSnapshot,
              commandTarget = object : MpvMediaSessionCommandTarget {
                  override fun setPlayWhenReady(playWhenReady: Boolean) {
 -                    if (!isUsingMpvEngine() || isInBackground) return
 -                    if (isPlaybackCurrentlyPlaying() != playWhenReady) {
-+                    val controller = this@PlayerRuntimeController
 +                    if (!controller.isUsingMpvEngine() || controller.isInBackground) return
 +                    if (controller.isPlaybackCurrentlyPlaying() != playWhenReady) {
                          // MediaSession commands should behave like ExoPlayer's session controls:
@@ -446013,7 +446020,6 @@ index 77db783f2f..9d9d36ced9 100644
                  override fun seekTo(positionMs: Long) {
 -                    if (!isUsingMpvEngine() || isInBackground) return
 -                    onEvent(PlayerEvent.OnSeekTo(positionMs), showPlaybackControls = false)
-+                    val controller = this@PlayerRuntimeController
 +                    if (!controller.isUsingMpvEngine() || controller.isInBackground) return
 +                    controller.onEvent(PlayerEvent.OnSeekTo(positionMs), showPlaybackControls = false)
                  }
