@@ -1,3 +1,46 @@
+diff --git a/app/autosync-proguard-rules.pro b/app/autosync-proguard-rules.pro
+new file mode 100644
+index 0000000000..45fcd27b51
+--- /dev/null
++++ b/app/autosync-proguard-rules.pro
+@@ -0,0 +1,5 @@
++# AutoSync R8 rules (ported from NuvioTV-Reshaped), added to every build type from autosync.gradle.
++
++# sherpa-onnx (audio subtitle sync speech recognition): JNI reads config fields by name.
++-keep class com.k2fsa.sherpa.onnx.** { *; }
++-keep interface com.k2fsa.sherpa.onnx.** { *; }
+diff --git a/app/autosync.gradle b/app/autosync.gradle
+new file mode 100644
+index 0000000000..1fe620323c
+--- /dev/null
++++ b/app/autosync.gradle
+@@ -0,0 +1,26 @@
++// AutoSync (ported from NuvioTV-Reshaped): build settings for the audio subtitle sync fallback.
++// Applied from the end of build.gradle.kts, so Nuvio's own build file carries a single line.
++
++// On-device speech recognition for the audio subtitle sync fallback (sherpa-onnx, Apache-2.0).
++// The AAR is ~50 MB, so it is downloaded once into libs/ (git-ignored) and verified instead of
++// committed.
++def sherpaOnnxVersion = "1.13.8"
++def sherpaOnnxSha256 = "633c24321e06b1fe79feafa03ea16cbc0f8a286641e2da3559bac91bdb13bd96"
++def sherpaOnnxAar = project.file("libs/sherpa-onnx-${sherpaOnnxVersion}.aar")
++def sha256 = { File file -> java.security.MessageDigest.getInstance("SHA-256").digest(file.bytes).encodeHex().toString() }
++if (!(sherpaOnnxAar.isFile() && sha256(sherpaOnnxAar) == sherpaOnnxSha256)) {
++    def url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/v${sherpaOnnxVersion}/sherpa-onnx-${sherpaOnnxVersion}.aar"
++    logger.lifecycle("Downloading $url")
++    sherpaOnnxAar.parentFile.mkdirs()
++    def partial = new File(sherpaOnnxAar.path + ".part")
++    new URL(url).withInputStream { input -> partial.withOutputStream { it << input } }
++    if (sha256(partial) != sherpaOnnxSha256) throw new GradleException("Checksum mismatch for $url")
++    partial.renameTo(sherpaOnnxAar)
++}
++// sherpa-onnx's JNI library only needs libonnxruntime; its C/C++ API libraries are unused.
++android.packaging.jniLibs.excludes.addAll(["lib/*/libsherpa-onnx-c-api.so", "lib/*/libsherpa-onnx-cxx-api.so"])
++android.buildTypes.configureEach { it.proguardFile("autosync-proguard-rules.pro") }
++
++dependencies {
++    implementation files(sherpaOnnxAar)
++}
 diff --git a/app/build.gradle.kts b/app/build.gradle.kts
 index c365507203..0272a4efeb 100644
 --- a/app/build.gradle.kts
