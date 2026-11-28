@@ -199354,11 +199354,310 @@ index 0000000000..c96b5766b4
 +        assertEquals("es", spanish.languageTag)
 +    }
 +}
+diff --git a/app/src/full/java/com/nuvio/tv/core/launcher/LocalAdbSetupFactory.kt b/app/src/full/java/com/nuvio/tv/core/launcher/LocalAdbSetupFactory.kt
+new file mode 100644
+index 0000000000..8e5f8b7faf
+--- /dev/null
++++ b/app/src/full/java/com/nuvio/tv/core/launcher/LocalAdbSetupFactory.kt
+@@ -0,0 +1,10 @@
++package com.nuvio.tv.core.launcher
++
++import android.content.Context
++import android.os.Build
++
++internal object LocalAdbSetupFactory {
++    /** Wireless debugging pairing exists from Android 11 (API 30). */
++    fun create(context: Context): LocalAdbSetup? =
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) LoopbackAdbSetup(context.applicationContext) else null
++}
+diff --git a/app/src/full/java/com/nuvio/tv/core/launcher/LoopbackAdbSetup.kt b/app/src/full/java/com/nuvio/tv/core/launcher/LoopbackAdbSetup.kt
+new file mode 100644
+index 0000000000..4a47cb3556
+--- /dev/null
++++ b/app/src/full/java/com/nuvio/tv/core/launcher/LoopbackAdbSetup.kt
+@@ -0,0 +1,277 @@
++package com.nuvio.tv.core.launcher
++
++import android.content.ComponentName
++import android.content.Context
++import android.os.Build
++import android.util.Log
++import com.nuvio.tv.MainActivity
++import io.github.muntashirakon.adb.AbsAdbConnectionManager
++import io.github.muntashirakon.adb.AdbPairingRequiredException
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++import org.bouncycastle.asn1.ASN1EncodableVector
++import org.bouncycastle.asn1.ASN1Encoding
++import org.bouncycastle.asn1.ASN1Integer
++import org.bouncycastle.asn1.DERBitString
++import org.bouncycastle.asn1.DERNull
++import org.bouncycastle.asn1.DERSequence
++import org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers
++import org.bouncycastle.asn1.x500.X500Name
++import org.bouncycastle.asn1.x509.AlgorithmIdentifier
++import org.bouncycastle.asn1.x509.SubjectPublicKeyInfo
++import org.bouncycastle.asn1.x509.Time
++import org.bouncycastle.asn1.x509.V3TBSCertificateGenerator
++import java.io.ByteArrayInputStream
++import java.io.File
++import java.io.IOException
++import java.math.BigInteger
++import java.security.KeyFactory
++import java.security.KeyPairGenerator
++import java.security.PrivateKey
++import java.security.Signature
++import java.security.SecureRandom
++import java.security.cert.Certificate
++import java.security.cert.CertificateFactory
++import java.security.spec.PKCS8EncodedKeySpec
++import java.util.Date
++import java.util.concurrent.TimeUnit
++
++/**
++ * Pairs with this TV's own Wireless debugging daemon over 127.0.0.1 and applies the grants the
++ * README otherwise asks the user to run from a computer.
++ */
++internal class LoopbackAdbSetup(private val context: Context) : LocalAdbSetup {
++
++    override suspend fun setUp(pairingPort: Int?, pairingCode: String?, connectPort: Int?): Result<Unit> =
++        withContext(Dispatchers.IO) {
++            runCatching {
++                val manager = KeyStoreAdbConnectionManager(context)
++                manager.use {
++                    it.setApi(Build.VERSION.SDK_INT)
++                    it.setTimeout(15, TimeUnit.SECONDS)
++                    if (pairingPort != null && !pairingCode.isNullOrBlank()) {
++                        check(it.pair(pairingPort, pairingCode.trim())) { "Pairing was rejected. Check the code and port." }
++                    }
++                    val connected = try {
++                        if (connectPort != null) it.connect(connectPort) else it.autoConnect(context, 15_000)
++                    } catch (e: AdbPairingRequiredException) {
++                        throw IllegalStateException("This TV isn't paired with Nuvio yet. Enter the pairing port and code.", e)
++                    }
++                    check(connected) { "Could not connect to Wireless debugging after pairing." }
++                    applyGrants(it)
++                }
++                LauncherSelfSetup.finish(context)
++            }.onFailure { Log.w(TAG, "Loopback ADB setup failed", it) }
++        }
++
++    override suspend fun run(action: DeviceAction, connectPort: Int?): Result<String> =
++        withContext(Dispatchers.IO) {
++            runCatching {
++                KeyStoreAdbConnectionManager(context).use { manager ->
++                    manager.setApi(Build.VERSION.SDK_INT)
++                    manager.setTimeout(15, TimeUnit.SECONDS)
++                    val connected = try {
++                        if (connectPort != null) manager.connect(connectPort) else manager.autoConnect(context, 15_000)
++                    } catch (e: AdbPairingRequiredException) {
++                        throw IllegalStateException("This TV isn't paired yet. Pair it first (the top box on this page).", e)
++                    }
++                    check(connected) { "Could not reach Wireless debugging. Is it still switched on?" }
++                    perform(manager, action)
++                }
++            }.onFailure { Log.w(TAG, "Loopback ADB action $action failed", it) }
++        }
++
++    private fun perform(manager: AbsAdbConnectionManager, action: DeviceAction): String = when (action) {
++        DeviceAction.MAKE_HOME -> {
++            makeHome(manager)
++            // The Home setting can take a moment to show up, so look again before saying it didn't take.
++            val held = (0 until 8).any { attempt ->
++                if (attempt > 0) Thread.sleep(500)
++                LauncherSetup.homeAppSet(context)
++            }
++            when {
++                !held -> "The command ran, but Android did not make this launcher the Home app. Try \"Turn on Home button override\"."
++                LauncherSetup.isDefaultHome(context) -> "Done. This launcher is the Home app and the Home button opens it."
++                LauncherSetup.homeWorks(context) -> "Done. This launcher holds the Home role, and the Home button override takes over from the TV's own launcher."
++                else -> "This launcher now holds the Home role, but this TV still opens its own launcher first (Google TV does that). Press \"Turn on Home button override\" so the Home button opens this launcher."
++            }
++        }
++        DeviceAction.ENABLE_NOTIFICATIONS -> {
++            allowNotifications(manager)
++            if (com.nuvio.tv.core.notification.LauncherNotificationListenerService.isAccessGranted(context)) "Notifications are on."
++            else "The command ran, but Android didn't turn notifications on. Open Settings → Apps → Special access → Notification access and switch this launcher on."
++        }
++        DeviceAction.KEEP_RUNNING -> {
++            keepRunning(manager)
++            val exempt = runCatching { shell(manager, DeviceCommands.listDozeWhitelist) }.getOrDefault("").contains(context.packageName)
++            if (exempt) "Done. Android will keep this app running in the background, so recordings, updates and sync run on time. If the TV restarts and recordings stop firing, run this again."
++            else "The commands ran, but this TV didn't confirm the Doze exemption. Some TVs ignore parts of this; the rest still applies."
++        }
++        DeviceAction.OPTIMIZE_SPEED -> {
++            val result = shell(manager, DeviceCommands.optimizeSpeed(context.packageName))
++            if (result.contains("Success", ignoreCase = true)) "Done. The app is compiled for speed, so it should start faster. An app update undoes it; this app repeats it after an update on a TV it has been set up on."
++            else "The TV did not accept the compile command (${result.trim().take(120).ifEmpty { "no answer" }}). Nothing was changed."
++        }
++        DeviceAction.ENABLE_OVERRIDE -> {
++            enableOverride(manager)
++            "Home button override is on. It stays on after a restart."
++        }
++        DeviceAction.CHECK_HOME -> {
++            val holder = DeviceCommands.roleHolder(runCatching { shell(manager, DeviceCommands.roleHolders) }.getOrDefault(""))
++            val resolved = DeviceCommands.resolvedHomePackage(shell(manager, DeviceCommands.resolveHome))
++            val override = LauncherAccessibilityService.isServiceEnabled(context) && LauncherAccessibilityService.isOperational.value
++            val me = context.packageName
++            when {
++                holder == me && resolved == me -> "This launcher is the Home app: the system opens it when you press Home."
++                holder == me && override -> "This launcher holds the Home role and the Home button override is on, so Home opens this launcher (the TV starts its own launcher first, and this launcher takes over from it)."
++                holder == me -> "This launcher holds the Home role, but the TV still opens ${resolved ?: "its own launcher"} first. Turn on the Home button override."
++                override -> "The Home button override is on, so Home opens this launcher. The Home role belongs to ${holder ?: "another launcher"}."
++                else -> "The Home button opens ${resolved ?: holder ?: "another launcher"}, not this launcher."
++            }
++        }
++        DeviceAction.DISABLE_STOCK -> {
++            DeviceCommands.disableStock.forEach { shell(manager, it) }
++            "The TV's own launcher is turned off. If the TV shows a black screen or a recovery screen, turn it back on from this page."
++        }
++        DeviceAction.UNINSTALL_STOCK -> {
++            DeviceCommands.uninstallStock.forEach { shell(manager, it) }
++            "The TV's own launcher is removed for this user and stays off after a restart. If the TV shows a black screen or a recovery screen, turn it back on from this page."
++        }
++        DeviceAction.ENABLE_STOCK -> {
++            DeviceCommands.enableStock.forEach { shell(manager, it) }
++            "The TV's own launcher is on."
++        }
++        DeviceAction.RESTORE_ORIGINAL -> {
++            val other = DeviceCommands.otherHomeComponent(shell(manager, DeviceCommands.listHomes), context.packageName)
++            if (other == null) {
++                "No other launcher found on this TV (the stock one may be turned off; turn it back on first)."
++            } else {
++                shell(manager, DeviceCommands.setHome(other))
++                "The Home button now opens $other."
++            }
++        }
++    }
++
++    private fun applyGrants(manager: AbsAdbConnectionManager) {
++        enableOverride(manager)
++        makeHome(manager)
++        allowNotifications(manager)
++        keepRunning(manager)
++    }
++
++    /** Lets recordings, updates and sync run on time with the TV idle: see [DeviceCommands.keepRunning]. Best effort. */
++    private fun keepRunning(manager: AbsAdbConnectionManager) {
++        DeviceCommands.keepRunning(context.packageName).forEach { runCatching { shell(manager, it) } }
++    }
++
++    /** Notification access normally needs a trip through Settings; the shell can grant it directly. */
++    private fun allowNotifications(manager: AbsAdbConnectionManager) {
++        val listener = ComponentName(context, com.nuvio.tv.core.notification.LauncherNotificationListenerService::class.java).flattenToString()
++        runCatching { shell(manager, DeviceCommands.allowNotificationListener(listener)) }
++    }
++
++    private fun makeHome(manager: AbsAdbConnectionManager) {
++        val home = ComponentName(context, MainActivity::class.java).flattenToShortString()
++        runCatching { shell(manager, DeviceCommands.setHome(home)) }
++    }
++
++    /** Lets the app enable its own accessibility service, keeps it enabled, and turns it on now. */
++    private fun enableOverride(manager: AbsAdbConnectionManager) {
++        val pkg = context.packageName
++        // Required: lets the app enable its own accessibility service and keep it enabled.
++        // Judge success by the resulting permission, not by command output (this prints nothing).
++        runCatching { shell(manager, "pm grant $pkg android.permission.WRITE_SECURE_SETTINGS") }
++        check(AccessibilityWatchdog.canWriteSecureSettings(context)) {
++            "Android did not grant the permission. Wireless debugging may be restricted on this TV."
++        }
++        // Best effort: unknown on older firmware, and not every TV restricts accessibility.
++        runCatching { shell(manager, "appops set $pkg ACCESS_RESTRICTED_SETTINGS allow") }
++        val service = ComponentName(context, LauncherAccessibilityService::class.java).flattenToString()
++        val current = runCatching { shell(manager, "settings get secure enabled_accessibility_services") }.getOrNull()
++        runCatching { shell(manager, "settings put secure enabled_accessibility_services ${DeviceCommands.withAccessibilityService(current, service)}") }
++        runCatching { shell(manager, "settings put secure accessibility_enabled 1") }
++        LauncherSetup.allowAccessibilityFallback(context)
++        LauncherSelfSetup.finish(context)
++    }
++
++    /** Runs a shell command and returns its output, which is often empty. */
++    private fun shell(manager: AbsAdbConnectionManager, command: String): String =
++        manager.openStream("shell:$command").use { stream ->
++            val input = stream.openInputStream()
++            val output = StringBuilder()
++            val buffer = ByteArray(1024)
++            try {
++                while (true) {
++                    val count = input.read(buffer)
++                    if (count < 0) break
++                    output.append(String(buffer, 0, count))
++                }
++            } catch (_: IOException) {
++                // libadb-android throws instead of returning -1 when the daemon closes the stream
++                // once the command has finished, which is the normal end of every command.
++            }
++            output.toString()
++        }.also { Log.d(TAG, "adb shell $command -> ${it.trim()}") }
++
++    private companion object {
++        const val TAG = "LoopbackAdbSetup"
++    }
++}
++
++/** Persists one RSA identity so the TV recognises this app on later connections. */
++private class KeyStoreAdbConnectionManager(context: Context) : AbsAdbConnectionManager() {
++    private val privateKey: PrivateKey
++    private val certificate: Certificate
++
++    init {
++        val dir = context.noBackupFilesDir
++        val keyFile = File(dir, "adb_key.pk8")
++        val certFile = File(dir, "adb_cert.der")
++        val loaded = runCatching {
++            val key = KeyFactory.getInstance("RSA").generatePrivate(PKCS8EncodedKeySpec(keyFile.readBytes()))
++            val cert = certFile.inputStream().use { CertificateFactory.getInstance("X.509").generateCertificate(it) }
++            key to cert
++        }.getOrNull()
++        val (key, cert) = loaded ?: generate().also { (newKey, newCert) ->
++            keyFile.writeBytes(newKey.encoded)
++            certFile.writeBytes(newCert.encoded)
++        }
++        privateKey = key
++        certificate = cert
++    }
++
++    override fun getPrivateKey(): PrivateKey = privateKey
++    override fun getCertificate(): Certificate = certificate
++    override fun getDeviceName(): String = "Nuvio TV"
++
++    private fun generate(): Pair<PrivateKey, Certificate> {
++        val pair = KeyPairGenerator.getInstance("RSA").apply { initialize(2048, SecureRandom()) }.generateKeyPair()
++        // Android's built-in "BC" provider has no SHA256withRSA, so build the certificate structure
++        // with BouncyCastle's ASN.1 classes and sign it with the platform's default provider.
++        val name = X500Name("CN=Nuvio TV")
++        val now = System.currentTimeMillis()
++        val signatureAlgorithm = AlgorithmIdentifier(PKCSObjectIdentifiers.sha256WithRSAEncryption, DERNull.INSTANCE)
++        val tbs = V3TBSCertificateGenerator().apply {
++            setSerialNumber(ASN1Integer(BigInteger.valueOf(now)))
++            setIssuer(name)
++            setSubject(name)
++            setStartDate(Time(Date(now - TimeUnit.DAYS.toMillis(1))))
++            setEndDate(Time(Date(now + TimeUnit.DAYS.toMillis(365L * 25))))
++            setSubjectPublicKeyInfo(SubjectPublicKeyInfo.getInstance(pair.public.encoded))
++            setSignature(signatureAlgorithm)
++        }.generateTBSCertificate()
++        val signature = Signature.getInstance("SHA256withRSA").run {
++            initSign(pair.private)
++            update(tbs.getEncoded(ASN1Encoding.DER))
++            sign()
++        }
++        val parts = ASN1EncodableVector().apply {
++            add(tbs)
++            add(signatureAlgorithm)
++            add(DERBitString(signature))
++        }
++        val der = DERSequence(parts).getEncoded(ASN1Encoding.DER)
++        val certificate = CertificateFactory.getInstance("X.509").generateCertificate(ByteArrayInputStream(der))
++        return pair.private to certificate
++    }
++}
 diff --git a/app/src/full/java/com/nuvio/tv/core/plugin/PluginManager.kt b/app/src/full/java/com/nuvio/tv/core/plugin/PluginManager.kt
-index b1c7e2eb09..d538a3ce32 100644
+index b1c7e2eb09..df00b4ec43 100644
 --- a/app/src/full/java/com/nuvio/tv/core/plugin/PluginManager.kt
 +++ b/app/src/full/java/com/nuvio/tv/core/plugin/PluginManager.kt
-@@ -241,6 +241,18 @@ class PluginManager @Inject constructor(
+@@ -241,11 +241,23 @@ class PluginManager @Inject constructor(
      val pluginsEnabled: Flow<Boolean> = dataStore.pluginsEnabled
  
      val groupStreamsByRepository: Flow<Boolean> = dataStore.groupStreamsByRepository
@@ -199368,15 +199667,20 @@ index b1c7e2eb09..d538a3ce32 100644
 +    val searchConfiguration: Flow<String> = combine(sourceLanguages, extensionDns) { languages, dns ->
 +        "${languages.sorted()}:$dns"
 +    }
-+
-+    init {
-+        syncScope.launch { extensionDns.collect { com.nuvio.tv.core.runtime.ExtensionDns.select(it) } }
-+    }
 +    suspend fun setSourceLanguages(languages: Set<String>) = dataStore.setSourceLanguages(languages.mapNotNull(com.nuvio.tv.core.plugin.SourceLanguages::normalize).toSet())
 +    suspend fun setExtensionDns(mode: String) = dataStore.setExtensionDns(mode)
      
      private val syncScope = kotlinx.coroutines.CoroutineScope(
          kotlinx.coroutines.SupervisorJob() + Dispatchers.IO
+     )
+ 
++    init {
++        syncScope.launch { extensionDns.collect { com.nuvio.tv.core.runtime.ExtensionDns.select(it) } }
++    }
++
+     var isSyncingFromRemote = false
+ 
+     /** Prevents concurrent reconciliation from StartupSyncService and AccountViewModel */
 @@ -979,6 +991,24 @@ class PluginManager @Inject constructor(
          }
      }
@@ -199616,6 +199920,52 @@ index 0000000000..1098fb70e8
 +            .bootstrapDnsHosts(addresses.map(InetAddress::getByName)).build())
 +    }
 +}
+diff --git a/app/src/full/java/com/nuvio/tv/core/runtime/PluginRuntimeHooks.kt b/app/src/full/java/com/nuvio/tv/core/runtime/PluginRuntimeHooks.kt
+index d8b01ef0dc..9a0de76faf 100644
+--- a/app/src/full/java/com/nuvio/tv/core/runtime/PluginRuntimeHooks.kt
++++ b/app/src/full/java/com/nuvio/tv/core/runtime/PluginRuntimeHooks.kt
+@@ -50,7 +50,7 @@ object PluginRuntimeHooks {
+ 
+             try {
+                 app.baseClient = OkHttpClient.Builder()
+-                    .dns(com.nuvio.tv.core.network.IPv4FirstDns())
++                    .dns(ExtensionDns)
+                     .cookieJar(NuvioApplication.extensionCookieJar)
+                     .followRedirects(true)
+                     .followSslRedirects(true)
+@@ -68,6 +68,10 @@ object PluginRuntimeHooks {
+         }
+     }
+ 
++    fun onExtensionDnsChanged() {
++        if (isCloudstreamInitialized) app.baseClient.connectionPool.evictAll()
++    }
++
+     fun onActivityCreate(activity: Activity) {
+         AcraApplication.setActivity(activity)
+     }
+diff --git a/app/src/full/java/com/nuvio/tv/updater/UpdateJobService.kt b/app/src/full/java/com/nuvio/tv/updater/UpdateJobService.kt
+index 136337cfd1..aad23e5c47 100644
+--- a/app/src/full/java/com/nuvio/tv/updater/UpdateJobService.kt
++++ b/app/src/full/java/com/nuvio/tv/updater/UpdateJobService.kt
+@@ -112,12 +112,14 @@ class UpdateJobService : JobService() {
+         fun canInstallSilently(context: Context): Boolean =
+             Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && ApkInstaller.canRequestPackageInstalls(context)
+ 
+-        fun schedulePeriodicCheck(context: Context) {
++        fun schedulePeriodicCheck(context: Context, intervalMs: Long? = null) {
+             val scheduler = context.jobScheduler()
+-            if (scheduler.hasPendingJob(JOB_ID_CHECK)) return
++            if (intervalMs == null) {
++                if (scheduler.hasPendingJob(JOB_ID_CHECK)) return
++            } else if (runCatching { scheduler.getPendingJob(JOB_ID_CHECK)?.intervalMillis }.getOrNull() == intervalMs) return
+             val job = JobInfo.Builder(JOB_ID_CHECK, ComponentName(context, UpdateJobService::class.java))
+                 .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
+-                .setPeriodic(CHECK_INTERVAL_MS)
++                .setPeriodic(intervalMs ?: CHECK_INTERVAL_MS)
+                 .setPersisted(true)
+                 .build()
+             scheduler.scheduleSafely(job)
 diff --git a/app/src/full/java/com/nuvio/tv/updater/UpdatePreferences.kt b/app/src/full/java/com/nuvio/tv/updater/UpdatePreferences.kt
 index 55dba24d0b..1e0e53cc32 100644
 --- a/app/src/full/java/com/nuvio/tv/updater/UpdatePreferences.kt
@@ -199655,6 +200005,84 @@ index 55dba24d0b..1e0e53cc32 100644
      suspend fun setUpdateBannerEnabled(enabled: Boolean) {
          dataStore.edit { prefs ->
              prefs[updateBannerEnabledKey] = enabled
+diff --git a/app/src/full/java/com/nuvio/tv/updater/UpdateViewModel.kt b/app/src/full/java/com/nuvio/tv/updater/UpdateViewModel.kt
+index 699bcec452..b4da844c2c 100644
+--- a/app/src/full/java/com/nuvio/tv/updater/UpdateViewModel.kt
++++ b/app/src/full/java/com/nuvio/tv/updater/UpdateViewModel.kt
+@@ -39,6 +39,7 @@ data class UpdateUiState(
+     val feedbackMessage: String? = null,
+     val updateBannerEnabled: Boolean = true,
+     val updateChannel: UpdateChannel = UpdateChannel.STABLE,
++    val checkFrequency: UpdateCheckFrequency = UpdateCheckFrequency.ALWAYS,
+     val autoInstallEnabled: Boolean = false,
+     val autoInstallSupported: Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S,
+     val autoInstallNoticeEnabled: Boolean = true,
+@@ -65,6 +66,7 @@ class UpdateViewModel @Inject constructor(
+         viewModelScope.launch {
+             val enabled = updatePreferences.updateBannerEnabled.first()
+             val channel = updatePreferences.getOrInitializeUpdateChannel()
++            val checkFrequency = updatePreferences.checkFrequency.first()
+             val autoInstallEnabled = updatePreferences.autoInstallEnabled.first()
+             val autoInstallNoticeEnabled = updatePreferences.autoInstallNoticeEnabled.first()
+             val optimizeDuringInstall = updatePreferences.optimizeDuringInstall.first()
+@@ -72,6 +74,7 @@ class UpdateViewModel @Inject constructor(
+                 it.copy(
+                     updateBannerEnabled = enabled,
+                     updateChannel = channel,
++                    checkFrequency = checkFrequency,
+                     autoInstallEnabled = autoInstallEnabled,
+                     autoInstallNoticeEnabled = autoInstallNoticeEnabled,
+                     optimizeDuringInstall = optimizeDuringInstall
+@@ -88,10 +91,12 @@ class UpdateViewModel @Inject constructor(
+     }
+ 
+     fun checkForUpdates(force: Boolean, showNoUpdateFeedback: Boolean) {
+-        if (!force && !_uiState.value.updateBannerEnabled) return
++        if (!force && (!_uiState.value.updateBannerEnabled ||
++                _uiState.value.checkFrequency == UpdateCheckFrequency.NEVER)) return
+ 
+         updateCheckJob?.cancel()
+         updateCheckJob = viewModelScope.launch {
++            if (!force && !_uiState.value.checkFrequency.isDue(updatePreferences.lastCheckAtMs.first(), System.currentTimeMillis())) return@launch
+             val channel = _uiState.value.updateChannel
+             _uiState.update {
+                 it.copy(
+@@ -387,13 +392,21 @@ class UpdateViewModel @Inject constructor(
+         if (BuildConfig.IS_DEBUG_BUILD) return
+         val state = _uiState.value
+         if (state.updateBannerEnabled || state.autoInstallEnabled) {
+-            UpdateJobService.schedulePeriodicCheck(context)
++            UpdateJobService.schedulePeriodicCheck(context, state.checkFrequency.backgroundIntervalMs)
+         } else {
+             UpdateJobService.cancelPeriodicCheck(context)
+         }
+         if (!state.autoInstallEnabled) UpdateJobService.cancelIdleInstall(context)
+     }
+ 
++    fun setCheckFrequency(frequency: UpdateCheckFrequency) {
++        viewModelScope.launch {
++            updatePreferences.setCheckFrequency(frequency)
++            _uiState.update { it.copy(checkFrequency = frequency) }
++            syncBackgroundJobs()
++        }
++    }
++
+     fun openUnknownSourcesSettings() {
+         listOfNotNull(
+             ApkInstaller.buildUnknownSourcesSettingsIntent(context),
+diff --git a/app/src/full/res/values/extension_settings.xml b/app/src/full/res/values/extension_settings.xml
+new file mode 100644
+index 0000000000..8bda82499a
+--- /dev/null
++++ b/app/src/full/res/values/extension_settings.xml
+@@ -0,0 +1,7 @@
++<resources>
++    <style name="Theme.ReSeq.ExtensionSettings" parent="Theme.Material3.Dark.NoActionBar">
++        <item name="android:windowIsTranslucent">true</item>
++        <item name="android:windowBackground">@android:color/transparent</item>
++    </style>
++    <string name="plugin_extension_settings_failed">This extension could not open its settings.</string>
++</resources>
 diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
 index bb25fba56f..51f4757bf8 100644
 --- a/app/src/main/AndroidManifest.xml
