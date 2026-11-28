@@ -1,0 +1,86 @@
+diff --git a/app/src/main/java/com/nuvio/tv/MainActivity.kt b/app/src/main/java/com/nuvio/tv/MainActivity.kt
+index d307d491d..5cd8e92de 100644
+--- a/app/src/main/java/com/nuvio/tv/MainActivity.kt
++++ b/app/src/main/java/com/nuvio/tv/MainActivity.kt
+@@ -252,7 +252,9 @@ import dev.chrisbanes.haze.hazeEffect
+ import dev.chrisbanes.haze.hazeSource
+ import java.util.Locale
+ import javax.inject.Inject
++import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.delay
++import kotlinx.coroutines.withContext
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.catch
+ import kotlinx.coroutines.flow.collectLatest
+@@ -533,10 +535,19 @@ open class MainActivity : ComponentActivity() {
+     override fun onCreate(savedInstanceState: Bundle?) {
+         installSplashScreen()
+         super.onCreate(savedInstanceState)
+-        com.nuvio.tv.core.storage.DatabaseVersions.blockingIssue(this)?.let { issue ->
+-            databaseCompatibilityBlocked = true
+-            com.nuvio.tv.ui.components.DatabaseCompatibilityNotice.show(this, issue)
+-            return
++        // Scout-merge regression: this used to run on a background thread. A synchronous
++        // SQLiteDatabase.openDatabase() call landed directly in onCreate, blocking first
++        // frame on disk I/O every launch for the common (no-incompatible-DB) case. Run the
++        // check off the main thread; only the rare "newer DB" case needs to interrupt startup,
++        // and it does so as soon as the check comes back instead of before the first frame.
++        lifecycleScope.launch {
++            val issue = withContext(Dispatchers.IO) {
++                com.nuvio.tv.core.storage.DatabaseVersions.blockingIssue(this@MainActivity)
++            }
++            if (issue != null) {
++                databaseCompatibilityBlocked = true
++                com.nuvio.tv.ui.components.DatabaseCompatibilityNotice.show(this@MainActivity, issue)
++            }
+         }
+         isFirstResumeAfterCreate = true
+         window?.setBackgroundDrawable(ColorDrawable(android.graphics.Color.TRANSPARENT))
+diff --git a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
+index 775901dd5..a8a744b2f 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/navigation/NuvioNavHost.kt
+@@ -2494,7 +2494,11 @@ private fun PlaybackNavHost(
+             com.nuvio.tv.ui.screens.scout.ScoutWordsScreen()
+         }
+ 
+-        composable(com.nuvio.tv.ui.navigation.Screen.Scout.route) {
++        // Scout is a sidebar root destination (same category as Apps): it needs the
++        // sidebar content inset, which plain composable() never applied. That left Scout's
++        // content starting under the sidebar instead of shifted right, like Apps before it
++        // was moved to rootComposable.
++        rootComposable(com.nuvio.tv.ui.navigation.Screen.Scout.route) {
+             com.nuvio.tv.ui.screens.scout.ScoutQuickStartGate(onOffer = { navController.navigate(com.nuvio.tv.ui.navigation.Screen.ScoutQuickStart.route) })
+             val askAccess: com.nuvio.tv.ui.screens.scout.ask.AskAccessViewModel = androidx.hilt.navigation.compose.hiltViewModel()
+             val askHasKey by askAccess.hasKey.collectAsStateWithLifecycle()
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+index bcf91ae25..d0968aeb4 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerInitialization.kt
+@@ -2475,8 +2475,16 @@ private class SubtitleOffsetRenderersFactory(
+         super.buildTextRenderers(context, normalizingOutput, outputLooper, extensionRendererMode, out)
+         // Nuvio-KE port (Spec 93 P4): swap the built-in text renderer for one with the PGS
+         // composition decoder factory (Media3's PGS parser shows one object per display set and
+-        // keeps no epoch state), and enable raw-sample decoding for the picture formats that
+-        // arrive unparsed from the extractors.
++        // keeps no epoch state). PGS/VOBSUB are already excluded from extraction-time parsing by
++        // RenderTimeSubtitles.extractionParsers, so Media3 already falls back to this decoder
++        // factory for those raw formats on its own.
++        //
++        // Scout-merge regression: this used to also call
++        // RenderTimeSubtitles.enableRenderTimeDecoding(out, startIndex), which forces
++        // experimentalSetLegacyDecodingEnabled(true) on the renderer. That flag is renderer-wide,
++        // not per-format: it made the SAME renderer treat already extraction-parsed cue samples
++        // (SRT/VTT/ASS) as raw bytes needing decode, so normal subtitles stopped rendering while
++        // PGS kept working. Removed; PGS does not need it.
+         if (out.size > startIndex) {
+             out[startIndex] = androidx.media3.exoplayer.text.TextRenderer(
+                 normalizingOutput,
+@@ -2484,7 +2492,6 @@ private class SubtitleOffsetRenderersFactory(
+                 com.nuvio.tv.core.player.PgsSubtitleDecoderFactory
+             )
+             while (out.size > startIndex + 1) out.removeAt(out.size - 1)
+-            com.nuvio.tv.core.player.RenderTimeSubtitles.enableRenderTimeDecoding(out, startIndex)
+         }
+         for (index in startIndex until out.size) {
+             out[index] = SubtitleOffsetRenderer(
