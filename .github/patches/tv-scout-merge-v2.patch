@@ -302984,7 +302984,7 @@ index b6bb445e95..9333b0c878 100644
  
  data class TrackingMediaReference(
 diff --git a/app/src/main/java/com/nuvio/tv/core/tracking/TrackingProgressProvider.kt b/app/src/main/java/com/nuvio/tv/core/tracking/TrackingProgressProvider.kt
-index b35171b322..b796df3d58 100644
+index b35171b322..f4a6e10eb2 100644
 --- a/app/src/main/java/com/nuvio/tv/core/tracking/TrackingProgressProvider.kt
 +++ b/app/src/main/java/com/nuvio/tv/core/tracking/TrackingProgressProvider.kt
 @@ -5,6 +5,7 @@ import com.nuvio.tv.domain.model.WatchedItem
@@ -303049,6 +303049,18 @@ index b35171b322..b796df3d58 100644
  }
  
  @Singleton
+@@ -112,4 +115,9 @@ class TrackingHistoryWriterRegistry @Inject constructor(
+         writersById.values.sortedBy { it.providerId.ordinal }
+ 
+     fun writer(id: TrackingProviderId): TrackingHistoryWriter? = writersById[id]
+-}
++    /**
++     * While the provider is the progress source, what it reports is what the app shows as watched,
++     * so the local completion follows its bar instead of deciding against it.
++     */
++    suspend fun completionThresholdPercent(contentEndPercent: Double?): Double? = null
++}
+\ No newline at end of file
 diff --git a/app/src/main/java/com/nuvio/tv/core/tracking/TrackingScrobbleCoordinator.kt b/app/src/main/java/com/nuvio/tv/core/tracking/TrackingScrobbleCoordinator.kt
 index aeae140046..000875729f 100644
 --- a/app/src/main/java/com/nuvio/tv/core/tracking/TrackingScrobbleCoordinator.kt
@@ -309685,7 +309697,7 @@ index 997aefa85a..bd1053ecf9 100644
          store().edit { prefs ->
              prefs[customThemeColorsKey] = colors.encode()
 diff --git a/app/src/main/java/com/nuvio/tv/data/local/TrailerSettingsDataStore.kt b/app/src/main/java/com/nuvio/tv/data/local/TrailerSettingsDataStore.kt
-index 5435e96dd5..a188563a06 100644
+index 5435e96dd5..63009c98c0 100644
 --- a/app/src/main/java/com/nuvio/tv/data/local/TrailerSettingsDataStore.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/local/TrailerSettingsDataStore.kt
 @@ -33,10 +33,10 @@ class TrailerSettingsDataStore @Inject constructor(
@@ -309700,17 +309712,17 @@ index 5435e96dd5..a188563a06 100644
  
      val settings: Flow<TrailerSettings> = profileManager.activeProfileId.flatMapLatest { pid ->
          factory.get(pid, FEATURE).data.map { prefs ->
-@@ -90,10 +90,6 @@ class TrailerSettingsDataStore @Inject constructor(
-     suspend fun setAllow4k(enabled: Boolean) {
-         store().edit { it[allow4kKey] = enabled }
+@@ -92,7 +92,9 @@ class TrailerSettingsDataStore @Inject constructor(
      }
--
--    suspend fun setSubtitlesEnabled(enabled: Boolean) {
+ 
+     suspend fun setSubtitlesEnabled(enabled: Boolean) {
 -        store().edit { it[subtitlesEnabledKey] = enabled }
--    }
++        store().edit { prefs ->
++            prefs[subtitlesEnabledKey] = enabled
++        }
+     }
  }
  
- data class TrailerSettings(
 diff --git a/app/src/main/java/com/nuvio/tv/data/local/TraktSettingsDataStore.kt b/app/src/main/java/com/nuvio/tv/data/local/TraktSettingsDataStore.kt
 index f906e6b098..81503c3d2c 100644
 --- a/app/src/main/java/com/nuvio/tv/data/local/TraktSettingsDataStore.kt
@@ -310748,7 +310760,7 @@ index 8ce933618e..e9dc95a46e 100644
              val row = try {
                  serverCatalog.catalog(addonBaseUrl, addonId, addonName, catalogId, catalogName, type, skip, extraArgs)
 diff --git a/app/src/main/java/com/nuvio/tv/data/repository/ImdbEpisodeRatingsRepository.kt b/app/src/main/java/com/nuvio/tv/data/repository/ImdbEpisodeRatingsRepository.kt
-index b588adc946..eaf01acc62 100644
+index b588adc946..962ce860ee 100644
 --- a/app/src/main/java/com/nuvio/tv/data/repository/ImdbEpisodeRatingsRepository.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/repository/ImdbEpisodeRatingsRepository.kt
 @@ -38,7 +38,7 @@ class ImdbEpisodeRatingsRepository @Inject constructor(
@@ -310760,6 +310772,17 @@ index b588adc946..eaf01acc62 100644
      ): Map<Pair<Int, Int>, Double> {
          return alignEpisodeRatings(addonEpisodes, getExternalEpisodes(imdbId, tmdbId))
      }
+@@ -110,7 +110,9 @@ class ImdbEpisodeRatingsRepository @Inject constructor(
+         OmdbKeyPreferences.ensureLoaded(appContext)
+         val omdbKey = OmdbKeyPreferences.key.value
+         if (!imdbId.isNullOrBlank() && omdbKey.isNotBlank()) {
+-            return OmdbEpisodeRatingsClient.fetch(imdbId, omdbKey)
++            return OmdbEpisodeRatingsClient.fetch(imdbId, omdbKey).map { (key, rating) ->
++                ExternalEpisodeRating(key.first, key.second, airDate = null, rating = rating)
++            }
+         }
+ 
+         if (primaryUnreachable) primaryOutage.markDown(networkUp = false, tag = tag)
 diff --git a/app/src/main/java/com/nuvio/tv/data/repository/LibraryRepositoryImpl.kt b/app/src/main/java/com/nuvio/tv/data/repository/LibraryRepositoryImpl.kt
 index a7f532888b..b0a6bdd6b1 100644
 --- a/app/src/main/java/com/nuvio/tv/data/repository/LibraryRepositoryImpl.kt
@@ -312746,7 +312769,7 @@ index 0000000000..89c6a3b0f8
 +    }
 +}
 diff --git a/app/src/main/java/com/nuvio/tv/data/simkl/SimklSyncRepository.kt b/app/src/main/java/com/nuvio/tv/data/simkl/SimklSyncRepository.kt
-index 43a6831e2c..a64516be9c 100644
+index 43a6831e2c..e4416fab4f 100644
 --- a/app/src/main/java/com/nuvio/tv/data/simkl/SimklSyncRepository.kt
 +++ b/app/src/main/java/com/nuvio/tv/data/simkl/SimklSyncRepository.kt
 @@ -2,9 +2,9 @@ package com.nuvio.tv.data.simkl
@@ -312895,10 +312918,15 @@ index 43a6831e2c..a64516be9c 100644
      private suspend fun buildProjection(
          snapshot: SimklSyncSnapshot,
          entryIndex: SimklEntryIndex? = null
-@@ -463,6 +358,84 @@ class SimklSyncRepository @Inject constructor(
+@@ -463,6 +358,89 @@ class SimklSyncRepository @Inject constructor(
      private companion object {
          const val TAG = "SimklSync"
      }
++
++    /* The mode is read from `TraktSettingsDataStore`; while it is off the runs are dropped. */
++    private suspend fun offersSimklRewatchRuns(): Boolean =
++        settingsDataStore.simklRewatchMode.first() != SimklRewatchMode.OFF
++
 +    internal suspend fun adoptRewatchSessions(sessions: List<SimklLibraryEntry>) =
 +        withContext(Dispatchers.IO) {
 +            // What the caller read is a delta outside the initial sync (it was paired with the sync
@@ -314686,11 +314714,15 @@ index 0000000000..bd709b5f92
 +/** Live TV V2: which IPTV implementation the TV Channels entry opens. */
 +enum class IptvEngine { CLASSIC, V2 }
 diff --git a/app/src/main/java/com/nuvio/tv/domain/model/WatchProgress.kt b/app/src/main/java/com/nuvio/tv/domain/model/WatchProgress.kt
-index 1cdc690288..5245e839e1 100644
+index 1cdc690288..3c4d58c43e 100644
 --- a/app/src/main/java/com/nuvio/tv/domain/model/WatchProgress.kt
 +++ b/app/src/main/java/com/nuvio/tv/domain/model/WatchProgress.kt
-@@ -33,26 +33,20 @@ data class WatchProgress(
+@@ -31,28 +31,24 @@ data class WatchProgress(
+     override val trackingProviderId: String? = null,
+     override val trackingProviderItemId: String? = null,
      override val trackingSourceUrl: String? = null,
++    /** True when this row mirrors a position the provider keeps open, not a finished watch. */
++    val isProviderPlaybackPosition: Boolean = false,
      val completionThresholdOverride: Float? = null,
      val excludedNextUpSeasons: Set<Int> = emptySet(),
 -    /**
@@ -314725,7 +314757,7 @@ index 1cdc690288..5245e839e1 100644
  ) : TrackingAttributedItem {
      override val trackingContentId: String
          get() = contentId
-@@ -69,6 +63,7 @@ data class WatchProgress(
+@@ -69,6 +65,7 @@ data class WatchProgress(
          const val SOURCE_SIMKL_PLAYBACK = "simkl_playback"
          const val SOURCE_REMOTE_PLAYBACK = "remote_playback"
          const val SOURCE_REMOTE_HISTORY = "remote_history"
@@ -314733,7 +314765,7 @@ index 1cdc690288..5245e839e1 100644
          const val COMPLETED_THRESHOLD = 0.90f
          const val SIMKL_COMPLETED_THRESHOLD = 0.80f
      }
-@@ -85,24 +80,40 @@ data class WatchProgress(
+@@ -85,24 +82,40 @@ data class WatchProgress(
          }
  
      /**
@@ -314783,7 +314815,7 @@ index 1cdc690288..5245e839e1 100644
      /**
       * Returns the remaining time in milliseconds
       */
-@@ -135,5 +146,6 @@ data class NextToWatch(
+@@ -135,5 +148,6 @@ data class NextToWatch(
      val nextVideoId: String?,           // Video ID to play next
      val nextSeason: Int?,               // Next season number
      val nextEpisode: Int?,              // Next episode number
@@ -427823,7 +427855,7 @@ index 494b1e9ae5..795843094a 100644
                  if (showAddonName) {
                      val addonText = if (catalogTitle.isBlank()) " " else stringResource(R.string.catalog_from_addon, catalogRow.addonName)
 diff --git a/app/src/main/java/com/nuvio/tv/ui/components/CollectionCardGlow.kt b/app/src/main/java/com/nuvio/tv/ui/components/CollectionCardGlow.kt
-index b6e28f1352..ff07a62b3b 100644
+index b6e28f1352..6565c5fb8b 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/components/CollectionCardGlow.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/components/CollectionCardGlow.kt
 @@ -19,7 +19,13 @@ import androidx.tv.material3.CardGlow
@@ -427831,7 +427863,7 @@ index b6e28f1352..ff07a62b3b 100644
  import androidx.tv.material3.Glow
  import coil3.BitmapImage
 +import coil3.size.Size
-+import coil3.SuccessResult
++import coil3.request.SuccessResult
 +import coil3.request.allowHardware
 +import coil3.request.ImageRequest
 +import androidx.compose.ui.platform.LocalContext
@@ -445950,7 +445982,7 @@ index 64358f654b..2dc4c286c8 100644
          Uri.parse(this).host ?: substringBefore("://").takeIf { it.isNotBlank() } ?: "unknown"
      }.getOrDefault("unknown")
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSessionMetadata.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSessionMetadata.kt
-index 77db783f2f..fc05933f62 100644
+index 77db783f2f..9d9d36ced9 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSessionMetadata.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSessionMetadata.kt
 @@ -6,8 +6,6 @@ import androidx.media3.common.MediaItem
@@ -445962,6 +445994,31 @@ index 77db783f2f..fc05933f62 100644
  
  /**
   * Builds a [MediaMetadata] from the current playback information so that
+@@ -129,17 +127,19 @@ internal fun PlayerRuntimeController.installMpvMediaSession() {
+             snapshotProvider = ::mpvMediaSessionSnapshot,
+             commandTarget = object : MpvMediaSessionCommandTarget {
+                 override fun setPlayWhenReady(playWhenReady: Boolean) {
+-                    if (!isUsingMpvEngine() || isInBackground) return
+-                    if (isPlaybackCurrentlyPlaying() != playWhenReady) {
++                    val controller = this@PlayerRuntimeController
++                    if (!controller.isUsingMpvEngine() || controller.isInBackground) return
++                    if (controller.isPlaybackCurrentlyPlaying() != playWhenReady) {
+                         // MediaSession commands should behave like ExoPlayer's session controls:
+                         // change playback without treating the button press as an in-player gesture.
+-                        onEvent(PlayerEvent.OnPlayPause, showPlaybackControls = false)
++                        controller.onEvent(PlayerEvent.OnPlayPause, showPlaybackControls = false)
+                     }
+                 }
+ 
+                 override fun seekTo(positionMs: Long) {
+-                    if (!isUsingMpvEngine() || isInBackground) return
+-                    onEvent(PlayerEvent.OnSeekTo(positionMs), showPlaybackControls = false)
++                    val controller = this@PlayerRuntimeController
++                    if (!controller.isUsingMpvEngine() || controller.isInBackground) return
++                    controller.onEvent(PlayerEvent.OnSeekTo(positionMs), showPlaybackControls = false)
+                 }
+             }
+         )
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt
 index e5daf086ec..03ff449724 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerMediaSourceFactory.kt
@@ -448981,7 +449038,7 @@ index 638c9d4a8a..58e84d1f3e 100644
      val url = currentStreamUrl
      if (!isShareableStreamUrl(url)) return null
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
-index 2e36f83ee8..3a072e2b4f 100644
+index 2e36f83ee8..5205dd69b2 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerPlaybackEvents.kt
 @@ -1,7 +1,5 @@
@@ -449755,21 +449812,7 @@ index 2e36f83ee8..3a072e2b4f 100644
              s.showSourcesPanel || s.showChaptersPanel || s.showAudioOverlay || s.showYouTubePanel || s.showStreamInfoOverlay ||
              s.showSubtitleTimingDialog || s.showSubtitleDelayOverlay || s.showPartyPanel
          if (!s.isPlaying && s.pauseOverlayEnabled && s.error == null && !anyPanelOpen) {
-@@ -1731,11 +1488,8 @@ fun PlayerRuntimeController.hideControls() {
-     _uiState.update { it.copy(showControls = false, showSeekOverlay = false, showMoreDialog = false) }
- }
- 
--fun PlayerRuntimeController.onEvent(
--    event: PlayerEvent,
--    showPlaybackControls: Boolean = true,
--) {
--    if (showPlaybackControls && event != PlayerEvent.OnParentalGuideHide) {
-+fun PlayerRuntimeController.onEvent(event: PlayerEvent) {
-+    if (event != PlayerEvent.OnParentalGuideHide) {
-         onUserInteraction()
-     }
-     when (event) {
-@@ -1748,17 +1502,18 @@ fun PlayerRuntimeController.onEvent(
+@@ -1748,17 +1505,18 @@ fun PlayerRuntimeController.onEvent(
                  val playing = isPlaybackCurrentlyPlaying()
                  if (playing) {
                      userPausedManually = true
@@ -449790,7 +449833,7 @@ index 2e36f83ee8..3a072e2b4f 100644
                      startProgressUpdates()
                      startWatchProgressSaving()
                      scheduleHideControls()
-@@ -1769,17 +1524,20 @@ fun PlayerRuntimeController.onEvent(
+@@ -1769,17 +1527,20 @@ fun PlayerRuntimeController.onEvent(
                  _exoPlayer?.let { player ->
                      if (player.isPlaying) {
                          userPausedManually = true
@@ -449812,7 +449855,7 @@ index 2e36f83ee8..3a072e2b4f 100644
          }
          PlayerEvent.OnSeekForward -> {
              if (_playbackTimeline.value.isLive) return
-@@ -1838,7 +1596,7 @@ fun PlayerRuntimeController.onEvent(
+@@ -1838,7 +1599,7 @@ fun PlayerRuntimeController.onEvent(
                      updatePlaybackTimeline(currentPosition = currentPlaybackPositionMs() ?: 0L)
                      return
                  }
@@ -449821,7 +449864,7 @@ index 2e36f83ee8..3a072e2b4f 100644
                  updatePlaybackTimeline(currentPosition = target)
                  pendingPreviewSeekPosition = null
                  scheduleProgressSyncAfterSeek()
-@@ -1858,12 +1616,10 @@ fun PlayerRuntimeController.onEvent(
+@@ -1858,12 +1619,10 @@ fun PlayerRuntimeController.onEvent(
              updatePlaybackTimeline(currentPosition = target)
              scheduleProgressSyncAfterSeek()
              publishPartyPlayback(positionMs = target)
@@ -449838,7 +449881,7 @@ index 2e36f83ee8..3a072e2b4f 100644
              }
          }
          is PlayerEvent.OnSkipChapter -> {
-@@ -1928,12 +1684,6 @@ fun PlayerRuntimeController.onEvent(
+@@ -1928,12 +1687,6 @@ fun PlayerRuntimeController.onEvent(
                  )
              }
          }
@@ -449851,7 +449894,7 @@ index 2e36f83ee8..3a072e2b4f 100644
          is PlayerEvent.OnSetCenterMixLevelDb -> {
              val clampedDb = event.db.coerceIn(CENTER_MIX_LEVEL_MIN_DB, CENTER_MIX_LEVEL_MAX_DB)
              applyCenterMixLevel(clampedDb)
-@@ -1953,7 +1703,7 @@ fun PlayerRuntimeController.onEvent(
+@@ -1953,7 +1706,7 @@ fun PlayerRuntimeController.onEvent(
              pendingAddonSubtitleTrackId = null
              pendingAudioSelectionAfterSubtitleRefresh = null
              resetSubtitleAutoSyncState()
@@ -449860,7 +449903,7 @@ index 2e36f83ee8..3a072e2b4f 100644
              if (_uiState.value.serverSubtitleTracks.isNotEmpty()) {
                  selectServerSubtitle(event.index)
              } else {
-@@ -1981,7 +1731,7 @@ fun PlayerRuntimeController.onEvent(
+@@ -1981,7 +1734,7 @@ fun PlayerRuntimeController.onEvent(
              pendingAddonSubtitleTrackId = null
              pendingAudioSelectionAfterSubtitleRefresh = null
              resetSubtitleAutoSyncState()
@@ -449869,7 +449912,7 @@ index 2e36f83ee8..3a072e2b4f 100644
              rememberSubtitleDisabled()
              disableSubtitles()
              if (hasBurnedInServerSubtitle) clearServerSubtitle()
-@@ -2220,11 +1970,7 @@ fun PlayerRuntimeController.onEvent(
+@@ -2220,11 +1973,7 @@ fun PlayerRuntimeController.onEvent(
              selectEpisodesSeason(event.season)
          }
          is PlayerEvent.OnEpisodeSelected -> {
@@ -449882,7 +449925,7 @@ index 2e36f83ee8..3a072e2b4f 100644
          }
          PlayerEvent.OnReloadEpisodeStreams -> {
              reloadEpisodeStreams()
-@@ -2257,9 +2003,12 @@ fun PlayerRuntimeController.onEvent(
+@@ -2257,9 +2006,12 @@ fun PlayerRuntimeController.onEvent(
              filterSourceStreamsByAddon(event.addonName)
          }
          is PlayerEvent.OnSourceStreamSelected -> {
@@ -449896,7 +449939,7 @@ index 2e36f83ee8..3a072e2b4f 100644
          PlayerEvent.OnDismissTransientOverlay -> {
              _uiState.update {
                  it.copy(
-@@ -2269,30 +2018,16 @@ fun PlayerRuntimeController.onEvent(
+@@ -2269,30 +2021,16 @@ fun PlayerRuntimeController.onEvent(
                      showSubtitleStylePanel = false,
                      showSubtitleTimingDialog = false,
                      showSpeedDialog = false,
@@ -449927,7 +449970,7 @@ index 2e36f83ee8..3a072e2b4f 100644
              hasRetriedCurrentStreamAfter416 = false
              playbackIssueReportRequestVersion.incrementAndGet()
              resetErrorRetryState()
-@@ -2334,7 +2069,7 @@ fun PlayerRuntimeController.onEvent(
+@@ -2334,7 +2072,7 @@ fun PlayerRuntimeController.onEvent(
                  )
              } else {
                  releasePlayer()
@@ -449936,7 +449979,7 @@ index 2e36f83ee8..3a072e2b4f 100644
              }
          }
          PlayerEvent.OnReportPlaybackIssue -> {
-@@ -2389,75 +2124,50 @@ fun PlayerRuntimeController.onEvent(
+@@ -2389,75 +2127,50 @@ fun PlayerRuntimeController.onEvent(
          PlayerEvent.OnStillWatchingContinue -> onStillWatchingContinue()
          PlayerEvent.OnDismissStillWatchingPrompt -> onDismissStillWatchingPrompt()
          is PlayerEvent.OnSetSubtitleSize -> {
@@ -450030,7 +450073,7 @@ index 2e36f83ee8..3a072e2b4f 100644
              }
          }
          PlayerEvent.OnToggleAspectRatio -> {
-@@ -2506,6 +2216,9 @@ fun PlayerRuntimeController.onEvent(
+@@ -2506,6 +2219,9 @@ fun PlayerRuntimeController.onEvent(
                  Log.d(PlayerRuntimeController.TAG, "Persisting aspect mode: $newMode")
                  deviceLocalPlayerPreferences.setAspectMode(newMode)
              }
@@ -450040,7 +450083,7 @@ index 2e36f83ee8..3a072e2b4f 100644
              hideAspectRatioIndicatorJob?.cancel()
              hideAspectRatioIndicatorJob = scope.launch {
                  delay(1500)
-@@ -2548,6 +2261,8 @@ fun PlayerRuntimeController.onEvent(
+@@ -2548,6 +2264,8 @@ fun PlayerRuntimeController.onEvent(
                  }
              }
          }
@@ -450049,7 +450092,7 @@ index 2e36f83ee8..3a072e2b4f 100644
      }
  }
  
-@@ -2570,7 +2285,8 @@ internal fun PlayerRuntimeController.buildStreamInfoData(): StreamInfoData {
+@@ -2570,7 +2288,8 @@ internal fun PlayerRuntimeController.buildStreamInfoData(): StreamInfoData {
      val videoHeight = matchedFormat?.height?.takeIf { it > 0 } ?: activeVideoFormat?.height?.takeIf { it > 0 } ?: currentVideoHeight
      val videoBitrate = activeVideoFormat?.bitrate?.takeIf { it > 0 } ?: currentVideoBitrate
      val videoCodec = activeVideoFormat?.let { format ->
@@ -450059,7 +450102,7 @@ index 2e36f83ee8..3a072e2b4f 100644
      } ?: currentVideoCodec
  
      return StreamInfoData(
-@@ -2606,6 +2322,7 @@ internal fun PlayerRuntimeController.buildStreamInfoData(): StreamInfoData {
+@@ -2606,6 +2325,7 @@ internal fun PlayerRuntimeController.buildStreamInfoData(): StreamInfoData {
          playerEngine = when (currentInternalPlayerEngine) {
              com.nuvio.tv.data.local.InternalPlayerEngine.EXOPLAYER -> context.getString(R.string.playback_engine_exoplayer)
              com.nuvio.tv.data.local.InternalPlayerEngine.MVP_PLAYER -> context.getString(R.string.playback_engine_mvplayer)
@@ -450067,7 +450110,7 @@ index 2e36f83ee8..3a072e2b4f 100644
              com.nuvio.tv.data.local.InternalPlayerEngine.AUTO -> null
          },
          serverPlayback = serverPlaybackSummary()
-@@ -2625,3 +2342,24 @@ private fun formatTorrentSpeed(context: android.content.Context, bytesPerSec: Lo
+@@ -2625,3 +2345,24 @@ private fun formatTorrentSpeed(context: android.content.Context, bytesPerSec: Lo
          else -> context.getString(R.string.unit_speed_b_s, bytesPerSec)
      }
  }
@@ -450169,7 +450212,7 @@ index 43d743b22c..fc50ae82bc 100644
          android.net.Uri.parse(this).host ?: substringBefore("://").takeIf { it.isNotBlank() } ?: "unknown"
      }.getOrDefault("unknown")
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
-index 5610a5e0f1..57c00b7eff 100644
+index 5610a5e0f1..727e9e28f5 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
 +++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/PlayerRuntimeControllerStreams.kt
 @@ -8,18 +8,19 @@ import com.nuvio.tv.core.debrid.DirectDebridPlayableResult
@@ -451164,7 +451207,7 @@ index 5610a5e0f1..57c00b7eff 100644
          val playerSettings = playerSettingsDataStore.playerSettings.first()
          directDebridStreamPreparer.prepare(
              streams = streams,
-@@ -1645,22 +1685,11 @@ internal fun PlayerRuntimeController.reloadEpisodeStreams() {
+@@ -1645,10 +1685,6 @@ internal fun PlayerRuntimeController.reloadEpisodeStreams() {
      }
  }
  
@@ -451175,20 +451218,7 @@ index 5610a5e0f1..57c00b7eff 100644
  internal fun PlayerRuntimeController.switchToEpisodeStream(
      stream: Stream,
      forcedTargetVideo: Video? = null,
--    isAutoPlay: Boolean = false,
--    continuingSelection: Boolean = false,
--    fallbackStreams: List<Stream>? = null,
--    autoSelection: SourceFallbackHandoff.TriedSources? = null
-+    isAutoPlay: Boolean = false
- ) {
--    if (!continuingSelection) {
--        beginStreamFallbackSession(stream, fallbackStreams ?: _uiState.value.episodeFilteredStreams.ifEmpty { _uiState.value.episodeAllStreams })
--    }
--    if (resolveUsenetForSwitch(stream, fromEpisodePanel = true, forcedTargetVideo, isAutoPlay)) return
-     if (openExternalStreamInBrowser(stream = stream, fromEpisodePanel = true)) {
-         return
-     }
-@@ -1672,11 +1701,9 @@ internal fun PlayerRuntimeController.switchToEpisodeStream(
+@@ -1672,11 +1708,9 @@ internal fun PlayerRuntimeController.switchToEpisodeStream(
              val prepared = prepareServerStream(stream)
              debridResolveJob = null
              if (prepared != null) {
@@ -451202,7 +451232,7 @@ index 5610a5e0f1..57c00b7eff 100644
              }
          }
          return
-@@ -1689,10 +1716,10 @@ internal fun PlayerRuntimeController.switchToEpisodeStream(
+@@ -1689,10 +1723,10 @@ internal fun PlayerRuntimeController.switchToEpisodeStream(
              val resolved = resolveYouTubeStream(stream)
              debridResolveJob = null
              if (resolved != null) {
@@ -451215,7 +451245,7 @@ index 5610a5e0f1..57c00b7eff 100644
                          isLoadingEpisodeStreams = false,
                          episodeStreamsError = context.getString(com.nuvio.tv.R.string.youtube_resolution_failed)
                      )
-@@ -1711,12 +1738,12 @@ internal fun PlayerRuntimeController.switchToEpisodeStream(
+@@ -1711,12 +1745,12 @@ internal fun PlayerRuntimeController.switchToEpisodeStream(
              val resolved = resolveDirectDebridStreamIfNeeded(stream, resolveSeason, resolveEpisode)
              debridResolveJob = null
              if (resolved != null && !resolved.getStreamUrl().isNullOrBlank()) {
@@ -451230,7 +451260,7 @@ index 5610a5e0f1..57c00b7eff 100644
                          isLoadingEpisodeStreams = false,
                          episodeStreamsError = context.getString(com.nuvio.tv.R.string.player_stream_error_invalid_url)
                      )
-@@ -1737,11 +1764,11 @@ internal fun PlayerRuntimeController.switchToEpisodeStream(
+@@ -1737,11 +1771,11 @@ internal fun PlayerRuntimeController.switchToEpisodeStream(
                  val resolved = resolveDirectDebridStreamIfNeeded(stream, resolveSeason, resolveEpisode)
                  if (resolved != null && !resolved.getStreamUrl().isNullOrBlank()) {
                      debridResolveJob = null
@@ -451244,7 +451274,7 @@ index 5610a5e0f1..57c00b7eff 100644
                              isLoadingEpisodeStreams = false,
                              episodeStreamsError = context.getString(com.nuvio.tv.R.string.player_stream_error_invalid_url)
                          )
-@@ -1750,11 +1777,7 @@ internal fun PlayerRuntimeController.switchToEpisodeStream(
+@@ -1750,11 +1784,7 @@ internal fun PlayerRuntimeController.switchToEpisodeStream(
              }
              return
          }
@@ -451257,7 +451287,7 @@ index 5610a5e0f1..57c00b7eff 100644
          return
      }
  
-@@ -1763,7 +1786,6 @@ internal fun PlayerRuntimeController.switchToEpisodeStream(
+@@ -1763,7 +1793,6 @@ internal fun PlayerRuntimeController.switchToEpisodeStream(
          isAutoPlay = isAutoPlay,
      )
  
@@ -451265,7 +451295,7 @@ index 5610a5e0f1..57c00b7eff 100644
      // Stop any active torrent before switching to HTTP stream
      stopTorrentStream()
  
-@@ -1800,7 +1822,6 @@ internal fun PlayerRuntimeController.switchToEpisodeStream(
+@@ -1800,7 +1829,6 @@ internal fun PlayerRuntimeController.switchToEpisodeStream(
      )
      val playbackUrl = currentStreamUrl
      val playbackHeaders = currentHeaders
@@ -451273,7 +451303,7 @@ index 5610a5e0f1..57c00b7eff 100644
      val targetVideoId = targetVideo?.id ?: _uiState.value.episodeStreamsForVideoId ?: currentVideoId
      // Do not persist an episode switch under the outgoing episode's reuse key.
      if (targetVideoId == currentVideoId) {
-@@ -1816,13 +1837,11 @@ internal fun PlayerRuntimeController.switchToEpisodeStream(
+@@ -1816,13 +1844,11 @@ internal fun PlayerRuntimeController.switchToEpisodeStream(
      currentSeason = targetVideo?.season ?: _uiState.value.episodeStreamsSeason ?: currentSeason
      currentEpisode = targetVideo?.episode ?: _uiState.value.episodeStreamsEpisode ?: currentEpisode
      currentEpisodeTitle = targetVideo?.title ?: _uiState.value.episodeStreamsTitle ?: currentEpisodeTitle
@@ -451287,7 +451317,7 @@ index 5610a5e0f1..57c00b7eff 100644
      currentTraktEpisodeMapping = null
      currentTraktEpisodeMappingKey = null
      lastSavedPosition = 0L
-@@ -1840,7 +1859,6 @@ internal fun PlayerRuntimeController.switchToEpisodeStream(
+@@ -1840,7 +1866,6 @@ internal fun PlayerRuntimeController.switchToEpisodeStream(
              currentStreamInfoHash = stream.infoHash ?: stream.clientResolve?.infoHash,
              currentStreamFileIdx = stream.clientResolve?.fileIdx,
              currentStreamAddonName = stream.addonName,
@@ -451295,7 +451325,7 @@ index 5610a5e0f1..57c00b7eff 100644
              audioTracks = emptyList(),
              subtitleTracks = emptyList(),
              selectedAudioTrackIndex = -1,
-@@ -1865,15 +1883,13 @@ internal fun PlayerRuntimeController.switchToEpisodeStream(
+@@ -1865,15 +1890,13 @@ internal fun PlayerRuntimeController.switchToEpisodeStream(
              isNextEpisodeMetadataResolved = false,
          )
      }
@@ -451312,7 +451342,7 @@ index 5610a5e0f1..57c00b7eff 100644
      skipIntroFetchedKey = null
      lastActiveSkipType = null
      autoSkippedIntervalKeys.clear()
-@@ -1893,10 +1909,6 @@ internal fun PlayerRuntimeController.switchToEpisodeStream(
+@@ -1893,10 +1916,6 @@ internal fun PlayerRuntimeController.switchToEpisodeStream(
          headers = playbackHeaders,
          loadSavedProgress = true
      )
@@ -451323,7 +451353,7 @@ index 5610a5e0f1..57c00b7eff 100644
  }
  
  private fun String.safeStreamTraceHost(): String {
-@@ -1910,8 +1922,7 @@ private fun String.safeStreamTraceHost(): String {
+@@ -1910,8 +1929,7 @@ private fun String.safeStreamTraceHost(): String {
   */
  private fun PlayerRuntimeController.switchToEpisodeStreamCommon(
      stream: Stream,
@@ -451333,7 +451363,7 @@ index 5610a5e0f1..57c00b7eff 100644
  ) {
      episodeStreamsScope?.cancel()
      episodeStreamsScope = null
-@@ -1963,7 +1974,6 @@ private fun PlayerRuntimeController.switchToEpisodeStreamCommon(
+@@ -1963,7 +1981,6 @@ private fun PlayerRuntimeController.switchToEpisodeStreamCommon(
              currentStreamInfoHash = stream.infoHash ?: stream.clientResolve?.infoHash,
              currentStreamFileIdx = stream.clientResolve?.fileIdx,
              currentStreamAddonName = stream.addonName,
@@ -451341,7 +451371,7 @@ index 5610a5e0f1..57c00b7eff 100644
              audioTracks = emptyList(),
              subtitleTracks = emptyList(),
              selectedAudioTrackIndex = -1,
-@@ -1988,15 +1998,13 @@ private fun PlayerRuntimeController.switchToEpisodeStreamCommon(
+@@ -1988,15 +2005,13 @@ private fun PlayerRuntimeController.switchToEpisodeStreamCommon(
              isNextEpisodeMetadataResolved = false,
          )
      }
@@ -451358,7 +451388,7 @@ index 5610a5e0f1..57c00b7eff 100644
      skipIntroFetchedKey = null
      lastActiveSkipType = null
      autoSkippedIntervalKeys.clear()
-@@ -2113,34 +2121,12 @@ internal fun PlayerRuntimeController.preloadNextEpisodeSources() {
+@@ -2113,34 +2128,12 @@ internal fun PlayerRuntimeController.preloadNextEpisodeSources() {
      nextEpisodePreloadJob?.cancel()
      nextEpisodePreloadJob = scope.launch {
          Log.d(PlayerRuntimeController.TAG, "Preloading sources for next episode: S${nextVideo.season}E${nextVideo.episode}")
@@ -451395,7 +451425,7 @@ index 5610a5e0f1..57c00b7eff 100644
      }
  }
  
-@@ -2191,11 +2177,22 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
+@@ -2191,11 +2184,22 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
      nextEpisodeAutoPlayJob = scope.launch {
          try {
              streamRepository.setLocalPluginSearchPaused(false)
@@ -451423,7 +451453,7 @@ index 5610a5e0f1..57c00b7eff 100644
              val shouldAutoSelectInManualMode =
                  playerSettings.streamAutoPlayMode == StreamAutoPlayMode.MANUAL &&
                      (
-@@ -2220,8 +2217,25 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
+@@ -2220,8 +2224,25 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
  
              val installedAddons = streamAddonsFor(nextVideo.id)
              val installedAddonOrder = installedAddons.map { it.displayName }
@@ -451450,7 +451480,7 @@ index 5610a5e0f1..57c00b7eff 100644
              val effectiveMode = if (shouldAutoSelectInManualMode) {
                  StreamAutoPlayMode.FIRST_STREAM
              } else {
-@@ -2257,11 +2271,7 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
+@@ -2257,11 +2278,7 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
              val searchSettled = CompletableDeferred<Unit>()
  
              fun trySelectStream(data: List<AddonStreams>): Stream? {
@@ -451463,7 +451493,7 @@ index 5610a5e0f1..57c00b7eff 100644
                  val allStreams = orderedStreams.flatMap { it.streams }
                  return StreamAutoPlaySelector.selectAutoPlayStream(
                      streams = allStreams,
-@@ -2279,17 +2289,14 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
+@@ -2279,17 +2296,14 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
                      preferBingeGroupInSelection = playerSettings.streamAutoPlayPreferBingeGroupForNextEpisode,
                      bingeGroupOnly = bingeGroupOnlyManualMode,
                      identity = autoPlayIdentity,
@@ -451484,7 +451514,7 @@ index 5610a5e0f1..57c00b7eff 100644
                  val allStreams = orderedStreams.flatMap { it.streams }
                  // Early: binge group + filename match (most precise)
                  val nextFilename = com.nuvio.tv.core.player.FilenameEpisodeMatcher.buildNextFilename(
-@@ -2300,15 +2307,13 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
+@@ -2300,15 +2314,13 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
                      nextEpisode = nextVideo.episode ?: 0
                  ) ?: currentFilename?.takeIf { it.isNotBlank() }
                  if (nextFilename != null) {
@@ -451507,7 +451537,7 @@ index 5610a5e0f1..57c00b7eff 100644
                      if (bingeAndFilename != null) return bingeAndFilename
                  }
                  // Early fallback: binge group alone
-@@ -2324,7 +2329,8 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
+@@ -2324,7 +2336,8 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
                      preferBingeGroupInSelection = true,
                      bingeGroupOnly = true,
                      identity = autoPlayIdentity,
@@ -451517,7 +451547,7 @@ index 5610a5e0f1..57c00b7eff 100644
                  )
              }
  
-@@ -2337,11 +2343,7 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
+@@ -2337,11 +2350,7 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
                      nextEpisode = nextVideo.episode ?: 0
                  ) ?: currentFilename?.takeIf { it.isNotBlank() }
                      ?: return null
@@ -451530,7 +451560,7 @@ index 5610a5e0f1..57c00b7eff 100644
                  return orderedStreams.flatMap { it.streams }.firstOrNull { stream ->
                      !stream.isExternal() &&
                          com.nuvio.tv.core.player.FilenameEpisodeMatcher.matches(
-@@ -2358,17 +2360,12 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
+@@ -2358,17 +2367,12 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
  
              val timeoutSeconds = playerSettings.streamAutoPlayTimeoutSeconds
  
@@ -451549,7 +451579,7 @@ index 5610a5e0f1..57c00b7eff 100644
                  ).collect { result ->
                      when (result) {
                          is NetworkResult.Success -> {
-@@ -2392,6 +2389,11 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
+@@ -2392,6 +2396,11 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
                  if (!autoSelectTriggered) {
                      lastSuccessData?.let { data -> trySelectStream(data)?.let { recordSelection(it) } }
                  }
@@ -451561,7 +451591,7 @@ index 5610a5e0f1..57c00b7eff 100644
                  searchSettled.complete(Unit)
              }
  
-@@ -2440,14 +2442,9 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
+@@ -2440,14 +2449,9 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
                  innerJob.cancel()
              }
  
@@ -451578,7 +451608,7 @@ index 5610a5e0f1..57c00b7eff 100644
              if (streamToPlay != null) {
                  val sourceName = (streamToPlay.name?.takeIf { it.isNotBlank() } ?: streamToPlay.addonName).trim()
                  for (remaining in 3 downTo 1) {
-@@ -2474,13 +2471,7 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
+@@ -2474,13 +2478,7 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
                  switchToEpisodeStream(
                      stream = streamToPlay,
                      forcedTargetVideo = nextVideo,
@@ -451593,7 +451623,7 @@ index 5610a5e0f1..57c00b7eff 100644
                  )
              } else {
                  _uiState.update {
-@@ -2508,60 +2499,6 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
+@@ -2508,60 +2506,6 @@ internal fun PlayerRuntimeController.playNextEpisode(userInitiated: Boolean = fa
      }
  }
  
@@ -451654,7 +451684,7 @@ index 5610a5e0f1..57c00b7eff 100644
  private fun PlayerRuntimeController.playNextCloudLibraryFile(
      nextVideo: Video,
      userInitiated: Boolean
-@@ -2635,12 +2572,15 @@ private fun PlayerRuntimeController.playNextCloudLibraryFile(
+@@ -2635,12 +2579,15 @@ private fun PlayerRuntimeController.playNextCloudLibraryFile(
      }
  }
  
@@ -455369,6 +455399,19 @@ index 0000000000..7a3ccb328a
 +        }
 +    }
 +}
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamSourcesSidePanel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamSourcesSidePanel.kt
+index 2a256e64bd..e4983c5742 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamSourcesSidePanel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/StreamSourcesSidePanel.kt
+@@ -66,7 +66,7 @@ import androidx.compose.ui.platform.LocalContext
+ @Composable
+ internal fun StreamSourcesSidePanel(
+     uiState: PlayerUiState,
+-    currentFilename: String?,
++    currentFilename: String? = null,
+     streamsFocusRequester: FocusRequester,
+     onClose: () -> Unit,
+     onReload: () -> Unit,
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/SubtitleSelectionOverlay.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/SubtitleSelectionOverlay.kt
 index de07243968..880ec903f0 100644
 --- a/app/src/main/java/com/nuvio/tv/ui/screens/player/SubtitleSelectionOverlay.kt
@@ -458726,6 +458769,35 @@ index 080b78e409..7987dffd22 100644
          val originalStartMs: Long,
          val originalEndMs: Long,
          val startMs: Long,
+diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncSyncedLabel.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncSyncedLabel.kt
+index 41568808e2..d99a49df6c 100644
+--- a/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncSyncedLabel.kt
++++ b/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncSyncedLabel.kt
+@@ -55,11 +55,16 @@ internal object AutoSyncSyncedSubtitle {
+     private val _status = MutableStateFlow<Status?>(null)
+     val status: StateFlow<Status?> = _status.asStateFlow()
+ 
++    private val _url = MutableStateFlow<String?>(null)
++    /** The add-on subtitle whose on-screen timing AutoSync corrected or confirmed most recently. */
++    val url: StateFlow<String?> = _url.asStateFlow()
++
+     fun start(subtitleUrl: String): Status =
+         Status(subtitleUrl, AutoSyncState.IN_PROGRESS).also { _status.value = it }
+ 
+     fun mark(subtitleUrl: String, state: AutoSyncState = AutoSyncState.SYNCED) {
+         _status.value = Status(subtitleUrl, state)
++        _url.value = subtitleUrl
+     }
+ 
+     fun fail(run: Status?) {
+@@ -72,6 +77,7 @@ internal object AutoSyncSyncedSubtitle {
+ 
+     fun clear() {
+         _status.value = null
++        _url.value = null
+     }
+ }
+ 
 diff --git a/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncTimingDump.kt b/app/src/main/java/com/nuvio/tv/ui/screens/player/autosync/AutoSyncTimingDump.kt
 new file mode 100644
 index 0000000000..4b489637ee
@@ -614689,10 +614761,10 @@ index 0000000000..824575f295
 +    <string name="scout_menu_visible_sub">Scout\'s Home rows keep their own switches</string>
 +</resources>
 diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
-index 78ca3ea92d..d6edeaed5e 100644
+index 78ca3ea92d..21481faa2c 100644
 --- a/app/src/main/res/values/strings.xml
 +++ b/app/src/main/res/values/strings.xml
-@@ -3898,4 +3898,88 @@
+@@ -3898,4 +3898,89 @@
      <string name="iptv_free_channel_count">%1$d channels</string>
      <string name="iptv_free_source_summary">Free channels · %1$d countries · %2$d channels</string>
      <string name="iptv_free_source_summary_short">Free channels · %1$d countries</string>
@@ -614747,6 +614819,7 @@ index 78ca3ea92d..d6edeaed5e 100644
 +    <string name="web_subtitle_font_pick_hint">No font chosen yet. Tap Choose Font File, then pick your font.</string>
 +    <string name="youtube_settings_continue_watching_on_home">Continue watching on Home</string>
 +    <string name="youtube_settings_continue_watching_on_home_desc">Show videos you started on the YouTube page in their own row on Nuvio\'s Home screen.</string>
++<string name="vod_search_playlist">IPTV · %1$s</string>
 +    <string name="usenet_opening">Opening Usenet video…</string>
 +    <string name="player_chapter_named">Chapter %1$d: %2$s</string>
 +    <string name="cd_playback_stats">Playback stats</string>
